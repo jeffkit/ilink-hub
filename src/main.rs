@@ -5,14 +5,15 @@ use tokio::sync::{broadcast, watch};
 use tracing::info;
 
 use ilink_hub::{
-    hub::{spawn_dispatcher, HubState},
-    ilink::UpstreamClient,
+    hub::{spawn_dispatcher, spawn_health_checker, HubState},
+    ilink::{LoginClient, UpstreamClient},
     server::build_router,
+    store::Store,
 };
 
 #[derive(Parser)]
 #[command(name = "ilink-hub")]
-#[command(about = "iLink-compatible multiplexer hub for WeChat ClawBot", long_about = None)]
+#[command(version, about = "iLink-compatible multiplexer hub for WeChat ClawBot")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -22,15 +23,33 @@ struct Cli {
 enum Commands {
     /// Start the hub server
     Serve {
-        /// Real iLink bot token (from WeChat ClawBot login)
+        /// Real iLink bot token. If omitted, loaded from DATABASE_URL or triggers QR login.
         #[arg(long, env = "ILINK_TOKEN")]
-        token: String,
+        token: Option<String>,
 
         /// Hub listen address
         #[arg(long, default_value = "0.0.0.0:8765", env = "ILINK_HUB_ADDR")]
         addr: String,
 
-        /// Override real iLink base URL (for testing)
+        /// Override real iLink base URL (for testing / custom deployments)
+        #[arg(long, env = "ILINK_BASE_URL")]
+        ilink_base_url: Option<String>,
+
+        /// Database connection URL.
+        /// Defaults to SQLite at ./ilink-hub.db
+        /// Examples:
+        ///   sqlite:///path/to/db.sqlite
+        ///   postgres://user:pass@localhost/ilink_hub
+        ///   mysql://user:pass@localhost/ilink_hub
+        #[arg(long, default_value = "sqlite:./ilink-hub.db", env = "DATABASE_URL")]
+        database_url: String,
+    },
+
+    /// Interactive QR-code login — scans WeChat and saves bot_token to DB
+    Login {
+        #[arg(long, default_value = "sqlite:./ilink-hub.db", env = "DATABASE_URL")]
+        database_url: String,
+
         #[arg(long, env = "ILINK_BASE_URL")]
         ilink_base_url: Option<String>,
     },
@@ -70,8 +89,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { token, addr, ilink_base_url } => {
-            run_server(token, addr, ilink_base_url).await?;
+        Commands::Serve { token, addr, ilink_base_url, database_url } => {
+            run_server(token, addr, ilink_base_url, database_url).await?;
+        }
+        Commands::Login { database_url, ilink_base_url } => {
+            run_login(database_url, ilink_base_url).await?;
         }
         Commands::Register { hub_url, name, label } => {
             register_client(&hub_url, name, label).await?;
@@ -84,20 +106,37 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_server(token: String, addr: String, ilink_base_url: Option<String>) -> Result<()> {
-    info!(%addr, "iLink Hub starting");
+async fn run_server(
+    token_arg: Option<String>,
+    addr: String,
+    ilink_base_url: Option<String>,
+    database_url: String,
+) -> Result<()> {
+    info!(%addr, %database_url, "iLink Hub starting");
 
-    let upstream = Arc::new(UpstreamClient::new(token, ilink_base_url));
+    // Connect to database
+    let store = Arc::new(Store::connect(&database_url).await?);
+
+    // Resolve bot token: arg > env > DB > QR login
+    let (token, base_url) = resolve_token(token_arg, ilink_base_url, store.clone()).await?;
+
+    let upstream = Arc::new(UpstreamClient::new(token, Some(base_url)));
     let state = HubState::new(upstream.clone());
 
-    // Upstream broadcast channel: capacity 256 messages
+    // Pre-load persisted clients into in-memory registry
+    load_clients_from_db(state.clone(), store.clone()).await;
+
+    // Upstream broadcast channel
     let (tx, rx) = broadcast::channel::<ilink_hub::ilink::types::InboundMessage>(256);
 
     // Shutdown signal
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // Start dispatcher (routes upstream messages to client queues)
+    // Start dispatcher
     spawn_dispatcher(state.clone(), rx);
+
+    // Start health checker
+    spawn_health_checker(state.clone());
 
     // Start upstream polling loop
     {
@@ -137,6 +176,63 @@ async fn run_server(token: String, addr: String, ilink_base_url: Option<String>)
     Ok(())
 }
 
+async fn resolve_token(
+    token_arg: Option<String>,
+    ilink_base_url: Option<String>,
+    store: Arc<Store>,
+) -> Result<(String, String)> {
+    let default_base = "https://ilinkai.weixin.qq.com".to_string();
+
+    if let Some(token) = token_arg {
+        let base = ilink_base_url.unwrap_or(default_base);
+        store.save_credentials(&token, &base).await?;
+        return Ok((token, base));
+    }
+
+    // Try loading from DB
+    if let Some((token, base)) = store.load_credentials().await? {
+        info!("Loaded bot token from database");
+        return Ok((token, base));
+    }
+
+    // Fall back to QR login
+    info!("No token found, starting QR login");
+    let login_client = LoginClient::new(ilink_base_url.clone());
+    let token = login_client.login_with_qr().await?;
+    let base = ilink_base_url.unwrap_or(default_base);
+    store.save_credentials(&token, &base).await?;
+    Ok((token, base))
+}
+
+async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
+    match store.list_clients().await {
+        Ok(clients) => {
+            let count = clients.len();
+            let mut registry = state.registry.write().await;
+            let mut queues = state.queues.lock().await;
+            for c in clients {
+                registry.register(c.name.clone(), c.label.clone());
+                // Override with stored vtoken
+                queues.ensure(&c.vtoken);
+            }
+            info!(count, "loaded clients from database");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load clients from DB");
+        }
+    }
+}
+
+async fn run_login(database_url: String, ilink_base_url: Option<String>) -> Result<()> {
+    let store = Store::connect(&database_url).await?;
+    let login_client = LoginClient::new(ilink_base_url.clone());
+    let token = login_client.login_with_qr().await?;
+    let base = ilink_base_url.unwrap_or_else(|| "https://ilinkai.weixin.qq.com".to_string());
+    store.save_credentials(&token, &base).await?;
+    println!("✅ Login successful! Token saved to {}", database_url);
+    Ok(())
+}
+
 async fn register_client(hub_url: &str, name: String, label: Option<String>) -> Result<()> {
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
@@ -150,11 +246,13 @@ async fn register_client(hub_url: &str, name: String, label: Option<String>) -> 
     if resp["ret"] == 0 {
         let vtoken = resp["vtoken"].as_str().unwrap_or("");
         println!("✅ Registered client '{name}'");
-        println!("   Virtual token: {vtoken}");
         println!();
-        println!("Configure your backend:");
-        println!("   WEIXIN_BASE_URL={hub_url}");
-        println!("   WEIXIN_TOKEN={vtoken}");
+        println!("Configure your backend with:");
+        println!("  WEIXIN_BASE_URL={hub_url}");
+        println!("  WEIXIN_TOKEN={vtoken}");
+        println!();
+        println!("Or for wechatbot Rust SDK:");
+        println!("  BotOptions {{ base_url: Some(\"{hub_url}\"), token: \"{vtoken}\", .. }}");
     } else {
         eprintln!("❌ Registration failed: {}", resp["errmsg"].as_str().unwrap_or("unknown"));
         std::process::exit(1);
@@ -176,13 +274,17 @@ async fn list_clients(hub_url: &str) -> Result<()> {
     if clients.is_empty() {
         println!("No clients registered.");
     } else {
-        println!("{:<20} {:<10} {}", "NAME", "STATUS", "LABEL");
-        println!("{}", "-".repeat(50));
+        println!("{:<20} {:<12} {}", "NAME", "STATUS", "LABEL");
+        println!("{}", "-".repeat(52));
         for c in clients {
             let name = c["name"].as_str().unwrap_or("-");
             let label = c["label"].as_str().unwrap_or("-");
-            let online = if c["online"].as_bool().unwrap_or(false) { "🟢 online" } else { "🔴 offline" };
-            println!("{:<20} {:<10} {}", name, online, label);
+            let online = if c["online"].as_bool().unwrap_or(false) {
+                "🟢 online "
+            } else {
+                "🔴 offline"
+            };
+            println!("{:<20} {:<12} {}", name, online, label);
         }
     }
 

@@ -1,3 +1,4 @@
+pub mod health;
 pub mod queue;
 pub mod registry;
 pub mod router;
@@ -9,6 +10,7 @@ use tracing::{error, info, warn};
 use crate::ilink::types::{InboundMessage, SendMessageRequest};
 use crate::ilink::UpstreamClient;
 
+pub use health::spawn_health_checker;
 pub use queue::{ClientQueue, ContextTokenMap, QueueStore};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
