@@ -1,0 +1,61 @@
+[package]
+name = "ilink-hub"
+version = "0.1.0"
+edition = "2021"
+description = "iLink-compatible multiplexer hub for WeChat ClawBot — route one WeChat account to multiple AI agent backends"
+license = "MIT"
+repository = "https://github.com/kongjie/ilink-hub"
+keywords = ["wechat", "ilink", "clawbot", "ai-agent", "proxy"]
+categories = ["web-programming", "network-programming"]
+
+[[bin]]
+name = "ilink-hub"
+path = "src/main.rs"
+
+[lib]
+name = "ilink_hub"
+path = "src/lib.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.8", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["time"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.8"
+base64 = "0.22"
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Config
+config = "0.14"
+dirs = "5"
+
+[dev-dependencies]
+tokio-test = "0.4"
