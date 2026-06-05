@@ -42,7 +42,9 @@ jobs:
 
       - name: Install dependencies
         working-directory: docs
-        run: pnpm install --frozen-lockfile
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm rebuild esbuild
 
       - name: Build docs
         working-directory: docs
