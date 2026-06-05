@@ -1,10 +1,10 @@
 //! Message router — decides which backend client receives each inbound message.
-//! Routing state is per-WeChat-user (from_user field).
+//! Routing state is per-WeChat-user (from_user_id field).
 
 use std::collections::HashMap;
 use tracing::debug;
 
-use crate::ilink::types::InboundMessage;
+use crate::ilink::types::WeixinMessage;
 
 // ─── Hub commands ────────────────────────────────────────────────────────────
 
@@ -42,21 +42,15 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-/// Routing decision for an inbound message.
 #[derive(Debug)]
 pub enum RoutingDecision {
-    /// Route to a specific client vtoken
     ForwardTo(String),
-    /// Broadcast to all online clients
     Broadcast,
-    /// Handle locally (hub command like /list, /use)
     HubInternal(HubCommand),
 }
 
 pub struct Router {
-    /// from_user → active client vtoken
     active_routes: HashMap<String, String>,
-    /// Default client vtoken used for users with no active route set
     default_client: Option<String>,
 }
 
@@ -72,32 +66,31 @@ impl Router {
         self.default_client = Some(vtoken);
     }
 
-    pub fn set_route(&mut self, from_user: &str, vtoken: String) {
-        self.active_routes.insert(from_user.to_string(), vtoken);
+    pub fn set_route(&mut self, from_user_id: &str, vtoken: String) {
+        self.active_routes.insert(from_user_id.to_string(), vtoken);
     }
 
-    pub fn get_route(&self, from_user: &str) -> Option<&str> {
+    pub fn get_route(&self, from_user_id: &str) -> Option<&str> {
         self.active_routes
-            .get(from_user)
+            .get(from_user_id)
             .map(String::as_str)
             .or(self.default_client.as_deref())
     }
 
     /// Decide routing for an inbound message.
-    pub fn route(&self, msg: &InboundMessage) -> RoutingDecision {
-        // Check for hub commands first
-        if let Some(text) = &msg.content {
+    pub fn route(&self, msg: &WeixinMessage) -> RoutingDecision {
+        // Check for hub commands in text messages
+        if let Some(text) = msg.text() {
             if let Some(cmd) = parse_hub_command(text) {
                 return RoutingDecision::HubInternal(cmd);
             }
         }
 
-        // Route based on active selection for this user
-        if let Some(vtoken) = self.get_route(&msg.from_user) {
-            debug!(from_user = %msg.from_user, vtoken = %vtoken, "routing message");
+        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+        if let Some(vtoken) = self.get_route(from_user_id) {
+            debug!(from_user_id, vtoken, "routing message");
             RoutingDecision::ForwardTo(vtoken.to_string())
         } else {
-            // No route set and no default — broadcast to all online
             RoutingDecision::Broadcast
         }
     }

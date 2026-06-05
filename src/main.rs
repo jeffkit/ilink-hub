@@ -140,7 +140,7 @@ async fn run_server(
     load_clients_from_db(state.clone(), store.clone()).await;
 
     // Upstream broadcast channel
-    let (tx, rx) = broadcast::channel::<ilink_hub::ilink::types::InboundMessage>(256);
+    let (tx, rx) = broadcast::channel::<ilink_hub::ilink::types::WeixinMessage>(256);
 
     // Shutdown signal
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

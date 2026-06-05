@@ -15,7 +15,6 @@ pub struct UpstreamClient {
     client: Client,
     base_url: String,
     token: String,
-    // Random base64 UIN required by iLink (regenerated per request)
     pub polls_ok: AtomicU64,
     pub polls_err: AtomicU64,
 }
@@ -35,16 +34,22 @@ impl UpstreamClient {
         }
     }
 
+    /// `X-WECHAT-UIN`: random uint32 as decimal string, then base64-encoded.
     fn random_uin(&self) -> String {
         use base64::Engine;
         use rand::Rng;
-        let bytes: [u8; 16] = rand::thread_rng().gen();
-        base64::engine::general_purpose::STANDARD.encode(bytes)
+        let uint32: u32 = rand::thread_rng().gen();
+        base64::engine::general_purpose::STANDARD.encode(uint32.to_string().as_bytes())
     }
 
     fn headers(&self) -> reqwest::header::HeaderMap {
         use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
         let mut headers = HeaderMap::new();
+        // Required by iLink: must be "ilink_bot_token" or session times out immediately
+        headers.insert(
+            "AuthorizationType",
+            HeaderValue::from_static("ilink_bot_token"),
+        );
         headers.insert(
             AUTHORIZATION,
             HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap(),
@@ -56,22 +61,22 @@ impl UpstreamClient {
         headers
     }
 
-    /// Long-poll for new messages. Returns when messages arrive or after `timeout` seconds.
+    /// Long-poll for new messages.
     pub async fn get_updates(
         &self,
-        buf: Option<String>,
-        timeout: u32,
+        get_updates_buf: String,
     ) -> Result<GetUpdatesResponse> {
         let url = format!("{}/ilink/bot/getupdates", self.base_url);
-        let req = GetUpdatesRequest {
-            buf,
-            timeout: Some(timeout),
+        let req_body = GetUpdatesRequest {
+            get_updates_buf,
+            base_info: Some(BaseInfo::default()),
+            timeout: None,
         };
         let resp = self
             .client
             .post(&url)
             .headers(self.headers())
-            .json(&req)
+            .json(&req_body)
             .send()
             .await?
             .json::<GetUpdatesResponse>()
@@ -81,16 +86,24 @@ impl UpstreamClient {
 
     pub async fn send_message(&self, req: SendMessageRequest) -> Result<SendMessageResponse> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
-        let resp = self
+        // The real API returns an empty body on success; parse loosely
+        let text = self
             .client
             .post(&url)
             .headers(self.headers())
             .json(&req)
             .send()
             .await?
-            .json::<SendMessageResponse>()
+            .text()
             .await?;
-        Ok(resp)
+        // Empty body or non-JSON means success
+        if text.trim().is_empty() {
+            return Ok(SendMessageResponse::ok());
+        }
+        match serde_json::from_str::<SendMessageResponse>(&text) {
+            Ok(resp) => Ok(resp),
+            Err(_) => Ok(SendMessageResponse::ok()), // treat unparseable as success
+        }
     }
 
     pub async fn send_typing(&self, req: SendTypingRequest) -> Result<()> {
@@ -134,13 +147,12 @@ impl UpstreamClient {
     }
 
     /// Continuous polling loop — sends received messages to `tx`.
-    /// Exits when `shutdown` is triggered.
     pub async fn run_polling_loop(
         self: Arc<Self>,
-        tx: broadcast::Sender<InboundMessage>,
+        tx: broadcast::Sender<WeixinMessage>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) {
-        let mut buf: Option<String> = None;
+        let mut get_updates_buf = String::new();
         let mut backoff_secs = 1u64;
 
         info!("iLink upstream polling started");
@@ -151,23 +163,35 @@ impl UpstreamClient {
                 return;
             }
 
-            let result = self.get_updates(buf.clone(), 30).await;
+            let result = self.get_updates(get_updates_buf.clone()).await;
 
             match result {
-                Ok(resp) if resp.ret == 0 => {
+                Ok(resp) if resp.ret == Some(0) || resp.errcode.is_none() => {
                     self.polls_ok.fetch_add(1, Ordering::Relaxed);
                     backoff_secs = 1;
-                    buf = resp.buf;
-                    if let Some(messages) = resp.list {
+                    if let Some(new_buf) = resp.get_updates_buf {
+                        if !new_buf.is_empty() {
+                            get_updates_buf = new_buf;
+                        }
+                    }
+                    if let Some(messages) = resp.msgs {
                         for msg in messages {
-                            debug!(msg_id = %msg.msg_id, "received upstream message");
+                            debug!(
+                                from = msg.from_user_id.as_deref().unwrap_or("?"),
+                                "received upstream message"
+                            );
                             let _ = tx.send(msg);
                         }
                     }
                 }
                 Ok(resp) => {
                     self.polls_err.fetch_add(1, Ordering::Relaxed);
-                    warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink upstream returned error");
+                    let code = resp.errcode.or(resp.ret).unwrap_or(-1);
+                    warn!(
+                        code,
+                        errmsg = ?resp.errmsg,
+                        "iLink upstream returned error"
+                    );
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(30);
                 }

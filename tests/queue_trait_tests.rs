@@ -1,18 +1,27 @@
-use ilink_hub::{hub::queue::InMemoryQueue, ilink::types::InboundMessage, MessageQueue};
+use ilink_hub::{
+    hub::queue::InMemoryQueue,
+    ilink::types::{MessageItem, TextItem, WeixinMessage},
+    MessageQueue,
+};
 use std::sync::Arc;
 
-fn make_msg(content: &str) -> InboundMessage {
-    InboundMessage {
-        msg_id: format!("test_{content}"),
-        from_user: "user1".to_string(),
-        chat_id: None,
-        chat_type: None,
-        msg_type: 1,
-        content: Some(content.to_string()),
-        context_token: "ctx1".to_string(),
-        timestamp: None,
-        extra: serde_json::Value::Object(serde_json::Map::new()),
+fn make_msg(content: &str) -> WeixinMessage {
+    WeixinMessage {
+        from_user_id: Some("user1".to_string()),
+        context_token: Some("ctx1".to_string()),
+        item_list: Some(vec![MessageItem {
+            item_type: Some(1),
+            text_item: Some(TextItem {
+                text: Some(content.to_string()),
+            }),
+            extra: serde_json::Value::Object(serde_json::Map::new()),
+        }]),
+        ..Default::default()
     }
+}
+
+fn msg_text(msg: &WeixinMessage) -> Option<&str> {
+    msg.text()
 }
 
 // ─── US1 Tests ───────────────────────────────────────────────────────────────
@@ -27,9 +36,9 @@ async fn test_push_and_drain() {
 
     let msgs = q.drain("v1").await.unwrap();
     assert_eq!(msgs.len(), 3);
-    assert_eq!(msgs[0].content, Some("a".to_string()));
-    assert_eq!(msgs[1].content, Some("b".to_string()));
-    assert_eq!(msgs[2].content, Some("c".to_string()));
+    assert_eq!(msg_text(&msgs[0]), Some("a"));
+    assert_eq!(msg_text(&msgs[1]), Some("b"));
+    assert_eq!(msg_text(&msgs[2]), Some("c"));
 }
 
 /// Edge case: drain on a vtoken with no prior pushes returns empty vec.
@@ -49,7 +58,6 @@ async fn test_overflow_head_drop() {
     let q = InMemoryQueue::new();
     for i in 0..=200 {
         let dropped = q.push("v1", make_msg(&format!("msg_{i}"))).await.unwrap();
-        // Only the 201st push (i == 200) should signal overflow.
         if i < 200 {
             assert!(!dropped, "unexpected overflow at push {i}");
         } else {
@@ -63,11 +71,11 @@ async fn test_overflow_head_drop() {
         "queue should hold exactly MAX_QUEUE_SIZE messages"
     );
     assert_eq!(
-        msgs[0].content,
-        Some("msg_1".to_string()),
+        msg_text(&msgs[0]),
+        Some("msg_1"),
         "oldest message (msg_0) should have been head-dropped"
     );
-    assert_eq!(msgs[199].content, Some("msg_200".to_string()));
+    assert_eq!(msg_text(&msgs[199]), Some("msg_200"));
 }
 
 /// FR-005: push from a spawned task wakes up wait_notify.
@@ -129,11 +137,10 @@ async fn test_remove_client() {
         "drain after remove_client should return empty"
     );
 
-    // Push after removal should recreate the entry
     q.push("v1", make_msg("3")).await.unwrap();
     let msgs = q.drain("v1").await.unwrap();
     assert_eq!(msgs.len(), 1);
-    assert_eq!(msgs[0].content, Some("3".to_string()));
+    assert_eq!(msg_text(&msgs[0]), Some("3"));
 }
 
 /// Concurrency: 10 tasks × 10 pushes to the same vtoken; result within cap, non-empty.
@@ -187,10 +194,10 @@ async fn test_mock_implementation() {
 
     #[async_trait]
     impl MessageQueue for NoopQueue {
-        async fn push(&self, _vtoken: &str, _msg: InboundMessage) -> Result<bool, HubError> {
+        async fn push(&self, _vtoken: &str, _msg: WeixinMessage) -> Result<bool, HubError> {
             Ok(false)
         }
-        async fn drain(&self, _vtoken: &str) -> Result<Vec<InboundMessage>, HubError> {
+        async fn drain(&self, _vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
             Ok(vec![])
         }
         async fn wait_notify(&self, _vtoken: &str, _timeout_secs: u64) -> Result<bool, HubError> {

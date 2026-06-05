@@ -1,6 +1,6 @@
 //! iLink-compatible HTTP routes exposed to backend clients.
 //! Clients configure `base_url = https://your-hub.example.com` and
-//! use their virtual token — they see the exact same API as ilinkai.weixin.qq.com.
+//! use their virtual token — they see the same API as ilinkai.weixin.qq.com.
 
 use axum::{
     extract::State,
@@ -25,13 +25,9 @@ fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Check admin token if `ILINK_ADMIN_TOKEN` env is set.
-/// Returns `true` (allowed) when:
-///   - The env var is not set (open access, for local dev)
-///   - The env var is set and the `Authorization: Bearer <token>` matches
 fn check_admin_auth(headers: &HeaderMap) -> bool {
     let Ok(required) = std::env::var("ILINK_ADMIN_TOKEN") else {
-        return true; // not configured → unrestricted
+        return true;
     };
     if required.is_empty() {
         return true;
@@ -82,7 +78,6 @@ pub async fn register(
         registry.register(req.name.clone(), req.label.clone())
     };
 
-    // Set as default if it's the first online client
     {
         let mut router = state.router.lock().await;
         let registry = state.registry.read().await;
@@ -91,7 +86,6 @@ pub async fn register(
         }
     }
 
-    // Persist to DB (best-effort)
     if let Err(e) = state
         .store
         .upsert_client(&vtoken, &req.name, req.label.as_deref())
@@ -105,7 +99,7 @@ pub async fn register(
         Json(RegisterResponse {
             ret: 0,
             vtoken: vtoken.clone(),
-            base_url: String::new(), // filled by the server layer
+            base_url: String::new(),
             errmsg: None,
         }),
     )
@@ -122,24 +116,25 @@ pub async fn getupdates(
         return (
             StatusCode::UNAUTHORIZED,
             Json(GetUpdatesResponse {
-                ret: 401,
+                ret: Some(401),
+                errcode: None,
                 errmsg: Some("Missing Authorization header".to_string()),
-                buf: None,
-                list: None,
+                msgs: None,
+                get_updates_buf: None,
             }),
         );
     };
 
-    // Mark client as online
     {
         let mut registry = state.registry.write().await;
         registry.mark_seen(&vtoken);
     }
 
-    let poll_secs = req.timeout.unwrap_or(30).min(60);
+    // Use timeout from legacy field if provided, otherwise 30s
+    let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
     let _ = state
         .queue
-        .wait_notify(&vtoken, poll_secs as u64)
+        .wait_notify(&vtoken, poll_secs)
         .await
         .unwrap_or_else(|e| {
             error!(error = %e, vtoken = %vtoken, "wait_notify failed");
@@ -156,10 +151,11 @@ pub async fn getupdates(
     (
         StatusCode::OK,
         Json(GetUpdatesResponse {
-            ret: 0,
+            ret: Some(0),
+            errcode: None,
             errmsg: None,
-            buf: Some(String::new()), // clients don't need real cursor since Hub manages it
-            list: if messages.is_empty() {
+            get_updates_buf: Some(String::new()),
+            msgs: if messages.is_empty() {
                 None
             } else {
                 Some(messages)
@@ -176,55 +172,56 @@ pub async fn sendmessage(
     Json(mut req): Json<SendMessageRequest>,
 ) -> Json<SendMessageResponse> {
     let Some(_vtoken) = extract_vtoken(&headers) else {
-        return Json(SendMessageResponse {
-            ret: 401,
-            errmsg: Some("Missing Authorization header".to_string()),
-        });
+        return Json(SendMessageResponse::err(401, "Missing Authorization header"));
     };
 
-    // Translate virtual context token → real context token (memory first, DB fallback)
+    // Extract context_token from req.msg
+    let vctx = match req.msg.as_ref().and_then(|m| m.context_token.as_deref()) {
+        Some(ctx) if !ctx.is_empty() => ctx.to_string(),
+        _ => {
+            return Json(SendMessageResponse::err(400, "Missing msg.context_token"));
+        }
+    };
+
+    // Translate virtual → real context token (memory first, DB fallback)
     let real_ctx = {
         let ctx_map = state.ctx_map.lock().await;
-        ctx_map.resolve(&req.context_token).map(str::to_string)
+        ctx_map.resolve(&vctx).map(str::to_string)
     };
 
     let real_ctx = match real_ctx {
         Some(ctx) => ctx,
         None => {
-            // Memory miss → try DB (covers restarts where memory cache was cold)
-            match state.store.resolve_context_token(&req.context_token).await {
+            match state.store.resolve_context_token(&vctx).await {
                 Ok(Some(ctx)) => {
-                    // Warm the in-memory cache
                     let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.seed(req.context_token.clone(), ctx.clone());
+                    ctx_map.seed(vctx.clone(), ctx.clone());
                     ctx
                 }
                 Ok(None) => {
-                    warn!(vctx = %req.context_token, "no mapping for virtual context token");
-                    return Json(SendMessageResponse {
-                        ret: 400,
-                        errmsg: Some("Unknown context_token".to_string()),
-                    });
+                    warn!(vctx = %vctx, "no mapping for virtual context token");
+                    return Json(SendMessageResponse::err(400, "Unknown context_token"));
                 }
                 Err(e) => {
-                    warn!(error = %e, vctx = %req.context_token, "DB lookup for context_token failed");
-                    return Json(SendMessageResponse {
-                        ret: 500,
-                        errmsg: Some("context_token resolution error".to_string()),
-                    });
+                    warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
+                    return Json(SendMessageResponse::err(500, "context_token resolution error"));
                 }
             }
         }
     };
 
-    req.context_token = real_ctx;
+    // Replace virtual context_token with real one in the message
+    if let Some(msg) = &mut req.msg {
+        msg.context_token = Some(real_ctx);
+    }
+    // Ensure base_info is set
+    if req.base_info.is_none() {
+        req.base_info = Some(BaseInfo::default());
+    }
 
     match state.upstream.send_message(req).await {
         Ok(resp) => Json(resp),
-        Err(e) => Json(SendMessageResponse {
-            ret: 500,
-            errmsg: Some(format!("upstream error: {e}")),
-        }),
+        Err(e) => Json(SendMessageResponse::err(500, format!("upstream error: {e}"))),
     }
 }
 
@@ -233,23 +230,13 @@ pub async fn sendmessage(
 pub async fn sendtyping(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
-    Json(mut req): Json<SendTypingRequest>,
+    Json(req): Json<SendTypingRequest>,
 ) -> Json<serde_json::Value> {
     let Some(_vtoken) = extract_vtoken(&headers) else {
         return Json(serde_json::json!({"ret": 401, "errmsg": "Missing Authorization"}));
     };
 
-    // Translate context token
-    let real_ctx = {
-        let ctx_map = state.ctx_map.lock().await;
-        ctx_map.resolve(&req.context_token).map(str::to_string)
-    };
-
-    if let Some(real_ctx) = real_ctx {
-        req.context_token = real_ctx;
-        let _ = state.upstream.send_typing(req).await;
-    }
-
+    let _ = state.upstream.send_typing(req).await;
     Json(serde_json::json!({"ret": 0}))
 }
 
@@ -262,26 +249,32 @@ pub async fn getconfig(
 ) -> Json<GetConfigResponse> {
     let Some(_vtoken) = extract_vtoken(&headers) else {
         return Json(GetConfigResponse {
-            ret: 401,
+            ret: Some(401),
             typing_ticket: None,
             errmsg: Some("Missing Authorization".to_string()),
         });
     };
 
-    // Translate context token
-    let real_ctx = {
-        let ctx_map = state.ctx_map.lock().await;
-        ctx_map.resolve(&req.context_token).map(str::to_string)
-    };
+    // Translate virtual context token if present
+    if let Some(vctx) = &req.context_token.clone() {
+        let real_ctx = {
+            let ctx_map = state.ctx_map.lock().await;
+            ctx_map.resolve(vctx).map(str::to_string)
+        };
+        if let Some(real) = real_ctx {
+            req.context_token = Some(real);
+        }
+    }
 
-    if let Some(real_ctx) = real_ctx {
-        req.context_token = real_ctx;
+    // Ensure base_info is set
+    if req.base_info.is_none() {
+        req.base_info = Some(BaseInfo::default());
     }
 
     match state.upstream.get_config(req).await {
         Ok(resp) => Json(resp),
         Err(e) => Json(GetConfigResponse {
-            ret: 500,
+            ret: Some(500),
             typing_ticket: None,
             errmsg: Some(format!("upstream error: {e}")),
         }),
@@ -390,37 +383,21 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     out.push_str("# TYPE ilink_hub_clients_total gauge\n");
     out.push_str(&format!("ilink_hub_clients_total {}\n", total));
 
-    out.push_str(
-        "# HELP ilink_hub_messages_dispatched_total Messages dispatched to client queues\n",
-    );
+    out.push_str("# HELP ilink_hub_messages_dispatched_total Messages dispatched\n");
     out.push_str("# TYPE ilink_hub_messages_dispatched_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dispatched_total {}\n",
-        messages_dispatched
-    ));
+    out.push_str(&format!("ilink_hub_messages_dispatched_total {}\n", messages_dispatched));
 
-    out.push_str("# HELP ilink_hub_messages_dropped_total Messages dropped (no online clients or queue overflow)\n");
+    out.push_str("# HELP ilink_hub_messages_dropped_total Messages dropped\n");
     out.push_str("# TYPE ilink_hub_messages_dropped_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dropped_total {}\n",
-        messages_dropped
-    ));
+    out.push_str(&format!("ilink_hub_messages_dropped_total {}\n", messages_dropped));
 
-    out.push_str(
-        "# HELP ilink_hub_upstream_polls_ok_total Successful upstream long-poll responses\n",
-    );
+    out.push_str("# HELP ilink_hub_upstream_polls_ok_total Successful upstream polls\n");
     out.push_str("# TYPE ilink_hub_upstream_polls_ok_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_ok_total {}\n",
-        upstream_polls_ok
-    ));
+    out.push_str(&format!("ilink_hub_upstream_polls_ok_total {}\n", upstream_polls_ok));
 
-    out.push_str("# HELP ilink_hub_upstream_polls_err_total Failed upstream long-poll responses\n");
+    out.push_str("# HELP ilink_hub_upstream_polls_err_total Failed upstream polls\n");
     out.push_str("# TYPE ilink_hub_upstream_polls_err_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_err_total {}\n",
-        upstream_polls_err
-    ));
+    out.push_str(&format!("ilink_hub_upstream_polls_err_total {}\n", upstream_polls_err));
 
     out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
     out.push_str("# TYPE ilink_hub_queue_size gauge\n");

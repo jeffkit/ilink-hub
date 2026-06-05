@@ -1,15 +1,32 @@
 use serde::{Deserialize, Serialize};
 
-/// Standard iLink API request headers.
-/// Clients must send `X-WECHAT-UIN` (random base64) and `Authorization: Bearer <token>`.
 pub const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 pub const ILINK_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+// ─── Common ──────────────────────────────────────────────────────────────────
+
+/// Attached to every outgoing CGI request per iLink protocol.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BaseInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_agent: Option<String>,
+}
+
+impl Default for BaseInfo {
+    fn default() -> Self {
+        Self {
+            channel_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            bot_agent: Some(format!("ilink-hub/{}", env!("CARGO_PKG_VERSION"))),
+        }
+    }
+}
 
 // ─── Login / QR Code ────────────────────────────────────────────────────────
 
 /// Response from `/ilink/bot/get_bot_qrcode`.
-/// Actual API shape:
-///   {"ret":0,"qrcode":"<key>","qrcode_img_content":"https://..."}
+/// Actual API shape: {"ret":0,"qrcode":"<key>","qrcode_img_content":"https://..."}
 #[derive(Debug, Deserialize)]
 pub struct GetQrcodeResponse {
     pub ret: i32,
@@ -35,81 +52,211 @@ pub struct QrcodeStatusResponse {
     pub errmsg: Option<String>,
 }
 
-// ─── Updates (getupdates) ────────────────────────────────────────────────────
+// ─── Message item types ──────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetUpdatesRequest {
-    /// Last-seen message cursor (returned by previous call)
-    pub buf: Option<String>,
-    /// Timeout in seconds (long-poll duration)
-    pub timeout: Option<u32>,
+pub mod msg_type {
+    pub const TEXT: i32 = 1;
+    pub const IMAGE: i32 = 2;
+    pub const VOICE: i32 = 3;
+    pub const FILE: i32 = 4;
+    pub const VIDEO: i32 = 5;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetUpdatesResponse {
-    pub ret: i32,
-    pub errmsg: Option<String>,
-    /// Updated cursor to pass on next call
-    pub buf: Option<String>,
-    pub list: Option<Vec<InboundMessage>>,
+/// Text content inside a MessageItem.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TextItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InboundMessage {
-    pub msg_id: String,
-    pub from_user: String,
-    pub chat_id: Option<String>,
-    /// "direct" | "group"
-    pub chat_type: Option<String>,
-    pub msg_type: i32,
-    pub content: Option<String>,
-    pub context_token: String,
-    pub timestamp: Option<i64>,
-    /// Additional metadata (image/file info etc.)
+/// One item inside a WeixinMessage's item_list.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MessageItem {
+    /// Item type: 1=text, 2=image, 3=voice, 4=file, 5=video
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub item_type: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text_item: Option<TextItem>,
+    /// All other item fields (image_item, voice_item, file_item, video_item, etc.)
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
 
-// ─── Send Message ────────────────────────────────────────────────────────────
+// ─── Unified message type ────────────────────────────────────────────────────
 
+/// The canonical message type used in both upstream (iLink wire protocol) and
+/// the hub's downstream API (what agent backends receive and send).
+///
+/// Field names mirror the official iLink / openclaw-weixin SDK.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WeixinMessage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_time_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_time_ms: Option<i64>,
+    /// Present for group messages (group/session identifier).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// 1 = user message, 2 = bot message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_type: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_state: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_list: Option<Vec<MessageItem>>,
+    /// Required for routing replies back to the correct conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_token: Option<String>,
+}
+
+impl WeixinMessage {
+    /// Extract the text content from the first text MessageItem.
+    pub fn text(&self) -> Option<&str> {
+        self.item_list.as_ref()?.iter().find_map(|item| {
+            item.text_item.as_ref()?.text.as_deref()
+        })
+    }
+
+    /// Build a text reply to this message.
+    pub fn build_text_reply(context_token: String, text: String) -> WeixinMessage {
+        WeixinMessage {
+            context_token: Some(context_token),
+            message_type: Some(2), // BOT
+            item_list: Some(vec![MessageItem {
+                item_type: Some(msg_type::TEXT),
+                text_item: Some(TextItem { text: Some(text) }),
+                extra: serde_json::Value::Object(Default::default()),
+            }]),
+            ..Default::default()
+        }
+    }
+}
+
+// ─── GetUpdates (getupdates endpoint) ────────────────────────────────────────
+
+/// Request body for `POST /ilink/bot/getupdates`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetUpdatesRequest {
+    /// Long-poll cursor; send empty string on first call.
+    #[serde(default)]
+    pub get_updates_buf: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_info: Option<BaseInfo>,
+    /// Legacy field accepted for backwards compat with older clients; ignored by hub.
+    #[serde(skip)]
+    pub timeout: Option<u32>,
+}
+
+/// Response body for `POST /ilink/bot/getupdates`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetUpdatesResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret: Option<i32>,
+    /// Server error code (e.g. -14 = session timeout). Present when request fails.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errcode: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errmsg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msgs: Option<Vec<WeixinMessage>>,
+    /// Updated cursor to pass on next request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub get_updates_buf: Option<String>,
+}
+
+// ─── SendMessage ─────────────────────────────────────────────────────────────
+
+/// Request body for `POST /ilink/bot/sendmessage`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendMessageRequest {
-    pub context_token: String,
-    pub msg_type: i32,
-    pub content: Option<String>,
-    /// For media messages
-    pub media_id: Option<String>,
-    #[serde(flatten)]
-    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub msg: Option<WeixinMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_info: Option<BaseInfo>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl SendMessageRequest {
+    pub fn text(context_token: String, text: String) -> Self {
+        Self {
+            msg: Some(WeixinMessage::build_text_reply(context_token, text)),
+            base_info: Some(BaseInfo::default()),
+        }
+    }
+}
+
+/// Response body for `POST /ilink/bot/sendmessage`.
+/// The real iLink API returns an empty body on success; ret/errmsg added by hub.
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SendMessageResponse {
-    pub ret: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub errmsg: Option<String>,
 }
 
-// ─── Typing ──────────────────────────────────────────────────────────────────
+impl SendMessageResponse {
+    pub fn ok() -> Self {
+        Self { ret: Some(0), errmsg: None }
+    }
+    pub fn err(code: i32, msg: impl Into<String>) -> Self {
+        Self { ret: Some(code), errmsg: Some(msg.into()) }
+    }
+}
 
-#[derive(Debug, Serialize, Deserialize)]
+// ─── GetConfig ───────────────────────────────────────────────────────────────
+
+/// Request body for `POST /ilink/bot/getconfig`.
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct GetConfigRequest {
-    pub context_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ilink_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_info: Option<BaseInfo>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Response body for `POST /ilink/bot/getconfig`.
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct GetConfigResponse {
-    pub ret: i32,
-    pub typing_ticket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub errmsg: Option<String>,
+    /// Base64-encoded typing ticket for sendTyping.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typing_ticket: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+// ─── SendTyping ──────────────────────────────────────────────────────────────
+
+/// Request body for `POST /ilink/bot/sendtyping`.
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SendTypingRequest {
-    pub context_token: String,
-    pub typing_ticket: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ilink_user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub typing_ticket: Option<String>,
+    /// 1 = typing (default), 2 = cancel typing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_info: Option<BaseInfo>,
 }
 
-// ─── Media Upload ────────────────────────────────────────────────────────────
+// ─── Media Upload ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetUploadUrlRequest {
@@ -124,14 +271,4 @@ pub struct GetUploadUrlResponse {
     pub upload_url: Option<String>,
     pub media_id: Option<String>,
     pub errmsg: Option<String>,
-}
-
-// ─── Message types ───────────────────────────────────────────────────────────
-
-pub mod msg_type {
-    pub const TEXT: i32 = 1;
-    pub const IMAGE: i32 = 3;
-    pub const FILE: i32 = 6;
-    pub const VIDEO: i32 = 43;
-    pub const VOICE: i32 = 34;
 }

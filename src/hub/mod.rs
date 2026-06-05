@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 
-use crate::ilink::types::{self, InboundMessage, SendMessageRequest};
+use crate::ilink::types::{SendMessageRequest, WeixinMessage};
 use crate::ilink::UpstreamClient;
 use crate::store::Store;
 
@@ -41,11 +41,9 @@ impl Default for Metrics {
 
 // ─── Shared Hub State ─────────────────────────────────────────────────────────
 
-/// The core hub state, shared across all server handlers via `Arc<HubState>`.
 pub struct HubState {
     pub upstream: Arc<UpstreamClient>,
     pub registry: RwLock<ClientRegistry>,
-    /// Queue backend injected at construction time.
     pub queue: Arc<dyn MessageQueue>,
     pub ctx_map: Mutex<ContextTokenMap>,
     pub router: Mutex<Router>,
@@ -54,7 +52,6 @@ pub struct HubState {
 }
 
 impl HubState {
-    /// `queue` — queue backend injected at construction time.
     pub fn new(
         upstream: Arc<UpstreamClient>,
         store: Arc<Store>,
@@ -74,9 +71,7 @@ impl HubState {
 
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
 
-/// Spawns a background task that receives messages from the upstream broadcast
-/// channel and dispatches them to the correct client queues.
-pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<InboundMessage>) {
+pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<WeixinMessage>) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
@@ -95,7 +90,7 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Inboun
     });
 }
 
-async fn dispatch_message(state: Arc<HubState>, mut msg: InboundMessage) {
+async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     let routing = {
         let router = state.router.lock().await;
         router.route(&msg)
@@ -106,15 +101,20 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: InboundMessage) {
             handle_hub_command(state, msg, cmd).await;
         }
         RoutingDecision::ForwardTo(vtoken) => {
-            // Replace real context_token with a virtual one (write-through to DB)
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(msg.context_token.clone())
+            let real_ctx = match msg.context_token.clone() {
+                Some(ctx) if !ctx.is_empty() => ctx,
+                _ => {
+                    warn!("message has no context_token, skipping dispatch");
+                    return;
+                }
             };
 
-            // Persist mapping to DB (best-effort, don't block dispatch on failure)
+            let vctx = {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.map(real_ctx.clone())
+            };
+
             let store = state.store.clone();
-            let real_ctx = msg.context_token.clone();
             let vctx_clone = vctx.clone();
             tokio::spawn(async move {
                 if let Err(e) = store.persist_context_token(&vctx_clone, &real_ctx).await {
@@ -122,31 +122,22 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: InboundMessage) {
                 }
             });
 
-            msg.context_token = vctx;
+            msg.context_token = Some(vctx);
 
-            state
-                .metrics
-                .messages_dispatched
-                .fetch_add(1, Ordering::Relaxed);
+            state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
             match state.queue.push(&vtoken, msg).await {
                 Ok(true) => {
-                    // Overflow: oldest message was dropped to make room
-                    state
-                        .metrics
-                        .messages_dropped
-                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(false) => {}
                 Err(e) => {
                     error!(error = %e, vtoken = %vtoken, "failed to push message to queue");
-                    state
-                        .metrics
-                        .messages_dropped
-                        .fetch_add(1, Ordering::Relaxed);
+                    state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
         RoutingDecision::Broadcast => {
+            let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
             let online = {
                 let registry = state.registry.read().await;
                 registry
@@ -157,64 +148,58 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: InboundMessage) {
             };
 
             if online.is_empty() {
-                warn!(from_user = %msg.from_user, "no online clients to dispatch to");
-                state
-                    .metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
+                warn!(from_user_id, "no online clients to dispatch to");
+                state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+
                 // Notify the user that no AI backends are available
-                let reply = SendMessageRequest {
-                    context_token: msg.context_token.clone(),
-                    msg_type: types::msg_type::TEXT,
-                    content: Some(
+                if let Some(real_ctx) = msg.context_token.clone() {
+                    let reply = SendMessageRequest::text(
+                        real_ctx,
                         "⚠️ No AI backends are currently online.\n\
                          Use /list to see registered workspaces, or /status for hub info."
                             .to_string(),
-                    ),
-                    media_id: None,
-                    extra: Default::default(),
-                };
-                if let Err(e) = state.upstream.send_message(reply).await {
-                    error!(error = %e, "failed to send no-clients reply");
+                    );
+                    if let Err(e) = state.upstream.send_message(reply).await {
+                        error!(error = %e, "failed to send no-clients reply");
+                    }
                 }
                 return;
             }
 
+            let real_ctx = match msg.context_token.clone() {
+                Some(ctx) if !ctx.is_empty() => ctx,
+                _ => {
+                    warn!("broadcast message has no context_token, skipping");
+                    return;
+                }
+            };
+
             for vtoken in &online {
                 let vctx = {
                     let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(msg.context_token.clone())
+                    ctx_map.map(real_ctx.clone())
                 };
 
                 let store = state.store.clone();
-                let real_ctx = msg.context_token.clone();
                 let vctx_clone = vctx.clone();
+                let real_ctx_clone = real_ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = store.persist_context_token(&vctx_clone, &real_ctx).await {
+                    if let Err(e) = store.persist_context_token(&vctx_clone, &real_ctx_clone).await {
                         warn!(error = %e, "failed to persist context_token mapping (broadcast)");
                     }
                 });
 
                 let mut msg_clone = msg.clone();
-                msg_clone.context_token = vctx;
-                state
-                    .metrics
-                    .messages_dispatched
-                    .fetch_add(1, Ordering::Relaxed);
+                msg_clone.context_token = Some(vctx);
+                state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
                 match state.queue.push(vtoken, msg_clone).await {
                     Ok(true) => {
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
+                        state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        error!(error = %e, vtoken = %vtoken, "failed to push broadcast message to queue");
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
+                        error!(error = %e, vtoken = %vtoken, "failed to push broadcast message");
+                        state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -222,8 +207,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: InboundMessage) {
     }
 }
 
-async fn handle_hub_command(state: Arc<HubState>, msg: InboundMessage, cmd: HubCommand) {
-    let real_ctx = msg.context_token.clone();
+async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCommand) {
+    let real_ctx = match msg.context_token.clone() {
+        Some(ctx) => ctx,
+        None => {
+            warn!("hub command message has no context_token");
+            return;
+        }
+    };
+    let from_user_id = msg.from_user_id.as_deref().unwrap_or_default().to_string();
 
     let reply_text = match cmd {
         HubCommand::List => {
@@ -250,11 +242,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: InboundMessage, cmd: HubC
 
                 {
                     let mut router = state.router.lock().await;
-                    router.set_route(&msg.from_user, vtoken.clone());
+                    router.set_route(&from_user_id, vtoken.clone());
                 }
 
-                // Persist routing state to DB
-                if let Err(e) = state.store.set_route(&msg.from_user, &vtoken).await {
+                if let Err(e) = state.store.set_route(&from_user_id, &vtoken).await {
                     warn!(error = %e, "failed to persist route to DB");
                 }
 
@@ -267,11 +258,6 @@ async fn handle_hub_command(state: Arc<HubState>, msg: InboundMessage, cmd: HubC
             }
         }
         HubCommand::Broadcast(text) => {
-            // Re-dispatch as a broadcast message
-            let broadcast_msg = InboundMessage {
-                content: Some(text),
-                ..msg.clone()
-            };
             let online = {
                 let registry = state.registry.read().await;
                 registry
@@ -283,14 +269,19 @@ async fn handle_hub_command(state: Arc<HubState>, msg: InboundMessage, cmd: HubC
             for vtoken in &online {
                 let vctx = {
                     let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(broadcast_msg.context_token.clone())
+                    ctx_map.map(real_ctx.clone())
                 };
-                let mut m = broadcast_msg.clone();
-                m.context_token = vctx;
-                state
-                    .metrics
-                    .messages_dispatched
-                    .fetch_add(1, Ordering::Relaxed);
+                let mut m = msg.clone();
+                m.context_token = Some(vctx.clone());
+                // Replace text content in item_list
+                if let Some(items) = &mut m.item_list {
+                    if let Some(first) = items.first_mut() {
+                        if let Some(ti) = &mut first.text_item {
+                            ti.text = Some(text.clone());
+                        }
+                    }
+                }
+                state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = state.queue.push(vtoken, m).await {
                     error!(error = %e, vtoken = %vtoken, "failed to push hub broadcast message");
                 }
@@ -305,15 +296,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: InboundMessage, cmd: HubC
         }
     };
 
-    // Send hub reply directly via upstream
-    let send_req = SendMessageRequest {
-        context_token: real_ctx,
-        msg_type: 1, // TEXT
-        content: Some(reply_text),
-        media_id: None,
-        extra: Default::default(),
-    };
-
+    let send_req = SendMessageRequest::text(real_ctx, reply_text);
     if let Err(e) = state.upstream.send_message(send_req).await {
         error!(error = %e, "failed to send hub command reply");
     }
