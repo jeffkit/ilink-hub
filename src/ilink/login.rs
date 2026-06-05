@@ -31,11 +31,13 @@ impl LoginClient {
 
         // Step 1: Get QR code
         let qr_resp = self.get_qrcode().await?;
+        // `qrcode` is the key/identifier used for polling
         let key = qr_resp
-            .key
-            .ok_or_else(|| anyhow!("no qrcode key in response"))?;
-        let qr_url = qr_resp
             .qrcode
+            .ok_or_else(|| anyhow!("no qrcode key in response"))?;
+        // `qrcode_img_content` is the URL to render as a QR code
+        let qr_url = qr_resp
+            .qrcode_img_content
             .ok_or_else(|| anyhow!("no qrcode URL in response"))?;
 
         // Step 2: Render QR code in terminal

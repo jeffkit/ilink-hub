@@ -1,6 +1,6 @@
 //! Database persistence layer.
 //! Uses sqlx with runtime driver selection via `DATABASE_URL`:
-//!   sqlite://./ilink-hub.db          → SQLite (default)
+//!   sqlite:./ilink-hub.db            → SQLite (default, file created if missing)
 //!   postgres://user:pass@host/db      → PostgreSQL
 //!   mysql://user:pass@host/db         → MySQL
 
@@ -14,12 +14,53 @@ pub struct Store {
 
 impl Store {
     /// Connect to the database and run migrations.
+    ///
+    /// For SQLite URLs, the database file is created automatically if it does
+    /// not exist yet (equivalent to `create_if_missing(true)`).
     pub async fn connect(url: &str) -> Result<Self> {
         sqlx::any::install_default_drivers();
+
+        // For SQLite we must ensure the file (and its parent directory) exist
+        // before connecting, because sqlx's AnyPool does not set
+        // `create_if_missing` by default and will return SQLITE_CANTOPEN (14).
+        if url.starts_with("sqlite:") {
+            Self::ensure_sqlite_file(url)?;
+        }
+
         let pool = AnyPool::connect(url).await?;
         let store = Self { pool };
         store.migrate().await?;
         Ok(store)
+    }
+
+    /// Extract the file path from a SQLite URL and create the file + parent
+    /// directories if they do not already exist.
+    fn ensure_sqlite_file(url: &str) -> Result<()> {
+        // Strip the "sqlite:" scheme prefix; handle the optional // or ///
+        let path_part = url
+            .strip_prefix("sqlite:///")
+            .or_else(|| url.strip_prefix("sqlite://"))
+            .or_else(|| url.strip_prefix("sqlite:"))
+            .unwrap_or("");
+
+        // Drop any query string (e.g. "?mode=rwc")
+        let path_str = path_part.split('?').next().unwrap_or("").trim();
+
+        // Skip in-memory databases (:memory: or empty)
+        if path_str.is_empty() || path_str == ":memory:" {
+            return Ok(());
+        }
+
+        let path = std::path::Path::new(path_str);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        if !path.exists() {
+            std::fs::File::create(path)?;
+        }
+        Ok(())
     }
 
     async fn migrate(&self) -> Result<()> {

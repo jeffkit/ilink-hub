@@ -7,11 +7,16 @@ pub const ILINK_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 
 // ─── Login / QR Code ────────────────────────────────────────────────────────
 
+/// Response from `/ilink/bot/get_bot_qrcode`.
+/// Actual API shape:
+///   {"ret":0,"qrcode":"<key>","qrcode_img_content":"https://..."}
 #[derive(Debug, Deserialize)]
 pub struct GetQrcodeResponse {
     pub ret: i32,
+    /// The QR code key / identifier used for polling.
     pub qrcode: Option<String>,
-    pub key: Option<String>,
+    /// The URL to render as a QR code (user scans this URL).
+    pub qrcode_img_content: Option<String>,
     pub errmsg: Option<String>,
 }
 
