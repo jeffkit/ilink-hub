@@ -14,6 +14,11 @@
 
 ::: code-group
 
+```bash [Homebrew（macOS 推荐）]
+brew tap jeffkit/tap
+brew install ilink-hub
+```
+
 ```bash [macOS Apple Silicon (M 系列)]
 curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-macos-aarch64
 chmod +x ilink-hub

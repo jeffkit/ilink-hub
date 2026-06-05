@@ -1,6 +1,29 @@
 # 安装
 
-## 方式一：预编译二进制（推荐）
+## 方式一：Homebrew（macOS 推荐）
+
+macOS 用户推荐使用 Homebrew 安装，自动处理安装和后续更新：
+
+```bash
+brew tap jeffkit/tap
+brew install ilink-hub
+```
+
+验证安装：
+
+```bash
+ilink-hub --version
+```
+
+升级到新版本：
+
+```bash
+brew upgrade ilink-hub
+```
+
+---
+
+## 方式二：预编译二进制
 
 无需 Rust 环境，直接下载对应平台的二进制文件。
 
