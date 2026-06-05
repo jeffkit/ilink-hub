@@ -159,11 +159,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 if let Some(real_ctx) = msg.context_token.clone() {
                     let bot_id = state.upstream.bot_id().to_string();
                     let to_uid = msg.from_user_id.as_deref().unwrap_or("");
+                    let reply_text = build_no_backend_reply(msg.text());
                     let reply = SendMessageRequest::reply(
                         real_ctx,
-                        "⚠️ No AI backends are currently online.\n\
-                         Use /list to see registered workspaces, or /status for hub info."
-                            .to_string(),
+                        reply_text,
                         &bot_id,
                         to_uid,
                     );
@@ -308,6 +307,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             let total = registry.all_clients().len();
             format!("iLink Hub — {}/{} clients online", online, total)
         }
+        HubCommand::Help => build_help_text(),
     };
 
     let bot_id = state.upstream.bot_id().to_string();
@@ -315,4 +315,54 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
     if let Err(e) = state.upstream.send_message(send_req).await {
         error!(error = %e, "failed to send hub command reply");
     }
+}
+
+// ─── Static responder helpers ─────────────────────────────────────────────────
+
+fn build_help_text() -> String {
+    "iLink Hub 帮助\n\
+     \n\
+     可用指令：\n\
+     /status   — 查看当前 Hub 状态\n\
+     /list     — 列出所有已注册的 AI 后端\n\
+     /use <名称> — 切换到指定的 AI 后端\n\
+     /help     — 显示此帮助\n\
+     \n\
+     关于 iLink Hub：\n\
+     本服务是一个消息路由中枢，可将您的微信消息\n\
+     转发给已接入的 AI 助手后端进行处理。\n\
+     \n\
+     管理员接入指南：\n\
+     1. 部署并启动 ilink-hub serve\n\
+     2. 运行 ilink-hub register --name <名称> 注册后端\n\
+     3. 将输出的 WEIXIN_TOKEN 配置到您的 AI 服务\n\
+     4. AI 服务调用 /ilink/bot/getupdates 接收消息\n\
+        并通过 /ilink/bot/sendmessage 回复"
+        .to_string()
+}
+
+/// Reply text when no AI backend is online.
+/// Varies slightly based on whether the user sent a hub command (handled separately)
+/// or a regular message.
+fn build_no_backend_reply(user_text: Option<&str>) -> String {
+    let is_command = user_text
+        .map(|t| t.trim().starts_with('/'))
+        .unwrap_or(false);
+
+    if is_command {
+        // User tried a command — give a hint that /help is available
+        return "未识别的指令。发送 /help 查看可用指令。".to_string();
+    }
+
+    "你好！我是 iLink Hub 消息路由服务。\n\
+     \n\
+     当前暂无 AI 助手后端在线，您的消息暂时无法被处理。\n\
+     \n\
+     您可以：\n\
+     • 发送 /status 查看服务状态\n\
+     • 发送 /list   查看已注册的后端\n\
+     • 发送 /help   查看完整帮助\n\
+     \n\
+     如需接入 AI 助手，请联系管理员配置后端服务。"
+        .to_string()
 }

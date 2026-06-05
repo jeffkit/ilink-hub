@@ -15,6 +15,7 @@ pub enum HubCommand {
     UseClient(String),
     Broadcast(String),
     Status,
+    Help,
 }
 
 pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
@@ -24,6 +25,9 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     }
     if text.eq_ignore_ascii_case("/status") {
         return Some(HubCommand::Status);
+    }
+    if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
+        return Some(HubCommand::Help);
     }
     if let Some(rest) = text
         .strip_prefix("/use ")
