@@ -104,31 +104,34 @@ impl LoginClient {
                 }
             };
 
-            match resp.status {
-                Some(0) => {
-                    // Still waiting
+            // API returns status as a string: "wait" | "confirmed" | "expired"
+            match resp.status.as_deref() {
+                Some("wait") | None => {
+                    // Still waiting for scan
                 }
-                Some(1) => {
+                Some("scanned") => {
                     info!("QR code scanned, waiting for confirmation...");
                 }
-                Some(2) => {
-                    // Confirmed / logged in
+                Some("confirmed") => {
                     if let Some(token) = resp.bot_token {
                         info!("QR login successful");
                         return Ok(token);
                     }
-                    return Err(anyhow!("login succeeded but no bot_token in response"));
+                    return Err(anyhow!("login confirmed but no bot_token in response"));
+                }
+                Some("expired") => {
+                    return Err(anyhow!("QR code expired, please run login again"));
                 }
                 Some(status) => {
-                    return Err(anyhow!("unexpected qrcode status: {}", status));
+                    if resp.ret != 0 {
+                        return Err(anyhow!(
+                            "qrcode status error: {}",
+                            resp.errmsg.as_deref().unwrap_or(status)
+                        ));
+                    }
+                    // Unknown status — log and keep polling
+                    warn!(status, "unknown qrcode status, continuing to poll");
                 }
-                None if resp.ret != 0 => {
-                    return Err(anyhow!(
-                        "qrcode status error: {}",
-                        resp.errmsg.as_deref().unwrap_or("unknown")
-                    ));
-                }
-                None => {}
             }
         }
     }

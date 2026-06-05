@@ -20,11 +20,18 @@ pub struct GetQrcodeResponse {
     pub errmsg: Option<String>,
 }
 
+/// Response from `/ilink/bot/get_qrcode_status`.
+/// Observed status values: "wait" | "confirmed" | "expired"
+/// On "confirmed": also includes bot_token, baseurl, ilink_bot_id, ilink_user_id.
 #[derive(Debug, Deserialize)]
 pub struct QrcodeStatusResponse {
     pub ret: i32,
-    pub status: Option<i32>,
+    /// "wait" | "confirmed" | "expired" (string, not integer)
+    pub status: Option<String>,
     pub bot_token: Option<String>,
+    pub baseurl: Option<String>,
+    pub ilink_bot_id: Option<String>,
+    pub ilink_user_id: Option<String>,
     pub errmsg: Option<String>,
 }
 
