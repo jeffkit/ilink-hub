@@ -214,18 +214,14 @@ pub async fn sendmessage(
         (real_ctx, peer_user_id)
     };
 
-    // Replace virtual context_token with real one and inject from/to user IDs
-    let bot_id = state.upstream.bot_id().to_string();
+    // Replace virtual context_token with real one and inject to_user_id if missing
     if let Some(msg) = &mut req.msg {
         msg.context_token = Some(real_ctx);
-        if msg.from_user_id.is_none() && !bot_id.is_empty() {
-            msg.from_user_id = Some(bot_id);
-        }
         if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
             msg.to_user_id = Some(peer_user_id);
         }
+        msg.ensure_outbound();
     }
-    // Ensure base_info is set
     if req.base_info.is_none() {
         req.base_info = Some(BaseInfo::default());
     }

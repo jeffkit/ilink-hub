@@ -103,8 +103,14 @@ impl UpstreamClient {
         Ok(resp)
     }
 
-    pub async fn send_message(&self, req: SendMessageRequest) -> Result<SendMessageResponse> {
+    pub async fn send_message(&self, mut req: SendMessageRequest) -> Result<SendMessageResponse> {
         let url = format!("{}/ilink/bot/sendmessage", self.base_url);
+        if let Some(msg) = &mut req.msg {
+            msg.ensure_outbound();
+        }
+        if req.base_info.is_none() {
+            req.base_info = Some(BaseInfo::default());
+        }
         // The real API returns an empty body on success; parse loosely
         let text = self
             .client
@@ -115,12 +121,22 @@ impl UpstreamClient {
             .await?
             .text()
             .await?;
-        // Empty body or non-JSON means success
+        debug!(response = %text, "send_message raw response");
+        // Empty body means success
         if text.trim().is_empty() {
             return Ok(SendMessageResponse::ok());
         }
         match serde_json::from_str::<SendMessageResponse>(&text) {
-            Ok(resp) => Ok(resp),
+            Ok(resp) => {
+                if resp.ret.map(|r| r != 0).unwrap_or(false) {
+                    warn!(
+                        ret = resp.ret,
+                        errmsg = ?resp.errmsg,
+                        "iLink sendmessage returned non-zero ret"
+                    );
+                }
+                Ok(resp)
+            }
             Err(_) => Ok(SendMessageResponse::ok()), // treat unparseable as success
         }
     }
@@ -200,13 +216,16 @@ impl UpstreamClient {
                         }
                     }
                     if let Some(messages) = resp.msgs {
-                        for msg in messages {
-                            debug!(
-                                from = msg.from_user_id.as_deref().unwrap_or("?"),
-                                "received upstream message"
-                            );
-                            let _ = tx.send(msg);
-                        }
+                    for msg in messages {
+                        debug!(
+                            from = msg.from_user_id.as_deref().unwrap_or("?"),
+                            ctx = msg.context_token.as_deref().unwrap_or("(none)"),
+                            text = msg.text().unwrap_or("(none)"),
+                            has_item_list = msg.item_list.is_some(),
+                            "received upstream message"
+                        );
+                        let _ = tx.send(msg);
+                    }
                     }
                 }
                 Ok(resp) => {

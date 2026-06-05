@@ -6,7 +6,7 @@ pub mod router;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ilink::types::{SendMessageRequest, WeixinMessage};
 use crate::ilink::UpstreamClient;
@@ -156,19 +156,20 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
 
                 // Notify the user that no AI backends are available
-                if let Some(real_ctx) = msg.context_token.clone() {
-                    let bot_id = state.upstream.bot_id().to_string();
+                if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
                     let to_uid = msg.from_user_id.as_deref().unwrap_or("");
                     let reply_text = build_no_backend_reply(msg.text());
-                    let reply = SendMessageRequest::reply(
-                        real_ctx,
-                        reply_text,
-                        &bot_id,
-                        to_uid,
-                    );
-                    if let Err(e) = state.upstream.send_message(reply).await {
-                        error!(error = %e, "failed to send no-clients reply");
+                    debug!(to = %to_uid, "sending no-backend fallback reply");
+                    let reply = SendMessageRequest::reply(real_ctx, reply_text, to_uid);
+                    match state.upstream.send_message(reply).await {
+                        Err(e) => error!(error = %e, "failed to send no-clients reply"),
+                        Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
+                            warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected no-clients reply");
+                        }
+                        Ok(_) => {}
                     }
+                } else {
+                    warn!(from_user_id, "no context_token in message, cannot send no-clients reply");
                 }
                 return;
             }
@@ -222,13 +223,14 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
 async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCommand) {
     let real_ctx = match msg.context_token.clone() {
-        Some(ctx) => ctx,
-        None => {
-            warn!("hub command message has no context_token");
+        Some(ctx) if !ctx.is_empty() => ctx,
+        _ => {
+            warn!(?cmd, "hub command message has no context_token, cannot reply");
             return;
         }
     };
     let from_user_id = msg.from_user_id.as_deref().unwrap_or_default().to_string();
+    debug!(?cmd, from_user_id, context_token = %real_ctx, "handling hub command");
 
     let reply_text = match cmd {
         HubCommand::List => {
@@ -247,7 +249,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 lines.join("\n")
             }
         }
-        HubCommand::UseClient(name) => {
+        HubCommand::UseClient(ref name) => {
             let registry = state.registry.read().await;
             if let Some(client) = registry.get_by_name(&name) {
                 let vtoken = client.vtoken.clone();
@@ -270,7 +272,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 )
             }
         }
-        HubCommand::Broadcast(text) => {
+        HubCommand::Broadcast(ref text) => {
             let online = {
                 let registry = state.registry.read().await;
                 registry
@@ -305,39 +307,40 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             let registry = state.registry.read().await;
             let online = registry.online_clients().len();
             let total = registry.all_clients().len();
-            format!("iLink Hub — {}/{} clients online", online, total)
+            format!("iLink Hub 状态：{}/{} 个客户端在线", online, total)
         }
         HubCommand::Help => build_help_text(),
     };
 
-    let bot_id = state.upstream.bot_id().to_string();
-    let send_req = SendMessageRequest::reply(real_ctx, reply_text, &bot_id, &from_user_id);
-    if let Err(e) = state.upstream.send_message(send_req).await {
-        error!(error = %e, "failed to send hub command reply");
+    debug!(to = %from_user_id, "sending hub command reply");
+    let send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
+    match state.upstream.send_message(send_req).await {
+        Err(e) => error!(error = %e, "failed to send hub command reply"),
+        Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
+            error!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected hub command reply");
+        }
+        Ok(_) => {
+            debug!(?cmd, "hub command reply sent successfully");
+        }
     }
 }
 
 // ─── Static responder helpers ─────────────────────────────────────────────────
 
 fn build_help_text() -> String {
-    "iLink Hub 帮助\n\
-     \n\
+    "iLink Hub 帮助\n\n\
      可用指令：\n\
-     /status   — 查看当前 Hub 状态\n\
-     /list     — 列出所有已注册的 AI 后端\n\
+     /status — 查看当前 Hub 状态\n\
+     /list — 列出所有已注册的 AI 后端\n\
      /use <名称> — 切换到指定的 AI 后端\n\
-     /help     — 显示此帮助\n\
-     \n\
+     /help — 显示此帮助\n\n\
      关于 iLink Hub：\n\
-     本服务是一个消息路由中枢，可将您的微信消息\n\
-     转发给已接入的 AI 助手后端进行处理。\n\
-     \n\
+     本服务是一个消息路由中枢，可将您的微信消息转发给已接入的 AI 助手后端进行处理。\n\n\
      管理员接入指南：\n\
      1. 部署并启动 ilink-hub serve\n\
      2. 运行 ilink-hub register --name <名称> 注册后端\n\
      3. 将输出的 WEIXIN_TOKEN 配置到您的 AI 服务\n\
-     4. AI 服务调用 /ilink/bot/getupdates 接收消息\n\
-        并通过 /ilink/bot/sendmessage 回复"
+     4. AI 服务调用 /ilink/bot/getupdates 接收消息，并通过 /ilink/bot/sendmessage 回复"
         .to_string()
 }
 

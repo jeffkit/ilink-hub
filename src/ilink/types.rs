@@ -62,6 +62,10 @@ pub mod msg_type {
     pub const VIDEO: i32 = 5;
 }
 
+pub mod message_state {
+    pub const FINISH: i32 = 2;
+}
+
 /// Text content inside a MessageItem.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TextItem {
@@ -131,16 +135,67 @@ impl WeixinMessage {
 
     /// Build a text reply to this message.
     pub fn build_text_reply(context_token: String, text: String) -> WeixinMessage {
-        WeixinMessage {
+        let mut msg = WeixinMessage {
             context_token: Some(context_token),
             message_type: Some(2), // BOT
+            message_state: Some(message_state::FINISH),
+            from_user_id: Some(String::new()),
+            client_id: Some(new_client_id()),
             item_list: Some(vec![MessageItem {
                 item_type: Some(msg_type::TEXT),
                 text_item: Some(TextItem { text: Some(text) }),
                 extra: serde_json::Value::Object(Default::default()),
             }]),
             ..Default::default()
+        };
+        msg.ensure_outbound();
+        msg
+    }
+
+    /// Normalize outbound fields per iLink protocol (empty from_user_id, unique client_id, FINISH state).
+    pub fn ensure_outbound(&mut self) {
+        self.from_user_id = Some(String::new());
+        if self.message_type.is_none() {
+            self.message_type = Some(2);
         }
+        if self.message_state.is_none() {
+            self.message_state = Some(message_state::FINISH);
+        }
+        if self
+            .client_id
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        {
+            self.client_id = Some(new_client_id());
+        }
+    }
+}
+
+fn new_client_id() -> String {
+    format!("ilink-hub:{}", uuid::Uuid::new_v4())
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+
+    #[test]
+    fn build_text_reply_sets_outbound_fields() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), "hi".to_string());
+        assert_eq!(msg.from_user_id.as_deref(), Some(""));
+        assert_eq!(msg.message_type, Some(2));
+        assert_eq!(msg.message_state, Some(message_state::FINISH));
+        assert!(msg.client_id.as_deref().unwrap().starts_with("ilink-hub:"));
+    }
+
+    #[test]
+    fn ensure_outbound_assigns_unique_client_id() {
+        let mut msg1 = WeixinMessage::default();
+        let mut msg2 = WeixinMessage::default();
+        msg1.ensure_outbound();
+        msg2.ensure_outbound();
+        assert_ne!(msg1.client_id, msg2.client_id);
     }
 }
 
@@ -195,17 +250,9 @@ impl SendMessageRequest {
         }
     }
 
-    /// Build a reply with explicit from/to user IDs (required by the iLink API).
-    pub fn reply(
-        context_token: String,
-        text: String,
-        from_user_id: &str,
-        to_user_id: &str,
-    ) -> Self {
+    /// Build a text reply to a WeChat user. `from_user_id` must be empty per iLink protocol.
+    pub fn reply(context_token: String, text: String, to_user_id: &str) -> Self {
         let mut msg = WeixinMessage::build_text_reply(context_token, text);
-        if !from_user_id.is_empty() {
-            msg.from_user_id = Some(from_user_id.to_string());
-        }
         if !to_user_id.is_empty() {
             msg.to_user_id = Some(to_user_id.to_string());
         }
