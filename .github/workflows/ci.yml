@@ -41,7 +41,7 @@ jobs:
       - name: Run tests
         run: cargo test --all-features
         env:
-          DATABASE_URL: sqlite::memory:
+          DATABASE_URL: "sqlite::memory:"
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
