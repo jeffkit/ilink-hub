@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>iLink Hub — Admin</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #0f1117;
+      --surface: #1a1d27;
+      --border: #2a2d3a;
+      --text: #e2e5f0;
+      --muted: #7c8196;
+      --green: #22c55e;
+      --red: #ef4444;
+      --blue: #3b82f6;
+      --blue-hover: #2563eb;
+      --radius: 8px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    header h1 { font-size: 18px; font-weight: 600; }
+    header .badge {
+      font-size: 11px;
+      background: var(--blue);
+      color: #fff;
+      padding: 2px 8px;
+      border-radius: 20px;
+    }
+
+    #status-bar {
+      font-size: 12px;
+      color: var(--muted);
+      margin-left: auto;
+    }
+
+    main { max-width: 900px; margin: 0 auto; padding: 28px 20px; }
+
+    section { margin-bottom: 32px; }
+    section h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; color: var(--text); }
+
+    /* Client cards */
+    #clients-grid { display: flex; flex-direction: column; gap: 10px; }
+
+    .client-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px 14px;
+      align-items: start;
+    }
+
+    .status-dot {
+      width: 10px; height: 10px; border-radius: 50%; margin-top: 4px; flex-shrink: 0;
+    }
+    .status-dot.online  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .status-dot.offline { background: var(--muted); }
+
+    .client-meta .name { font-weight: 600; font-size: 15px; }
+    .client-meta .label { font-size: 12px; color: var(--muted); }
+
+    .client-actions { display: flex; gap: 8px; flex-direction: column; align-items: flex-end; }
+
+    .vtoken-row {
+      grid-column: 1 / -1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--muted);
+      overflow: hidden;
+    }
+
+    .vtoken-value {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Buttons */
+    button, .btn {
+      border: none; cursor: pointer; border-radius: 6px; font-family: var(--font);
+      font-size: 12px; font-weight: 500; padding: 5px 12px; transition: background 0.15s;
+    }
+
+    .btn-primary { background: var(--blue); color: #fff; }
+    .btn-primary:hover { background: var(--blue-hover); }
+
+    .btn-ghost {
+      background: transparent;
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+    .btn-ghost:hover { background: var(--border); color: var(--text); }
+
+    .btn-sm { font-size: 11px; padding: 3px 8px; }
+
+    /* Forms */
+    .form-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+    }
+
+    .form-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+    input[type="text"], input[type="password"] {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      padding: 7px 10px;
+      flex: 1;
+      min-width: 140px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus { border-color: var(--blue); }
+    input::placeholder { color: var(--muted); }
+
+    label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+
+    .field { flex: 1; min-width: 120px; }
+
+    /* Result box */
+    #reg-result {
+      display: none;
+      margin-top: 14px;
+      background: var(--bg);
+      border: 1px solid var(--green);
+      border-radius: var(--radius);
+      padding: 14px;
+    }
+    #reg-result h3 { font-size: 13px; color: var(--green); margin-bottom: 10px; }
+
+    .env-block {
+      background: #0d1117;
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #a3e635;
+      margin-bottom: 10px;
+      white-space: pre;
+      overflow-x: auto;
+    }
+
+    /* Toast */
+    #toast {
+      position: fixed; bottom: 20px; right: 20px;
+      background: #1c2333; border: 1px solid var(--border);
+      color: var(--text); font-size: 13px;
+      padding: 10px 16px; border-radius: 8px;
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    #toast.show { opacity: 1; }
+
+    /* Util */
+    .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px 0; }
+    .online-count { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+
+    /* Auth warning */
+    #auth-warning {
+      background: #1f1200; border: 1px solid #7c4f00; border-radius: var(--radius);
+      padding: 10px 14px; font-size: 12px; color: #f59e0b; margin-bottom: 18px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+  </svg>
+  <h1>iLink Hub</h1>
+  <span class="badge">Admin</span>
+  <span id="status-bar">Connecting…</span>
+</header>
+
+<main>
+  <div id="auth-warning">
+    ⚠️ Admin token required — set <code>ILINK_ADMIN_TOKEN</code> env var and reload with
+    <code>Authorization: Bearer &lt;token&gt;</code> header, or use a reverse proxy.
+  </div>
+
+  <!-- Client list -->
+  <section>
+    <h2>Connected Workspaces <span class="online-count" id="online-count"></span></h2>
+    <div id="clients-grid"><div class="empty">Loading…</div></div>
+  </section>
+
+  <!-- Register new client -->
+  <section>
+    <h2>Register New Backend</h2>
+    <div class="form-card">
+      <div class="form-row">
+        <div class="field">
+          <label for="reg-name">Name (machine-readable)</label>
+          <input type="text" id="reg-name" placeholder="mac-home" />
+        </div>
+        <div class="field">
+          <label for="reg-label">Label (optional)</label>
+          <input type="text" id="reg-label" placeholder="Mac Home — Claude" />
+        </div>
+        <div class="field" id="token-field" style="display:none">
+          <label for="admin-token">Admin Token</label>
+          <input type="password" id="admin-token" placeholder="ILINK_ADMIN_TOKEN value" />
+        </div>
+        <div style="align-self:flex-end">
+          <button class="btn btn-primary" onclick="registerClient()">Register</button>
+        </div>
+      </div>
+
+      <div id="reg-result">
+        <h3>✅ Client registered!</h3>
+        <p style="font-size:12px;color:var(--muted);margin-bottom:8px">
+          Configure your backend with these environment variables:
+        </p>
+        <div class="env-block" id="reg-env-block"></div>
+        <button class="btn btn-ghost btn-sm" onclick="copyEnv()">Copy to clipboard</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Quick commands -->
+  <section>
+    <h2>WeChat Commands</h2>
+    <div class="form-card">
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <colgroup><col style="width:160px"/><col/></colgroup>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/list</td>
+          <td style="padding:8px 0;color:var(--muted)">List all registered backends and their status</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/use &lt;name&gt;</td>
+          <td style="padding:8px 0;color:var(--muted)">Switch active backend (e.g. <code style="font-family:monospace">/use mac-home</code>)</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/broadcast &lt;text&gt;</td>
+          <td style="padding:8px 0;color:var(--muted)">Send a message to all online backends</td>
+        </tr>
+        <tr>
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/status</td>
+          <td style="padding:8px 0;color:var(--muted)">Show Hub status (online/total clients)</td>
+        </tr>
+      </table>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const HUB_URL = window.location.origin;
+let adminToken = localStorage.getItem('ilink_admin_token') || '';
+let lastRegEnv = '';
+
+function authHeaders() {
+  const h = { 'Content-Type': 'application/json' };
+  if (adminToken) h['Authorization'] = 'Bearer ' + adminToken;
+  return h;
+}
+
+async function loadClients() {
+  try {
+    const r = await fetch('/hub/clients', { headers: authHeaders() });
+    if (r.status === 401) {
+      document.getElementById('auth-warning').style.display = 'block';
+      document.getElementById('token-field').style.display = 'block';
+      document.getElementById('clients-grid').innerHTML = '<div class="empty">Auth required — enter admin token below to register clients.</div>';
+      document.getElementById('status-bar').textContent = '🔒 Auth required';
+      return;
+    }
+    const data = await r.json();
+    const clients = data.clients || [];
+    const online = clients.filter(c => c.online).length;
+    document.getElementById('online-count').textContent = `${online} online / ${clients.length} total`;
+    document.getElementById('status-bar').textContent = `${online}/${clients.length} online — refreshes every 10s`;
+    renderClients(clients);
+  } catch(e) {
+    document.getElementById('clients-grid').innerHTML = '<div class="empty">Failed to load clients.</div>';
+  }
+}
+
+function renderClients(clients) {
+  const grid = document.getElementById('clients-grid');
+  if (!clients.length) {
+    grid.innerHTML = '<div class="empty">No clients registered yet — register one below.</div>';
+    return;
+  }
+  grid.innerHTML = clients.map(c => `
+    <div class="client-card">
+      <div class="status-dot ${c.online ? 'online' : 'offline'}"></div>
+      <div class="client-meta">
+        <div class="name">${esc(c.name)}</div>
+        ${c.label ? `<div class="label">${esc(c.label)}</div>` : ''}
+      </div>
+      <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'};margin-top:3px">
+        ${c.online ? '🟢 online' : '⚫ offline'}
+      </span>
+      <div class="vtoken-row">
+        <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_TOKEN</span>
+        <span class="vtoken-value">${esc(c.vtoken || '—')}</span>
+        ${c.vtoken ? `<button class="btn btn-ghost btn-sm" onclick="copyText('${esc(c.vtoken)}')">Copy</button>` : ''}
+      </div>
+      <div class="vtoken-row">
+        <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_BASE_URL</span>
+        <span class="vtoken-value">${esc(HUB_URL)}</span>
+        <button class="btn btn-ghost btn-sm" onclick="copyText('${esc(HUB_URL)}')">Copy</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function registerClient() {
+  const name = document.getElementById('reg-name').value.trim();
+  const label = document.getElementById('reg-label').value.trim();
+  const tokenInput = document.getElementById('admin-token').value.trim();
+
+  if (!name) { showToast('Name is required'); return; }
+
+  if (tokenInput) {
+    adminToken = tokenInput;
+    localStorage.setItem('ilink_admin_token', adminToken);
+  }
+
+  try {
+    const r = await fetch('/hub/register', {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ name, label: label || null }),
+    });
+    const data = await r.json();
+    if (data.ret !== 0) {
+      showToast('Registration failed: ' + (data.errmsg || 'unknown error'));
+      return;
+    }
+
+    const env = `WEIXIN_BASE_URL=${HUB_URL}\nWEIXIN_TOKEN=${data.vtoken}`;
+    lastRegEnv = env;
+    document.getElementById('reg-env-block').textContent = env;
+    document.getElementById('reg-result').style.display = 'block';
+    showToast('✅ Client registered!');
+    document.getElementById('reg-name').value = '';
+    document.getElementById('reg-label').value = '';
+    await loadClients();
+  } catch(e) {
+    showToast('Error: ' + e.message);
+  }
+}
+
+function copyEnv() {
+  copyText(lastRegEnv);
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => showToast('Copied!'));
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+function esc(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Init
+loadClients();
+setInterval(loadClients, 10000);
+</script>
+</body>
+</html>

@@ -1,10 +1,10 @@
 pub mod routes;
 
-use std::sync::Arc;
 use axum::{
     routing::{get, post},
     Router,
 };
+use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -22,6 +22,9 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         // Hub management (non-iLink)
         .route("/hub/register", post(register))
         .route("/hub/clients", get(admin_clients))
+        .route("/hub/ui", get(admin_ui))
+        // Observability
+        .route("/metrics", get(metrics))
         .route("/health", get(|| async { "ok" }))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())

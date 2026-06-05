@@ -2,7 +2,7 @@
 
 **iLink-compatible multiplexer hub for WeChat ClawBot** — connect one WeChat account to multiple AI agent backends running on different machines or workspaces, with zero client-side code changes.
 
-[![CI](https://github.com/kongjie/ilink-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/kongjie/ilink-hub/actions)
+[![CI](https://github.com/jeffkit/ilink-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/jeffkit/ilink-hub/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ---
@@ -35,17 +35,42 @@ iLink Hub is a **transparent iLink proxy**:
 
 - **iLink-compatible API** — any existing iLink client works out-of-the-box
 - **Multi-backend routing** — route messages to different backends via WeChat commands
-- **Context-token mapping** — real context tokens never leak to clients
+- **Context-token mapping** — real context tokens never leak to clients; persisted across restarts
 - **QR code login** — scan once, token saved to DB
 - **Multi-database** — SQLite (default), PostgreSQL, MySQL via `DATABASE_URL`
+- **Full persistence** — client registrations, routing state, and context mappings survive restarts
+- **Web admin panel** — manage clients and copy config at `/hub/ui`
+- **Admin auth** — protect `/hub/` endpoints with `ILINK_ADMIN_TOKEN` env var
+- **Bounded queues** — per-client message buffer capped at 200 to prevent OOM
+- **Prometheus metrics** — counters and gauges at `/metrics`
+- **Friendly fallback** — when all backends are offline, WeChat users get an instant reply
+- **Pre-built binaries** — download from GitHub Releases (Linux/macOS/Windows), no Rust required
 - **Health checks** — auto-marks offline clients after 90s idle
-- **Docker support** — single-command deployment
+- **Docker support** — single-command deployment, multi-arch image (amd64 + arm64)
 
 ---
 
 ## Quick Start
 
-### Option A: Binary
+### Option A: Pre-built Binary (fastest)
+
+```bash
+# Linux x86_64
+curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-linux-x86_64
+chmod +x ilink-hub && sudo mv ilink-hub /usr/local/bin/
+
+# macOS Apple Silicon
+curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-macos-aarch64
+chmod +x ilink-hub && sudo mv ilink-hub /usr/local/bin/
+
+# macOS Intel
+curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-macos-x86_64
+chmod +x ilink-hub && sudo mv ilink-hub /usr/local/bin/
+```
+
+> Windows: download `ilink-hub-windows-x86_64.exe` from [Releases](https://github.com/jeffkit/ilink-hub/releases).
+
+### Option B: Cargo (requires Rust)
 
 ```bash
 # Install
@@ -57,7 +82,10 @@ ilink-hub login
 # Step 2: Start Hub
 ilink-hub serve --addr 0.0.0.0:8765
 
-# Step 3: Register each backend (on the backend machines)
+# Step 3: Open web admin panel
+# Visit http://your-hub.example.com:8765/hub/ui
+
+# Step 4: Register each backend (CLI or via the web UI)
 ilink-hub register --hub-url http://your-hub.example.com \
   --name mac-home --label "Mac Home"
 # Outputs:
@@ -65,13 +93,13 @@ ilink-hub register --hub-url http://your-hub.example.com \
 #   WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxx
 ```
 
-### Option B: Docker Compose
+### Option C: Docker Compose
 
 ```yaml
 # docker-compose.yml
 services:
   ilink-hub:
-    image: ghcr.io/kongjie/ilink-hub:latest
+    image: ghcr.io/jeffkit/ilink-hub:latest
     restart: unless-stopped
     ports:
       - "8765:8765"
@@ -91,7 +119,7 @@ docker compose up -d
 docker compose exec ilink-hub ilink-hub login
 ```
 
-### Option C: PostgreSQL backend
+### Option D: PostgreSQL backend
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost/ilink_hub ilink-hub serve
@@ -177,8 +205,14 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/hub/register` | Register a new backend client |
-| `GET` | `/hub/clients` | List all registered clients |
+| `GET` | `/hub/clients` | List all registered clients (includes vtoken) |
+| `GET` | `/hub/ui` | Web admin panel (browser UI) |
+| `GET` | `/metrics` | Prometheus-format metrics |
 | `GET` | `/health` | Health check |
+
+**Admin auth:** Set `ILINK_ADMIN_TOKEN=<secret>` on the Hub. Then pass `Authorization: Bearer <secret>`
+when calling `/hub/register` or `/hub/clients`. If the env var is unset, these endpoints are open (suitable
+for local dev / private networks).
 
 ---
 
@@ -281,4 +315,4 @@ server {
 
 ## License
 
-MIT © 2026 kongjie
+MIT © 2026 jeffkit

@@ -16,4 +16,8 @@ pub enum HubError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Queue backend operation failed
+    #[error("queue backend error: {0}")]
+    QueueBackend(String),
 }

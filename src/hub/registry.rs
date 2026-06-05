@@ -1,4 +1,4 @@
-/// Client registry — tracks registered backend clients and their virtual tokens.
+//! Client registry — tracks registered backend clients and their virtual tokens.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -49,19 +49,34 @@ impl ClientRegistry {
     /// Register a new client, returning its virtual token.
     /// If a client with the same name already exists, its vtoken is reused.
     pub fn register(&mut self, name: String, label: Option<String>) -> String {
-        if let Some(vtoken) = self.by_name.get(&name) {
-            // Update label if provided
-            if let Some(info) = self.by_vtoken.get_mut(vtoken) {
+        self.register_with_vtoken(name, label, None)
+    }
+
+    /// Register a client with a specific vtoken (used when loading from DB on startup).
+    /// If name already exists, the existing entry is updated; vtoken argument is ignored.
+    /// If name is new and vtoken is provided, that vtoken is used; otherwise a fresh one is generated.
+    pub fn register_with_vtoken(
+        &mut self,
+        name: String,
+        label: Option<String>,
+        vtoken: Option<String>,
+    ) -> String {
+        if let Some(existing_vtoken) = self.by_name.get(&name) {
+            let existing_vtoken = existing_vtoken.clone();
+            if let Some(info) = self.by_vtoken.get_mut(&existing_vtoken) {
                 if label.is_some() {
                     info.label = label;
                 }
                 info.online = true;
                 info.last_seen = Some(Instant::now());
             }
-            return vtoken.clone();
+            return existing_vtoken;
         }
 
-        let info = ClientInfo::new(name.clone(), label);
+        let mut info = ClientInfo::new(name.clone(), label);
+        if let Some(vt) = vtoken {
+            info.vtoken = vt;
+        }
         let vtoken = info.vtoken.clone();
         self.by_name.insert(name, vtoken.clone());
         self.by_vtoken.insert(vtoken.clone(), info);

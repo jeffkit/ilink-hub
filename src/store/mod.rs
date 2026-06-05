@@ -1,8 +1,8 @@
-/// Database persistence layer.
-/// Uses sqlx with runtime driver selection via `DATABASE_URL`:
-///   sqlite://./ilink-hub.db          → SQLite (default)
-///   postgres://user:pass@host/db      → PostgreSQL
-///   mysql://user:pass@host/db         → MySQL
+//! Database persistence layer.
+//! Uses sqlx with runtime driver selection via `DATABASE_URL`:
+//!   sqlite://./ilink-hub.db          → SQLite (default)
+//!   postgres://user:pass@host/db      → PostgreSQL
+//!   mysql://user:pass@host/db         → MySQL
 
 use anyhow::Result;
 use sqlx::{AnyPool, Row};
@@ -98,21 +98,17 @@ impl Store {
     }
 
     pub async fn touch_client(&self, vtoken: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE clients SET last_seen = CURRENT_TIMESTAMP WHERE vtoken = $1",
-        )
-        .bind(vtoken)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE clients SET last_seen = CURRENT_TIMESTAMP WHERE vtoken = $1")
+            .bind(vtoken)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
-        let rows = sqlx::query(
-            "SELECT vtoken, name, label, last_seen FROM clients ORDER BY name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
 
         Ok(rows
             .into_iter()
@@ -126,12 +122,10 @@ impl Store {
     }
 
     pub async fn get_client_by_name(&self, name: &str) -> Result<Option<ClientRow>> {
-        let row = sqlx::query(
-            "SELECT vtoken, name, label, last_seen FROM clients WHERE name = $1",
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(row.map(|r| ClientRow {
             vtoken: r.get("vtoken"),
@@ -143,13 +137,27 @@ impl Store {
 
     // ─── Routing state ────────────────────────────────────────────────────────
 
+    pub async fn list_routes(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT from_user, active_vtoken FROM routing_state")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("from_user"),
+                    r.get::<String, _>("active_vtoken"),
+                )
+            })
+            .collect())
+    }
+
     pub async fn get_route(&self, from_user: &str) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT active_vtoken FROM routing_state WHERE from_user = $1",
-        )
-        .bind(from_user)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT active_vtoken FROM routing_state WHERE from_user = $1")
+            .bind(from_user)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| r.get("active_vtoken")))
     }
 
@@ -174,36 +182,60 @@ impl Store {
 
     pub async fn map_context_token(&self, real_ctx: &str) -> Result<String> {
         // Check existing mapping
-        let existing = sqlx::query(
-            "SELECT vctx FROM context_token_map WHERE real_ctx = $1",
-        )
-        .bind(real_ctx)
-        .fetch_optional(&self.pool)
-        .await?;
+        let existing = sqlx::query("SELECT vctx FROM context_token_map WHERE real_ctx = $1")
+            .bind(real_ctx)
+            .fetch_optional(&self.pool)
+            .await?;
 
         if let Some(row) = existing {
             return Ok(row.get("vctx"));
         }
 
         let vctx = format!("vctx_{}", Uuid::new_v4().simple());
-        sqlx::query(
-            "INSERT INTO context_token_map (vctx, real_ctx) VALUES ($1, $2)",
-        )
-        .bind(&vctx)
-        .bind(real_ctx)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO context_token_map (vctx, real_ctx) VALUES ($1, $2)")
+            .bind(&vctx)
+            .bind(real_ctx)
+            .execute(&self.pool)
+            .await?;
         Ok(vctx)
     }
 
-    pub async fn resolve_context_token(&self, vctx: &str) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT real_ctx FROM context_token_map WHERE vctx = $1",
+    /// Persist a known vctx→real_ctx mapping (idempotent: skips if already present).
+    pub async fn persist_context_token(&self, vctx: &str, real_ctx: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO context_token_map (vctx, real_ctx)
+            VALUES ($1, $2)
+            ON CONFLICT (vctx) DO NOTHING
+            "#,
         )
         .bind(vctx)
-        .fetch_optional(&self.pool)
+        .bind(real_ctx)
+        .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    pub async fn resolve_context_token(&self, vctx: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT real_ctx FROM context_token_map WHERE vctx = $1")
+            .bind(vctx)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| r.get("real_ctx")))
+    }
+
+    /// Load recent context_token mappings for in-memory cache warm-up.
+    /// Returns up to `limit` entries (no guaranteed ordering — all entries are returned if ≤ limit).
+    pub async fn list_recent_context_tokens(&self, limit: i64) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT vctx, real_ctx FROM context_token_map LIMIT $1")
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("vctx"), r.get::<String, _>("real_ctx")))
+            .collect())
     }
 
     // ─── Bot credentials ──────────────────────────────────────────────────────
@@ -227,11 +259,9 @@ impl Store {
     }
 
     pub async fn load_credentials(&self) -> Result<Option<(String, String)>> {
-        let row = sqlx::query(
-            "SELECT token, base_url FROM bot_credentials WHERE id = 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT token, base_url FROM bot_credentials WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| (r.get("token"), r.get("base_url"))))
     }
 }

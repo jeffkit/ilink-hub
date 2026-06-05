@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "iLink-compatible multiplexer hub for WeChat ClawBot — route one WeChat account to multiple AI agent backends"
 license = "MIT"
-repository = "https://github.com/kongjie/ilink-hub"
+authors = ["jeffkit <bbmyth@gmail.com>"]
+repository = "https://github.com/jeffkit/ilink-hub"
+homepage = "https://github.com/jeffkit/ilink-hub"
+documentation = "https://docs.rs/ilink-hub"
 keywords = ["wechat", "ilink", "clawbot", "ai-agent", "proxy"]
 categories = ["web-programming", "network-programming"]
 
@@ -24,6 +27,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["time"] }
 
 # HTTP client

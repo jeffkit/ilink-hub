@@ -1,5 +1,5 @@
-/// Background health checker — periodically evicts clients that have
-/// stopped polling `getupdates` for longer than `timeout`.
+//! Background health checker — periodically evicts clients that have
+//! stopped polling `getupdates` for longer than `timeout`.
 
 use std::sync::Arc;
 use std::time::Duration;

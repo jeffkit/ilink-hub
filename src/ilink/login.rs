@@ -1,9 +1,9 @@
-/// QR code login flow for the iLink Bot API.
-/// Handles get_bot_qrcode → polling get_qrcode_status → returns bot_token.
+//! QR code login flow for the iLink Bot API.
+//! Handles get_bot_qrcode → polling get_qrcode_status → returns bot_token.
 
-use std::time::Duration;
 use anyhow::{anyhow, Result};
 use reqwest::Client;
+use std::time::Duration;
 use tracing::{info, warn};
 
 use super::types::*;
@@ -31,8 +31,12 @@ impl LoginClient {
 
         // Step 1: Get QR code
         let qr_resp = self.get_qrcode().await?;
-        let key = qr_resp.key.ok_or_else(|| anyhow!("no qrcode key in response"))?;
-        let qr_url = qr_resp.qrcode.ok_or_else(|| anyhow!("no qrcode URL in response"))?;
+        let key = qr_resp
+            .key
+            .ok_or_else(|| anyhow!("no qrcode key in response"))?;
+        let qr_url = qr_resp
+            .qrcode
+            .ok_or_else(|| anyhow!("no qrcode URL in response"))?;
 
         // Step 2: Render QR code in terminal
         println!("\n╔══════════════════════════════════════╗");
@@ -51,7 +55,13 @@ impl LoginClient {
 
     async fn get_qrcode(&self) -> Result<GetQrcodeResponse> {
         let url = format!("{}/ilink/bot/get_bot_qrcode?bot_type=3", self.base_url);
-        let resp = self.client.get(&url).send().await?.json::<GetQrcodeResponse>().await?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await?
+            .json::<GetQrcodeResponse>()
+            .await?;
         if resp.ret != 0 {
             return Err(anyhow!(
                 "get_bot_qrcode failed: {}",
@@ -62,7 +72,10 @@ impl LoginClient {
     }
 
     async fn poll_qrcode_status(&self, key: &str) -> Result<String> {
-        let url = format!("{}/ilink/bot/get_qrcode_status?qrcode={}", self.base_url, key);
+        let url = format!(
+            "{}/ilink/bot/get_qrcode_status?qrcode={}",
+            self.base_url, key
+        );
         let mut attempts = 0u32;
         const MAX_ATTEMPTS: u32 = 120; // 2 minutes
 
@@ -74,7 +87,14 @@ impl LoginClient {
 
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let resp = match self.client.get(&url).send().await?.json::<QrcodeStatusResponse>().await {
+            let resp = match self
+                .client
+                .get(&url)
+                .send()
+                .await?
+                .json::<QrcodeStatusResponse>()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(error = %e, "error polling qrcode status");
@@ -114,8 +134,8 @@ impl LoginClient {
 
 /// Render a URL as a QR code using Unicode block characters.
 fn render_qr_terminal(url: &str) -> Result<()> {
-    use qrcode::{QrCode, EcLevel};
     use qrcode::render::unicode;
+    use qrcode::{EcLevel, QrCode};
 
     let code = QrCode::with_error_correction_level(url.as_bytes(), EcLevel::L)
         .map_err(|e| anyhow!("QR code error: {e}"))?;

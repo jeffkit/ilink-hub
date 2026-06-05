@@ -1,11 +1,11 @@
-use std::sync::Arc;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
 use tracing::info;
 
 use ilink_hub::{
-    hub::{spawn_dispatcher, spawn_health_checker, HubState},
+    hub::{spawn_dispatcher, spawn_health_checker, HubState, InMemoryQueue, MessageQueue},
     ilink::{LoginClient, UpstreamClient},
     server::build_router,
     store::Store,
@@ -89,13 +89,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { token, addr, ilink_base_url, database_url } => {
+        Commands::Serve {
+            token,
+            addr,
+            ilink_base_url,
+            database_url,
+        } => {
             run_server(token, addr, ilink_base_url, database_url).await?;
         }
-        Commands::Login { database_url, ilink_base_url } => {
+        Commands::Login {
+            database_url,
+            ilink_base_url,
+        } => {
             run_login(database_url, ilink_base_url).await?;
         }
-        Commands::Register { hub_url, name, label } => {
+        Commands::Register {
+            hub_url,
+            name,
+            label,
+        } => {
             register_client(&hub_url, name, label).await?;
         }
         Commands::Clients { hub_url } => {
@@ -121,9 +133,10 @@ async fn run_server(
     let (token, base_url) = resolve_token(token_arg, ilink_base_url, store.clone()).await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url)));
-    let state = HubState::new(upstream.clone());
+    let queue = build_queue_backend();
+    let state = HubState::new(upstream.clone(), store.clone(), queue);
 
-    // Pre-load persisted clients into in-memory registry
+    // Pre-load persisted clients, routing state, and recent ctx_map into memory
     load_clients_from_db(state.clone(), store.clone()).await;
 
     // Upstream broadcast channel
@@ -144,7 +157,9 @@ async fn run_server(
         let tx_clone = tx.clone();
         let shutdown_rx_clone = shutdown_rx.clone();
         tokio::spawn(async move {
-            upstream_clone.run_polling_loop(tx_clone, shutdown_rx_clone).await;
+            upstream_clone
+                .run_polling_loop(tx_clone, shutdown_rx_clone)
+                .await;
         });
     }
 
@@ -205,20 +220,83 @@ async fn resolve_token(
 }
 
 async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
+    // Load registered clients (preserving stored vtokens)
+    // Queue entries are created on first push, so no explicit ensure() is needed.
     match store.list_clients().await {
         Ok(clients) => {
             let count = clients.len();
             let mut registry = state.registry.write().await;
-            let mut queues = state.queues.lock().await;
             for c in clients {
-                registry.register(c.name.clone(), c.label.clone());
-                // Override with stored vtoken
-                queues.ensure(&c.vtoken);
+                registry.register_with_vtoken(
+                    c.name.clone(),
+                    c.label.clone(),
+                    Some(c.vtoken.clone()),
+                );
             }
             info!(count, "loaded clients from database");
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to load clients from DB");
+        }
+    }
+
+    // Restore routing state (from_user → vtoken)
+    match store.list_routes().await {
+        Ok(routes) => {
+            let count = routes.len();
+            let mut router = state.router.lock().await;
+            for (from_user, vtoken) in routes {
+                router.set_route(&from_user, vtoken);
+            }
+            info!(count, "loaded routing state from database");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load routing state from DB");
+        }
+    }
+
+    // Warm in-memory context_token cache from DB (recent 500 entries)
+    match store.list_recent_context_tokens(500).await {
+        Ok(entries) => {
+            let count = entries.len();
+            let mut ctx_map = state.ctx_map.lock().await;
+            for (vctx, real_ctx) in entries {
+                ctx_map.seed(vctx, real_ctx);
+            }
+            info!(count, "warmed context_token cache from database");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load context_token cache from DB");
+        }
+    }
+}
+
+/// Select and initialise the queue backend from the `ILINK_QUEUE_BACKEND` env var.
+///
+/// Supported values:
+/// - `"memory"` or unset — in-memory queue (default)
+/// - `"redis"` — not yet implemented; falls back to memory with a warning
+/// - anything else — falls back to memory with an error log
+fn build_queue_backend() -> Arc<dyn MessageQueue> {
+    match std::env::var("ILINK_QUEUE_BACKEND")
+        .as_deref()
+        .unwrap_or("")
+    {
+        "memory" | "" => {
+            info!(backend = "memory", "queue backend initialized");
+            Arc::new(InMemoryQueue::new())
+        }
+        "redis" => {
+            tracing::warn!("Redis queue backend is not yet implemented; falling back to memory");
+            Arc::new(InMemoryQueue::new())
+        }
+        other => {
+            tracing::error!(
+                backend = other,
+                "Unknown ILINK_QUEUE_BACKEND; supported values: 'memory'. \
+                 (redis: planned, not yet available). Falling back to memory."
+            );
+            Arc::new(InMemoryQueue::new())
         }
     }
 }
@@ -254,7 +332,10 @@ async fn register_client(hub_url: &str, name: String, label: Option<String>) -> 
         println!("Or for wechatbot Rust SDK:");
         println!("  BotOptions {{ base_url: Some(\"{hub_url}\"), token: \"{vtoken}\", .. }}");
     } else {
-        eprintln!("❌ Registration failed: {}", resp["errmsg"].as_str().unwrap_or("unknown"));
+        eprintln!(
+            "❌ Registration failed: {}",
+            resp["errmsg"].as_str().unwrap_or("unknown")
+        );
         std::process::exit(1);
     }
 
@@ -274,7 +355,7 @@ async fn list_clients(hub_url: &str) -> Result<()> {
     if clients.is_empty() {
         println!("No clients registered.");
     } else {
-        println!("{:<20} {:<12} {}", "NAME", "STATUS", "LABEL");
+        println!("{:<20} {:<12} LABEL", "NAME", "STATUS");
         println!("{}", "-".repeat(52));
         for c in clients {
             let name = c["name"].as_str().unwrap_or("-");

@@ -1,5 +1,5 @@
-/// Message router — decides which backend client receives each inbound message.
-/// Routing state is per-WeChat-user (from_user field).
+//! Message router — decides which backend client receives each inbound message.
+//! Routing state is per-WeChat-user (from_user field).
 
 use std::collections::HashMap;
 use tracing::debug;
@@ -25,10 +25,16 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     if text.eq_ignore_ascii_case("/status") {
         return Some(HubCommand::Status);
     }
-    if let Some(rest) = text.strip_prefix("/use ").or_else(|| text.strip_prefix("/switch ")) {
+    if let Some(rest) = text
+        .strip_prefix("/use ")
+        .or_else(|| text.strip_prefix("/switch "))
+    {
         return Some(HubCommand::UseClient(rest.trim().to_string()));
     }
-    if let Some(rest) = text.strip_prefix("/broadcast ").or_else(|| text.strip_prefix("/all ")) {
+    if let Some(rest) = text
+        .strip_prefix("/broadcast ")
+        .or_else(|| text.strip_prefix("/all "))
+    {
         return Some(HubCommand::Broadcast(rest.trim().to_string()));
     }
     None

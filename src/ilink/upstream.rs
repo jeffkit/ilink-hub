@@ -1,10 +1,11 @@
-/// Upstream iLink client — connects to the real `ilinkai.weixin.qq.com`
-/// and fans received messages out to the Hub's internal message bus.
+//! Upstream iLink client — connects to the real `ilinkai.weixin.qq.com`
+//! and fans received messages out to the Hub's internal message bus.
 
-use std::sync::Arc;
-use std::time::Duration;
 use anyhow::Result;
 use reqwest::Client;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
@@ -15,6 +16,8 @@ pub struct UpstreamClient {
     base_url: String,
     token: String,
     // Random base64 UIN required by iLink (regenerated per request)
+    pub polls_ok: AtomicU64,
+    pub polls_err: AtomicU64,
 }
 
 impl UpstreamClient {
@@ -27,12 +30,14 @@ impl UpstreamClient {
             client,
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
             token,
+            polls_ok: AtomicU64::new(0),
+            polls_err: AtomicU64::new(0),
         }
     }
 
     fn random_uin(&self) -> String {
-        use rand::Rng;
         use base64::Engine;
+        use rand::Rng;
         let bytes: [u8; 16] = rand::thread_rng().gen();
         base64::engine::general_purpose::STANDARD.encode(bytes)
     }
@@ -150,6 +155,7 @@ impl UpstreamClient {
 
             match result {
                 Ok(resp) if resp.ret == 0 => {
+                    self.polls_ok.fetch_add(1, Ordering::Relaxed);
                     backoff_secs = 1;
                     buf = resp.buf;
                     if let Some(messages) = resp.list {
@@ -160,11 +166,13 @@ impl UpstreamClient {
                     }
                 }
                 Ok(resp) => {
+                    self.polls_err.fetch_add(1, Ordering::Relaxed);
                     warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink upstream returned error");
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
                 Err(e) => {
+                    self.polls_err.fetch_add(1, Ordering::Relaxed);
                     error!(error = %e, "iLink upstream request failed");
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(30);
