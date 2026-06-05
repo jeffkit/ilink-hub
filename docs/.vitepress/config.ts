@@ -9,7 +9,7 @@ export default defineConfig({
   base: '/ilink-hub/',
 
   head: [
-    ['link', { rel: 'icon', href: '/favicon.svg' }],
+    ['link', { rel: 'icon', href: '/ilink-hub/favicon.svg' }],
     ['meta', { name: 'theme-color', content: '#6366f1' }],
   ],
 

@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="200" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+    <linearGradient id="spoke" x1="0" y1="0" x2="1" y2="0" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="#a5b4fc" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#c4b5fd" stop-opacity="0.5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="100" cy="100" r="96" fill="url(#bg)"/>
+
+  <!-- Hub center circle -->
+  <circle cx="100" cy="100" r="20" fill="white" opacity="0.95"/>
+
+  <!-- Spokes to satellite nodes -->
+  <!-- Top -->
+  <line x1="100" y1="80" x2="100" y2="44" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+  <!-- Top-right -->
+  <line x1="114" y1="88" x2="142" y2="62" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+  <!-- Right -->
+  <line x1="120" y1="100" x2="156" y2="100" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+  <!-- Bottom-right -->
+  <line x1="114" y1="112" x2="142" y2="138" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+  <!-- Bottom-left -->
+  <line x1="86" y1="112" x2="58" y2="138" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+  <!-- Left -->
+  <line x1="80" y1="100" x2="44" y2="100" stroke="white" stroke-width="3" stroke-opacity="0.7" stroke-linecap="round"/>
+
+  <!-- Satellite nodes -->
+  <!-- Top -->
+  <circle cx="100" cy="36" r="11" fill="white" opacity="0.85"/>
+  <!-- Top-right -->
+  <circle cx="150" cy="54" r="11" fill="white" opacity="0.85"/>
+  <!-- Right -->
+  <circle cx="164" cy="100" r="11" fill="white" opacity="0.85"/>
+  <!-- Bottom-right -->
+  <circle cx="150" cy="146" r="11" fill="white" opacity="0.85"/>
+  <!-- Bottom-left -->
+  <circle cx="50" cy="146" r="11" fill="white" opacity="0.85"/>
+  <!-- Left -->
+  <circle cx="36" cy="100" r="11" fill="white" opacity="0.85"/>
+
+  <!-- Center hub icon: two overlapping arrows (proxy/forward symbol) -->
+  <path d="M93 97 L107 97 L107 93 L114 100 L107 107 L107 103 L93 103 L93 107 L86 100 L93 93 Z" fill="url(#bg)" opacity="0.9"/>
+</svg>
