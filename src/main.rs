@@ -260,8 +260,8 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
         Ok(entries) => {
             let count = entries.len();
             let mut ctx_map = state.ctx_map.lock().await;
-            for (vctx, real_ctx) in entries {
-                ctx_map.seed(vctx, real_ctx);
+            for (vctx, real_ctx, peer_user_id) in entries {
+                ctx_map.seed_full(vctx, real_ctx, peer_user_id);
             }
             info!(count, "warmed context_token cache from database");
         }

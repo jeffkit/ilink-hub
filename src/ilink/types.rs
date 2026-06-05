@@ -194,6 +194,26 @@ impl SendMessageRequest {
             base_info: Some(BaseInfo::default()),
         }
     }
+
+    /// Build a reply with explicit from/to user IDs (required by the iLink API).
+    pub fn reply(
+        context_token: String,
+        text: String,
+        from_user_id: &str,
+        to_user_id: &str,
+    ) -> Self {
+        let mut msg = WeixinMessage::build_text_reply(context_token, text);
+        if !from_user_id.is_empty() {
+            msg.from_user_id = Some(from_user_id.to_string());
+        }
+        if !to_user_id.is_empty() {
+            msg.to_user_id = Some(to_user_id.to_string());
+        }
+        Self {
+            msg: Some(msg),
+            base_info: Some(BaseInfo::default()),
+        }
+    }
 }
 
 /// Response body for `POST /ilink/bot/sendmessage`.

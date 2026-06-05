@@ -183,36 +183,47 @@ pub async fn sendmessage(
         }
     };
 
-    // Translate virtual → real context token (memory first, DB fallback)
-    let real_ctx = {
+    // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
+    let (real_ctx, peer_user_id) = {
         let ctx_map = state.ctx_map.lock().await;
-        ctx_map.resolve(&vctx).map(str::to_string)
-    };
+        ctx_map.resolve_full(&vctx).map(|(r, p)| (r.to_string(), p.to_string()))
+    }
+    .map_or_else(
+        || None,
+        |pair| Some(pair),
+    )
+    .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
-    let real_ctx = match real_ctx {
-        Some(ctx) => ctx,
-        None => {
-            match state.store.resolve_context_token(&vctx).await {
-                Ok(Some(ctx)) => {
-                    let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.seed(vctx.clone(), ctx.clone());
-                    ctx
-                }
-                Ok(None) => {
-                    warn!(vctx = %vctx, "no mapping for virtual context token");
-                    return Json(SendMessageResponse::err(400, "Unknown context_token"));
-                }
-                Err(e) => {
-                    warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
-                    return Json(SendMessageResponse::err(500, "context_token resolution error"));
-                }
+    let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
+        match state.store.resolve_context_token_full(&vctx).await {
+            Ok(Some((r, p))) => {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
+                (r, p)
+            }
+            Ok(None) => {
+                warn!(vctx = %vctx, "no mapping for virtual context token");
+                return Json(SendMessageResponse::err(400, "Unknown context_token"));
+            }
+            Err(e) => {
+                warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
+                return Json(SendMessageResponse::err(500, "context_token resolution error"));
             }
         }
+    } else {
+        (real_ctx, peer_user_id)
     };
 
-    // Replace virtual context_token with real one in the message
+    // Replace virtual context_token with real one and inject from/to user IDs
+    let bot_id = state.upstream.bot_id().to_string();
     if let Some(msg) = &mut req.msg {
         msg.context_token = Some(real_ctx);
+        if msg.from_user_id.is_none() && !bot_id.is_empty() {
+            msg.from_user_id = Some(bot_id);
+        }
+        if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
+            msg.to_user_id = Some(peer_user_id);
+        }
     }
     // Ensure base_info is set
     if req.base_info.is_none() {

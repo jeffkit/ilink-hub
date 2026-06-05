@@ -34,6 +34,25 @@ impl UpstreamClient {
         }
     }
 
+    /// Extracts the bot ID from the token (`botid@im.bot:secretkey` → `botid@im.bot`).
+    pub fn bot_id(&self) -> &str {
+        self.token.split(':').next().unwrap_or("")
+    }
+
+    /// Calls `notifystart` — required before the bot can send messages.
+    pub async fn notify_start(&self) -> Result<()> {
+        let url = format!("{}/ilink/bot/msg/notifystart", self.base_url);
+        let body = serde_json::json!({ "base_info": BaseInfo::default() });
+        let _ = self
+            .client
+            .post(&url)
+            .headers(self.headers())
+            .json(&body)
+            .send()
+            .await?;
+        Ok(())
+    }
+
     /// `X-WECHAT-UIN`: random uint32 as decimal string, then base64-encoded.
     fn random_uin(&self) -> String {
         use base64::Engine;
@@ -156,6 +175,12 @@ impl UpstreamClient {
         let mut backoff_secs = 1u64;
 
         info!("iLink upstream polling started");
+
+        // notifystart enables outbound message sending for this bot session
+        match self.notify_start().await {
+            Ok(_) => info!("iLink notifystart successful"),
+            Err(e) => warn!(error = %e, "notifystart failed — outbound messages may not work"),
+        }
 
         loop {
             if *shutdown.borrow() {

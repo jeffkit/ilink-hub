@@ -21,20 +21,28 @@ const MAX_QUEUE_SIZE: usize = 200;
 
 /// Maps virtual context tokens (issued to clients) to real context tokens
 /// (from actual iLink upstream). Clients never see the real tokens.
+/// Also stores the peer_user_id (WeChat sender) so the hub can set `to_user_id` on replies.
 #[derive(Debug, Default)]
 pub struct ContextTokenMap {
     v_to_real: HashMap<String, String>,
     real_to_v: HashMap<String, String>,
+    v_to_peer: HashMap<String, String>,
 }
 
 impl ContextTokenMap {
-    pub fn map(&mut self, real_token: String) -> String {
+    pub fn map(&mut self, real_token: String, peer_user_id: String) -> String {
         if let Some(vtoken) = self.real_to_v.get(&real_token) {
+            if !peer_user_id.is_empty() {
+                self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+            }
             return vtoken.clone();
         }
         let vtoken = format!("vctx_{}", Uuid::new_v4().simple());
         self.v_to_real.insert(vtoken.clone(), real_token.clone());
         self.real_to_v.insert(real_token, vtoken.clone());
+        if !peer_user_id.is_empty() {
+            self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+        }
         vtoken
     }
 
@@ -42,12 +50,32 @@ impl ContextTokenMap {
         self.v_to_real.get(vtoken).map(String::as_str)
     }
 
-    /// Seed a known mapping into the in-memory cache.
+    /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
+    pub fn resolve_full(&self, vtoken: &str) -> Option<(&str, &str)> {
+        let real = self.v_to_real.get(vtoken)?.as_str();
+        let peer = self.v_to_peer.get(vtoken).map(String::as_str).unwrap_or("");
+        Some((real, peer))
+    }
+
+    /// Seed a known mapping into the in-memory cache (without peer_user_id).
     pub fn seed(&mut self, vctx: String, real_ctx: String) {
         self.v_to_real
             .entry(vctx.clone())
             .or_insert_with(|| real_ctx.clone());
         self.real_to_v.entry(real_ctx).or_insert(vctx);
+    }
+
+    /// Seed a known mapping including peer_user_id.
+    pub fn seed_full(&mut self, vctx: String, real_ctx: String, peer_user_id: String) {
+        self.v_to_real
+            .entry(vctx.clone())
+            .or_insert_with(|| real_ctx.clone());
+        self.real_to_v
+            .entry(real_ctx)
+            .or_insert_with(|| vctx.clone());
+        if !peer_user_id.is_empty() {
+            self.v_to_peer.entry(vctx).or_insert(peer_user_id);
+        }
     }
 }
 

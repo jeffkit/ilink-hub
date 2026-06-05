@@ -109,15 +109,19 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             };
 
+            let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+
             let vctx = {
                 let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone())
+                ctx_map.map(real_ctx.clone(), peer_user_id.clone())
             };
 
             let store = state.store.clone();
             let vctx_clone = vctx.clone();
             tokio::spawn(async move {
-                if let Err(e) = store.persist_context_token(&vctx_clone, &real_ctx).await {
+                if let Err(e) =
+                    store.persist_context_token(&vctx_clone, &real_ctx, &peer_user_id).await
+                {
                     warn!(error = %e, "failed to persist context_token mapping");
                 }
             });
@@ -153,11 +157,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
                 // Notify the user that no AI backends are available
                 if let Some(real_ctx) = msg.context_token.clone() {
-                    let reply = SendMessageRequest::text(
+                    let bot_id = state.upstream.bot_id().to_string();
+                    let to_uid = msg.from_user_id.as_deref().unwrap_or("");
+                    let reply = SendMessageRequest::reply(
                         real_ctx,
                         "⚠️ No AI backends are currently online.\n\
                          Use /list to see registered workspaces, or /status for hub info."
                             .to_string(),
+                        &bot_id,
+                        to_uid,
                     );
                     if let Err(e) = state.upstream.send_message(reply).await {
                         error!(error = %e, "failed to send no-clients reply");
@@ -174,17 +182,23 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             };
 
+            let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+
             for vtoken in &online {
                 let vctx = {
                     let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(real_ctx.clone())
+                    ctx_map.map(real_ctx.clone(), peer_user_id.clone())
                 };
 
                 let store = state.store.clone();
                 let vctx_clone = vctx.clone();
                 let real_ctx_clone = real_ctx.clone();
+                let peer_clone = peer_user_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = store.persist_context_token(&vctx_clone, &real_ctx_clone).await {
+                    if let Err(e) = store
+                        .persist_context_token(&vctx_clone, &real_ctx_clone, &peer_clone)
+                        .await
+                    {
                         warn!(error = %e, "failed to persist context_token mapping (broadcast)");
                     }
                 });
@@ -269,7 +283,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             for vtoken in &online {
                 let vctx = {
                     let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(real_ctx.clone())
+                    ctx_map.map(real_ctx.clone(), from_user_id.clone())
                 };
                 let mut m = msg.clone();
                 m.context_token = Some(vctx.clone());
@@ -296,7 +310,8 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
     };
 
-    let send_req = SendMessageRequest::text(real_ctx, reply_text);
+    let bot_id = state.upstream.bot_id().to_string();
+    let send_req = SendMessageRequest::reply(real_ctx, reply_text, &bot_id, &from_user_id);
     if let Err(e) = state.upstream.send_message(send_req).await {
         error!(error = %e, "failed to send hub command reply");
     }

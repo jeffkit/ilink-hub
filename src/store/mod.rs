@@ -102,6 +102,13 @@ impl Store {
         .execute(&self.pool)
         .await?;
 
+        // Soft migration: add peer_user_id if not present (idempotent).
+        let _ = sqlx::query(
+            "ALTER TABLE context_token_map ADD COLUMN peer_user_id TEXT NOT NULL DEFAULT ''",
+        )
+        .execute(&self.pool)
+        .await;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS bot_credentials (
@@ -221,7 +228,7 @@ impl Store {
 
     // ─── Context token map ────────────────────────────────────────────────────
 
-    pub async fn map_context_token(&self, real_ctx: &str) -> Result<String> {
+    pub async fn map_context_token(&self, real_ctx: &str, peer_user_id: &str) -> Result<String> {
         // Check existing mapping
         let existing = sqlx::query("SELECT vctx FROM context_token_map WHERE real_ctx = $1")
             .bind(real_ctx)
@@ -233,25 +240,34 @@ impl Store {
         }
 
         let vctx = format!("vctx_{}", Uuid::new_v4().simple());
-        sqlx::query("INSERT INTO context_token_map (vctx, real_ctx) VALUES ($1, $2)")
-            .bind(&vctx)
-            .bind(real_ctx)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id) VALUES ($1, $2, $3)",
+        )
+        .bind(&vctx)
+        .bind(real_ctx)
+        .bind(peer_user_id)
+        .execute(&self.pool)
+        .await?;
         Ok(vctx)
     }
 
     /// Persist a known vctx→real_ctx mapping (idempotent: skips if already present).
-    pub async fn persist_context_token(&self, vctx: &str, real_ctx: &str) -> Result<()> {
+    pub async fn persist_context_token(
+        &self,
+        vctx: &str,
+        real_ctx: &str,
+        peer_user_id: &str,
+    ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO context_token_map (vctx, real_ctx)
-            VALUES ($1, $2)
+            INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
+            VALUES ($1, $2, $3)
             ON CONFLICT (vctx) DO NOTHING
             "#,
         )
         .bind(vctx)
         .bind(real_ctx)
+        .bind(peer_user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -265,17 +281,44 @@ impl Store {
         Ok(row.map(|r| r.get("real_ctx")))
     }
 
+    /// Resolve a virtual context token to `(real_ctx, peer_user_id)`.
+    pub async fn resolve_context_token_full(
+        &self,
+        vctx: &str,
+    ) -> Result<Option<(String, String)>> {
+        let row = sqlx::query(
+            "SELECT real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
+             FROM context_token_map WHERE vctx = $1",
+        )
+        .bind(vctx)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("real_ctx"), r.get("peer_user_id"))))
+    }
+
     /// Load recent context_token mappings for in-memory cache warm-up.
-    /// Returns up to `limit` entries (no guaranteed ordering — all entries are returned if ≤ limit).
-    pub async fn list_recent_context_tokens(&self, limit: i64) -> Result<Vec<(String, String)>> {
-        let rows = sqlx::query("SELECT vctx, real_ctx FROM context_token_map LIMIT $1")
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+    /// Returns up to `limit` entries as `(vctx, real_ctx, peer_user_id)`.
+    pub async fn list_recent_context_tokens(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(String, String, String)>> {
+        let rows = sqlx::query(
+            "SELECT vctx, real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
+             FROM context_token_map LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows
             .into_iter()
-            .map(|r| (r.get::<String, _>("vctx"), r.get::<String, _>("real_ctx")))
+            .map(|r| {
+                (
+                    r.get::<String, _>("vctx"),
+                    r.get::<String, _>("real_ctx"),
+                    r.get::<String, _>("peer_user_id"),
+                )
+            })
             .collect())
     }
 
