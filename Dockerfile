@@ -4,7 +4,7 @@ FROM rust:1.87-slim AS builder
 WORKDIR /app
 
 # Cache dependency layers
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --release --locked || true
 RUN rm -rf src
