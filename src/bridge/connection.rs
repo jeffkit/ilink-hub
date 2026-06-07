@@ -99,10 +99,7 @@ async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result
                  若 Hub 未就绪：先启动 Hub 或改 URL；也可改用环境变量 `WEIXIN_TOKEN`，或在 Hub 可用时使用 `ilink-hub-bridge --pair` 扫码配对。"
             )
         })?;
-    let resp: serde_json::Value = resp
-        .json()
-        .await
-        .context("parse /hub/register response")?;
+    let resp: serde_json::Value = resp.json().await.context("parse /hub/register response")?;
     if resp["ret"] == 0 {
         let v = resp["vtoken"]
             .as_str()
@@ -197,7 +194,9 @@ pub async fn resolve_hub_connection(
             }
             return Ok((base, creds.token));
         }
-        LocalCredState::Missing => return auto_register_and_save(&path, &hub, register_client_name).await,
+        LocalCredState::Missing => {
+            return auto_register_and_save(&path, &hub, register_client_name).await
+        }
         LocalCredState::ExistsUnusable => {
             if force_register {
                 let _ = tokio::fs::remove_file(&path).await;
