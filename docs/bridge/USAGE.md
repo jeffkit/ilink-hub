@@ -107,6 +107,9 @@ ilink-hub-bridge --register-name my-claude --config ./bridge-claude.yaml
 **做法 B — 多进程 + `/use` 切换**  
 为每个 CLI 各注册一个 Hub 客户端名，各跑一个 bridge 进程（各用不同 `WEIXIN_TOKEN` 或不同 `ILINKHUB_BRIDGE_CREDS`）。在微信里用 **`/use <名称>`** 切换当前对话走哪条链路。注意：未活跃进程仍会占用 Hub 连接，按需启停即可。
 
+**做法 C — 一份 YAML 多 Profile（单进程）**  
+在一份 YAML 里写 `profiles` + `routing`（`fixed` 或 `prefix`）。`strategy: prefix` 时按 `prefix_rules` 匹配，命中前缀会从 `{{MESSAGE}}` 中**剥掉**该前缀再交给对应 CLI。示例：[multi-profile.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/multi-profile.example.yaml)。仍与 Hub 上**一个**下游客户端、一条长轮询一致；与「多进程 + `/use`」可并存，按场景选用。
+
 ## 6. 自测清单
 
 1. Hub `GET /health` 返回 `ok`。  

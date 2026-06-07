@@ -207,6 +207,34 @@ pub async fn sendmessage(
             msg.to_user_id = Some(peer_user_id);
         }
         msg.ensure_outbound();
+
+        let (client_meta, registered_count) = {
+            let reg = state.registry.read().await;
+            (
+                reg.get_by_vtoken(&_vtoken)
+                    .map(|i| (i.name.clone(), i.label.clone())),
+                reg.all_clients().len(),
+            )
+        };
+
+        let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
+        if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref())
+        {
+            if let Some((ref name, ref label)) = client_meta {
+                crate::hub::append_outbound_origin_footer_to_first_text_item(
+                    msg,
+                    name,
+                    label.as_deref(),
+                );
+            }
+        }
+
+        if let Some(cid) = msg.client_id.as_deref().filter(|s| !s.is_empty()) {
+            if let Some((name, label)) = client_meta {
+                let mut q = state.quote_index.lock().await;
+                q.register_pending_client(cid, _vtoken.clone(), name, label);
+            }
+        }
     }
     if req.base_info.is_none() {
         req.base_info = Some(BaseInfo::default());

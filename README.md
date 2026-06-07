@@ -139,6 +139,18 @@ Send these from WeChat to control the Hub:
 | `/broadcast <text>` | Send a message to all online backends |
 | `/status` | Show Hub status (online/total clients) |
 
+### Quote-reply routing (multi-session)
+
+If you **quote-reply** to a bot message, iLink includes structured `ref_msg` data. The Hub:
+
+1. Records each backend `sendmessage` by its outbound `client_id` (`ilink-hub:…`).
+2. When the real iLink `getupdates` stream returns the bot copy (`message_type == 2`) with the same `client_id`, the Hub indexes that message’s per-item `msg_id` (and top-level `message_id`).
+3. Your next user message that **quotes** that bot line is routed to the same backend (or the same Hub command, e.g. `/list`), **overriding** the current `/use` selection for that turn. Explicit `/…` hub commands in the new text still take priority over quote routing.
+
+**Operational note:** routing depends on iLink echoing your bot sends on the upstream poll. If your tenant never echoes them, the index stays empty and quote routing has nothing to match.
+
+**Optional display label:** by default, the Hub appends a short footer (`— workspace` or `— workspace · label`) to each **client** `sendmessage` text **only when more than one backend is registered** (so single-backend setups stay clean). Set `ILINKHUB_OUTBOUND_ORIGIN_LABEL=0` / `false` / `off` to disable, or `1` / `true` / `on` to **always** append (even with one client).
+
 ---
 
 ## Configuring Clients

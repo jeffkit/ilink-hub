@@ -1,0 +1,37 @@
+# 多 Profile 示例：一个进程、一份 YAML，按消息前缀选不同 CLI。
+# 路由规则见 routing；未命中任何 prefix 时用 default_profile。
+#
+# 微信里示例：
+#   普通文字        → echo 型 profile `plain`（默认）
+#   以 "/b " 开头   → profile `bar`（前缀会去掉再传给 {{MESSAGE}}）
+#   以 "/a " 开头   → profile `foo`
+
+skip_bot_messages: true
+require_text: true
+
+profiles:
+  plain:
+    command: echo
+    args: ["[plain]", "{{MESSAGE}}"]
+    stdin: none
+    timeout_secs: 15
+  foo:
+    command: echo
+    args: ["[foo]", "{{MESSAGE}}"]
+    stdin: none
+    timeout_secs: 15
+  bar:
+    command: echo
+    args: ["[bar]", "{{MESSAGE}}"]
+    stdin: none
+    timeout_secs: 15
+
+routing:
+  strategy: prefix
+  default_profile: plain
+  prefix_rules:
+    # 较长 / 较具体的规则放前面（先匹配先胜出）
+    - prefix: "/b "
+      profile: bar
+    - prefix: "/a "
+      profile: foo

@@ -1,6 +1,8 @@
 pub mod health;
+pub mod outbound_label;
 pub mod pairing;
 pub mod queue;
+pub mod quote_route;
 pub mod registry;
 pub mod router;
 
@@ -14,8 +16,13 @@ use crate::ilink::UpstreamClient;
 use crate::store::Store;
 
 pub use health::spawn_health_checker;
+pub use outbound_label::{
+    append_outbound_origin_footer_to_first_text_item, format_outbound_origin_line,
+    should_append_outbound_origin_label,
+};
 pub use pairing::PairingRegistry;
 pub use queue::{ClientQueue, ContextTokenMap, InMemoryQueue, MessageQueue};
+pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 
@@ -50,6 +57,8 @@ pub struct HubState {
     pub queue: Arc<dyn MessageQueue>,
     pub ctx_map: Mutex<ContextTokenMap>,
     pub router: Mutex<Router>,
+    /// Quote-reply → backend / hub command (see [`quote_route`]).
+    pub quote_index: Mutex<QuoteRouteIndex>,
     pub store: Arc<Store>,
     pub metrics: Metrics,
 }
@@ -67,6 +76,7 @@ impl HubState {
             queue,
             ctx_map: Mutex::new(ContextTokenMap::default()),
             router: Mutex::new(Router::new(None)),
+            quote_index: Mutex::new(QuoteRouteIndex::default()),
             store,
             metrics: Metrics::new(),
         })
@@ -95,10 +105,23 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
 }
 
 async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
+    // Bot-side copies from upstream (used to correlate outbound client_id → item msg_id).
+    if msg.message_type == Some(2) {
+        let mut q = state.quote_index.lock().await;
+        q.observe_upstream_bot_message(&msg);
+        return;
+    }
+
     let routing = {
         let router = state.router.lock().await;
         router.route(&msg)
     };
+
+    let quoted = {
+        let mut q = state.quote_index.lock().await;
+        q.resolve_user_quote(&msg)
+    };
+    let routing = merge_routing_with_quote(routing, quoted);
 
     match routing {
         RoutingDecision::HubInternal(cmd) => {
@@ -348,7 +371,23 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
     };
 
     debug!(to = %from_user_id, "sending hub command reply");
-    let send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
+    let mut send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
+    if let Some(m) = &mut send_req.msg {
+        m.ensure_outbound();
+        if let Some(cid) = m.client_id.as_deref().filter(|s| !s.is_empty()) {
+            let index_hub_quote = matches!(
+                &cmd,
+                HubCommand::List
+                    | HubCommand::Status
+                    | HubCommand::Help
+                    | HubCommand::UseClient(_)
+            );
+            if index_hub_quote {
+                let mut q = state.quote_index.lock().await;
+                q.register_pending_hub(cid, cmd.clone());
+            }
+        }
+    }
     match state.upstream.send_message(send_req).await {
         Err(e) => error!(error = %e, "failed to send hub command reply"),
         Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
@@ -369,6 +408,8 @@ fn build_help_text() -> String {
      /list — 列出所有已注册的 AI 后端\n\
      /use <名称> — 切换到指定的 AI 后端\n\
      /help — 显示此帮助\n\n\
+     引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
+     多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅一个注册后端时默认不加）；可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
      关于 iLink Hub：\n\
      本服务是一个消息路由中枢，可将您的微信消息转发给已接入的 AI 助手后端进行处理。\n\n\
      管理员接入指南：\n\

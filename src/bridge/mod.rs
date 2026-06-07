@@ -1,17 +1,18 @@
 //! CLI bridge: connect to iLink Hub as a virtual-token backend and run a local command per text message.
+//! Supports **single-profile YAML** (flat `command` / `args`) or **multi-profile YAML**
+//! (`profiles` + `routing`: `fixed` or `prefix`).
 //!
 //! Used by the `ilink-hub-bridge` binary; see `docs/bridge/README.md`.
 
+mod config;
 mod connection;
 
+pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{default_local_credential_path, resolve_hub_connection};
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{error, info, warn};
@@ -20,98 +21,6 @@ use crate::ilink::types::{
     BaseInfo, GetUpdatesRequest, GetUpdatesResponse, SendMessageRequest, SendMessageResponse,
     WeixinMessage,
 };
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum StdinMode {
-    /// Do not write stdin (use `{{MESSAGE}}` in args, or a fixed prompt).
-    #[default]
-    None,
-    /// Write the inbound message text to stdin (UTF-8).
-    Message,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BridgeConfig {
-    /// Executable name or path (e.g. `claude`, `/usr/local/bin/codex`).
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub stdin: StdinMode,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_max_reply_chars")]
-    pub max_reply_chars: usize,
-    #[serde(default = "default_truncation_suffix")]
-    pub truncation_suffix: String,
-    /// Ignore messages that look like bot replies (`message_type == 2`).
-    #[serde(default = "default_true")]
-    pub skip_bot_messages: bool,
-    /// If true, non-text inbound messages are ignored (no reply).
-    #[serde(default = "default_true")]
-    pub require_text: bool,
-    /// On CLI failure, send a short error text back to WeChat.
-    #[serde(default = "default_true")]
-    pub send_error_reply: bool,
-    /// Append stderr to the reply body after stdout (only on success).
-    #[serde(default)]
-    pub include_stderr_in_reply: bool,
-}
-
-fn default_timeout_secs() -> u64 {
-    300
-}
-
-fn default_max_reply_chars() -> usize {
-    8000
-}
-
-fn default_truncation_suffix() -> String {
-    "\n\n…(输出已截断)".to_string()
-}
-
-fn default_true() -> bool {
-    true
-}
-
-impl BridgeConfig {
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let raw =
-            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: BridgeConfig =
-            serde_yaml::from_str(&raw).with_context(|| format!("parse YAML {}", path.display()))?;
-        cfg.validate()?;
-        Ok(cfg)
-    }
-
-    fn validate(&self) -> Result<()> {
-        if self.command.trim().is_empty() {
-            anyhow::bail!("`command` must not be empty");
-        }
-        Ok(())
-    }
-}
-
-fn apply_placeholders(template: &str, message: &str, from_user_id: &str) -> String {
-    template
-        .replace("{{MESSAGE}}", message)
-        .replace("{{FROM_USER_ID}}", from_user_id)
-}
-
-fn truncate_chars(s: &str, max_chars: usize, suffix: &str) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    let budget = max_chars.saturating_sub(suffix.chars().count());
-    s.chars().take(budget).collect::<String>() + suffix
-}
 
 struct HubClient {
     http: reqwest::Client,
@@ -191,11 +100,12 @@ impl HubClient {
 }
 
 /// Long-poll Hub and dispatch inbound user text to the configured CLI (runs until process exit).
-pub async fn run_bridge(hub_url: String, token: String, config: BridgeConfig) {
+pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) {
     let client = HubClient::new(hub_url, token);
     let mut buf = String::new();
     info!(
-        command = %config.command,
+        routing = %app.routing_label(),
+        profiles = ?app.profile_names(),
         "ilink-hub-bridge connected; waiting for getupdates"
     );
 
@@ -219,30 +129,69 @@ pub async fn run_bridge(hub_url: String, token: String, config: BridgeConfig) {
         }
 
         for msg in resp.msgs.unwrap_or_default() {
-            if let Err(e) = handle_one_message(&client, &config, msg).await {
+            if let Err(e) = handle_one_message(&client, &app, msg).await {
                 error!(error = %e, "message handler failed");
             }
         }
     }
 }
 
-async fn handle_one_message(
-    client: &HubClient,
-    cfg: &BridgeConfig,
-    msg: WeixinMessage,
-) -> Result<()> {
-    if cfg.skip_bot_messages && msg.message_type == Some(2) {
+/// When `ILINKHUB_BRIDGE_DUMP_MSG` is `1` / `true` / `yes`, print the inbound message to stderr.
+///
+/// Shows the JSON shape **after Hub → serde** (same struct downstream always sees). Top-level
+/// fields unknown to [`WeixinMessage`](crate::ilink::types::WeixinMessage) are already dropped at
+/// deserialize; nested keys merged into each [`MessageItem`](crate::ilink::types::MessageItem)'s
+/// `extra` are visible here.
+fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
+    let Ok(flag) = std::env::var("ILINKHUB_BRIDGE_DUMP_MSG") else {
+        return;
+    };
+    let f = flag.trim().to_ascii_lowercase();
+    if !matches!(f.as_str(), "1" | "true" | "yes") {
+        return;
+    }
+
+    let full = serde_json::to_string_pretty(msg)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialize WeixinMessage: {e}\"}}"));
+    eprintln!("========== ILINKHUB_BRIDGE_DUMP_MSG: full WeixinMessage (JSON) ==========");
+    eprintln!("{full}");
+    eprintln!("========== end full message ==========");
+
+    if let Some(items) = msg.item_list.as_ref() {
+        for (i, item) in items.iter().enumerate() {
+            let extra = serde_json::to_string_pretty(&item.extra)
+                .unwrap_or_else(|_| "\"<extra serialize error>\"".to_string());
+            eprintln!("---------- item_list[{i}] ----------");
+            eprintln!("  type (item_type): {:?}", item.item_type);
+            eprintln!("  text_item: {:?}", item.text_item);
+            eprintln!("  extra (flattened fields from iLink, not in text_item):");
+            eprintln!("{extra}");
+        }
+        eprintln!("========== end item_list dump ==========");
+    } else {
+        eprintln!("========== item_list: <none> ==========");
+    }
+}
+
+async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMessage) -> Result<()> {
+    dump_inbound_weixin_message_for_debug(&msg);
+
+    if app.skip_bot_messages && msg.message_type == Some(2) {
         return Ok(());
     }
 
     let text = match msg.text() {
         Some(t) => t.to_string(),
-        None if !cfg.require_text => String::new(),
+        None if !app.require_text => String::new(),
         None => return Ok(()),
     };
-    if text.trim().is_empty() && cfg.require_text {
+    if text.trim().is_empty() && app.require_text {
         return Ok(());
     }
+
+    let (profile_name, profile, payload) = app
+        .resolve(&text)
+        .with_context(|| format!("route message for profile (text prefix): {text:?}"))?;
 
     let ctx = msg
         .context_token
@@ -251,14 +200,16 @@ async fn handle_one_message(
         .context("inbound message missing context_token")?;
     let from_user = msg.from_user_id.clone().unwrap_or_default();
 
-    match run_cli(cfg, &text, &from_user).await {
+    info!(%profile_name, %profile.command, "running bridge profile");
+
+    match run_cli(profile, &payload, &from_user).await {
         Ok(output) => {
-            let body = truncate_chars(&output, cfg.max_reply_chars, &cfg.truncation_suffix);
+            let body = truncate_chars(&output, profile.max_reply_chars, &profile.truncation_suffix);
             let req = SendMessageRequest::reply(ctx, body, &from_user);
             client.sendmessage(req).await.context("sendmessage reply")?;
         }
         Err(e) => {
-            if cfg.send_error_reply {
+            if app.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
                 let req = SendMessageRequest::reply(ctx, err_text, &from_user);
                 if let Err(send_e) = client.sendmessage(req).await {
@@ -271,7 +222,7 @@ async fn handle_one_message(
     Ok(())
 }
 
-async fn run_cli(cfg: &BridgeConfig, message: &str, from_user_id: &str) -> Result<String> {
+async fn run_cli(cfg: &BridgeProfile, message: &str, from_user_id: &str) -> Result<String> {
     let args: Vec<String> = cfg
         .args
         .iter()
@@ -349,22 +300,24 @@ async fn run_cli(cfg: &BridgeConfig, message: &str, from_user_id: &str) -> Resul
     Ok(stdout)
 }
 
+fn apply_placeholders(template: &str, message: &str, from_user_id: &str) -> String {
+    template
+        .replace("{{MESSAGE}}", message)
+        .replace("{{FROM_USER_ID}}", from_user_id)
+}
+
+fn truncate_chars(s: &str, max_chars: usize, suffix: &str) -> String {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_string();
+    }
+    let budget = max_chars.saturating_sub(suffix.chars().count());
+    s.chars().take(budget).collect::<String>() + suffix
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_minimal_yaml() {
-        let y = r#"
-command: echo
-args: ["{{MESSAGE}}"]
-stdin: none
-"#;
-        let c: BridgeConfig = serde_yaml::from_str(y).unwrap();
-        assert_eq!(c.command, "echo");
-        assert_eq!(c.args, vec!["{{MESSAGE}}"]);
-        assert_eq!(c.stdin, StdinMode::None);
-    }
 
     #[test]
     fn placeholders() {

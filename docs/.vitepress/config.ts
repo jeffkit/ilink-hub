@@ -23,7 +23,7 @@ export default defineConfig({
       { text: '配置参考', link: '/reference/configuration' },
       { text: 'API 参考', link: '/reference/api' },
       {
-        text: 'v0.1.8',
+        text: 'v0.1.9',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },

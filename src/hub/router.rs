@@ -9,7 +9,7 @@ use crate::ilink::types::WeixinMessage;
 // ─── Hub commands ────────────────────────────────────────────────────────────
 
 /// Commands the WeChat user can send to control routing.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HubCommand {
     List,
     UseClient(String),
@@ -46,7 +46,7 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
 
 // ─── Router ──────────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RoutingDecision {
     ForwardTo(String),
     Broadcast,
@@ -103,6 +103,7 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
 
     #[test]
     fn parse_list_command() {
@@ -127,7 +128,39 @@ mod tests {
     }
 
     #[test]
-    fn no_command() {
-        assert_eq!(parse_hub_command("hello world"), None);
+    fn route_uses_default_client_when_no_per_user_route() {
+        let r = Router::new(Some("default_vt".into()));
+        let msg = WeixinMessage {
+            from_user_id: Some("user@wechat".into()),
+            item_list: Some(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello".into()),
+                }),
+                extra: serde_json::Value::Object(Default::default()),
+            }]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            r.route(&msg),
+            RoutingDecision::ForwardTo(ref v) if v == "default_vt"
+        ));
+    }
+
+    #[test]
+    fn route_broadcast_when_no_default_and_no_route() {
+        let r = Router::new(None);
+        let msg = WeixinMessage {
+            from_user_id: Some("user@wechat".into()),
+            item_list: Some(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello".into()),
+                }),
+                extra: serde_json::Value::Object(Default::default()),
+            }]),
+            ..Default::default()
+        };
+        assert!(matches!(r.route(&msg), RoutingDecision::Broadcast));
     }
 }

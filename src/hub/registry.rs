@@ -132,3 +132,37 @@ impl Default for ClientRegistry {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_count_single_vs_multi() {
+        let mut reg = ClientRegistry::new();
+        assert_eq!(reg.all_clients().len(), 0);
+        reg.register("a".into(), None);
+        assert_eq!(reg.all_clients().len(), 1);
+        reg.register("b".into(), Some("B".into()));
+        assert_eq!(reg.all_clients().len(), 2);
+    }
+
+    #[test]
+    fn register_same_name_reuses_vtoken() {
+        let mut reg = ClientRegistry::new();
+        let v1 = reg.register("w".into(), None);
+        let v2 = reg.register("w".into(), Some("lbl".into()));
+        assert_eq!(v1, v2);
+        assert_eq!(reg.all_clients().len(), 1);
+    }
+
+    #[test]
+    fn get_by_name_roundtrip() {
+        let mut reg = ClientRegistry::new();
+        reg.register("echo".into(), Some("echo test".into()));
+        let c = reg.get_by_name("echo").expect("client");
+        assert_eq!(c.name, "echo");
+        assert_eq!(c.label.as_deref(), Some("echo test"));
+        assert!(reg.get_by_vtoken(&c.vtoken).is_some());
+    }
+}

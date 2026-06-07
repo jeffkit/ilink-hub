@@ -9,6 +9,8 @@
 //!
 //! 若 Hub 配置了 `ILINK_ADMIN_TOKEN`，本进程注册时需在同一环境中设置该变量。
 //!
+//! **调试**：`ILINKHUB_BRIDGE_DUMP_MSG=1`（或 `true` / `yes`）时在 stderr 打印每条入站的完整 `WeixinMessage` JSON 与各 `item_list[*].extra`。
+//!
 //! 配置见 `docs/bridge/README.md`。
 
 use std::path::PathBuf;
@@ -17,7 +19,7 @@ use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use ilink_hub::bridge::{resolve_hub_connection, run_bridge, BridgeConfig};
+use ilink_hub::bridge::{resolve_hub_connection, run_bridge, BridgeApp};
 
 #[derive(Parser)]
 #[command(name = "ilink-hub-bridge")]
@@ -84,10 +86,10 @@ async fn main() -> Result<()> {
     .await?;
     info!(%hub_url, "using Hub base URL for downstream");
 
-    let config = BridgeConfig::load(&cli.config)?;
+    let app = BridgeApp::load(&cli.config)?;
     info!(config_path = %cli.config.display(), "loaded bridge config");
 
-    let handle = tokio::spawn(run_bridge(hub_url, token, config));
+    let handle = tokio::spawn(run_bridge(hub_url, token, app));
     let _ = tokio::signal::ctrl_c().await;
     handle.abort();
     let _ = handle.await;

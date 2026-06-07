@@ -79,6 +79,37 @@ impl ContextTokenMap {
     }
 }
 
+#[cfg(test)]
+mod context_map_tests {
+    use super::ContextTokenMap;
+
+    #[test]
+    fn map_creates_stable_virtual_for_same_real() {
+        let mut m = ContextTokenMap::default();
+        let v1 = m.map("real-ctx".into(), "user1".into());
+        let v2 = m.map("real-ctx".into(), "user1".into());
+        assert_eq!(v1, v2);
+        assert_eq!(m.resolve(&v1), Some("real-ctx".as_ref()));
+        assert_eq!(m.resolve_full(&v1), Some(("real-ctx", "user1")));
+    }
+
+    #[test]
+    fn map_different_real_gets_different_virtual() {
+        let mut m = ContextTokenMap::default();
+        let va = m.map("ctx-a".into(), "u".into());
+        let vb = m.map("ctx-b".into(), "u".into());
+        assert_ne!(va, vb);
+    }
+
+    #[test]
+    fn seed_full_then_resolve() {
+        let mut m = ContextTokenMap::default();
+        m.seed_full("vctx_1".into(), "real".into(), "peer@x".into());
+        assert_eq!(m.resolve("vctx_1"), Some("real"));
+        assert_eq!(m.resolve_full("vctx_1"), Some(("real", "peer@x")));
+    }
+}
+
 // ─── Client queue ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
