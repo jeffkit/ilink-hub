@@ -80,6 +80,24 @@ impl UpstreamClient {
         headers
     }
 
+    /// Quick session check — returns false when token is missing, malformed, or expired.
+    pub async fn validate_session(&self) -> bool {
+        if self.token.is_empty() || !self.token.contains(':') {
+            return false;
+        }
+        match self.get_updates(String::new()).await {
+            Ok(resp) => {
+                let code = resp.errcode.or(resp.ret);
+                match code {
+                    None | Some(0) => true,
+                    Some(-14) => false,
+                    Some(_) => false,
+                }
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Long-poll for new messages.
     pub async fn get_updates(
         &self,

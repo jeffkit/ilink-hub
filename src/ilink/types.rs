@@ -27,7 +27,7 @@ impl Default for BaseInfo {
 
 /// Response from `/ilink/bot/get_bot_qrcode`.
 /// Actual API shape: {"ret":0,"qrcode":"<key>","qrcode_img_content":"https://..."}
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct GetQrcodeResponse {
     pub ret: i32,
     /// The QR code key / identifier used for polling.
@@ -38,9 +38,9 @@ pub struct GetQrcodeResponse {
 }
 
 /// Response from `/ilink/bot/get_qrcode_status`.
-/// Observed status values: "wait" | "confirmed" | "expired"
+/// Observed status values: "wait" | "scaned" | "confirmed" | "expired"
 /// On "confirmed": also includes bot_token, baseurl, ilink_bot_id, ilink_user_id.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QrcodeStatusResponse {
     pub ret: i32,
     /// "wait" | "confirmed" | "expired" (string, not integer)

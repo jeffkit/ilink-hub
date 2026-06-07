@@ -1,0 +1,16 @@
+[Unit]
+Description=iLink Hub Pairing Relay (ilinkhub.ai)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=RUST_LOG=info
+ExecStart=/opt/ilink-relay/ilink-relay --addr 127.0.0.1:8789
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

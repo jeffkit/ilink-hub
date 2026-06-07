@@ -11,9 +11,15 @@ documentation = "https://docs.rs/ilink-hub"
 keywords = ["wechat", "ilink", "clawbot", "ai-agent", "proxy"]
 categories = ["web-programming", "network-programming"]
 
+default-run = "ilink-hub"
+
 [[bin]]
 name = "ilink-hub"
 path = "src/main.rs"
+
+[[bin]]
+name = "ilink-relay"
+path = "src/bin/ilink-relay.rs"
 
 [lib]
 name = "ilink_hub"
@@ -21,7 +27,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # HTTP server
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
@@ -63,6 +69,11 @@ dirs = "5"
 
 # QR code display in terminal
 qrcode = "0.14"
+
+# Pairing relay WebSocket + registration auth
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch};
-use tracing::info;
+use tracing::{info, warn};
 
 use ilink_hub::{
     hub::{spawn_dispatcher, spawn_health_checker, HubState, InMemoryQueue, MessageQueue},
@@ -172,6 +172,25 @@ async fn run_server(
         }
     });
 
+    let identity = ilink_hub::relay::DeviceIdentity::load_or_create()?;
+    if ilink_hub::relay::relay_enabled() {
+        let hub_base = format!(
+            "http://{}",
+            ilink_hub::relay::hub_loopback_addr(&addr)
+        );
+        let relay_ws = ilink_hub::relay::relay_ws_url();
+        let pair_url = ilink_hub::relay::resolve_pair_public_url(identity.device_id());
+        info!(
+            device_id = %identity.device_id(),
+            pair_url = %pair_url,
+            relay = %relay_ws,
+            "pairing relay enabled (zero-config)"
+        );
+        ilink_hub::relay::client::spawn_relay_client(identity, hub_base, relay_ws);
+    } else {
+        info!("pairing relay disabled (set HUB_PAIR_URL or ILINKHUB_RELAY=0)");
+    }
+
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!(%addr, "iLink Hub listening");
@@ -197,25 +216,46 @@ async fn resolve_token(
     store: Arc<Store>,
 ) -> Result<(String, String)> {
     let default_base = "https://ilinkai.weixin.qq.com".to_string();
+    let from_cli = token_arg.is_some();
 
-    if let Some(token) = token_arg {
-        let base = ilink_base_url.unwrap_or(default_base);
-        store.save_credentials(&token, &base).await?;
-        return Ok((token, base));
+    let (candidate, base) = if let Some(token) = token_arg {
+        let base = ilink_base_url.clone().unwrap_or_else(|| default_base.clone());
+        (Some(token), base)
+    } else if let Some((token, base)) = store.load_credentials().await? {
+        info!("loaded bot token from database");
+        (Some(token), base)
+    } else {
+        (
+            None,
+            ilink_base_url.clone().unwrap_or_else(|| default_base.clone()),
+        )
+    };
+
+    if let Some(token) = candidate {
+        let client = UpstreamClient::new(token.clone(), Some(base.clone()));
+        if client.validate_session().await {
+            if from_cli {
+                store.save_credentials(&token, &base).await?;
+            }
+            return Ok((token, base));
+        }
+        warn!("iLink token invalid or expired");
+        println!();
+        println!("⚠️  未检测到有效的 iLink 微信登录态，请扫描下方二维码完成登录。");
+        println!();
+    } else {
+        info!("no iLink token found, starting QR login");
+        println!();
+        println!("首次启动需要绑定微信机器人，请扫描下方二维码登录。");
+        println!();
     }
 
-    // Try loading from DB
-    if let Some((token, base)) = store.load_credentials().await? {
-        info!("Loaded bot token from database");
-        return Ok((token, base));
-    }
-
-    // Fall back to QR login
-    info!("No token found, starting QR login");
-    let login_client = LoginClient::new(ilink_base_url.clone());
+    let login_base = ilink_base_url.clone();
+    let login_client = LoginClient::new(ilink_base_url);
     let token = login_client.login_with_qr().await?;
-    let base = ilink_base_url.unwrap_or(default_base);
+    let base = login_base.unwrap_or(default_base);
     store.save_credentials(&token, &base).await?;
+    info!("iLink login successful, token saved");
     Ok((token, base))
 }
 

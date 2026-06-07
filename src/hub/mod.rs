@@ -1,4 +1,5 @@
 pub mod health;
+pub mod pairing;
 pub mod queue;
 pub mod registry;
 pub mod router;
@@ -13,6 +14,7 @@ use crate::ilink::UpstreamClient;
 use crate::store::Store;
 
 pub use health::spawn_health_checker;
+pub use pairing::PairingRegistry;
 pub use queue::{ClientQueue, ContextTokenMap, InMemoryQueue, MessageQueue};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
@@ -44,6 +46,7 @@ impl Default for Metrics {
 pub struct HubState {
     pub upstream: Arc<UpstreamClient>,
     pub registry: RwLock<ClientRegistry>,
+    pub pairing: RwLock<PairingRegistry>,
     pub queue: Arc<dyn MessageQueue>,
     pub ctx_map: Mutex<ContextTokenMap>,
     pub router: Mutex<Router>,
@@ -60,6 +63,7 @@ impl HubState {
         Arc::new(Self {
             upstream,
             registry: RwLock::new(ClientRegistry::new()),
+            pairing: RwLock::new(PairingRegistry::new()),
             queue,
             ctx_map: Mutex::new(ContextTokenMap::default()),
             router: Mutex::new(Router::new(None)),

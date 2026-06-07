@@ -45,7 +45,7 @@ impl LoginClient {
         println!("║     WeChat ClawBot Login              ║");
         println!("╚══════════════════════════════════════╝");
         println!();
-        render_qr_terminal(&qr_url)?;
+        crate::client::pairing::render_qr_terminal(&qr_url)?;
         println!();
         println!("Scan the QR code with WeChat to log in.");
         println!("QR URL: {}", qr_url);
@@ -109,7 +109,7 @@ impl LoginClient {
                 Some("wait") | None => {
                     // Still waiting for scan
                 }
-                Some("scanned") => {
+                Some("scaned") | Some("scanned") => {
                     info!("QR code scanned, waiting for confirmation...");
                 }
                 Some("confirmed") => {
@@ -137,20 +137,3 @@ impl LoginClient {
     }
 }
 
-/// Render a URL as a QR code using Unicode block characters.
-fn render_qr_terminal(url: &str) -> Result<()> {
-    use qrcode::render::unicode;
-    use qrcode::{EcLevel, QrCode};
-
-    let code = QrCode::with_error_correction_level(url.as_bytes(), EcLevel::L)
-        .map_err(|e| anyhow!("QR code error: {e}"))?;
-
-    let image = code
-        .render::<unicode::Dense1x2>()
-        .dark_color(unicode::Dense1x2::Dark)
-        .light_color(unicode::Dense1x2::Light)
-        .build();
-
-    println!("{}", image);
-    Ok(())
-}

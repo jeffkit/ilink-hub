@@ -1,6 +1,8 @@
+pub mod client;
 pub mod error;
 pub mod hub;
 pub mod ilink;
+pub mod relay;
 pub mod server;
 pub mod store;
 

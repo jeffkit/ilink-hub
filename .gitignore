@@ -1,8 +1,15 @@
 /target
 .env
 *.credentials.json
+.DS_Store
+ilink-hub.db
+.playwright-mcp/
 
 # Docs
 docs/node_modules
 docs/.vitepress/dist
 docs/.vitepress/cache
+
+# Examples
+examples/**/target
+examples/**/.wechatbot-hub-credentials.json

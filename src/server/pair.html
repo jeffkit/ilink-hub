@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>iLink Hub — 设备配对</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #f8fafc;
+      --surface: #ffffff;
+      --border: #e2e8f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --green: #16a34a;
+      --blue: #2563eb;
+      --radius: 12px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px 16px;
+    }
+    .card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 24px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    }
+    h1 { font-size: 20px; margin-bottom: 8px; }
+    p { color: var(--muted); font-size: 14px; line-height: 1.6; margin-bottom: 16px; }
+    label { display: block; font-size: 13px; margin-bottom: 6px; color: var(--muted); }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font: inherit;
+      margin-bottom: 14px;
+    }
+    button {
+      width: 100%;
+      border: none;
+      border-radius: 8px;
+      padding: 12px 16px;
+      font: inherit;
+      font-weight: 600;
+      background: var(--blue);
+      color: #fff;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .success { color: var(--green); font-weight: 600; }
+    .error { color: #dc2626; font-weight: 600; }
+    .hidden { display: none; }
+    .badge {
+      display: inline-block;
+      background: #eff6ff;
+      color: var(--blue);
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="form-view">
+      <span class="badge">iLink Hub 配对</span>
+      <h1>添加 AI 客户端</h1>
+      <p>一个客户端（如 OpenClaw）正在请求接入此 Hub。确认后它将获得虚拟 Token 并开始收发微信消息。</p>
+      <label for="name">客户端名称</label>
+      <input id="name" type="text" placeholder="例如 openclaw-mac" />
+      <label for="label">显示标签（可选）</label>
+      <input id="label" type="text" placeholder="例如 Mac 本机 OpenClaw" />
+      <button id="confirm-btn">确认添加</button>
+    </div>
+    <div id="success-view" class="hidden">
+      <h1 class="success">配对成功</h1>
+      <p>客户端已获得 Token，可以关闭此页面并返回电脑端继续。</p>
+      <p id="client-info"></p>
+    </div>
+    <div id="error-view" class="hidden">
+      <h1 class="error">无法配对</h1>
+      <p id="error-msg"></p>
+    </div>
+  </div>
+  <script>
+    const code = "__PAIR_CODE__";
+    const btn = document.getElementById("confirm-btn");
+    const nameInput = document.getElementById("name");
+    nameInput.value = "openclaw-" + Math.random().toString(36).slice(2, 8);
+
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      btn.textContent = "确认中…";
+      try {
+        const confirmUrl = window.location.pathname.replace(/\/?$/, "") + "/confirm";
+        const res = await fetch(confirmUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            name: nameInput.value.trim(),
+            label: document.getElementById("label").value.trim() || null,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || "配对失败");
+        document.getElementById("form-view").classList.add("hidden");
+        document.getElementById("success-view").classList.remove("hidden");
+        document.getElementById("client-info").textContent =
+          `客户端：${data.name}，Token 已发放给等待中的设备。`;
+      } catch (err) {
+        document.getElementById("form-view").classList.add("hidden");
+        document.getElementById("error-view").classList.remove("hidden");
+        document.getElementById("error-msg").textContent = err.message;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -1,6 +1,23 @@
 # 配置 AI 客户端
 
-注册客户端后，将 Hub 地址和虚拟 Token 填入你的 AI 客户端配置。客户端无需任何代码修改，仅需替换连接信息。
+## 首次接入：终端二维码配对（推荐）
+
+只需配置 Hub 地址，客户端首次启动会显示终端二维码，手机扫码确认即可获得 `vhub_` Token：
+
+```bash
+export WEIXIN_BASE_URL=http://127.0.0.1:8765
+# 不设 WEIXIN_TOKEN — 走扫码配对
+```
+
+Rust 可复用 `ilink_hub::client::HubPairingClient`；或直接运行 `examples/wechatbot-echo` 体验完整流程。详见 [手机扫码配对](./pairing-tunnel.md)。
+
+## 已有 Token 时
+
+注册或配对完成后，将 Hub 地址和虚拟 Token 填入 AI 客户端。消息收发无需改代码，仅需替换连接信息。
+
+::: tip 不确定你的 SDK 是否支持？
+各 SDK 对 Hub 的兼容情况、以及我们为打通它们提交的上游 PR 进度，见 [SDK 兼容性与推进动态](./sdk-compatibility.md)。
+:::
 
 ## Recursive
 
@@ -52,6 +69,23 @@ let bot = WeChatBot::new(BotOptions {
 export WEIXIN_BASE_URL=http://your-hub.example.com:8765
 export WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
+
+## 用 wechatbot 快速验证（Echo 示例）
+
+仓库自带一个最小测试客户端，使用 crates.io 上的 [`wechatbot`](https://crates.io/crates/wechatbot) SDK：
+
+```bash
+# 1. 注册客户端
+ilink-hub register --name echo --label "echo test"
+
+# 2. 运行示例（把 token 换成上一步输出）
+cd examples/wechatbot-echo
+export WEIXIN_BASE_URL=http://localhost:8765
+export WEIXIN_TOKEN=vhub_xxxxxxxx
+cargo run
+```
+
+微信发 `你好`，应收到 `Echo: 你好`。详见 [`examples/wechatbot-echo/README.md`](https://github.com/jeffkit/ilink-hub/tree/main/examples/wechatbot-echo)。
 
 ## 验证连接是否正常
 

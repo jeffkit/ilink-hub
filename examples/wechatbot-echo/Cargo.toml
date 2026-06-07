@@ -1,0 +1,17 @@
+[package]
+name = "ilink-hub-wechatbot-echo"
+version = "0.1.0"
+edition = "2021"
+description = "Echo test client for iLink Hub using the wechatbot crate"
+publish = false
+
+[dependencies]
+ilink-hub = { path = "../.." }
+wechatbot = "0.3.2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

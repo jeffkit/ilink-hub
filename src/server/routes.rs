@@ -14,6 +14,7 @@ use tracing::{debug, error, warn};
 
 use crate::hub::HubState;
 use crate::ilink::types::*;
+use crate::server::pairing::register_client_in_hub;
 
 // ─── Auth helper ─────────────────────────────────────────────────────────────
 
@@ -73,26 +74,8 @@ pub async fn register(
         );
     }
 
-    let vtoken = {
-        let mut registry = state.registry.write().await;
-        registry.register(req.name.clone(), req.label.clone())
-    };
-
-    {
-        let mut router = state.router.lock().await;
-        let registry = state.registry.read().await;
-        if registry.online_clients().len() == 1 {
-            router.set_default(vtoken.clone());
-        }
-    }
-
-    if let Err(e) = state
-        .store
-        .upsert_client(&vtoken, &req.name, req.label.as_deref())
-        .await
-    {
-        warn!(error = %e, name = %req.name, "failed to persist client registration to DB");
-    }
+    let vtoken =
+        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
     (
         StatusCode::OK,

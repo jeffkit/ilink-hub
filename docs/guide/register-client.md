@@ -2,6 +2,12 @@
 
 每个需要接入 Hub 的 AI 后端（如不同机器上的 Recursive、OpenClaw 等）都需要注册一次，获得一个专属的**虚拟 Token（vtoken）**。
 
+::: tip 本机 Hub + 终端二维码（推荐）
+若 Hub 跑在本机，AI 客户端只需 `WEIXIN_BASE_URL=http://127.0.0.1:8765`，首次启动会在终端显示二维码，手机扫码即可完成配对——**无需** `ilink-hub register` 或 Tunely。详见 [手机扫码配对](./pairing-tunnel.md)。
+
+快速体验：`cd examples/wechatbot-echo && cargo run`
+:::
+
 ## 通过 CLI 注册
 
 ```bash

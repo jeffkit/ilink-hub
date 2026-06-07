@@ -39,6 +39,7 @@ export default defineConfig({
           { text: '安装', link: '/guide/installation' },
           { text: 'QR 码登录', link: '/guide/login' },
           { text: '注册客户端', link: '/guide/register-client' },
+          { text: '手机扫码配对', link: '/guide/pairing-tunnel' },
           { text: '配置 AI 客户端', link: '/guide/client-config' },
         ],
       },
@@ -63,6 +64,7 @@ export default defineConfig({
         items: [
           { text: '常见问题 FAQ', link: '/guide/faq' },
           { text: '与同类项目对比', link: '/guide/comparison' },
+          { text: 'SDK 兼容性与推进动态', link: '/guide/sdk-compatibility' },
         ],
       },
     ],
