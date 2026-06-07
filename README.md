@@ -185,14 +185,14 @@ let bot = WeChatBot::new(BotOptions {
 
 ### ilink-hub-bridge (local CLI)
 
-Run a **local** command (Claude Code, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Quick path (Chinese doc site):** [5-minute try with Homebrew + optional QR pairing](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
+Run a **local** command (Claude Code, Cursor Agent, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Usage guide (Chinese):** [bridge/USAGE](https://jeffkit.github.io/ilink-hub/bridge/USAGE.html). **Quick echo path:** [5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
 
 ```bash
 cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml
-# Option A — Hub client QR pairing (no WEIXIN_TOKEN; saves ~/.ilink-hub/bridge-credentials.json)
+# Default — no WEIXIN_TOKEN and no cred file yet: POST /hub/register, saves ~/.ilink-hub/bridge-credentials.json (ILINK_ADMIN_TOKEN if Hub requires it). If the file exists but is corrupt/empty, bridge errors instead of overwriting — use --force-register or delete the file.
 WEIXIN_BASE_URL=http://127.0.0.1:8765 ilink-hub-bridge --config ./ilink-hub-bridge.yaml
-# Option B — explicit vtoken from `ilink-hub register`
-WEIXIN_BASE_URL=http://127.0.0.1:8765 WEIXIN_TOKEN=vhub_xxx ilink-hub-bridge --config ./ilink-hub-bridge.yaml
+# Optional — Hub client QR pairing instead: add --pair
+# Optional — explicit vtoken: WEIXIN_TOKEN=vhub_xxx …
 ```
 
 ---

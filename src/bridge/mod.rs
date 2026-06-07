@@ -2,6 +2,10 @@
 //!
 //! Used by the `ilink-hub-bridge` binary; see `docs/bridge/README.md`.
 
+mod connection;
+
+pub use connection::{default_local_credential_path, resolve_hub_connection};
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;

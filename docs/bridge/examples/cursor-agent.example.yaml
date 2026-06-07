@@ -1,0 +1,12 @@
+# Cursor Agent CLI（非交互）：PATH 中需有 `agent`（见 https://cursor.com/docs/cli/overview 安装）。
+# 使用 `-p` / `--print` 将回答打到 stdout，供 bridge 收集后发回微信。
+# 认证：自动化常用环境变量 CURSOR_API_KEY；或先在本机执行 `agent login`。
+# 若需在无确认下允许改仓库文件，请查阅官方文档中的 `--force` / `--yolo` 等选项（有安全风险，仅用于可信目录）。
+command: agent
+args: ["-p", "{{MESSAGE}}"]
+stdin: none
+cwd: /path/to/your/project
+timeout_secs: 600
+max_reply_chars: 8000
+# env:
+#   CURSOR_API_KEY: "key-..."  # 建议仅在 shell 中 export，勿提交到 Git

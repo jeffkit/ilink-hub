@@ -1,8 +1,11 @@
-# Claude Code CLI（示例）：请按本机安装路径与官方文档调整参数。
-# 常见为在 PATH 中的 `claude`，非交互单次输出可用类似 `-p` 的 print 模式（以你安装的 CLI 为准）。
+# Claude Code CLI（Anthropic）：请按本机安装路径与 `claude --help` 调整参数。
+# 非交互、单次输出常用 `-p`（print）；若你本机版本 flag 不同，以官方 CLI 为准。
 command: claude
 args: ["-p", "{{MESSAGE}}"]
 stdin: none
 cwd: /path/to/your/project
 timeout_secs: 600
 max_reply_chars: 8000
+# 认证通常依赖本机 `claude login` 或 ANTHROPIC_API_KEY 等；可用 env 块注入，勿把密钥提交到仓库。
+# env:
+#   ANTHROPIC_API_KEY: "sk-ant-..."

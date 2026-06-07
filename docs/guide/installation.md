@@ -16,7 +16,7 @@ ilink-hub --version
 ilink-hub-bridge --version
 ```
 
-从 **v0.1.7** 起，同一 formula 会安装 **`ilink-hub`** 与 **`ilink-hub-bridge`** 两个命令（均来自同一 GitHub Release 标签）。若 `brew install` 后没有 `ilink-hub-bridge`，请先执行 `brew update` 再升级：
+从 **v0.1.7** 起（**v0.1.8** 起包含凭证保护与 `--force-register` 等 bridge 更新），同一 formula 会安装 **`ilink-hub`** 与 **`ilink-hub-bridge`** 两个命令（均来自同一 GitHub Release 标签）。若 `brew install` 后没有 `ilink-hub-bridge`，请先执行 `brew update` 再升级：
 
 ```bash
 brew update
@@ -66,7 +66,7 @@ sudo mv ilink-hub /usr/local/bin/
 
 ```bash
 ilink-hub --version
-# ilink-hub 0.1.4
+ilink-hub-bridge --version
 ```
 
 ---
@@ -79,7 +79,7 @@ ilink-hub --version
 cargo install ilink-hub
 ```
 
-安装后二进制在 `~/.cargo/bin/ilink-hub`，确保该目录在 PATH 中。
+安装后二进制在 `~/.cargo/bin/`（含 `ilink-hub` 与 `ilink-hub-bridge`），确保该目录在 PATH 中。
 
 ---
 

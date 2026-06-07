@@ -19,11 +19,11 @@ export default defineConfig({
 
     nav: [
       { text: '快速入门', link: '/guide/getting-started' },
-      { text: '本地 CLI', link: '/bridge/quick-try' },
+      { text: '本地 CLI', link: '/bridge/USAGE' },
       { text: '配置参考', link: '/reference/configuration' },
       { text: 'API 参考', link: '/reference/api' },
       {
-        text: 'v0.1.4',
+        text: 'v0.1.8',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -47,6 +47,7 @@ export default defineConfig({
       {
         text: '本地 CLI Bridge',
         items: [
+          { text: '使用指引（多 CLI）', link: '/bridge/USAGE' },
           { text: '5 分钟上手', link: '/bridge/quick-try' },
           { text: '功能与配置', link: '/bridge/README' },
         ],

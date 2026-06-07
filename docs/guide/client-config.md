@@ -27,7 +27,8 @@ Rust 可复用 `ilink_hub::client::HubPairingClient`；或直接运行 `examples
 
 ::: tip 推荐路径
 1. 先跟文档站 [5 分钟上手：echo 链路](/bridge/quick-try) 跑通  
-2. 再读 [功能与配置](/bridge/README) 替换 `command` / `args`、调超时与占位符 `{{MESSAGE}}`  
+2. 再读 **[使用指引：Claude Code / Cursor Agent / Codex](/bridge/USAGE)**，按需复制示例 YAML  
+3. 字段字典与进阶选项见 [功能与配置](/bridge/README)  
 :::
 
 与 Recursive / OpenClaw **可同时注册**：多占一个 `--name`，用微信 `/use` 在「大模型客户端」和「CLI bridge」之间切换。

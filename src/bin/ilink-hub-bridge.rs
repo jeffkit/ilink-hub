@@ -1,18 +1,23 @@
 //! Connect to iLink Hub and run a local CLI for each inbound text message.
 //!
-//! - **Token**：`--token` / `WEIXIN_TOKEN`（与 `ilink-hub register` 相同），或
-//! - **扫码配对**：不传 token 时，走 Hub 终端二维码（凭证默认 `~/.ilink-hub/bridge-credentials.json`，可用 `ILINKHUB_BRIDGE_CREDS` 覆盖）。
+//! - **显式 Token**：`--token` / `WEIXIN_TOKEN`
+//! - **扫码配对**：`--pair`（或首次无凭证且你希望用手机确认）
+//! - **零交互（默认）**：不传 token、且凭证路径**不存在**时，进程自行调用 Hub 的通用 `POST /hub/register`，
+//!   将虚拟 token 写入本地 JSON（与配对成功后的格式相同），Hub 侧不区分调用方类型。
+//!   若凭证文件**已存在但损坏或 token 为空**，默认**不会**静默覆盖（避免误伤扫码配对）；需删文件、
+//!   用 `--token` / `--pair`，或显式 **`--force-register`**。
+//!
+//! 若 Hub 配置了 `ILINK_ADMIN_TOKEN`，本进程注册时需在同一环境中设置该变量。
 //!
 //! 配置见 `docs/bridge/README.md`。
 
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 use tracing::info;
 
-use ilink_hub::bridge::{run_bridge, BridgeConfig};
-use ilink_hub::client::{HubPairingClient, HubPairingOptions};
+use ilink_hub::bridge::{resolve_hub_connection, run_bridge, BridgeConfig};
 
 #[derive(Parser)]
 #[command(name = "ilink-hub-bridge")]
@@ -25,61 +30,36 @@ struct Cli {
     #[arg(long, env = "WEIXIN_BASE_URL", default_value = "http://127.0.0.1:8765")]
     hub_url: String,
 
-    /// Virtual token from `ilink-hub register` or pairing. Omit to load saved pairing creds or scan QR.
+    /// Virtual token. Omit to use saved local credentials, auto-register, or `--pair` QR flow.
     #[arg(long, env = "WEIXIN_TOKEN")]
     token: Option<String>,
 
-    /// JSON file for pairing credentials (default: ~/.ilink-hub/bridge-credentials.json).
+    /// Local credential JSON path (default: ~/.ilink-hub/bridge-credentials.json).
     #[arg(long, env = "ILINKHUB_BRIDGE_CREDS")]
     cred_file: Option<String>,
 
-    /// Ignore saved pairing file and run Hub QR pairing again.
+    /// Ignore saved credentials and run Hub QR pairing (phone confirm).
     #[arg(long, default_value_t = false)]
     pair: bool,
+
+    /// Stable client name when auto-registering via `/hub/register` (optional; default random `local-<uuid>`).
+    #[arg(long, env = "ILINKHUB_BRIDGE_REGISTER_NAME")]
+    register_name: Option<String>,
+
+    /// If the credential file exists but is invalid or has an empty token, delete it and auto-register again.
+    #[arg(long, default_value_t = false)]
+    force_register: bool,
 
     /// Path to bridge YAML (command, args, timeout, …).
     #[arg(long, default_value = "ilink-hub-bridge.yaml")]
     config: PathBuf,
 }
 
-fn default_bridge_cred_path() -> String {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ilink-hub")
-        .join("bridge-credentials.json")
-        .to_string_lossy()
-        .into_owned()
-}
-
-fn explicit_token(cli: &Cli) -> Option<String> {
+fn explicit_token(cli: &Cli) -> Option<&str> {
     cli.token
-        .as_ref()
-        .map(|s| s.trim())
+        .as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-}
-
-async fn resolve_hub_and_token(cli: &Cli) -> Result<(String, String)> {
-    let hub = cli.hub_url.trim().trim_end_matches('/').to_string();
-
-    if let Some(tok) = explicit_token(cli) {
-        return Ok((hub, tok));
-    }
-
-    let cred_path = cli
-        .cred_file
-        .clone()
-        .unwrap_or_else(default_bridge_cred_path);
-
-    let mut opts = HubPairingOptions::new(&hub);
-    opts.cred_path = Some(cred_path);
-    opts.force = cli.pair;
-
-    let client = HubPairingClient::new(opts);
-    let creds = client.pair().await.context("Hub pairing")?;
-
-    let base = creds.base_url.trim().trim_end_matches('/').to_string();
-    Ok((base, creds.token))
 }
 
 #[tokio::main]
@@ -93,8 +73,16 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let (hub_url, token) = resolve_hub_and_token(&cli).await?;
-    info!(%hub_url, "using Hub base URL for bridge");
+    let (hub_url, token) = resolve_hub_connection(
+        &cli.hub_url,
+        explicit_token(&cli),
+        cli.cred_file.as_deref(),
+        cli.pair,
+        cli.register_name.as_deref(),
+        cli.force_register,
+    )
+    .await?;
+    info!(%hub_url, "using Hub base URL for downstream");
 
     let config = BridgeConfig::load(&cli.config)?;
     info!(config_path = %cli.config.display(), "loaded bridge config");

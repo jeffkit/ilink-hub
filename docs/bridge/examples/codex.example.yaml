@@ -1,6 +1,9 @@
-# OpenAI Codex CLI（示例）：命令与 flag 以本机 `codex --help` 为准。
+# OpenAI Codex CLI：命令与子命令以本机 `codex --help` 为准。
+# 常见非交互执行：`codex exec "<提示>"`；此处用占位符注入用户消息。
 command: codex
 args: ["exec", "{{MESSAGE}}"]
 stdin: none
 cwd: /path/to/your/project
 timeout_secs: 600
+max_reply_chars: 8000
+# 若 CLI 读 OPENAI_API_KEY / 其他变量，可在 env 中设置（不要提交真实密钥到 Git）。
