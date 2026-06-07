@@ -128,10 +128,10 @@ ilink-hub register --hub-url http://... --name mac-home --label "Mac 本机"
 如果使用 SQLite，定期备份数据文件：
 
 ```bash
-# 简单备份
-cp ~/.local/share/ilink-hub/ilink-hub.db ~/backups/ilink-hub-$(date +%Y%m%d).db
+# 简单备份（路径与 DATABASE_URL 一致；本机默认常为当前目录下的 ilink-hub.db）
+cp ./ilink-hub.db ~/backups/ilink-hub-$(date +%Y%m%d).db
 
-# cron 每日备份
+# cron 每日备份（Docker 常见挂载路径）
 0 2 * * * cp /data/ilink-hub.db /backup/ilink-hub-$(date +\%Y\%m\%d).db
 ```
 

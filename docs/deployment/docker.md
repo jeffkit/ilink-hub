@@ -31,14 +31,18 @@ volumes:
 docker compose up -d
 ```
 
-## 首次登录（QR 码扫码）
+## 首次绑定微信（iLink QR）
+
+镜像入口为 `ilink-hub serve`，**无需**先单独执行 `login`。首次启动若没有有效 Token，进程会在标准输出打印二维码。
 
 ```bash
-# 需要 -it 显示 QR 码（交互式终端）
-docker compose exec ilink-hub ilink-hub login
+docker compose up -d
+docker compose logs -f ilink-hub
 ```
 
-登录成功后 Token 保存在 `/data/ilink-hub.db`，下次启动无需重新登录。
+用手机微信扫码后，Token 会写入 `DATABASE_URL` 指向的数据库（上例中为卷内 `/data/ilink-hub.db`），之后重启容器会自动加载。
+
+若你更习惯「先 login 再后台 serve」，也可在一次性交互容器里执行 `ilink-hub login`（需 `-it` 与相同的数据卷、`DATABASE_URL`），再 `docker compose up -d`。详见 [QR 码登录](/guide/login)。
 
 ## 使用 PostgreSQL 数据库
 
@@ -83,13 +87,14 @@ volumes:
 # 创建数据卷
 docker volume create ilink-hub-data
 
-# 首次登录
+# 首次启动：前台运行以便在终端看到二维码，扫码后再 Ctrl+C
 docker run -it --rm \
+  -p 8765:8765 \
   -v ilink-hub-data:/data \
   -e DATABASE_URL=sqlite:/data/ilink-hub.db \
-  ghcr.io/jeffkit/ilink-hub:latest login
+  ghcr.io/jeffkit/ilink-hub:latest serve
 
-# 后台运行服务
+# 后台常驻（Token 已写入卷内 DB 后）
 docker run -d \
   --name ilink-hub \
   --restart unless-stopped \

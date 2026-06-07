@@ -1,5 +1,7 @@
 # 手机扫码配对（零配置）
 
+> 最后更新：2026-06-07
+
 本机运行 Hub 时，手机无法直接访问 `localhost`。**ilinkhub.ai** 上的配对中继（`ilink-relay`）只在绑定时转发确认页；日常 API 仍走本机。
 
 ## 用户只需配置
@@ -11,7 +13,7 @@ ilink-hub serve
 
 首次启动会自动：
 
-1. 生成并保存设备身份（`~/.local/share/ilink-hub/device_identity.json`，含 Ed25519 密钥对）
+1. 生成并保存设备身份（本机数据目录下的 `ilink-hub/device_identity.json`，含 Ed25519 密钥对；Linux 多为 `~/.local/share/ilink-hub/`，macOS 多为 `~/Library/Application Support/ilink-hub/`）
 2. 用签名向中继注册 `device_id`，防止他人抢占
 3. 出站连接 `wss://ilinkhub.ai/ws/pairing`
 4. 二维码 URL 为 `https://ilinkhub.ai/pair/{device_id}/{code}`

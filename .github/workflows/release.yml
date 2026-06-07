@@ -208,8 +208,7 @@ jobs:
             ## Quick Start
 
             ```bash
-            ilink-hub login                              # scan WeChat QR
-            ilink-hub serve --addr 0.0.0.0:8765          # start hub
+            ilink-hub serve --addr 0.0.0.0:8765          # QR login on first start if needed
             ilink-hub register --name my-ai              # register a backend
             # open http://your-hub:8765/hub/ui           # web admin panel
             ```

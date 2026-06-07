@@ -1,6 +1,8 @@
 # 快速开始
 
-本指南带你在 5 分钟内完成 iLink Hub 的安装、登录和客户端接入。
+本指南带你在 5 分钟内完成 iLink Hub 的安装、启动和客户端接入。
+
+> **路径说明**：默认数据库为**当前工作目录**下的 `./ilink-hub.db`（可用 `DATABASE_URL` 覆盖）。与 AI 客户端相关的 URL 一般为 `http://<hub 主机>:8765`，管理面板为 `http://<hub 主机>:8765/hub/ui`。
 
 ## 前提条件
 
@@ -49,46 +51,43 @@ cargo install ilink-hub
 
 ```bash
 ilink-hub --version
-# 输出：ilink-hub 0.1.4
 ```
 
-## 第二步：扫码登录微信
+## 第二步：启动 Hub（首次会自动出码登录）
 
-```bash
-ilink-hub login
-```
-
-终端会显示一个二维码，用**已开通 iLink API 的微信账号**扫码登录。登录成功后，Token 会自动保存到本地数据库，无需重复登录。
-
-```
-扫描以下二维码登录：
-█████████████████████████████████
-█ ▄▄▄▄▄ █▀▀▄██▄▀ ▄█ █ ▄▄▄▄▄ █
-█ █   █ █▀█▀▀▀▀▄▀▀▀▄ █ █   █ █
-...（二维码内容）...
-✓ 登录成功！Token 已保存。
-```
-
-## 第三步：启动 Hub 服务
+直接启动即可，**不必**先单独执行 `ilink-hub login`：
 
 ```bash
 ilink-hub serve --addr 0.0.0.0:8765
 ```
 
+启动时 Hub 会按顺序解析真实 iLink Token：`ILINK_TOKEN` / `--token` → 数据库中已保存的凭证 → 若仍没有或已失效，则**在当前终端打印二维码**，用**已开通 iLink API 的微信**扫码后 Token 会写入数据库，随后服务继续运行。
+
+```
+首次启动需要绑定微信机器人，请扫描下方二维码登录。
+（终端中的二维码块字符）
+…
+iLink login successful, token saved
+```
+
+若你只想更新 Token、不想拉起 HTTP 服务，可改用独立子命令（见 [QR 码登录](./login.md)）。
+
 服务启动后，你会看到类似输出：
 
 ```
-2026-06-05T10:00:00Z  INFO ilink_hub: Starting iLink Hub v0.1.4
-2026-06-05T10:00:00Z  INFO ilink_hub: Listening on 0.0.0.0:8765
-2026-06-05T10:00:00Z  INFO ilink_hub: Admin UI: http://localhost:8765/hub/ui
-2026-06-05T10:00:00Z  INFO ilink_hub: Polling upstream iLink...
+INFO ilink_hub: iLink Hub listening
+INFO ilink_hub: … Admin / pairing …
 ```
 
 ::: tip 后台运行
 使用 `nohup ilink-hub serve --addr 0.0.0.0:8765 &` 或者 systemd/screen 在后台保持运行。
 :::
 
-## 第四步：打开 Web 管理面板
+::: tip 本机 Hub + 手机扫码
+若 Hub 跑在本机、需要手机扫配对页，默认会走 **ilinkhub.ai** 中继，无需先跑隧道。详见 [手机扫码配对](./pairing-tunnel.md)。
+:::
+
+## 第三步：打开 Web 管理面板
 
 在浏览器中访问：
 
@@ -98,7 +97,7 @@ http://localhost:8765/hub/ui
 
 你会看到 iLink Hub 的管理界面，可以在这里注册客户端并复制配置。
 
-## 第五步：注册 AI 客户端
+## 第四步：注册 AI 客户端
 
 每个需要接入的 AI 后端都需要注册一次，获取一个专属的虚拟 Token。
 
@@ -126,7 +125,7 @@ ilink-hub register \
   WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-## 第六步：配置 AI 客户端
+## 第五步：配置 AI 客户端
 
 将上一步获得的配置填入你的 AI 客户端：
 

@@ -73,23 +73,19 @@ chmod +x ilink-hub && sudo mv ilink-hub /usr/local/bin/
 ### Option B: Cargo (requires Rust)
 
 ```bash
-# Install
 cargo install ilink-hub
 
-# Step 1: QR login (save token to DB)
-ilink-hub login
-
-# Step 2: Start Hub
+# Start Hub (QR login runs inline on first start if no token in DB)
 ilink-hub serve --addr 0.0.0.0:8765
 
-# Step 3: Open web admin panel
+# Open web admin panel
 # Visit http://your-hub.example.com:8765/hub/ui
 
-# Step 4: Register each backend (CLI or via the web UI)
-ilink-hub register --hub-url http://your-hub.example.com \
+# Register each backend (CLI or via the web UI)
+ilink-hub register --hub-url http://your-hub.example.com:8765 \
   --name mac-home --label "Mac Home"
 # Outputs:
-#   WEIXIN_BASE_URL=http://your-hub.example.com
+#   WEIXIN_BASE_URL=http://your-hub.example.com:8765
 #   WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxx
 ```
 
@@ -115,8 +111,8 @@ volumes:
 
 ```bash
 docker compose up -d
-# First login (interactive):
-docker compose exec ilink-hub ilink-hub login
+# First-time iLink bind: follow logs for the QR code
+docker compose logs -f ilink-hub
 ```
 
 ### Option D: PostgreSQL backend

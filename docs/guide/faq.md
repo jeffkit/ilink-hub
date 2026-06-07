@@ -28,12 +28,12 @@ xattr -rd com.apple.quarantine /usr/local/bin/ilink-hub
 
 ### Q: QR 码扫码后提示「此二维码已过期」
 
-iLink 登录二维码有效期较短（约 2 分钟）。重新执行 `ilink-hub login` 获取新码。
+iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub serve`（会再次出码），或执行 `ilink-hub login` 仅更新凭证。
 
 ### Q: 登录成功但 Hub 启动后提示「upstream connection failed」
 
 可能原因：
-1. Token 已过期 → 重新执行 `ilink-hub login`
+1. Token 已过期 → 再次运行 `ilink-hub serve` 完成扫码，或执行 `ilink-hub login`
 2. 网络不通 → 确认服务器可以访问 `ilinkai.weixin.qq.com`
 3. 数据库路径不一致 → 确认 `DATABASE_URL` 指向同一个数据库文件
 
@@ -65,9 +65,7 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新执行 `ilink-hub
 
 ### Q: 数据库文件在哪里？
 
-默认位置：
-- **macOS/Linux**: `~/.local/share/ilink-hub/ilink-hub.db`
-- **Docker**: 挂载的 `/data/ilink-hub.db` 卷
+由 `DATABASE_URL` 决定。未设置时，Hub 默认在当前工作目录创建 **`./ilink-hub.db`**（SQLite）。Docker 部署示例中常为卷内的 **`/data/ilink-hub.db`**。
 
 ### Q: 可以迁移从 SQLite 到 PostgreSQL 吗？
 

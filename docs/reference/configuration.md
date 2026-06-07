@@ -1,12 +1,14 @@
 # 环境变量配置
 
+> 最后更新：2026-06-07
+
 iLink Hub 遵循 [12-Factor](https://12factor.net/config) 配置原则，所有配置均可通过环境变量注入。
 
 ## 核心变量
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `DATABASE_URL` | `sqlite:~/.local/share/ilink-hub/ilink-hub.db` | 数据库连接字符串 |
+| `DATABASE_URL` | `sqlite:./ilink-hub.db`（当前工作目录下的 SQLite 文件） | 数据库连接字符串 |
 | `ILINK_HUB_ADDR` | `0.0.0.0:8765` | Hub 监听地址和端口 |
 | `ILINK_ADMIN_TOKEN` | （未设置） | 管理端点认证 Token，**生产环境必须设置** |
 | `ILINK_TOKEN` | （未设置） | 跳过 QR 登录，直接使用已有的 iLink context_token |
@@ -77,16 +79,21 @@ ilink-hub serve
 
 ## CLI 参数
 
-部分配置也可以通过 CLI 参数传递：
+部分配置也可以通过 CLI 参数传递。以 `serve` 为例：
 
 ```bash
 ilink-hub serve --help
-
-Options:
-  --addr <ADDR>           监听地址 [env: ILINK_HUB_ADDR] [default: 0.0.0.0:8765]
-  --db <DATABASE_URL>     数据库连接 [env: DATABASE_URL]
-  --admin-token <TOKEN>   管理认证 Token [env: ILINK_ADMIN_TOKEN]
-  --ilink-token <TOKEN>   直接注入 iLink Token [env: ILINK_TOKEN]
 ```
+
+常见选项（详见 `--help` 输出）：
+
+| 子命令 / 选项 | 说明 |
+|---------------|------|
+| `serve` | 启动 Hub；无有效 iLink Token 时会在终端内联二维码登录 |
+| `--addr` | 监听地址，默认 `0.0.0.0:8765`，环境变量 `ILINK_HUB_ADDR` |
+| `--database-url` | 数据库 URL，默认 `sqlite:./ilink-hub.db`，环境变量 `DATABASE_URL` |
+| `--token` | 直接注入真实 iLink Token，环境变量 `ILINK_TOKEN` |
+| `--ilink-base-url` | 真实 iLink API 根地址，环境变量 `ILINK_BASE_URL` |
+| `login` | 仅执行二维码登录并写入数据库后退出，参数与 `serve` 中的数据库 / base URL 一致 |
 
 CLI 参数的优先级高于环境变量。

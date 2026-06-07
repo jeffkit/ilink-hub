@@ -81,11 +81,12 @@ cargo install ilink-hub
 # 拉取最新镜像（支持 amd64 和 arm64）
 docker pull ghcr.io/jeffkit/ilink-hub:latest
 
-# 运行（首次登录需要交互式终端）
+# 镜像默认 CMD 为 serve；首次启动会在日志里打印 iLink 登录二维码
 docker run -it --rm \
+  -p 8765:8765 \
   -v ilink-hub-data:/data \
   -e DATABASE_URL=sqlite:/data/ilink-hub.db \
-  ghcr.io/jeffkit/ilink-hub:latest login
+  ghcr.io/jeffkit/ilink-hub:latest serve
 ```
 
 详细 Docker 部署见 [Docker 部署指南](/deployment/docker)。

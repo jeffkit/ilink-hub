@@ -37,7 +37,7 @@ export default defineConfig({
           { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
           { text: '快速开始', link: '/guide/getting-started' },
           { text: '安装', link: '/guide/installation' },
-          { text: 'QR 码登录', link: '/guide/login' },
+          { text: 'QR 码登录（可选）', link: '/guide/login' },
           { text: '注册客户端', link: '/guide/register-client' },
           { text: '手机扫码配对', link: '/guide/pairing-tunnel' },
           { text: '配置 AI 客户端', link: '/guide/client-config' },
