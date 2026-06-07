@@ -13,6 +13,14 @@ brew install ilink-hub
 
 ```bash
 ilink-hub --version
+ilink-hub-bridge --version
+```
+
+从 **v0.1.7** 起，同一 formula 会安装 **`ilink-hub`** 与 **`ilink-hub-bridge`** 两个命令（均来自同一 GitHub Release 标签）。若 `brew install` 后没有 `ilink-hub-bridge`，请先执行 `brew update` 再升级：
+
+```bash
+brew update
+brew upgrade ilink-hub
 ```
 
 升级到新版本：

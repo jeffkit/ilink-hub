@@ -25,30 +25,35 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset_name: ilink-hub-linux-x86_64
+            bridge_asset: ilink-hub-bridge-linux-x86_64
             use_cross: true
 
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             asset_name: ilink-hub-linux-aarch64
+            bridge_asset: ilink-hub-bridge-linux-aarch64
             use_cross: true
 
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             asset_name: ilink-hub-macos-x86_64
+            bridge_asset: ilink-hub-bridge-macos-x86_64
             use_cross: false
 
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             asset_name: ilink-hub-macos-aarch64
+            bridge_asset: ilink-hub-bridge-macos-aarch64
             use_cross: false
 
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: ilink-hub-windows-x86_64.exe
+            bridge_asset: ilink-hub-bridge-windows-x86_64.exe
             use_cross: false
 
     steps:
@@ -90,11 +95,31 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" `
                     "${{ matrix.asset_name }}"
 
+      - name: Rename bridge (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cp "target/${{ matrix.target }}/release/ilink-hub-bridge" "${{ matrix.bridge_asset }}"
+          chmod +x "${{ matrix.bridge_asset }}"
+
+      - name: Rename bridge (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/ilink-hub-bridge.exe" `
+                    "${{ matrix.bridge_asset }}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
           path: ${{ matrix.asset_name }}
+          retention-days: 1
+
+      - name: Upload bridge artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bridge_asset }}
+          path: ${{ matrix.bridge_asset }}
           retention-days: 1
 
   # ─── Docker image ─────────────────────────────────────────────────────────
@@ -204,6 +229,17 @@ jobs:
             ```bash
             cargo install ilink-hub
             ```
+
+            ### ilink-hub-bridge (per platform)
+
+            Same release tag includes `ilink-hub-bridge-*` assets. Example (macOS arm64):
+
+            ```bash
+            curl -LO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ilink-hub-bridge-macos-aarch64"
+            chmod +x ilink-hub-bridge-macos-aarch64 && sudo mv ilink-hub-bridge-macos-aarch64 /usr/local/bin/ilink-hub-bridge
+            ```
+
+            Omit `--token` and scan the Hub pairing QR on first run; credentials default to `~/.ilink-hub/bridge-credentials.json`.
 
             ## Quick Start
 

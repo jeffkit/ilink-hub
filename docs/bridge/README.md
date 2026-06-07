@@ -1,8 +1,13 @@
 # ilink-hub-bridge：本地 CLI 后端
 
-`ilink-hub-bridge` 是一个**独立进程**：用与其他 AI 客户端相同的方式（`WEIXIN_BASE_URL` + 虚拟 `WEIXIN_TOKEN`）连接 Hub，对每条**用户文本消息**按 YAML 配置执行本机命令，把 **stdout** 作为回复发回微信。
+`ilink-hub-bridge` 是一个**独立进程**：对每条**用户文本消息**按 YAML 配置执行本机命令，把 **stdout** 作为回复发回微信。与 Recursive / OpenClaw 一样，通过 Hub 暴露的 iLink 兼容 API（`getupdates` / `sendmessage`）通信。
 
-Hub **不执行**你的 CLI，仍只做 iLink 代理；任意命令执行都发生在运行 bridge 的机器上，权限与风险边界清晰。
+**连接 Hub 的两种方式（二选一）**
+
+1. **扫码配对（推荐）**：不传 `--token` / `WEIXIN_TOKEN` 时，终端展示 Hub 客户端配对二维码，手机浏览器确认并填写客户端名称后，虚拟 Token 写入 **`~/.ilink-hub/bridge-credentials.json`**。再次启动会自动读入；需要换机或换 Hub 时加 **`--pair`** 重新扫码。路径可用 **`ILINKHUB_BRIDGE_CREDS`** 或 **`--cred-file`** 覆盖。  
+2. **显式 Token**：使用 `ilink-hub register` 得到的 `vhub_…`，通过 `--token` 或环境变量 **`WEIXIN_TOKEN`** 传入。
+
+Hub **不执行**你的 CLI，仍只做 iLink 代理；命令执行只发生在运行 bridge 的机器上。
 
 ::: tip 想先跑通再读细节？
 直接跟做 **[5 分钟上手（echo 链路）](./quick-try.md)**，再回到本页查字段与进阶用法。
@@ -38,20 +43,32 @@ flowchart LR
 
 | 方式 | 说明 |
 |------|------|
-| **源码构建** | 在仓库根目录 `cargo build --release --bin ilink-hub-bridge` |
-| **cargo install** | `cargo install ilink-hub` 会安装 crate 内声明的二进制（需发行版已包含该 bin） |
-| **Release 预编译** | 查看 [GitHub Releases](https://github.com/jeffkit/ilink-hub/releases) 资产中是否提供与 `ilink-hub` 同包的可执行文件 |
+| **Homebrew（macOS）** | `brew install ilink-hub` 同时安装 `ilink-hub` 与 `ilink-hub-bridge`（见 [安装](/guide/installation)） |
+| **源码构建** | 仓库根目录 `cargo build --release --bin ilink-hub-bridge` |
+| **cargo install** | `cargo install ilink-hub` |
+| **Release 预编译** | [Releases](https://github.com/jeffkit/ilink-hub/releases) 中的 `ilink-hub-bridge-*` 资产 |
 
 ## 前置条件
 
 1. Hub 已运行并完成微信侧绑定（见 [快速开始](/guide/getting-started)）。
-2. 在 Hub 上 [注册客户端](/guide/register-client)，例如 `--name local-cli`，记下 `WEIXIN_TOKEN`。
-3. 在微信中 [切换路由](/reference/commands)：`/use local-cli`。
+2. **任选其一**：用 [扫码配对](./quick-try.md) 在手机上为该 bridge 起名并完成注册；或事先执行 `ilink-hub register` 取得 `WEIXIN_TOKEN`。
+3. 若 Hub 上已有多个客户端，在微信中 [切换路由](/reference/commands)：`/use <配对时填写的名称>`。
 4. 运行 bridge 的机器能访问 Hub 的 HTTP 端口。
 
 ## 最小启动示例
 
-若已从仓库复制了 [echo 示例 YAML](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/echo.example.yaml)，或已自建 `ilink-hub-bridge.yaml`：
+若已准备好 `ilink-hub-bridge.yaml`（可先使用 [echo 示例](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/echo.example.yaml)）：
+
+**方式 A：扫码配对（不传 token）**
+
+```bash
+export WEIXIN_BASE_URL=http://127.0.0.1:8765
+ilink-hub-bridge --config ./ilink-hub-bridge.yaml
+```
+
+首次按终端提示扫码；成功后凭证保存在 `~/.ilink-hub/bridge-credentials.json`。
+
+**方式 B：显式虚拟 Token**
 
 ```bash
 export WEIXIN_BASE_URL=http://127.0.0.1:8765
@@ -64,7 +81,9 @@ ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 | 参数 | 环境变量 | 说明 |
 |------|-----------|------|
 | `--hub-url` | `WEIXIN_BASE_URL` | Hub 根 URL（无路径后缀） |
-| `--token` | `WEIXIN_TOKEN` | `ilink-hub register` 输出的虚拟 Token |
+| `--token` | `WEIXIN_TOKEN` | 可选；省略则读配对凭证文件或发起扫码 |
+| `--cred-file` | `ILINKHUB_BRIDGE_CREDS` | 配对凭证 JSON 路径，默认 `~/.ilink-hub/bridge-credentials.json` |
+| `--pair` | — | 忽略已存凭证，强制重新扫码配对 |
 | `--config` | — | YAML 路径，默认 `./ilink-hub-bridge.yaml` |
 
 ## 配置字段（YAML）

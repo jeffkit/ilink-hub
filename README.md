@@ -185,12 +185,14 @@ let bot = WeChatBot::new(BotOptions {
 
 ### ilink-hub-bridge (local CLI)
 
-Run a **local** command (Claude Code, Codex, etc.) for each routed WeChat text message — same virtual-token flow as other backends. **Step-by-step (Chinese doc site):** [Local CLI bridge — 5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
+Run a **local** command (Claude Code, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Quick path (Chinese doc site):** [5-minute try with Homebrew + optional QR pairing](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
 
 ```bash
-ilink-hub register --hub-url http://127.0.0.1:8765 --name local-cli --label "Local CLI"
 cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml
-WEIXIN_BASE_URL=http://127.0.0.1:8765 WEIXIN_TOKEN=vhub_xxx ilink-hub-bridge
+# Option A — Hub client QR pairing (no WEIXIN_TOKEN; saves ~/.ilink-hub/bridge-credentials.json)
+WEIXIN_BASE_URL=http://127.0.0.1:8765 ilink-hub-bridge --config ./ilink-hub-bridge.yaml
+# Option B — explicit vtoken from `ilink-hub register`
+WEIXIN_BASE_URL=http://127.0.0.1:8765 WEIXIN_TOKEN=vhub_xxx ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 ```
 
 ---
