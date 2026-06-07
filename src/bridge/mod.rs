@@ -21,19 +21,14 @@ use crate::ilink::types::{
     WeixinMessage,
 };
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StdinMode {
     /// Do not write stdin (use `{{MESSAGE}}` in args, or a fixed prompt).
+    #[default]
     None,
     /// Write the inbound message text to stdin (UTF-8).
     Message,
-}
-
-impl Default for StdinMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Deserialize)]

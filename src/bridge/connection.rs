@@ -190,24 +190,24 @@ pub async fn resolve_hub_connection(
         LocalCredState::Valid(creds) => {
             let base = creds.base_url.trim().trim_end_matches('/').to_string();
             if base.is_empty() {
-                return Ok((hub, creds.token));
+                Ok((hub, creds.token))
+            } else {
+                Ok((base, creds.token))
             }
-            return Ok((base, creds.token));
         }
-        LocalCredState::Missing => {
-            return auto_register_and_save(&path, &hub, register_client_name).await
-        }
+        LocalCredState::Missing => auto_register_and_save(&path, &hub, register_client_name).await,
         LocalCredState::ExistsUnusable => {
             if force_register {
                 let _ = tokio::fs::remove_file(&path).await;
-                return auto_register_and_save(&path, &hub, register_client_name).await;
+                auto_register_and_save(&path, &hub, register_client_name).await
+            } else {
+                anyhow::bail!(
+                    "凭证文件 {} 已存在但无法使用（内容损坏或 token 为空）。\
+                     为避免静默覆盖扫码配对等已有文件，已停止自动注册。\
+                     请删除该文件、设置 WEIXIN_TOKEN、使用 `--pair`，或加上 `--force-register` 删除该文件后重新自动注册。",
+                    path.display()
+                );
             }
-            anyhow::bail!(
-                "凭证文件 {} 已存在但无法使用（内容损坏或 token 为空）。\
-                 为避免静默覆盖扫码配对等已有文件，已停止自动注册。\
-                 请删除该文件、设置 WEIXIN_TOKEN、使用 `--pair`，或加上 `--force-register` 删除该文件后重新自动注册。",
-                path.display()
-            );
         }
     }
 }
