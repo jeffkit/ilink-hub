@@ -99,10 +99,7 @@ impl UpstreamClient {
     }
 
     /// Long-poll for new messages.
-    pub async fn get_updates(
-        &self,
-        get_updates_buf: String,
-    ) -> Result<GetUpdatesResponse> {
+    pub async fn get_updates(&self, get_updates_buf: String) -> Result<GetUpdatesResponse> {
         let url = format!("{}/ilink/bot/getupdates", self.base_url);
         let req_body = GetUpdatesRequest {
             get_updates_buf,
@@ -234,16 +231,16 @@ impl UpstreamClient {
                         }
                     }
                     if let Some(messages) = resp.msgs {
-                    for msg in messages {
-                        debug!(
-                            from = msg.from_user_id.as_deref().unwrap_or("?"),
-                            ctx = msg.context_token.as_deref().unwrap_or("(none)"),
-                            text = msg.text().unwrap_or("(none)"),
-                            has_item_list = msg.item_list.is_some(),
-                            "received upstream message"
-                        );
-                        let _ = tx.send(msg);
-                    }
+                        for msg in messages {
+                            debug!(
+                                from = msg.from_user_id.as_deref().unwrap_or("?"),
+                                ctx = msg.context_token.as_deref().unwrap_or("(none)"),
+                                text = msg.text().unwrap_or("(none)"),
+                                has_item_list = msg.item_list.is_some(),
+                                "received upstream message"
+                            );
+                            let _ = tx.send(msg);
+                        }
                     }
                 }
                 Ok(resp) => {

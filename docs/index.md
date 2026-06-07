@@ -13,6 +13,9 @@ hero:
       text: 快速开始
       link: /guide/getting-started
     - theme: alt
+      text: 本地 CLI 体验
+      link: /bridge/quick-try
+    - theme: alt
       text: 在 GitHub 查看
       link: https://github.com/jeffkit/ilink-hub
 
@@ -32,6 +35,9 @@ features:
   - icon: 💬
     title: 微信命令控制
     details: 在微信中发送 /list、/use、/broadcast 等命令，随时切换活跃后端，无需操作服务器。
+  - icon: 🖥️
+    title: 本地 CLI Bridge
+    details: 独立进程 ilink-hub-bridge 以虚拟 Token 接入 Hub，把微信文本交给本机命令（echo、Claude Code、Codex 等），stdout 即回复。详见「本地 CLI Bridge」栏目。
   - icon: 🗄️
     title: 多数据库支持
     details: 默认使用 SQLite，也支持 PostgreSQL 和 MySQL，通过 DATABASE_URL 一个环境变量切换，无需改代码。

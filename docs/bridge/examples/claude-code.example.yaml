@@ -1,0 +1,8 @@
+# Claude Code CLI（示例）：请按本机安装路径与官方文档调整参数。
+# 常见为在 PATH 中的 `claude`，非交互单次输出可用类似 `-p` 的 print 模式（以你安装的 CLI 为准）。
+command: claude
+args: ["-p", "{{MESSAGE}}"]
+stdin: none
+cwd: /path/to/your/project
+timeout_secs: 600
+max_reply_chars: 8000

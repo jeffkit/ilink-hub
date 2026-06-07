@@ -1,0 +1,6 @@
+# OpenAI Codex CLI（示例）：命令与 flag 以本机 `codex --help` 为准。
+command: codex
+args: ["exec", "{{MESSAGE}}"]
+stdin: none
+cwd: /path/to/your/project
+timeout_secs: 600

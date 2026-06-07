@@ -26,8 +26,7 @@ pub struct PairingSession {
 
 impl PairingSession {
     fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > PAIRING_TTL
-            && self.status != PairingStatus::Confirmed
+        self.created_at.elapsed() > PAIRING_TTL && self.status != PairingStatus::Confirmed
     }
 
     pub fn public_status(&self) -> PairingStatus {
@@ -108,10 +107,7 @@ impl PairingRegistry {
         vtoken: String,
     ) -> Result<(), PairingError> {
         self.purge_expired();
-        let session = self
-            .sessions
-            .get_mut(code)
-            .ok_or(PairingError::NotFound)?;
+        let session = self.sessions.get_mut(code).ok_or(PairingError::NotFound)?;
 
         if session.is_expired() {
             session.status = PairingStatus::Expired;
@@ -166,6 +162,8 @@ mod tests {
         session.created_at = Instant::now() - Duration::from_secs(700);
 
         assert_eq!(reg.get(&code).unwrap().status_str(), "expired");
-        assert!(reg.confirm(&code, "x".into(), None, "vhub_x".into()).is_err());
+        assert!(reg
+            .confirm(&code, "x".into(), None, "vhub_x".into())
+            .is_err());
     }
 }

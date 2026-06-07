@@ -98,15 +98,8 @@ async fn run_session(
                         body: Some(r#"{"error":"forbidden path"}"#.into()),
                     }
                 } else {
-                    match forward_to_hub(
-                        &http,
-                        hub_base,
-                        &method,
-                        &path,
-                        &headers,
-                        body.as_deref(),
-                    )
-                    .await
+                    match forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref())
+                        .await
                     {
                         Ok((status, headers, body)) => RelayMessage::Response {
                             id,

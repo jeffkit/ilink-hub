@@ -46,7 +46,12 @@ iLink Hub is a **transparent iLink proxy**:
 - **Friendly fallback** — when all backends are offline, WeChat users get an instant reply
 - **Pre-built binaries** — download from GitHub Releases (Linux/macOS/Windows), no Rust required
 - **Health checks** — auto-marks offline clients after 90s idle
+- **CLI bridge (`ilink-hub-bridge`)** — connect as a Hub backend and run a local CLI per message ([`docs/bridge/README.md`](docs/bridge/README.md))
 - **Docker support** — single-command deployment, multi-arch image (amd64 + arm64)
+
+### Desktop app (Tauri)
+
+A **Tauri 2** desktop shell lives under [`desktop/ilink-hub-desktop/`](desktop/ilink-hub-desktop/): it embeds the same [`run_serve`](src/runtime/serve.rs) runtime as `ilink-hub serve` (default listen `127.0.0.1:8765`, SQLite under the OS app data dir). The root crate stays out of any workspace with this app, so `cargo build` / `cargo test` at the repo root are unchanged. See [`desktop/ilink-hub-desktop/README.md`](desktop/ilink-hub-desktop/README.md) for `npm run tauri dev` / `tauri build`. Longer-term notes: [`docs/desktop-tauri-roadmap.md`](docs/desktop-tauri-roadmap.md).
 
 ---
 
@@ -176,6 +181,16 @@ let bot = WeChatBot::new(BotOptions {
     }
   }
 }
+```
+
+### ilink-hub-bridge (local CLI)
+
+Run a **local** command (Claude Code, Codex, etc.) for each routed WeChat text message — same virtual-token flow as other backends. **Step-by-step (Chinese doc site):** [Local CLI bridge — 5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
+
+```bash
+ilink-hub register --hub-url http://127.0.0.1:8765 --name local-cli --label "Local CLI"
+cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml
+WEIXIN_BASE_URL=http://127.0.0.1:8765 WEIXIN_TOKEN=vhub_xxx ilink-hub-bridge
 ```
 
 ---

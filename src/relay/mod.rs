@@ -26,7 +26,8 @@ pub fn resolve_pair_public_url(device_id: &str) -> String {
         return "http://127.0.0.1:8765".to_string();
     }
 
-    let relay_base = std::env::var("ILINKHUB_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+    let relay_base =
+        std::env::var("ILINKHUB_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
     format!(
         "{}/pair/{}",
         relay_base.trim().trim_end_matches('/'),
@@ -54,7 +55,8 @@ pub fn relay_enabled() -> bool {
 }
 
 pub fn relay_ws_url() -> String {
-    let base = std::env::var("ILINKHUB_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
+    let base =
+        std::env::var("ILINKHUB_RELAY_URL").unwrap_or_else(|_| DEFAULT_RELAY_URL.to_string());
     let base = base.trim().trim_end_matches('/');
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}/ws/pairing")

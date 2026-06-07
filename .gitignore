@@ -5,6 +5,11 @@
 ilink-hub.db
 .playwright-mcp/
 
+# Desktop (Tauri) — see desktop/ilink-hub-desktop/.gitignore
+desktop/ilink-hub-desktop/node_modules/
+desktop/ilink-hub-desktop/dist/
+desktop/ilink-hub-desktop/src-tauri/target/
+
 # Docs
 docs/node_modules
 docs/.vitepress/dist

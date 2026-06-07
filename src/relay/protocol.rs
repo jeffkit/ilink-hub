@@ -12,7 +12,10 @@ pub enum RelayMessage {
         timestamp: i64,
         signature: String,
     },
-    Registered { ok: bool, error: Option<String> },
+    Registered {
+        ok: bool,
+        error: Option<String>,
+    },
     Request {
         id: String,
         method: String,

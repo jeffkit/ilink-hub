@@ -123,8 +123,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let store = state.store.clone();
             let vctx_clone = vctx.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    store.persist_context_token(&vctx_clone, &real_ctx, &peer_user_id).await
+                if let Err(e) = store
+                    .persist_context_token(&vctx_clone, &real_ctx, &peer_user_id)
+                    .await
                 {
                     warn!(error = %e, "failed to persist context_token mapping");
                 }
@@ -132,15 +133,24 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
             msg.context_token = Some(vctx);
 
-            state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
+            state
+                .metrics
+                .messages_dispatched
+                .fetch_add(1, Ordering::Relaxed);
             match state.queue.push(&vtoken, msg).await {
                 Ok(true) => {
-                    state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .messages_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Ok(false) => {}
                 Err(e) => {
                     error!(error = %e, vtoken = %vtoken, "failed to push message to queue");
-                    state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .metrics
+                        .messages_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -157,7 +167,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
             if online.is_empty() {
                 warn!(from_user_id, "no online clients to dispatch to");
-                state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .messages_dropped
+                    .fetch_add(1, Ordering::Relaxed);
 
                 // Notify the user that no AI backends are available
                 if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
@@ -173,7 +186,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         Ok(_) => {}
                     }
                 } else {
-                    warn!(from_user_id, "no context_token in message, cannot send no-clients reply");
+                    warn!(
+                        from_user_id,
+                        "no context_token in message, cannot send no-clients reply"
+                    );
                 }
                 return;
             }
@@ -209,15 +225,24 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
                 let mut msg_clone = msg.clone();
                 msg_clone.context_token = Some(vctx);
-                state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .messages_dispatched
+                    .fetch_add(1, Ordering::Relaxed);
                 match state.queue.push(vtoken, msg_clone).await {
                     Ok(true) => {
-                        state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .messages_dropped
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                     Ok(false) => {}
                     Err(e) => {
                         error!(error = %e, vtoken = %vtoken, "failed to push broadcast message");
-                        state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+                        state
+                            .metrics
+                            .messages_dropped
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -229,7 +254,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
     let real_ctx = match msg.context_token.clone() {
         Some(ctx) if !ctx.is_empty() => ctx,
         _ => {
-            warn!(?cmd, "hub command message has no context_token, cannot reply");
+            warn!(
+                ?cmd,
+                "hub command message has no context_token, cannot reply"
+            );
             return;
         }
     };
@@ -255,7 +283,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
         HubCommand::UseClient(ref name) => {
             let registry = state.registry.read().await;
-            if let Some(client) = registry.get_by_name(&name) {
+            if let Some(client) = registry.get_by_name(name) {
                 let vtoken = client.vtoken.clone();
                 drop(registry);
 
@@ -300,7 +328,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                         }
                     }
                 }
-                state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .messages_dispatched
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = state.queue.push(vtoken, m).await {
                     error!(error = %e, vtoken = %vtoken, "failed to push hub broadcast message");
                 }

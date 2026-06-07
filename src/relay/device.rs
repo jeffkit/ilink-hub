@@ -25,7 +25,8 @@ impl DeviceIdentity {
     pub fn load_or_create() -> Result<Self> {
         let path = device_identity_path()?;
         if path.exists() {
-            let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+            let raw =
+                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
             let id: Self = serde_json::from_str(&raw).context("parse device_identity.json")?;
             if validate_device_id(&id.device_id) && !id.signing_key_b64.is_empty() {
                 return Ok(id);
@@ -95,7 +96,11 @@ impl DeviceIdentity {
     }
 
     pub fn sign_register(&self, timestamp: i64) -> Result<String> {
-        Ok(sign_register(&self.signing_key()?, &self.device_id, timestamp))
+        Ok(sign_register(
+            &self.signing_key()?,
+            &self.device_id,
+            timestamp,
+        ))
     }
 }
 
@@ -118,8 +123,7 @@ pub fn validate_device_id(id: &str) -> bool {
     if id.len() < 8 || id.len() > 64 {
         return false;
     }
-    id.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 /// Only pairing endpoints may be forwarded from the public relay.

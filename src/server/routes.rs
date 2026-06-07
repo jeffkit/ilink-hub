@@ -74,8 +74,7 @@ pub async fn register(
         );
     }
 
-    let vtoken =
-        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let vtoken = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
     (
         StatusCode::OK,
@@ -155,7 +154,10 @@ pub async fn sendmessage(
     Json(mut req): Json<SendMessageRequest>,
 ) -> Json<SendMessageResponse> {
     let Some(_vtoken) = extract_vtoken(&headers) else {
-        return Json(SendMessageResponse::err(401, "Missing Authorization header"));
+        return Json(SendMessageResponse::err(
+            401,
+            "Missing Authorization header",
+        ));
     };
 
     // Extract context_token from req.msg
@@ -169,12 +171,10 @@ pub async fn sendmessage(
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
         let ctx_map = state.ctx_map.lock().await;
-        ctx_map.resolve_full(&vctx).map(|(r, p)| (r.to_string(), p.to_string()))
+        ctx_map
+            .resolve_full(&vctx)
+            .map(|(r, p)| (r.to_string(), p.to_string()))
     }
-    .map_or_else(
-        || None,
-        |pair| Some(pair),
-    )
     .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
@@ -190,7 +190,10 @@ pub async fn sendmessage(
             }
             Err(e) => {
                 warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
-                return Json(SendMessageResponse::err(500, "context_token resolution error"));
+                return Json(SendMessageResponse::err(
+                    500,
+                    "context_token resolution error",
+                ));
             }
         }
     } else {
@@ -211,7 +214,10 @@ pub async fn sendmessage(
 
     match state.upstream.send_message(req).await {
         Ok(resp) => Json(resp),
-        Err(e) => Json(SendMessageResponse::err(500, format!("upstream error: {e}"))),
+        Err(e) => Json(SendMessageResponse::err(
+            500,
+            format!("upstream error: {e}"),
+        )),
     }
 }
 
@@ -375,19 +381,31 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
 
     out.push_str("# HELP ilink_hub_messages_dispatched_total Messages dispatched\n");
     out.push_str("# TYPE ilink_hub_messages_dispatched_total counter\n");
-    out.push_str(&format!("ilink_hub_messages_dispatched_total {}\n", messages_dispatched));
+    out.push_str(&format!(
+        "ilink_hub_messages_dispatched_total {}\n",
+        messages_dispatched
+    ));
 
     out.push_str("# HELP ilink_hub_messages_dropped_total Messages dropped\n");
     out.push_str("# TYPE ilink_hub_messages_dropped_total counter\n");
-    out.push_str(&format!("ilink_hub_messages_dropped_total {}\n", messages_dropped));
+    out.push_str(&format!(
+        "ilink_hub_messages_dropped_total {}\n",
+        messages_dropped
+    ));
 
     out.push_str("# HELP ilink_hub_upstream_polls_ok_total Successful upstream polls\n");
     out.push_str("# TYPE ilink_hub_upstream_polls_ok_total counter\n");
-    out.push_str(&format!("ilink_hub_upstream_polls_ok_total {}\n", upstream_polls_ok));
+    out.push_str(&format!(
+        "ilink_hub_upstream_polls_ok_total {}\n",
+        upstream_polls_ok
+    ));
 
     out.push_str("# HELP ilink_hub_upstream_polls_err_total Failed upstream polls\n");
     out.push_str("# TYPE ilink_hub_upstream_polls_err_total counter\n");
-    out.push_str(&format!("ilink_hub_upstream_polls_err_total {}\n", upstream_polls_err));
+    out.push_str(&format!(
+        "ilink_hub_upstream_polls_err_total {}\n",
+        upstream_polls_err
+    ));
 
     out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
     out.push_str("# TYPE ilink_hub_queue_size gauge\n");

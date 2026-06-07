@@ -142,7 +142,10 @@ impl HubPairingClient {
 
     async fn save_credentials(&self, creds: &HubPairingCredentials) -> Result<()> {
         let path = self.cred_path();
-        if let Some(parent) = Path::new(&path).parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Some(parent) = Path::new(&path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
             tokio::fs::create_dir_all(parent).await?;
         }
         let data = serde_json::to_string_pretty(creds)?;
@@ -250,7 +253,9 @@ impl HubPairingClient {
                         account_id: body
                             .ilink_bot_id
                             .unwrap_or_else(|| "ilink-hub@hub.local".to_string()),
-                        user_id: body.ilink_user_id.unwrap_or_else(|| "hub-client".to_string()),
+                        user_id: body
+                            .ilink_user_id
+                            .unwrap_or_else(|| "hub-client".to_string()),
                         saved_at: Some(chrono_now()),
                     });
                 }
@@ -265,7 +270,10 @@ impl HubPairingClient {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        Err(anyhow!("pairing timed out after {}s", PAIRING_DEADLINE.as_secs()))
+        Err(anyhow!(
+            "pairing timed out after {}s",
+            PAIRING_DEADLINE.as_secs()
+        ))
     }
 }
 

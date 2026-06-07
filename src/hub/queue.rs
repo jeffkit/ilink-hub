@@ -98,7 +98,10 @@ impl ClientQueue {
     pub fn push(&mut self, msg: WeixinMessage) -> bool {
         let dropped = if self.pending.len() >= MAX_QUEUE_SIZE {
             self.pending.pop_front();
-            warn!(max = MAX_QUEUE_SIZE, "client queue full, dropping oldest message");
+            warn!(
+                max = MAX_QUEUE_SIZE,
+                "client queue full, dropping oldest message"
+            );
             true
         } else {
             false

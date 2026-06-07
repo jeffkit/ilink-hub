@@ -35,6 +35,10 @@
 /use server-prod
 ```
 
+::: tip Bridge 也是普通客户端
+[`ilink-hub-bridge`](/bridge/quick-try) 注册时同样有一个 `--name`，例如 `local-bridge`。只有执行 `/use local-bridge` 后，微信里的普通消息才会交给该进程上的本地 CLI。
+:::
+
 **回复示例：**
 
 ```

@@ -19,6 +19,7 @@ export default defineConfig({
 
     nav: [
       { text: '快速入门', link: '/guide/getting-started' },
+      { text: '本地 CLI', link: '/bridge/quick-try' },
       { text: '配置参考', link: '/reference/configuration' },
       { text: 'API 参考', link: '/reference/api' },
       {
@@ -41,6 +42,13 @@ export default defineConfig({
           { text: '注册客户端', link: '/guide/register-client' },
           { text: '手机扫码配对', link: '/guide/pairing-tunnel' },
           { text: '配置 AI 客户端', link: '/guide/client-config' },
+        ],
+      },
+      {
+        text: '本地 CLI Bridge',
+        items: [
+          { text: '5 分钟上手', link: '/bridge/quick-try' },
+          { text: '功能与配置', link: '/bridge/README' },
         ],
       },
       {

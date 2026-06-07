@@ -55,6 +55,13 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub
 
 这是设计行为。iLink Hub 同一时间只有一个「活跃客户端」接收消息，用微信命令 `/use <name>` 切换。如需同时发给所有客户端，用 `/broadcast <消息>`。
 
+### Q: `ilink-hub-bridge` 一直在线但微信发文字没反应 {#bridge-no-msg}
+
+1. 确认已对该后端执行 `/use <注册时用的 name>`，且 `/list` 里该客户端为 **在线**  
+2. 看 bridge 终端：是否有 `getupdates` 报错、或 `spawn` / 超时日志  
+3. 配置里 `require_text: true` 时，纯图片/语音不会触发 CLI；先发纯文本试 `echo` 链路（见 [5 分钟上手](/bridge/quick-try)）  
+4. Hub URL / Token 是否与 `ilink-hub register` 输出一致（勿多空格）
+
 ### Q: 注册时提示「name already exists」
 
 客户端名称已存在。要么选一个不同的名称，要么先删除旧客户端（通过 Web UI 或 API）。

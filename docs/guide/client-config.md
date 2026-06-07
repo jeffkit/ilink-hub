@@ -19,6 +19,19 @@ Rust 可复用 `ilink_hub::client::HubPairingClient`；或直接运行 `examples
 各 SDK 对 Hub 的兼容情况、以及我们为打通它们提交的上游 PR 进度，见 [SDK 兼容性与推进动态](./sdk-compatibility.md)。
 :::
 
+## ilink-hub-bridge（本地 CLI）
+
+官方提供的 **`ilink-hub-bridge`** 与上面客户端**协议相同**：也是虚拟 Token + `getupdates` / `sendmessage`。区别在于它不内置「大模型」，而是每收到一条**用户文本**，就在本机 `spawn` 你在 YAML 里配置的命令，把 **stdout** 发回微信。
+
+适合：把 **Claude Code、Codex、自写脚本** 接到微信，又不需要改 Hub 代码。
+
+::: tip 推荐路径
+1. 先跟文档站 [5 分钟上手：echo 链路](/bridge/quick-try) 跑通  
+2. 再读 [功能与配置](/bridge/README) 替换 `command` / `args`、调超时与占位符 `{{MESSAGE}}`  
+:::
+
+与 Recursive / OpenClaw **可同时注册**：多占一个 `--name`，用微信 `/use` 在「大模型客户端」和「CLI bridge」之间切换。
+
 ## Recursive
 
 ::: code-group

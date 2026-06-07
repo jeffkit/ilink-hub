@@ -3,7 +3,10 @@ use clap::Parser;
 use tracing::info;
 
 #[derive(Parser)]
-#[command(name = "ilink-relay", about = "Public pairing relay for iLink Hub (zero-config phone binding)")]
+#[command(
+    name = "ilink-relay",
+    about = "Public pairing relay for iLink Hub (zero-config phone binding)"
+)]
 struct Cli {
     /// Listen address
     #[arg(long, default_value = "127.0.0.1:8789", env = "ILINK_RELAY_ADDR")]

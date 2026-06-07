@@ -128,9 +128,10 @@ pub struct WeixinMessage {
 impl WeixinMessage {
     /// Extract the text content from the first text MessageItem.
     pub fn text(&self) -> Option<&str> {
-        self.item_list.as_ref()?.iter().find_map(|item| {
-            item.text_item.as_ref()?.text.as_deref()
-        })
+        self.item_list
+            .as_ref()?
+            .iter()
+            .find_map(|item| item.text_item.as_ref()?.text.as_deref())
     }
 
     /// Build a text reply to this message.
@@ -275,10 +276,16 @@ pub struct SendMessageResponse {
 
 impl SendMessageResponse {
     pub fn ok() -> Self {
-        Self { ret: Some(0), errmsg: None }
+        Self {
+            ret: Some(0),
+            errmsg: None,
+        }
     }
     pub fn err(code: i32, msg: impl Into<String>) -> Self {
-        Self { ret: Some(code), errmsg: Some(msg.into()) }
+        Self {
+            ret: Some(code),
+            errmsg: Some(msg.into()),
+        }
     }
 }
 

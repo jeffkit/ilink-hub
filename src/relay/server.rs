@@ -72,7 +72,10 @@ pub fn build_relay_router() -> Router {
 }
 
 async fn health() -> impl IntoResponse {
-    (StatusCode::OK, r#"{"status":"healthy","service":"ilink-relay"}"#)
+    (
+        StatusCode::OK,
+        r#"{"status":"healthy","service":"ilink-relay"}"#,
+    )
 }
 
 async fn ws_pairing(
@@ -99,14 +102,8 @@ async fn accept_registration(
     }
 
     let verifying_key = verifying_key_from_b64(public_key).map_err(|e| e.to_string())?;
-    verify_register(
-        &verifying_key,
-        device_id,
-        timestamp,
-        signature,
-        unix_now(),
-    )
-    .map_err(|e| e.to_string())?;
+    verify_register(&verifying_key, device_id, timestamp, signature, unix_now())
+        .map_err(|e| e.to_string())?;
 
     let key_bytes = verifying_key.to_bytes();
     let mut keys = state.device_keys.write().await;
@@ -244,7 +241,13 @@ async fn forward_to_hub(
 }
 
 fn relay_response_to_http(resp: RelayMessage) -> Response {
-    let RelayMessage::Response { status, headers, body, .. } = resp else {
+    let RelayMessage::Response {
+        status,
+        headers,
+        body,
+        ..
+    } = resp
+    else {
         return (StatusCode::BAD_GATEWAY, "invalid relay response").into_response();
     };
 
@@ -256,15 +259,9 @@ fn relay_response_to_http(resp: RelayMessage) -> Response {
         builder = builder.header(k, v);
     }
     let body = body.unwrap_or_default();
-    builder
-        .body(Body::from(body))
-        .unwrap_or_else(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "response build error",
-            )
-                .into_response()
-        })
+    builder.body(Body::from(body)).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "response build error").into_response()
+    })
 }
 
 fn check_pair_rate(state: &RelayState, addr: &SocketAddr) -> Result<(), StatusCode> {

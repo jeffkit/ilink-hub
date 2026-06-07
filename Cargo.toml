@@ -21,6 +21,10 @@ path = "src/main.rs"
 name = "ilink-relay"
 path = "src/bin/ilink-relay.rs"
 
+[[bin]]
+name = "ilink-hub-bridge"
+path = "src/bin/ilink-hub-bridge.rs"
+
 [lib]
 name = "ilink_hub"
 path = "src/lib.rs"
@@ -66,6 +70,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgre
 # Config
 config = "0.14"
 dirs = "5"
+serde_yaml = "0.9"
 
 # QR code display in terminal
 qrcode = "0.14"

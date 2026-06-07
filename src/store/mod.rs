@@ -282,10 +282,7 @@ impl Store {
     }
 
     /// Resolve a virtual context token to `(real_ctx, peer_user_id)`.
-    pub async fn resolve_context_token_full(
-        &self,
-        vctx: &str,
-    ) -> Result<Option<(String, String)>> {
+    pub async fn resolve_context_token_full(&self, vctx: &str) -> Result<Option<(String, String)>> {
         let row = sqlx::query(
             "SELECT real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
              FROM context_token_map WHERE vctx = $1",

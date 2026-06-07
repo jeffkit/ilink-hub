@@ -2,4 +2,4 @@
 
 pub mod pairing;
 
-pub use pairing::{HubPairingCredentials, HubPairingOptions, HubPairingClient};
+pub use pairing::{HubPairingClient, HubPairingCredentials, HubPairingOptions};

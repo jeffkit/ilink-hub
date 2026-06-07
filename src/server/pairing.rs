@@ -246,7 +246,9 @@ pub async fn pair_page(
         let name = session.client_name.as_deref().unwrap_or("client");
         return (
             StatusCode::OK,
-            Html(format!("<h1>已配对</h1><p>客户端 <strong>{name}</strong> 已成功接入。</p>")),
+            Html(format!(
+                "<h1>已配对</h1><p>客户端 <strong>{name}</strong> 已成功接入。</p>"
+            )),
         )
             .into_response();
     }

@@ -1,0 +1,5 @@
+# 调试用：把用户消息 echo 回去（需系统有 echo）
+command: echo
+args: ["{{MESSAGE}}"]
+stdin: none
+timeout_secs: 10
