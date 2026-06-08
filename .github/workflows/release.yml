@@ -340,7 +340,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-native, publish-crates, build-desktop, publish-npm]
+    needs: [build-native, publish-crates, build-desktop]
     steps:
       - uses: actions/checkout@v4
 
