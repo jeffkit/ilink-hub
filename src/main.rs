@@ -104,6 +104,8 @@ async fn main() -> Result<()> {
                     addr,
                     ilink_base_url,
                     database_url,
+                    on_listening: None,
+                    qr_login_ui: None,
                 },
                 shutdown_rx,
             )

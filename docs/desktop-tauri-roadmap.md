@@ -8,7 +8,7 @@
 - 桌面子工程 **独立目录**、**独立构建**；未加入根 `[workspace]` 前，在仓库根执行 `cargo build` / `cargo test` 与现在完全一致。
 - CLI 子命令（`serve` / `login` / `register` / `clients`）逻辑以 **单一事实来源** 为准：优先抽到 `ilink_hub` 库或共享模块，桌面与 CLI 共用，避免双份实现。
 
-**最后更新**：2026-06-07
+**最后更新**：2026-06-08
 
 ---
 
@@ -69,7 +69,7 @@ Hub 启动逻辑已迁入 `ilink_hub::runtime::serve`，由 CLI 与未来的 Tau
 | 4.1 | 简单页：服务状态、监听地址、`DATABASE_URL` 只读或高级设置 | 可本地打开 |
 | 4.2 | 日志：`tracing` 订阅层把事件推到 Tauri event / 前端只读区域，或轮询小日志 API（若后续加管理接口） | 可观察启动错误 |
 | 4.3 | QR 登录：扩展 `LoginClient` 或 `resolve_token` 支持「生成 PNG / data URL」回调，在 WebView 展示；或桌面内嵌 `ilogin` 子命令输出到临时 HTML | 无需依赖终端扫码即可完成首次绑定 |
-| 4.4 | 与现有 `/hub/ui` 关系：可选「在浏览器打开管理页」按钮，与内嵌页二选一或并存 | 产品决策写入本文档 |
+| 4.4 | 与 `/hub/ui` 关系：桌面主窗口为**紧凑原生 UI**（状态 + 客户端列表 + 插件占位）；完整注册 / 复制 Token 等仍在浏览器 `/hub/ui`。列表通过本机 HTTP `GET /hub/clients` 拉取（未设置 `ILINK_ADMIN_TOKEN` 时免鉴权；已设置时需为桌面进程配置相同环境变量） | 已写入本文档 |
 
 ---
 
@@ -77,8 +77,8 @@ Hub 启动逻辑已迁入 `ilink_hub::runtime::serve`，由 CLI 与未来的 Tau
 
 | 任务 | 说明 | 验收 |
 |------|------|------|
-| 5.1 | GitHub Actions 单独 workflow：`desktop` 路径变更时构建 `.dmg` / `.msi` / `.AppImage`（按需） | Release 可附桌面制品 |
-| 5.2 | 根 `README.md` 增加「桌面版」小节：构建前提、与 CLI 关系、数据目录 | 用户可自助安装 |
+| 5.1 | 在 **推送 `v*` tag** 的 `release.yml` 中增加 `build-desktop` job：构建 `ilink-hub-desktop-{macos-aarch64,macos-x86_64,windows-x86_64,linux-x86_64}.{dmg,msi,deb}` 并随 Release 上传 | Release Assets 含 `ilink-hub-desktop-*` |
+| 5.2 | 文档站 [安装](/guide/installation#desktop) + 首页入口；根 `README` 指向 Releases 桌面包 | 公众可从文档/GitHub 获取安装包 |
 
 ---
 

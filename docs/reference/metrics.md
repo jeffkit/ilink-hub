@@ -14,29 +14,25 @@ curl http://localhost:8765/metrics
 
 ## 指标列表
 
-### 消息相关
+以下为当前实现中实际输出的指标名（与 `/metrics` 文本一致）。
+
+### 客户端与队列
 
 | 指标名 | 类型 | 说明 |
 |--------|------|------|
-| `ilink_hub_messages_routed_total` | Counter | 成功路由到客户端的消息总数 |
-| `ilink_hub_messages_dropped_total` | Counter | 因队列满而丢弃的消息总数（head-drop） |
-| `ilink_hub_messages_broadcast_total` | Counter | 广播消息总数 |
-| `ilink_hub_upstream_poll_errors_total` | Counter | 上游轮询失败次数 |
+| `ilink_hub_clients_online` | Gauge | 当前在线后端数量 |
+| `ilink_hub_clients_total` | Gauge | 已注册后端总数 |
+| `ilink_hub_queue_size` | Gauge（带 `client` 标签） | 每个后端当前待下发队列长度 |
 
-### 客户端相关
-
-| 指标名 | 类型 | 说明 |
-|--------|------|------|
-| `ilink_hub_clients_active` | Gauge | 当前在线客户端数量 |
-| `ilink_hub_clients_total` | Gauge | 已注册客户端总数 |
-| `ilink_hub_queue_size` | Gauge（带 `client` 标签） | 每个客户端当前队列长度 |
-
-### HTTP 请求
+### 消息与上游
 
 | 指标名 | 类型 | 说明 |
 |--------|------|------|
-| `ilink_hub_http_requests_total` | Counter（带 `method`、`path`、`status` 标签） | HTTP 请求总数 |
-| `ilink_hub_http_request_duration_seconds` | Histogram | HTTP 请求延迟分布 |
+| `ilink_hub_messages_dispatched_total` | Counter | 已尝试下发到后端队列的消息条数（含广播分支中每个目标一条） |
+| `ilink_hub_messages_dropped_total` | Counter | 因队列满或推送失败而丢弃的条数 |
+| `ilink_hub_upstream_user_messages_total` | Counter | 从微信上游进入 Hub 并参与路由的消息条数（不含 `message_type == 2` 的 bot echo 副本） |
+| `ilink_hub_upstream_polls_ok_total` | Counter | 上游 `getupdates` 长轮询成功次数 |
+| `ilink_hub_upstream_polls_err_total` | Counter | 上游轮询失败或错误响应次数 |
 
 ## 示例 Prometheus 配置
 
@@ -52,22 +48,20 @@ scrape_configs:
 
 ## 示例 Grafana 面板查询
 
-**消息路由速率（每分钟）：**
+**消息下发速率（每分钟）：**
+
 ```promql
-rate(ilink_hub_messages_routed_total[1m]) * 60
+rate(ilink_hub_messages_dispatched_total[1m]) * 60
 ```
 
 **消息丢弃率（告警用）：**
+
 ```promql
 rate(ilink_hub_messages_dropped_total[5m]) > 0
 ```
 
 **在线客户端数量：**
-```promql
-ilink_hub_clients_active
-```
 
-**API 请求 P95 延迟：**
 ```promql
-histogram_quantile(0.95, rate(ilink_hub_http_request_duration_seconds_bucket[5m]))
+ilink_hub_clients_online
 ```

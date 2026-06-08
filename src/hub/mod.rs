@@ -31,6 +31,9 @@ pub use router::{HubCommand, Router, RoutingDecision};
 pub struct Metrics {
     pub messages_dispatched: AtomicU64,
     pub messages_dropped: AtomicU64,
+    /// User-side (or command) messages taken from upstream and passed into routing
+    /// (excludes bot-side echo copies with `message_type == 2`).
+    pub upstream_user_messages: AtomicU64,
 }
 
 impl Metrics {
@@ -38,6 +41,7 @@ impl Metrics {
         Self {
             messages_dispatched: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
+            upstream_user_messages: AtomicU64::new(0),
         }
     }
 }
@@ -111,6 +115,11 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         q.observe_upstream_bot_message(&msg);
         return;
     }
+
+    state
+        .metrics
+        .upstream_user_messages
+        .fetch_add(1, Ordering::Relaxed);
 
     let routing = {
         let router = state.router.lock().await;
@@ -377,10 +386,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         if let Some(cid) = m.client_id.as_deref().filter(|s| !s.is_empty()) {
             let index_hub_quote = matches!(
                 &cmd,
-                HubCommand::List
-                    | HubCommand::Status
-                    | HubCommand::Help
-                    | HubCommand::UseClient(_)
+                HubCommand::List | HubCommand::Status | HubCommand::Help | HubCommand::UseClient(_)
             );
             if index_hub_quote {
                 let mut q = state.quote_index.lock().await;

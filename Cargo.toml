@@ -1,6 +1,6 @@
 [package]
 name = "ilink-hub"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
 description = "iLink-compatible multiplexer hub for WeChat ClawBot — route one WeChat account to multiple AI agent backends"
 license = "MIT"
@@ -73,7 +73,7 @@ dirs = "5"
 serde_yaml = "0.9"
 
 # QR code display in terminal
-qrcode = "0.14"
+qrcode = { version = "0.14", features = ["svg"] }
 
 # Pairing relay WebSocket + registration auth
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }

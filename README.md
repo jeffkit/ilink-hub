@@ -51,7 +51,9 @@ iLink Hub is a **transparent iLink proxy**:
 
 ### Desktop app (Tauri)
 
-A **Tauri 2** desktop shell lives under [`desktop/ilink-hub-desktop/`](desktop/ilink-hub-desktop/): it embeds the same [`run_serve`](src/runtime/serve.rs) runtime as `ilink-hub serve` (default listen `127.0.0.1:8765`, SQLite under the OS app data dir). The root crate stays out of any workspace with this app, so `cargo build` / `cargo test` at the repo root are unchanged. See [`desktop/ilink-hub-desktop/README.md`](desktop/ilink-hub-desktop/README.md) for `npm run tauri dev` / `tauri build`. Longer-term notes: [`docs/desktop-tauri-roadmap.md`](docs/desktop-tauri-roadmap.md).
+A **Tauri 2** desktop shell lives under [`desktop/ilink-hub-desktop/`](desktop/ilink-hub-desktop/): it embeds the same [`run_serve`](src/runtime/serve.rs) runtime as `ilink-hub serve` (default listen `127.0.0.1:8765`, SQLite under the OS app data dir). The root crate stays out of any workspace with this app, so `cargo build` / `cargo test` at the repo root are unchanged.
+
+**Prebuilt installers** (`.dmg` / `.msi` / `.deb`, filenames prefixed with `ilink-hub-desktop-`) are attached to [GitHub Releases](https://github.com/jeffkit/ilink-hub/releases) when a `v*` tag is published (same workflow as CLI binaries). User-facing install notes: [docs — 安装（桌面版）](docs/guide/installation.md#desktop). Dev commands and data paths: [`desktop/ilink-hub-desktop/README.md`](desktop/ilink-hub-desktop/README.md). Roadmap: [`docs/desktop-tauri-roadmap.md`](docs/desktop-tauri-roadmap.md).
 
 ---
 

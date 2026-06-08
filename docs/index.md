@@ -6,12 +6,15 @@ hero:
   text: 一个微信账号，连接多个 AI 后端
   tagline: 透明代理，零客户端改造。让 Recursive、OpenClaw 等多个 AI 工具同时接入同一个微信账号。
   image:
-    src: /logo.svg
+    src: /logo.png
     alt: iLink Hub
   actions:
     - theme: brand
       text: 快速开始
       link: /guide/getting-started
+    - theme: alt
+      text: 下载桌面版
+      link: /guide/installation#desktop
     - theme: alt
       text: 本地 CLI 体验
       link: /bridge/quick-try

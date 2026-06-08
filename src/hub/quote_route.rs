@@ -161,8 +161,7 @@ impl QuoteRouteIndex {
 
     fn evict_expired(&mut self) {
         let now = Instant::now();
-        self.pending_by_client_id
-            .retain(|_, p| now <= p.deadline);
+        self.pending_by_client_id.retain(|_, p| now <= p.deadline);
         self.by_msg_key.retain(|_, v| now <= v.deadline);
     }
 }
@@ -294,7 +293,10 @@ mod tests {
                 cmd: HubCommand::List,
             }),
         );
-        assert!(matches!(out, RoutingDecision::HubInternal(HubCommand::List)));
+        assert!(matches!(
+            out,
+            RoutingDecision::HubInternal(HubCommand::List)
+        ));
     }
 
     #[test]
@@ -308,7 +310,10 @@ mod tests {
                 label: None,
             }),
         );
-        assert!(matches!(out, RoutingDecision::HubInternal(HubCommand::Status)));
+        assert!(matches!(
+            out,
+            RoutingDecision::HubInternal(HubCommand::Status)
+        ));
     }
 
     #[test]

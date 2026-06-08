@@ -89,7 +89,7 @@ mod context_map_tests {
         let v1 = m.map("real-ctx".into(), "user1".into());
         let v2 = m.map("real-ctx".into(), "user1".into());
         assert_eq!(v1, v2);
-        assert_eq!(m.resolve(&v1), Some("real-ctx".as_ref()));
+        assert_eq!(m.resolve(&v1), Some("real-ctx"));
         assert_eq!(m.resolve_full(&v1), Some(("real-ctx", "user1")));
     }
 

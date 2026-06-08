@@ -6,24 +6,42 @@
 //! process should stop (e.g. Ctrl+C in the CLI, or app exit in a desktop shell). The same
 //! receiver is cloned for the upstream polling task and for Axum graceful shutdown.
 
+use std::fmt;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
 use crate::hub::{spawn_dispatcher, spawn_health_checker, HubState, InMemoryQueue, MessageQueue};
-use crate::ilink::{LoginClient, UpstreamClient};
+use crate::ilink::{LoginClient, QrLoginUiEvent, UpstreamClient};
 use crate::server::build_router;
 use crate::store::Store;
 
 /// Arguments for [`run_serve`], matching the `ilink-hub serve` CLI flags.
-#[derive(Debug, Clone)]
 pub struct ServeOptions {
     pub token: Option<String>,
     pub addr: String,
     pub ilink_base_url: Option<String>,
     pub database_url: String,
+    /// After [`TcpListener::bind`] succeeds, sends the bound socket display string (e.g.
+    /// `127.0.0.1:8765`). Embedders use this to avoid showing a listen address before bind.
+    pub on_listening: Option<tokio::sync::oneshot::Sender<String>>,
+    /// Optional channel for WeChat QR login UI (desktop); [`None`] keeps terminal-only flow.
+    pub qr_login_ui: Option<mpsc::UnboundedSender<QrLoginUiEvent>>,
+}
+
+impl fmt::Debug for ServeOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServeOptions")
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("addr", &self.addr)
+            .field("ilink_base_url", &self.ilink_base_url)
+            .field("database_url", &self.database_url)
+            .field("on_listening", &self.on_listening.is_some())
+            .field("qr_login_ui", &self.qr_login_ui.is_some())
+            .finish()
+    }
 }
 
 /// Run the hub HTTP server until `shutdown` signals `true`.
@@ -36,13 +54,16 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         addr,
         ilink_base_url,
         database_url,
+        on_listening,
+        qr_login_ui,
     } = opts;
 
     info!(%addr, %database_url, "iLink Hub starting");
 
     let store = Arc::new(Store::connect(&database_url).await?);
 
-    let (token, base_url) = resolve_token(token_arg, ilink_base_url, store.clone()).await?;
+    let (token, base_url) =
+        resolve_token(token_arg, ilink_base_url, store.clone(), qr_login_ui).await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url)));
     let queue = build_queue_backend();
@@ -85,6 +106,13 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let router = build_router(state);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let local_display = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| addr.clone());
+    if let Some(tx) = on_listening {
+        let _ = tx.send(local_display);
+    }
     info!(%addr, "iLink Hub listening");
 
     axum::serve(listener, router)
@@ -105,7 +133,9 @@ async fn resolve_token(
     token_arg: Option<String>,
     ilink_base_url: Option<String>,
     store: Arc<Store>,
+    qr_login_ui: Option<mpsc::UnboundedSender<QrLoginUiEvent>>,
 ) -> Result<(String, String)> {
+    let quiet_ui = qr_login_ui.is_some();
     let default_base = "https://ilinkai.weixin.qq.com".to_string();
     let from_cli = token_arg.is_some();
 
@@ -135,19 +165,23 @@ async fn resolve_token(
             return Ok((token, base));
         }
         warn!("iLink token invalid or expired");
-        println!();
-        println!("⚠️  未检测到有效的 iLink 微信登录态，请扫描下方二维码完成登录。");
-        println!();
+        if !quiet_ui {
+            println!();
+            println!("⚠️  未检测到有效的 iLink 微信登录态，请扫描下方二维码完成登录。");
+            println!();
+        }
     } else {
         info!("no iLink token found, starting QR login");
-        println!();
-        println!("首次启动需要绑定微信机器人，请扫描下方二维码登录。");
-        println!();
+        if !quiet_ui {
+            println!();
+            println!("首次启动需要绑定微信机器人，请扫描下方二维码登录。");
+            println!();
+        }
     }
 
     let login_base = ilink_base_url.clone();
     let login_client = LoginClient::new(ilink_base_url);
-    let token = login_client.login_with_qr().await?;
+    let token = login_client.login_with_qr_ui(qr_login_ui).await?;
     let base = login_base.unwrap_or(default_base);
     store.save_credentials(&token, &base).await?;
     info!("iLink login successful, token saved");

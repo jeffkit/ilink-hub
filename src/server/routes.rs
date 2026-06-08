@@ -218,8 +218,7 @@ pub async fn sendmessage(
         };
 
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
-        if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref())
-        {
+        if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {
             if let Some((ref name, ref label)) = client_meta {
                 crate::hub::append_outbound_origin_footer_to_first_text_item(
                     msg,
@@ -394,6 +393,7 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
 
     let messages_dispatched = state.metrics.messages_dispatched.load(Ordering::Relaxed);
     let messages_dropped = state.metrics.messages_dropped.load(Ordering::Relaxed);
+    let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
     let upstream_polls_ok = state.upstream.polls_ok.load(Ordering::Relaxed);
     let upstream_polls_err = state.upstream.polls_err.load(Ordering::Relaxed);
 
@@ -419,6 +419,13 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     out.push_str(&format!(
         "ilink_hub_messages_dropped_total {}\n",
         messages_dropped
+    ));
+
+    out.push_str("# HELP ilink_hub_upstream_user_messages_total User-side messages received from upstream (excl. bot echo copies)\n");
+    out.push_str("# TYPE ilink_hub_upstream_user_messages_total counter\n");
+    out.push_str(&format!(
+        "ilink_hub_upstream_user_messages_total {}\n",
+        upstream_user_messages
     ));
 
     out.push_str("# HELP ilink_hub_upstream_polls_ok_total Successful upstream polls\n");

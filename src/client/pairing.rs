@@ -277,6 +277,27 @@ impl HubPairingClient {
     }
 }
 
+/// Encode `payload` (usually a URL) as a QR code and return a base64 SVG `data:` URI for `<img src>`.
+pub fn encode_qr_svg_data_uri(payload: &str) -> Result<String> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+    use qrcode::render::svg;
+    use qrcode::{EcLevel, QrCode};
+
+    let code = QrCode::with_error_correction_level(payload.as_bytes(), EcLevel::L)
+        .map_err(|e| anyhow!("QR encode error: {e}"))?;
+    let svg = code
+        .render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .max_dimensions(360, 360)
+        .dark_color(svg::Color("#111111"))
+        .light_color(svg::Color("#ffffff"))
+        .build();
+    Ok(format!(
+        "data:image/svg+xml;base64,{}",
+        B64.encode(svg.as_bytes())
+    ))
+}
+
 /// Render a URL as a terminal QR code (same approach as OpenClaw `qrcode-terminal`).
 pub fn render_qr_terminal(url: &str) -> Result<()> {
     use qrcode::render::unicode;

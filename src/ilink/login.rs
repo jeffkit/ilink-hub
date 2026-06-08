@@ -4,9 +4,22 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use std::time::Duration;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
 use super::types::*;
+
+/// UI hints for embedders (e.g. Tauri) during WeChat QR login — safe to serialize to the webview.
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind")]
+pub enum QrLoginUiEvent {
+    #[serde(rename = "ready")]
+    Ready { image: String, link: String },
+    #[serde(rename = "status")]
+    Status { message: String },
+    #[serde(rename = "done")]
+    Done,
+}
 
 pub struct LoginClient {
     client: Client,
@@ -25,34 +38,48 @@ impl LoginClient {
     }
 
     /// Full QR login flow — prints QR to terminal, polls until scanned.
-    /// Returns (bot_token, bot_type) on success.
     pub async fn login_with_qr(&self) -> Result<String> {
+        self.login_with_qr_ui(None).await
+    }
+
+    /// Same as [`login_with_qr`], but can push QR + status to `ui` (e.g. a desktop window).
+    pub async fn login_with_qr_ui(
+        &self,
+        ui: Option<UnboundedSender<QrLoginUiEvent>>,
+    ) -> Result<String> {
         info!("Starting iLink QR login");
 
-        // Step 1: Get QR code
         let qr_resp = self.get_qrcode().await?;
-        // `qrcode` is the key/identifier used for polling
         let key = qr_resp
             .qrcode
             .ok_or_else(|| anyhow!("no qrcode key in response"))?;
-        // `qrcode_img_content` is the URL to render as a QR code
         let qr_url = qr_resp
             .qrcode_img_content
             .ok_or_else(|| anyhow!("no qrcode URL in response"))?;
 
-        // Step 2: Render QR code in terminal
-        println!("\n╔══════════════════════════════════════╗");
-        println!("║     WeChat ClawBot Login              ║");
-        println!("╚══════════════════════════════════════╝");
-        println!();
-        crate::client::pairing::render_qr_terminal(&qr_url)?;
-        println!();
-        println!("Scan the QR code with WeChat to log in.");
-        println!("QR URL: {}", qr_url);
-        println!();
+        if let Some(ref tx) = ui {
+            let image = crate::client::pairing::encode_qr_svg_data_uri(&qr_url)?;
+            let _ = tx.send(QrLoginUiEvent::Ready {
+                image,
+                link: qr_url.clone(),
+            });
+        } else {
+            println!("\n╔══════════════════════════════════════╗");
+            println!("║     WeChat ClawBot Login              ║");
+            println!("╚══════════════════════════════════════╝");
+            println!();
+            crate::client::pairing::render_qr_terminal(&qr_url)?;
+            println!();
+            println!("Scan the QR code with WeChat to log in.");
+            println!("QR URL: {}", qr_url);
+            println!();
+        }
 
-        // Step 3: Poll for scan
-        self.poll_qrcode_status(&key).await
+        let out = self.poll_qrcode_status(&key, ui.as_ref()).await;
+        if let Some(tx) = &ui {
+            let _ = tx.send(QrLoginUiEvent::Done);
+        }
+        out
     }
 
     async fn get_qrcode(&self) -> Result<GetQrcodeResponse> {
@@ -73,7 +100,11 @@ impl LoginClient {
         Ok(resp)
     }
 
-    async fn poll_qrcode_status(&self, key: &str) -> Result<String> {
+    async fn poll_qrcode_status(
+        &self,
+        key: &str,
+        ui: Option<&UnboundedSender<QrLoginUiEvent>>,
+    ) -> Result<String> {
         let url = format!(
             "{}/ilink/bot/get_qrcode_status?qrcode={}",
             self.base_url, key
@@ -104,13 +135,15 @@ impl LoginClient {
                 }
             };
 
-            // API returns status as a string: "wait" | "confirmed" | "expired"
             match resp.status.as_deref() {
-                Some("wait") | None => {
-                    // Still waiting for scan
-                }
+                Some("wait") | None => {}
                 Some("scaned") | Some("scanned") => {
                     info!("QR code scanned, waiting for confirmation...");
+                    if let Some(tx) = ui {
+                        let _ = tx.send(QrLoginUiEvent::Status {
+                            message: "已在手机上扫码，请在微信里确认登录".into(),
+                        });
+                    }
                 }
                 Some("confirmed") => {
                     if let Some(token) = resp.bot_token {
@@ -129,7 +162,6 @@ impl LoginClient {
                             resp.errmsg.as_deref().unwrap_or(status)
                         ));
                     }
-                    // Unknown status — log and keep polling
                     warn!(status, "unknown qrcode status, continuing to poll");
                 }
             }

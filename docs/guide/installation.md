@@ -16,7 +16,7 @@ ilink-hub --version
 ilink-hub-bridge --version
 ```
 
-从 **v0.1.7** 起（**v0.1.8** 起包含凭证保护与 `--force-register` 等 bridge 更新；**v0.1.9** 起为多后端默认展示名脚注与引用路由相关改进），同一 formula 会安装 **`ilink-hub`** 与 **`ilink-hub-bridge`** 两个命令（均来自同一 GitHub Release 标签）。若 `brew install` 后没有 `ilink-hub-bridge`，请先执行 `brew update` 再升级：
+从 **v0.1.7** 起（**v0.1.8** 起包含凭证保护与 `--force-register` 等 bridge 更新；**v0.1.9** 起为多后端默认展示名脚注与引用路由相关改进；**v0.1.10** 起 GitHub Release 附带 Tauri 桌面安装包 `ilink-hub-desktop-*`），同一 formula 会安装 **`ilink-hub`** 与 **`ilink-hub-bridge`** 两个命令（均来自同一 GitHub Release 标签）。若 `brew install` 后没有 `ilink-hub-bridge`，请先执行 `brew update` 再升级：
 
 ```bash
 brew update
@@ -109,6 +109,44 @@ cd ilink-hub
 cargo build --release
 # 二进制在 target/release/ilink-hub
 ```
+
+---
+
+## 方式五：桌面应用（Tauri） {#desktop}
+
+与命令行 `ilink-hub serve` 使用同一套运行时（默认监听 `127.0.0.1:8765`，首次绑定微信时窗口内展示二维码）。数据库位于各系统用户数据目录下的 `ilink-hub-desktop/ilink-hub.db`，与 CLI 默认的当前目录 `./ilink-hub.db` 不同。
+
+### 从哪里下载
+
+在 **[GitHub Releases](https://github.com/jeffkit/ilink-hub/releases)** 的对应版本中，查找以下 **Assets**（文件名以 `ilink-hub-desktop-` 开头）。自 **推送 `v*` 版本 tag 并完成 Release 流水线**起，这些文件会随 `ilink-hub` 预编译二进制一并由 CI 上传；若某个历史版本没有这些条目，说明该 tag 发布时尚未包含桌面构建，请改用 [预编译二进制](#方式二预编译二进制) 或 [从源码打包桌面包](#自行从源码打包安装包)。
+
+| 文件 | 适用环境 |
+|------|----------|
+| `ilink-hub-desktop-macos-aarch64.dmg` | macOS Apple Silicon（M 系列） |
+| `ilink-hub-desktop-macos-x86_64.dmg` | macOS Intel |
+| `ilink-hub-desktop-windows-x86_64.msi` | Windows 64 位 |
+| `ilink-hub-desktop-linux-x86_64.deb` | Debian / Ubuntu 等 x86_64 |
+
+使用 **`…/releases/latest/download/<文件名>`** 可始终指向当前最新版（与 CLI 二进制下载方式一致）。
+
+### 安装后说明
+
+- **macOS**：当前 Release **未做 Apple 公证**。首次打开若被拦截，请在访达中对应用 **右键 → 打开**，或在「隐私与安全性」中允许运行。需要分发级公证时，维护者需在 CI 中配置证书与 notarization（成本与密钥管理高于 CLI）。
+- **Windows**：按 MSI 向导安装；若 SmartScreen 提示未知发布者，选择「仍要运行」或改用 CLI/Docker。
+- **Linux**：例如 `sudo apt install ./ilink-hub-desktop-linux-x86_64.deb`（路径以你下载位置为准）。依赖系统已安装的 WebKitGTK 等，与 [Tauri Linux 前置依赖](https://v2.tauri.app/start/prerequisites/) 一致。
+- **与 ilink-hub-bridge**：桌面版只负责在本机拉起 Hub；接 Claude Code / Codex 等仍按 [本地 CLI Bridge 使用指引](/bridge/USAGE) 安装 `ilink-hub-bridge` 并配置 `WEIXIN_BASE_URL=http://127.0.0.1:8765`（若改过端口则写实际地址）。
+
+### 自行从源码打包安装包
+
+若 Releases 尚未包含桌面包，或你需要本地修改后再安装：
+
+```bash
+cd desktop/ilink-hub-desktop
+npm install
+npm run tauri build
+```
+
+产物目录见 [`desktop/ilink-hub-desktop/README.md`](https://github.com/jeffkit/ilink-hub/blob/main/desktop/ilink-hub-desktop/README.md)。
 
 ---
 

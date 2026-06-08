@@ -1,0 +1,25 @@
+[package]
+name = "ilink-hub-desktop"
+version = "0.1.10"
+description = "Desktop shell for iLink Hub (Tauri)"
+authors = ["jeffkit <bbmyth@gmail.com>"]
+edition = "2021"
+publish = false
+
+[lib]
+name = "ilink_hub_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+ilink-hub = { path = "../../../" }
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+dirs = "5"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

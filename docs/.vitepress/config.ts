@@ -14,7 +14,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/logo.svg',
+    logo: '/logo.png',
     siteTitle: 'iLink Hub',
 
     nav: [
@@ -23,7 +23,7 @@ export default defineConfig({
       { text: '配置参考', link: '/reference/configuration' },
       { text: 'API 参考', link: '/reference/api' },
       {
-        text: 'v0.1.9',
+        text: 'v0.1.10',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -38,6 +38,7 @@ export default defineConfig({
           { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
           { text: '快速开始', link: '/guide/getting-started' },
           { text: '安装', link: '/guide/installation' },
+          { text: '桌面应用（下载）', link: '/guide/installation#desktop' },
           { text: 'QR 码登录（可选）', link: '/guide/login' },
           { text: '注册客户端', link: '/guide/register-client' },
           { text: '手机扫码配对', link: '/guide/pairing-tunnel' },

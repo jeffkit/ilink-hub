@@ -122,6 +122,135 @@ jobs:
           path: ${{ matrix.bridge_asset }}
           retention-days: 1
 
+  # ─── Desktop (Tauri) installers ───────────────────────────────────────────
+  build-desktop:
+    name: Desktop (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundle: dmg
+            ext: dmg
+          - name: macos-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bundle: dmg
+            ext: dmg
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundle: msi
+            ext: msi
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundle: deb
+            ext: deb
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/ilink-hub-desktop/package-lock.json
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo (Tauri)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/ilink-hub-desktop/src-tauri
+          key: desktop-${{ matrix.target }}
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            patchelf
+
+      - name: Install frontend dependencies
+        working-directory: desktop/ilink-hub-desktop
+        run: npm ci
+
+      - name: Build Tauri
+        working-directory: desktop/ilink-hub-desktop
+        env:
+          CI: true
+        run: npm run tauri build -- --ci --target ${{ matrix.target }} -b ${{ matrix.bundle }}
+
+      - name: Stage desktop bundle (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BUNDLE: ${{ matrix.bundle }}
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          ROOT="desktop/ilink-hub-desktop/src-tauri/target/${TARGET}/release/bundle"
+          mkdir -p staging
+          shopt -s nullglob
+          case "$BUNDLE" in
+            dmg) files=("$ROOT"/dmg/*.dmg) ;;
+            deb) files=("$ROOT"/deb/*.deb) ;;
+            *) echo "Unknown bundle: $BUNDLE"; exit 1 ;;
+          esac
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No bundle under $ROOT"
+            find "$ROOT" -type f 2>/dev/null | head -80 || true
+            exit 1
+          fi
+          cp "${files[0]}" "staging/ilink-hub-desktop-${NAME}.${EXT}"
+          ls -lh "staging/ilink-hub-desktop-${NAME}.${EXT}"
+
+      - name: Stage desktop bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          $root = "desktop/ilink-hub-desktop/src-tauri/target/$env:TARGET/release/bundle/msi"
+          if (-not (Test-Path $root)) {
+            Get-ChildItem -Recurse "desktop/ilink-hub-desktop/src-tauri/target/$env:TARGET/release/bundle" -ErrorAction SilentlyContinue |
+              Select-Object -First 50 | Format-Table
+            throw "MSI directory not found: $root"
+          }
+          New-Item -ItemType Directory -Force staging | Out-Null
+          $msi = Get-ChildItem "$root/*.msi" | Select-Object -First 1
+          if (-not $msi) { throw "No MSI under $root" }
+          Copy-Item $msi.FullName "staging/ilink-hub-desktop-$env:NAME.$env:EXT"
+          Get-Item "staging/ilink-hub-desktop-$env:NAME.$env:EXT" | Format-List *
+
+      - name: Upload desktop artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ilink-hub-desktop-${{ matrix.name }}
+          path: staging/ilink-hub-desktop-${{ matrix.name }}.${{ matrix.ext }}
+          retention-days: 1
+
   # ─── Docker image ─────────────────────────────────────────────────────────
   docker:
     name: Docker (ghcr.io)
@@ -184,7 +313,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-native, publish-crates]
+    needs: [build-native, publish-crates, build-desktop]
     steps:
       - uses: actions/checkout@v4
 
@@ -204,6 +333,10 @@ jobs:
           generate_release_notes: true
           body: |
             ## Install
+
+            ### Desktop app (Tauri)
+
+            Prebuilt installers are attached as `ilink-hub-desktop-*` assets (macOS `.dmg` Apple Silicon + Intel, Windows `.msi`, Linux `.deb`). Unsigned macOS builds may require **right-click → Open** the first time. Linux: `sudo apt install ./ilink-hub-desktop-linux-x86_64.deb` (or use your package manager). Same Hub behavior as `ilink-hub serve`; see [docs](https://jeffkit.github.io/ilink-hub/guide/installation#desktop).
 
             ### Linux / macOS — download binary
 

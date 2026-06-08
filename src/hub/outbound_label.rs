@@ -102,10 +102,7 @@ mod tests {
 
     #[test]
     fn format_line_same_label_skipped() {
-        assert_eq!(
-            format_outbound_origin_line("echo", Some("echo")),
-            "echo"
-        );
+        assert_eq!(format_outbound_origin_line("echo", Some("echo")), "echo");
     }
 
     #[test]

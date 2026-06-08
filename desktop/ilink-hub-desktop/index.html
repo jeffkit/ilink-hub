@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>iLink Hub</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div class="brand">
+          <img class="brand-mark" src="/logo.png" alt="iLink Hub" width="38" height="38" />
+          <div class="brand-text">
+            <h1>iLink Hub</h1>
+            <p>本机微信中转 · 多后端共用一条连接</p>
+          </div>
+        </div>
+      </header>
+
+      <div class="tabbar" role="tablist" aria-label="主功能">
+        <button type="button" class="tab" role="tab" id="tab-home" aria-controls="panel-home" aria-selected="true">首页</button>
+        <button type="button" class="tab" role="tab" id="tab-backends" aria-controls="panel-backends" aria-selected="false">后端</button>
+      </div>
+
+      <main class="content">
+        <div id="panel-home" class="tab-panel" role="tabpanel" aria-labelledby="tab-home">
+          <section class="hero" id="hero" data-state="starting">
+            <div class="hero-glow" aria-hidden="true"></div>
+            <div class="hero-top">
+              <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+              <span class="status-pill" id="status-pill">启动中</span>
+            </div>
+            <p class="hero-line" id="status-line">正在启动…</p>
+
+            <div class="hero-addr" id="hero-hub-url" hidden>
+              <span class="addr-label">后端连接地址（环境变量 WEIXIN_BASE_URL）</span>
+              <div class="addr-row">
+                <code id="hub-base-url" class="addr-value">—</code>
+                <button type="button" id="btn-copy-hub-url" class="icon-btn" title="复制地址" aria-label="复制 Hub 地址">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="9" width="11" height="11" rx="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                </button>
+              </div>
+              <p id="hero-listen-note" class="hero-sub" hidden></p>
+            </div>
+
+            <section class="stats-grid" id="stats-section" hidden aria-label="运行统计">
+              <div class="stat-card">
+                <span class="stat-label">已接入后端</span>
+                <span class="stat-value" id="stat-total">—</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">在线状态</span>
+                <span class="stat-value" id="stat-online">—</span>
+                <span class="stat-sub" id="stat-online-sub">在线数 / 已注册</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">对话次数</span>
+                <span class="stat-value" id="stat-dispatched">—</span>
+                <span class="stat-sub">已转发至后端的消息条数</span>
+              </div>
+              <div class="stat-card">
+                <span class="stat-label">用户上行次数</span>
+                <span class="stat-value" id="stat-upstream">—</span>
+                <span class="stat-sub">从微信侧进入 Hub 的消息条数</span>
+              </div>
+            </section>
+
+            <p id="bind-hint" class="callout" hidden>
+              <strong>端口可能被占用。</strong>
+              若状态一直停在「启动中」，多半是已有一个
+              <code>ilink-hub serve</code> 在运行。请先停掉它，或设置
+              <code>ILINK_HUB_ADDR=127.0.0.1:8770</code> 后重启本应用。
+            </p>
+          </section>
+        </div>
+
+        <div id="panel-backends" class="tab-panel" role="tabpanel" aria-labelledby="tab-backends" hidden>
+          <section class="block backends-unified">
+            <header class="be-header">
+              <div class="be-header-main">
+                <h2 class="be-title">接入管理</h2>
+                <p class="be-lead">已接入实例见下列表；需要新增时先点「添加后端」。</p>
+              </div>
+              <span class="counter be-counter" id="clients-counter" hidden></span>
+            </header>
+
+            <div class="be-panel be-panel-list">
+              <div class="be-list-surface">
+                <p id="clients-status" class="list-hint be-empty-hint">服务就绪后将自动刷新列表。</p>
+                <ul id="client-list" class="clients be-client-list" hidden></ul>
+              </div>
+              <button type="button" id="btn-toggle-add" class="btn-add-below" disabled aria-expanded="false">
+                添加后端
+              </button>
+              <div id="register-form-wrap" class="register-form-wrap" hidden>
+                <p class="register-hint">
+                  填写后将生成可复制的 <code>WEIXIN_BASE_URL</code> 与 <code>WEIXIN_TOKEN</code>。
+                </p>
+                <div class="register-inline form be-register-form">
+                  <div class="form-row">
+                    <label class="field">
+                      <span class="field-label">名称</span>
+                      <input type="text" id="reg-name" placeholder="例如 mac-home" autocomplete="off" spellcheck="false" />
+                    </label>
+                    <label class="field">
+                      <span class="field-label">备注</span>
+                      <input type="text" id="reg-label" placeholder="可选，如「家里的 Mac」" autocomplete="off" />
+                    </label>
+                  </div>
+                  <button type="button" id="btn-register" class="btn btn-primary btn-block btn-register">
+                    注册并生成连接配置
+                  </button>
+                  <p id="reg-msg" class="form-msg" hidden></p>
+                  <div id="reg-result" class="reg-result" hidden>
+                    <div class="reg-result-head">
+                      <span class="reg-ok">已生成配置</span>
+                      <button type="button" id="btn-copy-env" class="btn btn-ghost btn-sm">复制</button>
+                    </div>
+                    <pre class="env-block" id="reg-env"></pre>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <details class="help-collapsible be-help">
+              <summary class="help-summary">
+                <span class="help-q" aria-hidden="true">?</span>
+                <span class="help-summary-text">连接说明与微信命令</span>
+              </summary>
+              <div class="help-body">
+                <ol class="steps steps-compact">
+                  <li><span>1</span>点击「添加后端」展开表单，注册后复制 <code>WEIXIN_BASE_URL</code> 与 <code>WEIXIN_TOKEN</code>。</li>
+                  <li><span>2</span>将两个环境变量配置到你的后端（机器人 / Agent）。</li>
+                  <li><span>3</span>启动后端，稍候会出现在列表中并显示在线。</li>
+                </ol>
+                <div class="cmds cmds-compact">
+                  <div class="cmd"><code>/list</code><span>列出所有后端及状态</span></div>
+                  <div class="cmd"><code>/use &lt;名称&gt;</code><span>切换当前后端（如 <code>/use mac-home</code>）</span></div>
+                  <div class="cmd"><code>/broadcast &lt;文字&gt;</code><span>向所有在线后端群发</span></div>
+                  <div class="cmd"><code>/status</code><span>Hub 在线 / 总数</span></div>
+                </div>
+              </div>
+            </details>
+          </section>
+        </div>
+
+        <p id="error-line" class="error" hidden></p>
+      </main>
+
+      <footer class="actions">
+        <button type="button" id="btn-stop" class="btn btn-danger btn-block" disabled>
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="6" y="6" width="12" height="12" rx="2" />
+          </svg>
+          停止服务
+        </button>
+      </footer>
+    </div>
+
+    <div id="qr-modal" class="modal" hidden aria-modal="true" role="dialog">
+      <div class="modal-backdrop"></div>
+      <div class="modal-card">
+        <div class="modal-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="3" width="7" height="7" rx="1" />
+            <rect x="14" y="3" width="7" height="7" rx="1" />
+            <rect x="3" y="14" width="7" height="7" rx="1" />
+            <line x1="14" y1="14" x2="14" y2="14" />
+            <line x1="21" y1="14" x2="21" y2="14" />
+            <line x1="14" y1="21" x2="14" y2="21" />
+            <line x1="21" y1="21" x2="21" y2="21" />
+            <line x1="17.5" y1="17.5" x2="17.5" y2="17.5" />
+          </svg>
+        </div>
+        <h3>微信扫码登录</h3>
+        <p class="modal-lead">用<strong>微信</strong>扫描下方二维码，按提示完成登录。</p>
+        <div class="qr-frame">
+          <img id="qr-img" alt="微信登录二维码" />
+          <div class="qr-loading" id="qr-loading" aria-hidden="true"></div>
+        </div>
+        <p id="qr-status" class="qr-status"></p>
+        <div class="qr-actions">
+          <button type="button" id="qr-copy" class="btn btn-ghost btn-sm">复制备用链接</button>
+        </div>
+        <p class="modal-foot">二维码不显示时，可复制链接发到手机微信里打开。</p>
+      </div>
+    </div>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
