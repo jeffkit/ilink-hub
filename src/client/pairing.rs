@@ -26,6 +26,9 @@ pub struct HubPairingCredentials {
     pub user_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<String>,
+    /// Hub client name used at registration (stable across re-register).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
 }
 
 /// Options for [`HubPairingClient::pair`].
@@ -257,6 +260,7 @@ impl HubPairingClient {
                             .ilink_user_id
                             .unwrap_or_else(|| "hub-client".to_string()),
                         saved_at: Some(chrono_now()),
+                        client_name: None,
                     });
                 }
                 Some("expired") => {

@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.16] — 2026-06-08
+
+### Bridge — 稳定自动注册名
+
+**修复**
+
+- 自动注册默认使用 **`local-<hostname>-<config-stem>`**（如 `local-MacBook-ilink-claude`），不再每次生成随机 `local-<uuid>`，避免 `/list` 堆积失效后端。
+- 凭证 JSON 保存 `client_name`；token 失效重注册时复用同一名称。
+
 ## [0.1.15] — 2026-06-08
 
 ### Hub — 多轮对话 session 连续性

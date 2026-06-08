@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
             account_id: "ilink-hub-client".to_string(),
             user_id: "hub-client".to_string(),
             saved_at: None,
+            client_name: None,
         }
     } else {
         tracing::info!(%hub_url, "no token — starting Hub QR pairing");
@@ -120,6 +121,7 @@ async fn write_hub_credentials(path: &str, hub_url: &str, token: &str) -> anyhow
         account_id: "ilink-hub-client".to_string(),
         user_id: "hub-client".to_string(),
         saved_at: None,
+        client_name: None,
     };
     save_json_credentials(path, &creds).await
 }

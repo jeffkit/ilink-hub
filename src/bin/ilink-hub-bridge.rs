@@ -52,7 +52,8 @@ struct Cli {
     #[arg(long, default_value_t = false, global = true)]
     pair: bool,
 
-    /// Stable client name when auto-registering via `/hub/register` (optional; default random `local-<uuid>`).
+    /// Stable client name when auto-registering via `/hub/register`.
+    /// Default: `local-<hostname>-<config-stem>` (e.g. `local-MacBook-ilink-claude`).
     #[arg(long, env = "ILINKHUB_BRIDGE_REGISTER_NAME", global = true)]
     register_name: Option<String>,
 
@@ -134,6 +135,7 @@ async fn main() -> Result<()> {
                     cli.pair,
                     cli.register_name.as_deref(),
                     cli.force_register,
+                    Some(config_path.as_path()),
                 )
                 .await?;
                 info!(%hub_url, "using Hub base URL for downstream");

@@ -4,7 +4,7 @@
 
 **连接 Hub 的方式（任选）**
 
-1. **零交互（默认，本机最省事）**：不传 `--token`、且**凭证路径尚不存在**时，进程会自行调用 Hub 已有的 **`POST /hub/register`**（与任何其他客户端相同），生成随机客户端名、拿到 `vhub_…` 后写入 **`~/.ilink-hub/bridge-credentials.json`**。终端会打印 `已向 Hub 自动注册客户端「…」`，按提示在微信发 `/use <名称>` 即可。若 Hub 配置了 **`ILINK_ADMIN_TOKEN`**，请在本机同一环境导出该变量，否则注册会 401。可用 **`--register-name` / `ILINKHUB_BRIDGE_REGISTER_NAME`** 固定注册名。  
+1. **零交互（默认，本机最省事）**：不传 `--token`、且**凭证路径尚不存在**时，进程会自行调用 Hub 已有的 **`POST /hub/register`**（与任何其他客户端相同），按 **`local-<hostname>-<配置名>`** 生成稳定客户端名（例如 `local-MacBook-ilink-claude`）、拿到 `vhub_…` 后写入 **`~/.ilink-hub/bridge-credentials.json`**。同名重启会复用 Hub 上的同一客户端，不会在 `/list` 里堆积 `local-<uuid>`。终端会打印 `已向 Hub 自动注册客户端「…」`，按提示在微信发 `/use <名称>` 即可。若 Hub 配置了 **`ILINK_ADMIN_TOKEN`**，请在本机同一环境导出该变量，否则注册会 401。可用 **`--register-name` / `ILINKHUB_BRIDGE_REGISTER_NAME`** 覆盖默认名。  
    **凭证文件已存在但损坏或 token 为空**时：为避免静默覆盖扫码配对结果，默认**不会**再自动注册；请删文件、改用 **`WEIXIN_TOKEN` / `--pair`**，或显式加 **`--force-register`**（会先删该路径再自动注册）。  
 2. **扫码配对**：加 **`--pair`**（或你希望用手机确认时），走 Hub 通用配对流程；凭证仍写入上述 JSON。
 
@@ -104,7 +104,7 @@ ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 | `--cred-file` | `ILINKHUB_BRIDGE_CREDS` | 凭证 JSON 路径，默认 `~/.ilink-hub/bridge-credentials.json` |
 | `--pair` | — | 忽略已存凭证，强制走 Hub 扫码配对 |
 | `--force-register` | — | 凭证文件存在但无效时：删除该文件后重新走自动 `/hub/register`（默认在这种情况下会报错而不覆盖） |
-| `--register-name` | `ILINKHUB_BRIDGE_REGISTER_NAME` | 自动注册时使用的客户端名（可选；默认随机 `local-<uuid>`） |
+| `--register-name` | `ILINKHUB_BRIDGE_REGISTER_NAME` | 自动注册时使用的客户端名（可选；默认 `local-<hostname>-<config-stem>`） |
 | `--config` | — | YAML 路径，默认 `./ilink-hub-bridge.yaml` |
 | （环境） | `ILINK_ADMIN_TOKEN` | Hub 若要求管理端鉴权注册，需与 Hub 相同，供自动注册请求携带 |
 | （环境） | `ILINKHUB_BRIDGE_DUMP_MSG` | 设为 `1` / `true` / `yes` 时，每条入站消息在 **stderr** 打印完整 `WeixinMessage` JSON，并逐项打印 `item_list[*].extra`（用于查看 iLink 嵌在 item 里的扩展字段，如引用信息是否落在 `extra`） |

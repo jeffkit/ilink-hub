@@ -10,8 +10,8 @@ pub mod builtin;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{
-    default_local_credential_path, hub_response_token_rejected, resolve_hub_connection,
-    validate_hub_token,
+    default_auto_client_name, default_local_credential_path, hub_response_token_rejected,
+    resolve_hub_connection, validate_hub_token,
 };
 
 /// Returned from [`run_bridge`] when Hub rejects the virtual token at runtime.

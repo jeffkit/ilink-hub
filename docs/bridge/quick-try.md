@@ -65,7 +65,7 @@ export WEIXIN_BASE_URL=http://127.0.0.1:8765
 ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 ```
 
-- 第一次：进程会调用 Hub 已有的 **`POST /hub/register`**，随机生成客户端名（如 `local-…`），把 `vhub_…` 写入 **`~/.ilink-hub/bridge-credentials.json`**。  
+- 第一次：进程会调用 Hub 已有的 **`POST /hub/register`**，按 **`local-<hostname>-<配置名>`** 注册稳定客户端名（如 `local-MacBook-ilink-claude`），把 `vhub_…` 写入 **`~/.ilink-hub/bridge-credentials.json`**。  
 - 终端会打印一行中文提示，里面包含 **`/use <客户端名>`**，按提示在微信发送即可（若这是 Hub 上**第一个**客户端，通常已是默认路由，也可直接发测试消息）。  
 - 第二次起：直接读凭证文件，**无需再注册**。
 
