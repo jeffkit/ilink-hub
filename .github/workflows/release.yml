@@ -309,11 +309,38 @@ jobs:
       - name: Publish to crates.io
         run: cargo publish --token ${{ secrets.CRATES_IO_TOKEN }} || true
 
+  # ─── Publish Node.js SDK to npm ──────────────────────────────────────────
+  publish-npm:
+    name: Publish sdk/node to npm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/node
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install dependencies (if any)
+        run: npm install --ignore-scripts 2>/dev/null || true
+
+      - name: Run tests
+        run: npm test
+
+      - name: Publish
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
   # ─── GitHub Release ───────────────────────────────────────────────────────
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-native, publish-crates, build-desktop]
+    needs: [build-native, publish-crates, build-desktop, publish-npm]
     steps:
       - uses: actions/checkout@v4
 

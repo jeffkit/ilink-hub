@@ -1,11 +1,21 @@
 # Claude Code CLI（Anthropic）：请按本机安装路径与 `claude --help` 调整参数。
-# 非交互、单次输出常用 `-p`（print）；若你本机版本 flag 不同，以官方 CLI 为准。
+#
+# 单轮 / 不要求接续上文：仅用 -p
+# command: claude
+# args: ["-p", "{{MESSAGE}}"]
+#
+# 同一微信会话内多轮、共用当前 cwd 下最近一次 Claude 会话：加 --continue（勿与 --no-session-persistence 同用）
 command: claude
-args: ["-p", "{{MESSAGE}}"]
+args: ["-p", "{{MESSAGE}}", "--continue"]
 stdin: none
 cwd: /path/to/your/project
 timeout_secs: 600
 max_reply_chars: 8000
+# 需要「每个 Hub 会话线程一个工作区」时（与 {{SESSION_ID}} / ilink_hub_session_id 对齐）：
+# cwd: "/path/to/workspaces/{{SESSION_ID}}"
+# 目录需已存在或由你自己的脚本创建。
+# env:
+#   ILINK_HUB_SESSION: "{{SESSION_ID}}"
 # 认证通常依赖本机 `claude login` 或 ANTHROPIC_API_KEY 等；可用 env 块注入，勿把密钥提交到仓库。
 # env:
 #   ANTHROPIC_API_KEY: "sk-ant-..."

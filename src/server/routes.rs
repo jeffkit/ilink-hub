@@ -200,8 +200,31 @@ pub async fn sendmessage(
         (real_ctx, peer_user_id)
     };
 
-    // Replace virtual context_token with real one and inject to_user_id if missing
     if let Some(msg) = &mut req.msg {
+        // Read cli_session_id from hub_ext and persist it to the active session.
+        if let Some(ext) = msg.ilink_hub_ext.as_mut() {
+            if let Some(cli_sid) = ext.cli_session_id.take() {
+                let t = cli_sid.trim().to_string();
+                if !t.is_empty() {
+                    let session_name = state
+                        .store
+                        .get_active_session_name(&vctx)
+                        .await
+                        .unwrap_or_else(|_| "default".to_string());
+                    if let Err(e) = state
+                        .store
+                        .set_backend_session(&vctx, &session_name, &t)
+                        .await
+                    {
+                        warn!(error = %e, vctx = %vctx, "failed to persist backend session");
+                    }
+                }
+            }
+        }
+        // Strip ilink_hub_ext before forwarding to upstream iLink.
+        msg.ilink_hub_ext = None;
+
+        // Replace virtual context_token with real one and inject to_user_id if missing
         msg.context_token = Some(real_ctx);
         if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
             msg.to_user_id = Some(peer_user_id);

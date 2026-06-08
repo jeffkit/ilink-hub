@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
-use crate::ilink::types::{SendMessageRequest, WeixinMessage};
+use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 use crate::ilink::UpstreamClient;
 use crate::store::Store;
 
@@ -163,7 +163,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             });
 
+            let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
+
             msg.context_token = Some(vctx);
+            msg.ilink_hub_ext = hub_ext;
 
             state
                 .metrics
@@ -256,7 +259,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 });
 
                 let mut msg_clone = msg.clone();
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
                 msg_clone.context_token = Some(vctx);
+                msg_clone.ilink_hub_ext = hub_ext;
                 state
                     .metrics
                     .messages_dispatched
@@ -351,7 +356,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     ctx_map.map(real_ctx.clone(), from_user_id.clone())
                 };
                 let mut m = msg.clone();
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
                 m.context_token = Some(vctx.clone());
+                m.ilink_hub_ext = hub_ext;
                 // Replace text content in item_list
                 if let Some(items) = &mut m.item_list {
                     if let Some(first) = items.first_mut() {
@@ -377,6 +384,123 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             format!("iLink Hub 状态：{}/{} 个客户端在线", online, total)
         }
         HubCommand::Help => build_help_text(),
+
+        HubCommand::SessionList => {
+            let vctx = {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.map(real_ctx.clone(), from_user_id.clone())
+            };
+            let active = state
+                .store
+                .get_active_session_name(&vctx)
+                .await
+                .unwrap_or_else(|_| "default".to_string());
+            match state.store.list_backend_sessions(&vctx).await {
+                Ok(sessions) if sessions.is_empty() => {
+                    format!("当前对话尚无 session 记录。\n发送 `/session new <名称>` 创建一个 session。")
+                }
+                Ok(sessions) => {
+                    let mut lines = vec!["**当前对话的 sessions：**".to_string()];
+                    for s in &sessions {
+                        let marker = if s.session_name == active { " ✅" } else { "" };
+                        let uuid_hint = if s.backend_session_id.is_empty() {
+                            "（尚无 UUID，下次对话时由后端写入）".to_string()
+                        } else {
+                            format!("`{}`", &s.backend_session_id[..s.backend_session_id.len().min(12)])
+                        };
+                        lines.push(format!("• `{}`{} — {}", s.session_name, marker, uuid_hint));
+                    }
+                    lines.push(format!("\n当前活跃：`{}`", active));
+                    lines.push("\n用 `/session use <名称>` 切换，`/session new <名称>` 新建。".to_string());
+                    lines.join("\n")
+                }
+                Err(e) => format!("❌ 查询 session 失败：{e}"),
+            }
+        }
+
+        HubCommand::SessionNew(ref session_name, ref initial_uuid) => {
+            let vctx = {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.map(real_ctx.clone(), from_user_id.clone())
+            };
+            match state
+                .store
+                .set_backend_session(&vctx, session_name, initial_uuid)
+                .await
+            {
+                Ok(()) => {
+                    if initial_uuid.is_empty() {
+                        format!(
+                            "✅ 已创建 session `{session_name}`。\n下次对话时后端会写入 UUID。\n发送 `/session use {session_name}` 切换到此 session。"
+                        )
+                    } else {
+                        format!(
+                            "✅ 已创建 session `{session_name}`，UUID: `{}`。\n发送 `/session use {session_name}` 切换到此 session。",
+                            &initial_uuid[..initial_uuid.len().min(12)]
+                        )
+                    }
+                }
+                Err(e) => format!("❌ 创建 session 失败：{e}"),
+            }
+        }
+
+        HubCommand::SessionUse(ref session_name) => {
+            let vctx = {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.map(real_ctx.clone(), from_user_id.clone())
+            };
+            // Ensure the session exists (auto-create slot with empty UUID if not)
+            let ensure_result: Result<(), String> =
+                match state.store.get_backend_session(&vctx, session_name).await {
+                    Ok(None) => state
+                        .store
+                        .set_backend_session(&vctx, session_name, "")
+                        .await
+                        .map_err(|e| format!("❌ 创建 session slot 失败：{e}")),
+                    Err(e) => Err(format!("❌ 查询 session 失败：{e}")),
+                    Ok(Some(_)) => Ok(()),
+                };
+            match ensure_result {
+                Err(msg) => msg,
+                Ok(()) => {
+                    match state
+                        .store
+                        .set_active_session_name(&vctx, session_name)
+                        .await
+                    {
+                        Ok(()) => format!("✅ 已切换到 session `{session_name}`"),
+                        Err(e) => format!("❌ 切换 session 失败：{e}"),
+                    }
+                }
+            }
+        }
+
+        HubCommand::SessionDelete(ref session_name) => {
+            let vctx = {
+                let mut ctx_map = state.ctx_map.lock().await;
+                ctx_map.map(real_ctx.clone(), from_user_id.clone())
+            };
+            let active = state
+                .store
+                .get_active_session_name(&vctx)
+                .await
+                .unwrap_or_else(|_| "default".to_string());
+            if *session_name == active {
+                format!(
+                    "❌ 无法删除当前活跃的 session `{session_name}`。\n请先用 `/session use <其他名称>` 切换后再删除。"
+                )
+            } else {
+                match state
+                    .store
+                    .delete_backend_session(&vctx, session_name)
+                    .await
+                {
+                    Ok(true) => format!("✅ 已删除 session `{session_name}`"),
+                    Ok(false) => format!("❌ 未找到 session `{session_name}`"),
+                    Err(e) => format!("❌ 删除 session 失败：{e}"),
+                }
+            }
+        }
     };
 
     debug!(to = %from_user_id, "sending hub command reply");
@@ -386,7 +510,14 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         if let Some(cid) = m.client_id.as_deref().filter(|s| !s.is_empty()) {
             let index_hub_quote = matches!(
                 &cmd,
-                HubCommand::List | HubCommand::Status | HubCommand::Help | HubCommand::UseClient(_)
+                HubCommand::List
+                    | HubCommand::Status
+                    | HubCommand::Help
+                    | HubCommand::UseClient(_)
+                    | HubCommand::SessionList
+                    | HubCommand::SessionNew(_, _)
+                    | HubCommand::SessionUse(_)
+                    | HubCommand::SessionDelete(_)
             );
             if index_hub_quote {
                 let mut q = state.quote_index.lock().await;
@@ -405,6 +536,33 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
     }
 }
 
+// ─── Hub extension helper ─────────────────────────────────────────────────────
+
+/// Build `HubExt` for an outbound message by looking up the active session for the given vctx.
+async fn build_hub_ext_for_vctx(store: &Store, vctx: &str) -> Option<HubExt> {
+    let session_name = store
+        .get_active_session_name(vctx)
+        .await
+        .ok()
+        .unwrap_or_else(|| "default".to_string());
+
+    let session_id = store
+        .get_backend_session(vctx, &session_name)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            let t = s.trim().to_string();
+            (!t.is_empty()).then_some(t)
+        });
+
+    Some(HubExt {
+        session_id,
+        session_name: Some(session_name),
+        cli_session_id: None,
+    })
+}
+
 // ─── Static responder helpers ─────────────────────────────────────────────────
 
 fn build_help_text() -> String {
@@ -414,6 +572,11 @@ fn build_help_text() -> String {
      /list — 列出所有已注册的 AI 后端\n\
      /use <名称> — 切换到指定的 AI 后端\n\
      /help — 显示此帮助\n\n\
+     Session 管理（同一后端下的多会话）：\n\
+     /session list — 列出当前对话的所有 sessions\n\
+     /session new <名称> [UUID] — 创建新 session（可选初始 UUID）\n\
+     /session use <名称> — 切换到指定 session\n\
+     /session delete <名称> — 删除指定 session\n\n\
      引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
      多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅一个注册后端时默认不加）；可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
      关于 iLink Hub：\n\

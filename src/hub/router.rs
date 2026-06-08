@@ -16,6 +16,15 @@ pub enum HubCommand {
     Broadcast(String),
     Status,
     Help,
+    /// List all backend sessions for the current conversation.
+    SessionList,
+    /// Create a new named backend session (optionally with an initial UUID).
+    /// `(session_name, initial_uuid)` — uuid is empty string if not provided.
+    SessionNew(String, String),
+    /// Switch the active backend session.
+    SessionUse(String),
+    /// Delete a named backend session.
+    SessionDelete(String),
 }
 
 pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
@@ -41,6 +50,46 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     {
         return Some(HubCommand::Broadcast(rest.trim().to_string()));
     }
+
+    // /session subcommands
+    if text.eq_ignore_ascii_case("/session list") || text.eq_ignore_ascii_case("/session ls") {
+        return Some(HubCommand::SessionList);
+    }
+    if let Some(rest) = text.strip_prefix("/session new ").or_else(|| {
+        if text.eq_ignore_ascii_case("/session new") {
+            Some("")
+        } else {
+            None
+        }
+    }) {
+        let rest = rest.trim();
+        let mut parts = rest.splitn(2, ' ');
+        let name = parts.next().unwrap_or("default").trim().to_string();
+        let uuid = parts.next().unwrap_or("").trim().to_string();
+        let name = if name.is_empty() {
+            "default".to_string()
+        } else {
+            name
+        };
+        return Some(HubCommand::SessionNew(name, uuid));
+    }
+    if let Some(rest) = text.strip_prefix("/session use ") {
+        let name = rest.trim().to_string();
+        if !name.is_empty() {
+            return Some(HubCommand::SessionUse(name));
+        }
+    }
+    if let Some(rest) = text
+        .strip_prefix("/session delete ")
+        .or_else(|| text.strip_prefix("/session rm "))
+        .or_else(|| text.strip_prefix("/session del "))
+    {
+        let name = rest.trim().to_string();
+        if !name.is_empty() {
+            return Some(HubCommand::SessionDelete(name));
+        }
+    }
+
     None
 }
 
@@ -145,6 +194,53 @@ mod tests {
             r.route(&msg),
             RoutingDecision::ForwardTo(ref v) if v == "default_vt"
         ));
+    }
+
+    #[test]
+    fn parse_session_list_command() {
+        assert_eq!(parse_hub_command("/session list"), Some(HubCommand::SessionList));
+        assert_eq!(parse_hub_command("/session ls"), Some(HubCommand::SessionList));
+    }
+
+    #[test]
+    fn parse_session_new_command() {
+        assert_eq!(
+            parse_hub_command("/session new feature-a"),
+            Some(HubCommand::SessionNew("feature-a".to_string(), "".to_string()))
+        );
+        assert_eq!(
+            parse_hub_command("/session new feature-b some-uuid-123"),
+            Some(HubCommand::SessionNew("feature-b".to_string(), "some-uuid-123".to_string()))
+        );
+        // bare /session new → name defaults to "default"
+        assert_eq!(
+            parse_hub_command("/session new"),
+            Some(HubCommand::SessionNew("default".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_use_command() {
+        assert_eq!(
+            parse_hub_command("/session use my-session"),
+            Some(HubCommand::SessionUse("my-session".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_session_delete_command() {
+        assert_eq!(
+            parse_hub_command("/session delete old-session"),
+            Some(HubCommand::SessionDelete("old-session".to_string()))
+        );
+        assert_eq!(
+            parse_hub_command("/session rm old-session"),
+            Some(HubCommand::SessionDelete("old-session".to_string()))
+        );
+        assert_eq!(
+            parse_hub_command("/session del old-session"),
+            Some(HubCommand::SessionDelete("old-session".to_string()))
+        );
     }
 
     #[test]

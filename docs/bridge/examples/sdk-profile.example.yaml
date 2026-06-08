@@ -1,0 +1,92 @@
+# SDK Profile 示例
+#
+# 展示如何用 ilink-bridge-profile SDK（Python / Node.js）编写自定义 profile，
+# 并通过 `script:` 字段让 bridge 自动推断运行时。
+#
+# ─── 前提条件 ──────────────────────────────────────────────────────────────
+#
+#   Python SDK：
+#     pip install ilink-bridge-profile
+#
+#   Node.js SDK：
+#     npm install ilink-bridge-profile
+#
+# ─── bridge 如何运行你的脚本（script: 字段）─────────────────────────────────
+#
+#   只需指定 script 路径，bridge 根据扩展名自动推断运行时：
+#     .py         →  python3 <script>
+#     .js / .mjs  →  node <script>
+#     .ts         →  npx tsx <script>
+#     .sh         →  bash <script>
+#     .rb         →  ruby <script>
+#     其他/无     →  直接执行（需 chmod +x + shebang）
+#
+#   如需指定特定 Python 路径（如 venv），设置 command 覆盖：
+#     script: ./my_handler.py
+#     command: .venv/bin/python3
+#     args: ["./my_handler.py"]
+#
+# ─── 测试脚本 ─────────────────────────────────────────────────────────────
+#
+#   不启动 bridge，直接在终端模拟一次调用：
+#     ILINK_MESSAGE="你好" \
+#     ILINK_SESSION_ID="" \
+#     ILINK_SESSION_NAME="default" \
+#     ILINK_FROM_USER="test" \
+#     ILINK_CONTEXT_TOKEN="test-token" \
+#     python3 ./my_handler.py
+#
+# ─────────────────────────────────────────────────────────────────────────
+
+profiles:
+
+  # ── Python SDK profile ────────────────────────────────────────────────
+  #
+  # 对应的 my_handler.py：
+  #
+  #   from ilink_bridge import create_profile
+  #
+  #   async def handler(ctx):
+  #       reply = await my_ai_call(ctx.message)
+  #       return reply
+  #
+  #   create_profile(handler)
+  #
+  python-bot:
+    script: ./my_handler.py    # bridge 自动调用：python3 ./my_handler.py
+    timeout_secs: 60
+    max_reply_chars: 8000
+
+  # ── Node.js SDK profile ───────────────────────────────────────────────
+  #
+  # 对应的 my_handler.js：
+  #
+  #   const { createProfile } = require('ilink-bridge-profile');
+  #
+  #   createProfile(async ({ message, sessionId }) => {
+  #     const reply = await myAICall(message);
+  #     return { response: reply };
+  #   });
+  #
+  node-bot:
+    script: ./my_handler.js    # bridge 自动调用：node ./my_handler.js
+    timeout_secs: 60
+    max_reply_chars: 8000
+
+  # ── TypeScript profile（npx tsx）──────────────────────────────────────
+  ts-bot:
+    script: ./my_handler.ts    # bridge 自动调用：npx tsx ./my_handler.ts
+    timeout_secs: 60
+
+  # ── 裸 Bash profile（无 SDK）─────────────────────────────────────────
+  bash-echo:
+    script: ./echo.sh          # bridge 自动调用：bash ./echo.sh
+    timeout_secs: 10
+
+routing:
+  strategy: fixed
+  default_profile: python-bot
+
+skip_bot_messages: true
+require_text: true
+send_error_reply: true

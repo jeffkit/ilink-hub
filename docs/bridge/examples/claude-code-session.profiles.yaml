@@ -1,0 +1,90 @@
+# Claude Code 接入示例（推荐配置）
+#
+# 功能：
+#   · 连续对话  ── 同一 Hub session 内的消息通过 --resume <UUID> 保持 Claude 上下文
+#   · 多 session ── 微信里用 /session 命令在多个命名 Claude 会话间切换
+#   · 降级容错  ── session UUID 失效时自动降级为新会话，无需重启 bridge
+#
+# ─── 前提条件 ────────────────────────────────────────────────────────────────
+#
+#   1. 安装 Claude Code CLI：
+#        npm install -g @anthropic-ai/claude-code
+#        （或按官方文档：https://docs.anthropic.com/zh-CN/docs/claude-code）
+#
+#   2. 登录认证（任选一种）：
+#        claude login          # OAuth 登录（推荐）
+#        export ANTHROPIC_API_KEY=sk-ant-...  # 或直接用 API Key
+#
+#   3. 确认 claude 在 PATH 中：
+#        claude --version
+#
+#   4. 修改下方 cwd 为你的项目目录，其他配置按需调整。
+#
+# ─── 快速开始 ─────────────────────────────────────────────────────────────────
+#
+#   ilink-hub-bridge --config claude-code-session.profiles.yaml
+#
+# ─── 微信里的用法 ─────────────────────────────────────────────────────────────
+#
+#   发送普通消息（使用默认 session "default"）：
+#     你: 帮我解释一下 src/lib.rs 里的 dispatch_message 函数
+#
+#   查看当前对话的所有 sessions：
+#     你: /session list
+#
+#   创建 & 切换 session（隔离不同任务上下文）：
+#     你: /session new feature-login
+#     你: /session use feature-login
+#     你: 我要做一个用户登录功能，帮我设计接口
+#
+#   切回之前的 session：
+#     你: /session use default
+#
+#   强制开一条不存档的临时对话：
+#     你: /new 帮我解释一下 HTTP 状态码 429 是什么
+#
+# ─── 测试 profile 是否工作 ────────────────────────────────────────────────────
+#
+#   不启动 bridge，直接在终端模拟一次调用：
+#     ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ilink-hub-bridge profile claude-code
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+profiles:
+
+  # ── 主 profile：连续对话 + session 追踪 ──────────────────────────────────
+  claude:
+    # type: claude-code 由 bridge 自动展开为：
+    #   command: ilink-hub-bridge  args: [profile, claude-code]
+    #   cli_session_first_line_prefix: "ILINK_SESSION:"
+    # 无需额外脚本，bridge 会自动注入 ILINK_SESSION_ID / ILINK_MESSAGE 等变量。
+    type: claude-code
+    cwd: /path/to/your/project  # ← 改为你的项目目录
+    timeout_secs: 600           # 单次调用超时（秒），复杂任务可调大
+    max_reply_chars: 8000       # 微信单条上限（超长自动截断）
+    truncation_suffix: "\n\n…（内容已截断，可缩小问题范围或分多条发送）"
+    # 若尚未 claude login，可在此注入 API Key（勿提交到 git）：
+    # env:
+    #   ANTHROPIC_API_KEY: "sk-ant-..."
+
+  # ── 辅助 profile：强制开新会话（不 resume）──────────────────────────────
+  claude_new:
+    type: claude-code
+    cwd: /path/to/your/project  # ← 与上面保持一致
+    timeout_secs: 600
+    max_reply_chars: 8000
+    truncation_suffix: "\n\n…（内容已截断）"
+    env:
+      ILINK_SESSION_ID: ""  # 覆盖掉自动注入的值，强制开新会话
+
+routing:
+  strategy: prefix
+  default_profile: claude
+  prefix_rules:
+    # "/new <问题>" → 强制新开 Claude 会话，不 resume，也不影响 Hub 存储的 sessions
+    - prefix: "/new "
+      profile: claude_new
+
+skip_bot_messages: true
+require_text: true
+send_error_reply: true

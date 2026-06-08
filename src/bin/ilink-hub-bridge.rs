@@ -11,15 +11,18 @@
 //!
 //! **调试**：`ILINKHUB_BRIDGE_DUMP_MSG=1`（或 `true` / `yes`）时在 stderr 打印每条入站的完整 `WeixinMessage` JSON 与各 `item_list[*].extra`。
 //!
-//! 配置见 `docs/bridge/README.md`。
+//! **内置 Profile**：`ilink-hub-bridge profile <type>` 运行内置 profile 处理器（如 `claude-code`），
+//! 遵循 P0 exec 协议：从 `ILINK_*` 环境变量读取输入，向 stdout 写出回复。
+//!
+//! 配置见 `docs/bridge/README.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
 
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::info;
 
-use ilink_hub::bridge::{resolve_hub_connection, run_bridge, BridgeApp};
+use ilink_hub::bridge::{builtin, resolve_hub_connection, run_bridge, BridgeApp};
 
 #[derive(Parser)]
 #[command(name = "ilink-hub-bridge")]
@@ -29,32 +32,50 @@ use ilink_hub::bridge::{resolve_hub_connection, run_bridge, BridgeApp};
 )]
 struct Cli {
     /// Hub base URL (same as WEIXIN_BASE_URL for other backends).
-    #[arg(long, env = "WEIXIN_BASE_URL", default_value = "http://127.0.0.1:8765")]
+    #[arg(long, env = "WEIXIN_BASE_URL", default_value = "http://127.0.0.1:8765", global = true)]
     hub_url: String,
 
     /// Virtual token. Omit to use saved local credentials, auto-register, or `--pair` QR flow.
-    #[arg(long, env = "WEIXIN_TOKEN")]
+    #[arg(long, env = "WEIXIN_TOKEN", global = true)]
     token: Option<String>,
 
     /// Local credential JSON path (default: ~/.ilink-hub/bridge-credentials.json).
-    #[arg(long, env = "ILINKHUB_BRIDGE_CREDS")]
+    #[arg(long, env = "ILINKHUB_BRIDGE_CREDS", global = true)]
     cred_file: Option<String>,
 
     /// Ignore saved credentials and run Hub QR pairing (phone confirm).
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     pair: bool,
 
     /// Stable client name when auto-registering via `/hub/register` (optional; default random `local-<uuid>`).
-    #[arg(long, env = "ILINKHUB_BRIDGE_REGISTER_NAME")]
+    #[arg(long, env = "ILINKHUB_BRIDGE_REGISTER_NAME", global = true)]
     register_name: Option<String>,
 
     /// If the credential file exists but is invalid or has an empty token, delete it and auto-register again.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     force_register: bool,
 
-    /// Path to bridge YAML (command, args, timeout, …).
+    /// Path to bridge YAML (command, args, timeout, …). Used only in bridge (default) mode.
     #[arg(long, default_value = "ilink-hub-bridge.yaml")]
     config: PathBuf,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run a built-in profile handler (P0 exec protocol: reads ILINK_* env vars, writes to stdout).
+    ///
+    /// Example: ilink-hub-bridge profile claude-code
+    ///
+    /// Built-in types:
+    ///   claude-code   Wrap the `claude` CLI with automatic --resume session continuity
+    Profile {
+        /// Built-in profile type (e.g. `claude-code`).
+        #[arg(value_name = "TYPE")]
+        profile_type: String,
+    },
 }
 
 fn explicit_token(cli: &Cli) -> Option<&str> {
@@ -75,24 +96,34 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let (hub_url, token) = resolve_hub_connection(
-        &cli.hub_url,
-        explicit_token(&cli),
-        cli.cred_file.as_deref(),
-        cli.pair,
-        cli.register_name.as_deref(),
-        cli.force_register,
-    )
-    .await?;
-    info!(%hub_url, "using Hub base URL for downstream");
+    match &cli.command {
+        Some(Commands::Profile { profile_type }) => {
+            // Run as a built-in profile subprocess (P0 exec protocol).
+            // No Hub connection needed — just read env vars and write to stdout.
+            builtin::run_builtin_profile(profile_type).await
+        }
+        None => {
+            // Default mode: connect to Hub and long-poll for messages.
+            let (hub_url, token) = resolve_hub_connection(
+                &cli.hub_url,
+                explicit_token(&cli),
+                cli.cred_file.as_deref(),
+                cli.pair,
+                cli.register_name.as_deref(),
+                cli.force_register,
+            )
+            .await?;
+            info!(%hub_url, "using Hub base URL for downstream");
 
-    let app = BridgeApp::load(&cli.config)?;
-    info!(config_path = %cli.config.display(), "loaded bridge config");
+            let app = BridgeApp::load(&cli.config)?;
+            info!(config_path = %cli.config.display(), "loaded bridge config");
 
-    let handle = tokio::spawn(run_bridge(hub_url, token, app));
-    let _ = tokio::signal::ctrl_c().await;
-    handle.abort();
-    let _ = handle.await;
-    info!("exit");
-    Ok(())
+            let handle = tokio::spawn(run_bridge(hub_url, token, app));
+            let _ = tokio::signal::ctrl_c().await;
+            handle.abort();
+            let _ = handle.await;
+            info!("exit");
+            Ok(())
+        }
+    }
 }

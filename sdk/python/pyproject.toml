@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ilink-bridge-profile"
+version = "0.1.0"
+description = "iLink Hub Bridge Profile SDK — write one async function, get a cross-platform P0-compliant profile"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/jeffkit/ilink-hub"
+Documentation = "https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/profile-spec.md"
+
+[tool.setuptools.packages.find]
+where = ["src"]

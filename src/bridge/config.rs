@@ -54,8 +54,32 @@ pub enum StdinMode {
 }
 
 /// Per-profile CLI settings (multi-profile YAML) or the only profile (legacy single file).
+///
+/// **`type` shorthand**: set `type: claude-code` to use a built-in profile.
+///
+/// **`script` shorthand**: set `script: ./my-handler.py` (or `.js`, `.sh`, `.ts`, `.rb`) and
+/// bridge infers the runtime automatically:
+/// - `.py`  → `python3 <script>`
+/// - `.js` / `.mjs` → `node <script>`
+/// - `.ts`  → `npx tsx <script>`
+/// - `.sh`  → `bash <script>`
+/// - `.rb`  → `ruby <script>`
+/// - other  → execute directly (must be chmod +x)
+///
+/// An explicit `command` always wins over `type` / `script`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BridgeProfile {
+    /// Optional built-in type shorthand (e.g. `"claude-code"`).
+    /// When set and `command` is empty, the profile is expanded to the corresponding built-in.
+    #[serde(default, rename = "type")]
+    pub profile_type: Option<String>,
+
+    /// Path to a script file. Bridge infers the runtime from the file extension.
+    /// Expanded to `command` + `args` at load time. An explicit `command` takes priority.
+    #[serde(default)]
+    pub script: Option<String>,
+
+    #[serde(default)]
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
@@ -73,6 +97,10 @@ pub struct BridgeProfile {
     pub truncation_suffix: String,
     #[serde(default)]
     pub include_stderr_in_reply: bool,
+    /// If non-empty: stdout 的第一行若以该前缀开头，则该行去掉前缀后的剩余部分为 **CLI 会话 id**，
+    /// 会随 `sendmessage` 写入 Hub；其余行作为发给微信的正文。
+    #[serde(default)]
+    pub cli_session_first_line_prefix: Option<String>,
 }
 
 fn default_timeout_secs() -> u64 {
@@ -117,6 +145,8 @@ pub struct BridgeConfig {
     pub send_error_reply: bool,
     #[serde(default)]
     pub include_stderr_in_reply: bool,
+    #[serde(default)]
+    pub cli_session_first_line_prefix: Option<String>,
 }
 
 impl BridgeConfig {
@@ -179,6 +209,8 @@ impl BridgeApp {
         profiles.insert(
             "default".to_string(),
             BridgeProfile {
+                profile_type: None,
+                script: None,
                 command: c.command.clone(),
                 args: c.args.clone(),
                 stdin: c.stdin.clone(),
@@ -188,6 +220,7 @@ impl BridgeApp {
                 max_reply_chars: c.max_reply_chars,
                 truncation_suffix: c.truncation_suffix.clone(),
                 include_stderr_in_reply: c.include_stderr_in_reply,
+                cli_session_first_line_prefix: c.cli_session_first_line_prefix.clone(),
             },
         );
         Ok(Self {
@@ -203,12 +236,27 @@ impl BridgeApp {
         if m.profiles.is_empty() {
             anyhow::bail!("`profiles` must contain at least one profile");
         }
-        for (name, p) in &m.profiles {
+        // Expand script/type shortcuts before validation so `command` is filled in.
+        // Order matters: script → type (explicit command wins over both).
+        let profiles: HashMap<String, BridgeProfile> = m
+            .profiles
+            .into_iter()
+            .map(|(name, p)| {
+                let expanded = expand_script_field(p, &name)?;
+                let expanded = expand_profile_type(expanded, &name)?;
+                Ok((name, expanded))
+            })
+            .collect::<Result<_>>()?;
+
+        for (name, p) in &profiles {
             if p.command.trim().is_empty() {
-                anyhow::bail!("profile `{name}`: `command` must not be empty");
+                anyhow::bail!(
+                    "profile `{name}`: `command` must not be empty \
+                     (set `command`, `script`, or use a recognized `type`)"
+                );
             }
         }
-        if !m.profiles.contains_key(&m.routing.default_profile) {
+        if !profiles.contains_key(&m.routing.default_profile) {
             anyhow::bail!(
                 "routing.default_profile `{}` is not a key in `profiles`",
                 m.routing.default_profile
@@ -218,7 +266,7 @@ impl BridgeApp {
             if rule.prefix.is_empty() {
                 anyhow::bail!("routing.prefix_rules[{i}]: `prefix` must not be empty");
             }
-            if !m.profiles.contains_key(&rule.profile) {
+            if !profiles.contains_key(&rule.profile) {
                 anyhow::bail!(
                     "routing.prefix_rules[{i}]: unknown profile `{}`",
                     rule.profile
@@ -243,7 +291,7 @@ impl BridgeApp {
         };
 
         Ok(Self {
-            profiles: m.profiles,
+            profiles,
             routing,
             skip_bot_messages: m.skip_bot_messages,
             require_text: m.require_text,
@@ -291,6 +339,108 @@ impl BridgeApp {
             RoutingState::Fixed(_) => "fixed",
             RoutingState::Prefix { .. } => "prefix",
         }
+    }
+}
+
+/// Expand a `script: <path>` field to `command` + `args` based on file extension.
+///
+/// | Extension            | Inferred runtime              |
+/// |----------------------|-------------------------------|
+/// | `.py`                | `python3 <script>`            |
+/// | `.js` / `.mjs`       | `node <script>`               |
+/// | `.ts`                | `npx tsx <script>`            |
+/// | `.sh` / `.bash`      | `bash <script>`               |
+/// | `.rb`                | `ruby <script>`               |
+/// | other / no extension | execute directly (chmod +x)   |
+///
+/// If `command` is already set, returns the profile unchanged (explicit wins).
+fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
+    let Some(ref script) = p.script.clone() else {
+        return Ok(p);
+    };
+    if !p.command.trim().is_empty() {
+        // Explicit command wins; script field is informational only.
+        return Ok(p);
+    }
+    let script_path = script.trim().to_string();
+    let ext = std::path::Path::new(&script_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "py" => {
+            p.command = "python3".to_string();
+            let mut args = vec![script_path];
+            args.extend(p.args.drain(..));
+            p.args = args;
+        }
+        "js" | "mjs" | "cjs" => {
+            p.command = "node".to_string();
+            let mut args = vec![script_path];
+            args.extend(p.args.drain(..));
+            p.args = args;
+        }
+        "ts" => {
+            p.command = "npx".to_string();
+            let mut args = vec!["tsx".to_string(), script_path];
+            args.extend(p.args.drain(..));
+            p.args = args;
+        }
+        "sh" | "bash" => {
+            p.command = "bash".to_string();
+            let mut args = vec![script_path];
+            args.extend(p.args.drain(..));
+            p.args = args;
+        }
+        "rb" => {
+            p.command = "ruby".to_string();
+            let mut args = vec![script_path];
+            args.extend(p.args.drain(..));
+            p.args = args;
+        }
+        _ => {
+            // No known extension: run as executable (requires chmod +x / shebang).
+            p.command = script_path;
+        }
+    }
+    tracing::debug!(
+        profile = name,
+        command = %p.command,
+        "script: field expanded"
+    );
+    Ok(p)
+}
+
+/// Expand a `type: <shorthand>` profile into a full exec-mode profile.
+///
+/// Recognised shorthands:
+/// - `"claude-code"` → `command: ilink-hub-bridge  args: [profile, claude-code]`
+///   with `cli_session_first_line_prefix: "ILINK_SESSION:"` auto-set.
+///
+/// If `profile_type` is `None` or the command is already set, returns the profile unchanged.
+fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
+    let Some(ref pt) = p.profile_type.clone() else {
+        return Ok(p);
+    };
+    if !p.command.trim().is_empty() {
+        // Explicit command wins; type is informational only.
+        return Ok(p);
+    }
+    match pt.as_str() {
+        "claude-code" => {
+            p.command = "ilink-hub-bridge".to_string();
+            p.args = vec!["profile".to_string(), "claude-code".to_string()];
+            p.stdin = StdinMode::Message;
+            if p.cli_session_first_line_prefix.is_none() {
+                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+            }
+            Ok(p)
+        }
+        other => anyhow::bail!(
+            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code"
+        ),
     }
 }
 
@@ -365,6 +515,88 @@ routing:
         let (n, _, pay) = app.resolve("/b hello").unwrap();
         assert_eq!(n, "p2");
         assert_eq!(pay, "/b hello");
+    }
+
+    #[test]
+    fn script_field_py_expands_to_python3() {
+        let y = r#"
+profiles:
+  bot:
+    script: ./my_handler.py
+    timeout_secs: 60
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hello").unwrap();
+        assert_eq!(p.command, "python3");
+        assert_eq!(p.args, vec!["./my_handler.py"]);
+    }
+
+    #[test]
+    fn script_field_js_expands_to_node() {
+        let y = r#"
+profiles:
+  bot:
+    script: ./handler.js
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "node");
+        assert_eq!(p.args, vec!["./handler.js"]);
+    }
+
+    #[test]
+    fn script_field_ts_expands_to_npx_tsx() {
+        let y = r#"
+profiles:
+  bot:
+    script: ./handler.ts
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "npx");
+        assert_eq!(p.args, vec!["tsx", "./handler.ts"]);
+    }
+
+    #[test]
+    fn script_field_sh_expands_to_bash() {
+        let y = r#"
+profiles:
+  bot:
+    script: ./run.sh
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "bash");
+        assert_eq!(p.args, vec!["./run.sh"]);
+    }
+
+    #[test]
+    fn explicit_command_wins_over_script() {
+        let y = r#"
+profiles:
+  bot:
+    script: ./handler.py
+    command: /usr/bin/python3.11
+    args: ["./handler.py"]
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "/usr/bin/python3.11");
     }
 
     #[test]

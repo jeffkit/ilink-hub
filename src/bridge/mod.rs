@@ -6,6 +6,7 @@
 
 mod config;
 mod connection;
+pub mod builtin;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{default_local_credential_path, resolve_hub_connection};
@@ -199,13 +200,25 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
         .filter(|s| !s.is_empty())
         .context("inbound message missing context_token")?;
     let from_user = msg.from_user_id.clone().unwrap_or_default();
+    let session_for_cli = msg
+        .ilink_hub_ext
+        .as_ref()
+        .and_then(|e| e.session_id.as_deref())
+        .unwrap_or("")
+        .to_string();
+    let session_name_for_cli = msg
+        .ilink_hub_ext
+        .as_ref()
+        .and_then(|e| e.session_name.as_deref())
+        .unwrap_or("default")
+        .to_string();
 
-    info!(%profile_name, %profile.command, "running bridge profile");
+    info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
-    match run_cli(profile, &payload, &from_user).await {
-        Ok(output) => {
-            let body = truncate_chars(&output, profile.max_reply_chars, &profile.truncation_suffix);
-            let req = SendMessageRequest::reply(ctx, body, &from_user);
+    match run_cli(profile, &payload, &session_for_cli, &session_name_for_cli, &from_user, &ctx).await {
+        Ok((raw_body, cli_session)) => {
+            let body = truncate_chars(&raw_body, profile.max_reply_chars, &profile.truncation_suffix);
+            let req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
             client.sendmessage(req).await.context("sendmessage reply")?;
         }
         Err(e) => {
@@ -222,11 +235,40 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
     Ok(())
 }
 
-async fn run_cli(cfg: &BridgeProfile, message: &str, from_user_id: &str) -> Result<String> {
+/// If the first line of `stdout` starts with `prefix`, the remainder of that line is the CLI session id
+/// (returned as `Some`); the rest of `stdout` (following lines) is the reply body. If `prefix` is empty
+/// or the first line does not match, returns `(stdout, None)`.
+fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<String>) {
+    if prefix.is_empty() {
+        return (stdout.to_string(), None);
+    }
+    let mut lines = stdout.lines();
+    let Some(first) = lines.next() else {
+        return (stdout.to_string(), None);
+    };
+    if let Some(rest) = first.strip_prefix(prefix) {
+        let sid = rest.trim();
+        if sid.is_empty() {
+            return (stdout.to_string(), None);
+        }
+        let rest_lines: String = lines.collect::<Vec<_>>().join("\n");
+        return (rest_lines, Some(sid.to_string()));
+    }
+    (stdout.to_string(), None)
+}
+
+async fn run_cli(
+    cfg: &BridgeProfile,
+    message: &str,
+    session_id: &str,
+    session_name: &str,
+    from_user: &str,
+    context_token: &str,
+) -> Result<(String, Option<String>)> {
     let args: Vec<String> = cfg
         .args
         .iter()
-        .map(|a| apply_placeholders(a, message, from_user_id))
+        .map(|a| apply_placeholders(a, message, session_id, session_name))
         .collect();
 
     let mut cmd = Command::new(&cfg.command);
@@ -234,11 +276,20 @@ async fn run_cli(cfg: &BridgeProfile, message: &str, from_user_id: &str) -> Resu
     cmd.kill_on_drop(true);
 
     if let Some(dir) = &cfg.cwd {
-        cmd.current_dir(dir);
+        cmd.current_dir(apply_placeholders(dir, message, session_id, session_name));
     }
 
+    // P0: always inject ILINK_* env vars so any profile script/SDK can read them without
+    // requiring explicit `env:` entries in the YAML. User-defined `env:` entries below
+    // can override these defaults.
+    cmd.env("ILINK_MESSAGE", message);
+    cmd.env("ILINK_SESSION_ID", session_id);
+    cmd.env("ILINK_SESSION_NAME", session_name);
+    cmd.env("ILINK_FROM_USER", from_user);
+    cmd.env("ILINK_CONTEXT_TOKEN", context_token);
+
     for (k, v) in &cfg.env {
-        cmd.env(k, apply_placeholders(v, message, from_user_id));
+        cmd.env(k, apply_placeholders(v, message, session_id, session_name));
     }
 
     match cfg.stdin {
@@ -297,13 +348,25 @@ async fn run_cli(cfg: &BridgeProfile, message: &str, from_user_id: &str) -> Resu
         stdout.push_str(&stderr);
     }
 
-    Ok(stdout)
+    let prefix = cfg
+        .cli_session_first_line_prefix
+        .as_deref()
+        .unwrap_or("")
+        .trim();
+    let (body, cli_sid) = split_cli_session_from_stdout(prefix, &stdout);
+    Ok((body, cli_sid))
 }
 
-fn apply_placeholders(template: &str, message: &str, from_user_id: &str) -> String {
+/// Replace `{{MESSAGE}}`, `{{SESSION_ID}}`, and `{{SESSION_NAME}}` in a template string.
+///
+/// - `{{MESSAGE}}` — the user's text (prefix stripped when using prefix routing)
+/// - `{{SESSION_ID}}` — Hub-persisted backend session UUID (e.g. for `claude --resume`)
+/// - `{{SESSION_NAME}}` — human-readable session name (e.g. `"feature-a"`, default `"default"`)
+fn apply_placeholders(template: &str, message: &str, session_id: &str, session_name: &str) -> String {
     template
         .replace("{{MESSAGE}}", message)
-        .replace("{{FROM_USER_ID}}", from_user_id)
+        .replace("{{SESSION_ID}}", session_id)
+        .replace("{{SESSION_NAME}}", session_name)
 }
 
 fn truncate_chars(s: &str, max_chars: usize, suffix: &str) -> String {
@@ -320,11 +383,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholders() {
+    fn placeholders_message_session_id_and_name() {
         assert_eq!(
-            apply_placeholders("x {{MESSAGE}} y {{FROM_USER_ID}}", "hi", "u1"),
-            "x hi y u1"
+            apply_placeholders("{{MESSAGE}}|{{SESSION_ID}}|{{SESSION_NAME}}", "hi", "sid-9", "feat-a"),
+            "hi|sid-9|feat-a"
         );
+    }
+
+    #[test]
+    fn placeholder_session_name_defaults_to_default() {
+        assert_eq!(
+            apply_placeholders("name={{SESSION_NAME}}", "", "", "default"),
+            "name=default"
+        );
+    }
+
+    #[test]
+    fn split_cli_session_first_line() {
+        let (body, sid) = split_cli_session_from_stdout(
+            "ILINK_SESSION:",
+            "ILINK_SESSION:uuid-1\nhello\n",
+        );
+        assert_eq!(sid.as_deref(), Some("uuid-1"));
+        assert_eq!(body, "hello");
+    }
+
+    #[test]
+    fn split_cli_session_no_match_returns_full() {
+        let (body, sid) = split_cli_session_from_stdout("ILINK_SESSION:", "plain\n");
+        assert!(sid.is_none());
+        assert_eq!(body, "plain\n");
     }
 
     #[test]

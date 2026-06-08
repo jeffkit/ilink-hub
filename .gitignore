@@ -18,3 +18,9 @@ docs/.vitepress/cache
 # Examples
 examples/**/target
 examples/**/.wechatbot-hub-credentials.json
+
+# SDK build artifacts
+sdk/python/dist/
+sdk/python/**/__pycache__/
+sdk/python/**/*.pyc
+sdk/python/**/*.egg-info/

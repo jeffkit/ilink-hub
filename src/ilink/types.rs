@@ -123,6 +123,32 @@ pub struct WeixinMessage {
     /// Required for routing replies back to the correct conversation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_token: Option<String>,
+    /// ilink-hub 扩展元数据（Hub 与已注册后端之间专用，不会透传给官方 iLink 上游）。
+    ///
+    /// Hub 在转发消息给下游前注入此字段；下游回复时可在此字段中携带 `cli_session_id`
+    /// 以告知 Hub 当前活跃的后端 session UUID（如 Claude Code `--resume` 的 UUID）。
+    ///
+    /// 使用官方 iLink SDK 的后端不感知此字段（忽略未知 JSON key）；
+    /// 不支持 session 管理的后端同样可以正常收发消息，只是无法利用 session 连续性。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ilink_hub_ext: Option<HubExt>,
+}
+
+/// ilink-hub 专有扩展字段，封装于 `WeixinMessage.ilink_hub_ext`。
+///
+/// * **Hub → 下游**：`session_id`（当前活跃 session 的后端 UUID）、`session_name`（可读标识）
+/// * **下游 → Hub**：`cli_session_id`（下游上报的后端 UUID，Hub 将其持久化到对应 session）
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HubExt {
+    /// Hub 注入：当前活跃 session 已持久化的后端 UUID（如 Claude `--resume` 值）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Hub 注入：当前活跃 session 的可读名称（如 `"feature-a"`，默认 `"default"`）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// 下游 → Hub：下游在 `sendmessage` 时填入，Hub 将其写入当前活跃 session 的存储。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
 }
 
 impl WeixinMessage {
@@ -253,9 +279,25 @@ impl SendMessageRequest {
 
     /// Build a text reply to a WeChat user. `from_user_id` must be empty per iLink protocol.
     pub fn reply(context_token: String, text: String, to_user_id: &str) -> Self {
+        Self::reply_text(context_token, text, to_user_id, None)
+    }
+
+    /// Same as [`reply`](Self::reply) but allows bridge to attach `cli_session_id` (via `ilink_hub_ext`) for Hub to persist.
+    pub fn reply_text(
+        context_token: String,
+        text: String,
+        to_user_id: &str,
+        cli_session_id: Option<String>,
+    ) -> Self {
         let mut msg = WeixinMessage::build_text_reply(context_token, text);
         if !to_user_id.is_empty() {
             msg.to_user_id = Some(to_user_id.to_string());
+        }
+        if cli_session_id.is_some() {
+            msg.ilink_hub_ext = Some(HubExt {
+                cli_session_id,
+                ..Default::default()
+            });
         }
         Self {
             msg: Some(msg),
