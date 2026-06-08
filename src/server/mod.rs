@@ -2,7 +2,7 @@ pub mod pairing;
 pub mod routes;
 
 use axum::{
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use std::sync::Arc;
@@ -29,6 +29,7 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         // Hub management (non-iLink)
         .route("/hub/register", post(register))
         .route("/hub/clients", get(admin_clients))
+        .route("/hub/clients/{name}", delete(admin_delete_client))
         .route("/hub/ui", get(admin_ui))
         .route("/hub/pair/{code}", get(pair_page))
         .route("/hub/pair/{code}/confirm", post(pair_confirm))

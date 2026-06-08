@@ -125,6 +125,21 @@ impl ClientRegistry {
             false
         }
     }
+
+    /// Remove routing entries that pointed at `vtoken`. Clears default if it matched.
+    /// Returns the new default vtoken, if any.
+    pub fn pick_default_after_remove(&self, removed_vtoken: &str) -> Option<String> {
+        self.online_clients()
+            .iter()
+            .find(|c| c.vtoken != removed_vtoken)
+            .map(|c| c.vtoken.clone())
+            .or_else(|| {
+                self.all_clients()
+                    .iter()
+                    .find(|c| c.vtoken != removed_vtoken)
+                    .map(|c| c.vtoken.clone())
+            })
+    }
 }
 
 impl Default for ClientRegistry {

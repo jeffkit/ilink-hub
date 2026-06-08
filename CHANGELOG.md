@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.17] — 2026-06-08
+
+### Hub — 管理后台删除离线后端
+
+**新增**
+
+- **Admin UI**：离线后端卡片显示 **Delete** 按钮，可清理 `/list` 中的失效注册项。
+- **`DELETE /hub/clients/{name}`**：仅允许删除离线客户端；同步清理内存路由、消息队列与数据库中的 routing 记录。
+
 ## [0.1.16] — 2026-06-08
 
 ### Bridge — 稳定自动注册名

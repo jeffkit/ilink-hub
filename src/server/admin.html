@@ -122,6 +122,13 @@
     }
     .btn-ghost:hover { background: var(--border); color: var(--text); }
 
+    .btn-danger {
+      background: transparent;
+      color: var(--red);
+      border: 1px solid #7f1d1d;
+    }
+    .btn-danger:hover { background: #7f1d1d; color: #fff; }
+
     .btn-sm { font-size: 11px; padding: 3px 8px; }
 
     /* Forms */
@@ -330,9 +337,12 @@ function renderClients(clients) {
         <div class="name">${esc(c.name)}</div>
         ${c.label ? `<div class="label">${esc(c.label)}</div>` : ''}
       </div>
-      <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'};margin-top:3px">
-        ${c.online ? '🟢 online' : '⚫ offline'}
-      </span>
+      <div class="client-actions">
+        <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'}">
+          ${c.online ? '🟢 online' : '⚫ offline'}
+        </span>
+        ${c.online ? '' : `<button class="btn btn-danger btn-sm" onclick="deleteClient(${JSON.stringify(c.name)})">Delete</button>`}
+      </div>
       <div class="vtoken-row">
         <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_TOKEN</span>
         <span class="vtoken-value">${esc(c.vtoken || '—')}</span>
@@ -345,6 +355,26 @@ function renderClients(clients) {
       </div>
     </div>
   `).join('');
+}
+
+async function deleteClient(name) {
+  if (!confirm(`Delete offline backend "${name}"?\n\nThis removes it from /list and clears any routing to it.`)) return;
+
+  try {
+    const r = await fetch('/hub/clients/' + encodeURIComponent(name), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    });
+    const data = await r.json();
+    if (data.ret !== 0) {
+      showToast('Delete failed: ' + (data.errmsg || 'unknown error'));
+      return;
+    }
+    showToast('Deleted ' + name);
+    await loadClients();
+  } catch(e) {
+    showToast('Error: ' + e.message);
+  }
 }
 
 async function registerClient() {

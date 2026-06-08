@@ -204,6 +204,22 @@ impl Store {
         }))
     }
 
+    pub async fn delete_client_by_name(&self, name: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM clients WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn clear_routes_for_vtoken(&self, vtoken: &str) -> Result<()> {
+        sqlx::query("DELETE FROM routing_state WHERE active_vtoken = $1")
+            .bind(vtoken)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ─── Routing state ────────────────────────────────────────────────────────
 
     pub async fn list_routes(&self) -> Result<Vec<(String, String)>> {

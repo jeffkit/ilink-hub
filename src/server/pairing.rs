@@ -113,6 +113,56 @@ pub async fn register_client_in_hub(
     vtoken
 }
 
+#[derive(Debug)]
+pub enum UnregisterClientError {
+    NotFound,
+    StillOnline,
+    Store(anyhow::Error),
+}
+
+/// Remove a registered backend client from memory, DB, routing, and its message queue.
+/// Only offline clients can be deleted.
+pub async fn unregister_client_in_hub(state: &HubState, name: &str) -> Result<(), UnregisterClientError> {
+    let vtoken = {
+        let registry = state.registry.read().await;
+        let Some(client) = registry.get_by_name(name) else {
+            return Err(UnregisterClientError::NotFound);
+        };
+        if client.online {
+            return Err(UnregisterClientError::StillOnline);
+        }
+        client.vtoken.clone()
+    };
+
+    {
+        let mut registry = state.registry.write().await;
+        if !registry.remove(name) {
+            return Err(UnregisterClientError::NotFound);
+        }
+        let new_default = registry.pick_default_after_remove(&vtoken);
+        let mut router = state.router.lock().await;
+        router.remove_routes_for_vtoken(&vtoken, new_default);
+    }
+
+    if let Err(e) = state.queue.remove_client(&vtoken).await {
+        warn!(error = %e, vtoken = %vtoken, "failed to remove client queue");
+    }
+
+    state
+        .store
+        .clear_routes_for_vtoken(&vtoken)
+        .await
+        .map_err(UnregisterClientError::Store)?;
+    state
+        .store
+        .delete_client_by_name(name)
+        .await
+        .map_err(UnregisterClientError::Store)?;
+
+    info!(client = %name, vtoken = %vtoken, "admin deleted offline client");
+    Ok(())
+}
+
 fn build_pairing_qr_response(code: String) -> GetQrcodeResponse {
     let base = pair_public_url();
     let pair_url = crate::relay::pair_qr_url(&base, &code);

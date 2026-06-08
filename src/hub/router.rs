@@ -123,6 +123,14 @@ impl Router {
         self.active_routes.insert(from_user_id.to_string(), vtoken);
     }
 
+    /// Drop per-user routes and default client entry for a removed backend vtoken.
+    pub fn remove_routes_for_vtoken(&mut self, vtoken: &str, new_default: Option<String>) {
+        if self.default_client.as_deref() == Some(vtoken) {
+            self.default_client = new_default;
+        }
+        self.active_routes.retain(|_, vt| vt != vtoken);
+    }
+
     pub fn get_route(&self, from_user_id: &str) -> Option<&str> {
         self.active_routes
             .get(from_user_id)

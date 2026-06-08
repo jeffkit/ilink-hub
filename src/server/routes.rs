@@ -414,6 +414,84 @@ pub async fn admin_clients(
     )
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminDeleteClientResponse {
+    pub ret: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errmsg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+pub async fn admin_delete_client(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> (StatusCode, Json<AdminDeleteClientResponse>) {
+    if !check_admin_auth(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(AdminDeleteClientResponse {
+                ret: 401,
+                errmsg: Some("Unauthorized".to_string()),
+                name: None,
+            }),
+        );
+    }
+
+    let name = name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AdminDeleteClientResponse {
+                ret: 400,
+                errmsg: Some("Client name is required".to_string()),
+                name: None,
+            }),
+        );
+    }
+
+    match crate::server::pairing::unregister_client_in_hub(state.as_ref(), name).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(AdminDeleteClientResponse {
+                ret: 0,
+                errmsg: None,
+                name: Some(name.to_string()),
+            }),
+        ),
+        Err(crate::server::pairing::UnregisterClientError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(AdminDeleteClientResponse {
+                ret: 404,
+                errmsg: Some(format!("Client `{name}` not found")),
+                name: None,
+            }),
+        ),
+        Err(crate::server::pairing::UnregisterClientError::StillOnline) => (
+            StatusCode::CONFLICT,
+            Json(AdminDeleteClientResponse {
+                ret: 409,
+                errmsg: Some(format!(
+                    "Client `{name}` is still online; stop the backend process first"
+                )),
+                name: None,
+            }),
+        ),
+        Err(crate::server::pairing::UnregisterClientError::Store(e)) => {
+            error!(error = %e, %name, "failed to delete client from store");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminDeleteClientResponse {
+                    ret: 500,
+                    errmsg: Some("Failed to delete client".to_string()),
+                    name: None,
+                }),
+            )
+        }
+    }
+}
+
 // ─── Web Admin UI ─────────────────────────────────────────────────────────────
 
 static ADMIN_HTML: &str = include_str!("admin.html");
