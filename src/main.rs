@@ -3,7 +3,9 @@ use clap::{Parser, Subcommand};
 use tokio::sync::watch;
 use tracing::info;
 
-use ilink_hub::{ilink::LoginClient, run_serve, store::Store, ServeOptions};
+use ilink_hub::{
+    ilink::LoginClient, paths::default_database_url, run_serve, store::Store, ServeOptions,
+};
 
 #[derive(Parser)]
 #[command(name = "ilink-hub")]
@@ -30,18 +32,18 @@ enum Commands {
         ilink_base_url: Option<String>,
 
         /// Database connection URL.
-        /// Defaults to SQLite at ./ilink-hub.db
+        /// Defaults to SQLite at ~/.ilink-hub/ilink-hub.db
         /// Examples:
         ///   sqlite:///path/to/db.sqlite
         ///   postgres://user:pass@localhost/ilink_hub
         ///   mysql://user:pass@localhost/ilink_hub
-        #[arg(long, default_value = "sqlite:./ilink-hub.db", env = "DATABASE_URL")]
+        #[arg(long, default_value_t = default_database_url(), env = "DATABASE_URL")]
         database_url: String,
     },
 
     /// Interactive QR-code login — scans WeChat and saves bot_token to DB
     Login {
-        #[arg(long, default_value = "sqlite:./ilink-hub.db", env = "DATABASE_URL")]
+        #[arg(long, default_value_t = default_database_url(), env = "DATABASE_URL")]
         database_url: String,
 
         #[arg(long, env = "ILINK_BASE_URL")]

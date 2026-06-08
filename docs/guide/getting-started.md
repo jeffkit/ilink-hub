@@ -2,7 +2,7 @@
 
 本指南带你在 5 分钟内完成 iLink Hub 的安装、启动和客户端接入。
 
-> **路径说明**：默认数据库为**当前工作目录**下的 `./ilink-hub.db`（可用 `DATABASE_URL` 覆盖）。与 AI 客户端相关的 URL 一般为 `http://<hub 主机>:8765`，管理面板为 `http://<hub 主机>:8765/hub/ui`。
+> **路径说明**：默认数据库为 **`~/.ilink-hub/ilink-hub.db`**（可用 `DATABASE_URL` 覆盖）；bridge 默认配置为 **`~/.ilink-hub/ilink-hub-bridge.yaml`**，凭证为 **`~/.ilink-hub/bridge-credentials.json`**。与 AI 客户端相关的 URL 一般为 `http://<hub 主机>:8765`，管理面板为 `http://<hub 主机>:8765/hub/ui`。
 
 ## 前提条件
 

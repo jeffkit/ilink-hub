@@ -72,7 +72,7 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub
 
 ### Q: 数据库文件在哪里？
 
-由 `DATABASE_URL` 决定。未设置时，Hub 默认在当前工作目录创建 **`./ilink-hub.db`**（SQLite）。Docker 部署示例中常为卷内的 **`/data/ilink-hub.db`**。
+由 `DATABASE_URL` 决定。未设置时，Hub 默认使用 **`~/.ilink-hub/ilink-hub.db`**（SQLite）。Docker 部署示例中常为卷内的 **`/data/ilink-hub.db`**。
 
 ### Q: 可以迁移从 SQLite 到 PostgreSQL 吗？
 

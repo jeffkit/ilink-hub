@@ -1,6 +1,6 @@
 //! Database persistence layer.
 //! Uses sqlx with runtime driver selection via `DATABASE_URL`:
-//!   sqlite:./ilink-hub.db            → SQLite (default, file created if missing)
+//!   sqlite:~/.ilink-hub/ilink-hub.db → SQLite (default, file created if missing)
 //!   postgres://user:pass@host/db      → PostgreSQL
 //!   mysql://user:pass@host/db         → MySQL
 

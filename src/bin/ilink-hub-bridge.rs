@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use ilink_hub::bridge::{builtin, resolve_hub_connection, run_bridge, BridgeApp};
+use ilink_hub::paths::default_bridge_config_path;
 
 #[derive(Parser)]
 #[command(name = "ilink-hub-bridge")]
@@ -56,8 +57,9 @@ struct Cli {
     force_register: bool,
 
     /// Path to bridge YAML (command, args, timeout, …). Used only in bridge (default) mode.
-    #[arg(long, default_value = "ilink-hub-bridge.yaml")]
-    config: PathBuf,
+    /// Defaults to `~/.ilink-hub/ilink-hub-bridge.yaml`.
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -115,8 +117,12 @@ async fn main() -> Result<()> {
             .await?;
             info!(%hub_url, "using Hub base URL for downstream");
 
-            let app = BridgeApp::load(&cli.config)?;
-            info!(config_path = %cli.config.display(), "loaded bridge config");
+            let config_path = cli
+                .config
+                .clone()
+                .unwrap_or_else(default_bridge_config_path);
+            let app = BridgeApp::load(&config_path)?;
+            info!(config_path = %config_path.display(), "loaded bridge config");
 
             let handle = tokio::spawn(run_bridge(hub_url, token, app));
             let _ = tokio::signal::ctrl_c().await;

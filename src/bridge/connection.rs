@@ -22,10 +22,7 @@ use crate::client::{HubPairingClient, HubPairingCredentials, HubPairingOptions};
 
 /// Default path for cached downstream credentials (same JSON shape as Hub pairing).
 pub fn default_local_credential_path() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ilink-hub")
-        .join("bridge-credentials.json")
+    crate::paths::default_bridge_credentials_path()
 }
 
 fn credential_path(cred_file: Option<&str>) -> PathBuf {

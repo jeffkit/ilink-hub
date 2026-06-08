@@ -34,7 +34,7 @@ ilink-hub login \
 DATABASE_URL=sqlite:/data/ilink-hub.db ilink-hub login
 ```
 
-默认数据库为**当前工作目录**下的 `./ilink-hub.db`（与 `serve` 一致），除非你通过 `--database-url` 或 `DATABASE_URL` 指定了其他路径。
+默认数据库为 **`~/.ilink-hub/ilink-hub.db`**（与 `serve` 一致），除非你通过 `--database-url` 或 `DATABASE_URL` 指定了其他路径。
 
 ## 登录流程
 
@@ -62,7 +62,7 @@ ILINK_TOKEN=your-existing-token ilink-hub serve
 
 ### 登录后 Token 保存在哪里？
 
-由 `DATABASE_URL` 决定，未设置时默认为当前目录下的 **`./ilink-hub.db`**（SQLite 文件）。Docker 示例中常为挂载卷内的 `/data/ilink-hub.db`。
+由 `DATABASE_URL` 决定，未设置时默认为 **`~/.ilink-hub/ilink-hub.db`**（SQLite 文件）。Docker 示例中常为挂载卷内的 `/data/ilink-hub.db`。
 
 ### Token 会过期吗？
 
