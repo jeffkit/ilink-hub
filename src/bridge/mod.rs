@@ -9,7 +9,16 @@ mod connection;
 pub mod builtin;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
-pub use connection::{default_local_credential_path, resolve_hub_connection};
+pub use connection::{
+    default_local_credential_path, hub_response_token_rejected, resolve_hub_connection,
+    validate_hub_token,
+};
+
+/// Returned from [`run_bridge`] when Hub rejects the virtual token at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeStop {
+    TokenRejected,
+}
 
 use std::time::Duration;
 
@@ -22,6 +31,11 @@ use crate::ilink::types::{
     BaseInfo, GetUpdatesRequest, GetUpdatesResponse, SendMessageRequest, SendMessageResponse,
     WeixinMessage,
 };
+
+enum GetUpdatesOutcome {
+    Ok(GetUpdatesResponse),
+    TokenRejected,
+}
 
 struct HubClient {
     http: reqwest::Client,
@@ -44,7 +58,7 @@ impl HubClient {
         }
     }
 
-    async fn getupdates(&self, buf: &mut String) -> Result<GetUpdatesResponse> {
+    async fn getupdates(&self, buf: &mut String) -> Result<GetUpdatesOutcome> {
         let body = GetUpdatesRequest {
             get_updates_buf: buf.clone(),
             base_info: Some(BaseInfo::default()),
@@ -58,16 +72,23 @@ impl HubClient {
             .json(&body)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let t = resp.text().await.unwrap_or_default();
-            anyhow::bail!("getupdates HTTP {status}: {t}");
-        }
+        let status = resp.status();
         let out: GetUpdatesResponse = resp.json().await?;
+        if hub_response_token_rejected(status, out.ret) {
+            warn!(
+                status = %status,
+                errmsg = ?out.errmsg,
+                "hub rejected virtual token during getupdates"
+            );
+            return Ok(GetUpdatesOutcome::TokenRejected);
+        }
+        if !status.is_success() {
+            anyhow::bail!("getupdates HTTP {status}: {:?}", out.errmsg);
+        }
         if let Some(ref newbuf) = out.get_updates_buf {
             *buf = newbuf.clone();
         }
-        Ok(out)
+        Ok(GetUpdatesOutcome::Ok(out))
     }
 
     async fn sendmessage(&self, req: SendMessageRequest) -> Result<()> {
@@ -100,8 +121,10 @@ impl HubClient {
     }
 }
 
-/// Long-poll Hub and dispatch inbound user text to the configured CLI (runs until process exit).
-pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) {
+/// Long-poll Hub and dispatch inbound user text to the configured CLI.
+///
+/// Returns [`BridgeStop::TokenRejected`] when Hub returns 401 for an unknown/revoked vtoken.
+pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> BridgeStop {
     let client = HubClient::new(hub_url, token);
     let mut buf = String::new();
     info!(
@@ -112,7 +135,8 @@ pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) {
 
     loop {
         let resp = match client.getupdates(&mut buf).await {
-            Ok(r) => r,
+            Ok(GetUpdatesOutcome::Ok(r)) => r,
+            Ok(GetUpdatesOutcome::TokenRejected) => return BridgeStop::TokenRejected,
             Err(e) => {
                 error!(error = %e, "getupdates failed; retrying in 3s");
                 tokio::time::sleep(Duration::from_secs(3)).await;

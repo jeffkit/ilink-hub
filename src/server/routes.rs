@@ -16,6 +16,9 @@ use crate::hub::HubState;
 use crate::ilink::types::*;
 use crate::server::pairing::register_client_in_hub;
 
+/// Returned when a downstream `Authorization` vtoken is not in the Hub registry.
+pub const UNKNOWN_VTOKEN_MSG: &str = "Unknown or revoked virtual token; register via POST /hub/register or ilink-hub-bridge --force-register";
+
 // ─── Auth helper ─────────────────────────────────────────────────────────────
 
 fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
@@ -108,6 +111,23 @@ pub async fn getupdates(
     };
 
     {
+        let registry = state.registry.read().await;
+        if registry.get_by_vtoken(&vtoken).is_none() {
+            warn!(vtoken = %vtoken, "getupdates rejected: unknown virtual token");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(GetUpdatesResponse {
+                    ret: Some(401),
+                    errcode: None,
+                    errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+                    msgs: None,
+                    get_updates_buf: None,
+                }),
+            );
+        }
+    }
+
+    {
         let mut registry = state.registry.write().await;
         registry.mark_seen(&vtoken);
     }
@@ -153,12 +173,20 @@ pub async fn sendmessage(
     headers: HeaderMap,
     Json(mut req): Json<SendMessageRequest>,
 ) -> Json<SendMessageResponse> {
-    let Some(_vtoken) = extract_vtoken(&headers) else {
+    let Some(vtoken) = extract_vtoken(&headers) else {
         return Json(SendMessageResponse::err(
             401,
             "Missing Authorization header",
         ));
     };
+
+    {
+        let registry = state.registry.read().await;
+        if registry.get_by_vtoken(&vtoken).is_none() {
+            warn!(vtoken = %vtoken, "sendmessage rejected: unknown virtual token");
+            return Json(SendMessageResponse::err(401, UNKNOWN_VTOKEN_MSG));
+        }
+    }
 
     // Extract context_token from req.msg
     let vctx = match req.msg.as_ref().and_then(|m| m.context_token.as_deref()) {
@@ -234,7 +262,7 @@ pub async fn sendmessage(
         let (client_meta, registered_count) = {
             let reg = state.registry.read().await;
             (
-                reg.get_by_vtoken(&_vtoken)
+                reg.get_by_vtoken(&vtoken)
                     .map(|i| (i.name.clone(), i.label.clone())),
                 reg.all_clients().len(),
             )
@@ -254,7 +282,7 @@ pub async fn sendmessage(
         if let Some(cid) = msg.client_id.as_deref().filter(|s| !s.is_empty()) {
             if let Some((name, label)) = client_meta {
                 let mut q = state.quote_index.lock().await;
-                q.register_pending_client(cid, _vtoken.clone(), name, label);
+                q.register_pending_client(cid, vtoken.clone(), name, label);
             }
         }
     }

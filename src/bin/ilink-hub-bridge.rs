@@ -20,9 +20,13 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tracing::info;
+use tracing::{info, warn};
 
-use ilink_hub::bridge::{builtin, resolve_hub_connection, run_bridge, BridgeApp};
+use anyhow::Context;
+use ilink_hub::bridge::{
+    builtin, default_local_credential_path, resolve_hub_connection, run_bridge, BridgeApp,
+    BridgeStop,
+};
 use ilink_hub::paths::default_bridge_config_path;
 
 #[derive(Parser)]
@@ -106,17 +110,6 @@ async fn main() -> Result<()> {
         }
         None => {
             // Default mode: connect to Hub and long-poll for messages.
-            let (hub_url, token) = resolve_hub_connection(
-                &cli.hub_url,
-                explicit_token(&cli),
-                cli.cred_file.as_deref(),
-                cli.pair,
-                cli.register_name.as_deref(),
-                cli.force_register,
-            )
-            .await?;
-            info!(%hub_url, "using Hub base URL for downstream");
-
             let config_path = cli
                 .config
                 .clone()
@@ -124,12 +117,60 @@ async fn main() -> Result<()> {
             let app = BridgeApp::load(&config_path)?;
             info!(config_path = %config_path.display(), "loaded bridge config");
 
-            let handle = tokio::spawn(run_bridge(hub_url, token, app));
-            let _ = tokio::signal::ctrl_c().await;
-            handle.abort();
-            let _ = handle.await;
-            info!("exit");
-            Ok(())
+            let cred_path = cli
+                .cred_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_local_credential_path);
+            let using_explicit_token = explicit_token(&cli).is_some();
+
+            'reconnect: loop {
+                let (hub_url, token) = resolve_hub_connection(
+                    &cli.hub_url,
+                    explicit_token(&cli),
+                    cli.cred_file.as_deref(),
+                    cli.pair,
+                    cli.register_name.as_deref(),
+                    cli.force_register,
+                )
+                .await?;
+                info!(%hub_url, "using Hub base URL for downstream");
+
+                let mut handle = tokio::spawn(run_bridge(hub_url, token, app.clone()));
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            handle.abort();
+                            let _ = handle.await;
+                            info!("exit");
+                            return Ok(());
+                        }
+                        result = &mut handle => {
+                            match result {
+                                Ok(BridgeStop::TokenRejected) if using_explicit_token => {
+                                    anyhow::bail!(
+                                        "Hub 拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
+                                         请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
+                                    );
+                                }
+                                Ok(BridgeStop::TokenRejected) => {
+                                    warn!(
+                                        path = %cred_path.display(),
+                                        "hub token revoked at runtime; removing credentials and re-registering"
+                                    );
+                                    let _ = tokio::fs::remove_file(&cred_path).await;
+                                    continue 'reconnect;
+                                }
+                                Err(e) => {
+                                    return Err(e).context("bridge task panicked or failed");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

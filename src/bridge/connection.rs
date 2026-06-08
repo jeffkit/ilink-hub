@@ -14,11 +14,13 @@
 //! reachable `WEIXIN_BASE_URL` (local or remote).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::client::{HubPairingClient, HubPairingCredentials, HubPairingOptions};
+use crate::ilink::types::{BaseInfo, GetUpdatesRequest, GetUpdatesResponse};
 
 /// Default path for cached downstream credentials (same JSON shape as Hub pairing).
 pub fn default_local_credential_path() -> PathBuf {
@@ -72,6 +74,64 @@ async fn write_credentials(path: &Path, hub_url: &str, vtoken: &str) -> Result<(
         .await
         .with_context(|| format!("write {}", path.display()))?;
     Ok(())
+}
+
+/// Returns `true` when Hub rejects the virtual token (HTTP 401 or `ret == 401`).
+pub fn hub_response_token_rejected(status: reqwest::StatusCode, ret: Option<i32>) -> bool {
+    status == reqwest::StatusCode::UNAUTHORIZED || ret == Some(401)
+}
+
+/// Probe Hub with a zero-timeout `getupdates` to ensure `token` is registered.
+pub async fn validate_hub_token(hub_url: &str, token: &str) -> Result<()> {
+    let hub = hub_url.trim().trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build HTTP client for token validation")?;
+    let url = format!("{hub}/ilink/bot/getupdates");
+    let body = GetUpdatesRequest {
+        get_updates_buf: String::new(),
+        base_info: Some(BaseInfo::default()),
+        timeout: Some(0),
+    };
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("probe Hub token via {url}"))?;
+    let status = resp.status();
+    let out: GetUpdatesResponse = resp.json().await.context("parse getupdates probe")?;
+    if hub_response_token_rejected(status, out.ret) {
+        let detail = out.errmsg.unwrap_or_else(|| "token rejected".into());
+        anyhow::bail!("{detail}");
+    }
+    if let Some(ret) = out.ret {
+        if ret != 0 {
+            anyhow::bail!(
+                "getupdates probe failed: ret={ret} errmsg={}",
+                out.errmsg.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hub_response_token_rejected_detects_401() {
+        assert!(hub_response_token_rejected(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None
+        ));
+        assert!(hub_response_token_rejected(reqwest::StatusCode::OK, Some(401)));
+        assert!(!hub_response_token_rejected(reqwest::StatusCode::OK, Some(0)));
+    }
 }
 
 async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result<String> {
@@ -168,6 +228,12 @@ pub async fn resolve_hub_connection(
     let hub = hub_url.trim().trim_end_matches('/').to_string();
 
     if let Some(tok) = explicit_token.map(str::trim).filter(|s| !s.is_empty()) {
+        validate_hub_token(&hub, tok)
+            .await
+            .with_context(|| {
+                "WEIXIN_TOKEN / --token 未被当前 Hub 接受（未注册或已失效）。\
+                 请用 `ilink-hub register` 或 `ilink-hub-bridge --force-register` 重新注册。"
+            })?;
         return Ok((hub, tok.to_string()));
     }
 
@@ -186,6 +252,20 @@ pub async fn resolve_hub_connection(
     match local_credential_state(&path).await? {
         LocalCredState::Valid(creds) => {
             let base = creds.base_url.trim().trim_end_matches('/').to_string();
+            let hub_for_token = if base.is_empty() {
+                hub.clone()
+            } else {
+                base.clone()
+            };
+            if let Err(e) = validate_hub_token(&hub_for_token, &creds.token).await {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "saved bridge token rejected by Hub; removing credentials and re-registering"
+                );
+                let _ = tokio::fs::remove_file(&path).await;
+                return auto_register_and_save(&path, &hub, register_client_name).await;
+            }
             if base.is_empty() {
                 Ok((hub, creds.token))
             } else {

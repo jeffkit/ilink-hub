@@ -6,7 +6,9 @@
 
 1. **零交互（默认，本机最省事）**：不传 `--token`、且**凭证路径尚不存在**时，进程会自行调用 Hub 已有的 **`POST /hub/register`**（与任何其他客户端相同），生成随机客户端名、拿到 `vhub_…` 后写入 **`~/.ilink-hub/bridge-credentials.json`**。终端会打印 `已向 Hub 自动注册客户端「…」`，按提示在微信发 `/use <名称>` 即可。若 Hub 配置了 **`ILINK_ADMIN_TOKEN`**，请在本机同一环境导出该变量，否则注册会 401。可用 **`--register-name` / `ILINKHUB_BRIDGE_REGISTER_NAME`** 固定注册名。  
    **凭证文件已存在但损坏或 token 为空**时：为避免静默覆盖扫码配对结果，默认**不会**再自动注册；请删文件、改用 **`WEIXIN_TOKEN` / `--pair`**，或显式加 **`--force-register`**（会先删该路径再自动注册）。  
-2. **扫码配对**：加 **`--pair`**（或你希望用手机确认时），走 Hub 通用配对流程；凭证仍写入上述 JSON。  
+2. **扫码配对**：加 **`--pair`**（或你希望用手机确认时），走 Hub 通用配对流程；凭证仍写入上述 JSON。
+
+**Token 校验（v0.1.13+）**：Hub 在 `getupdates` / `sendmessage` 会拒绝未注册的 `vhub_…` token（HTTP 401）。Bridge 启动时会探测凭证是否仍被当前 Hub 接受；若本地 JSON 里的 token 已失效，会**自动删除凭证并重新 `POST /hub/register`**（除非你用 `WEIXIN_TOKEN` / `--token` 显式指定）。运行中若 Hub 撤销 token，bridge 也会同样自动重注册。  
 3. **显式 Token**：自行 `ilink-hub register` 或拷贝 `vhub_…`，通过 **`--token` / `WEIXIN_TOKEN`** 传入。
 
 Hub 侧**不区分**调用方是不是 bridge：只看到普通的「注册客户端」与「长轮询下游」。

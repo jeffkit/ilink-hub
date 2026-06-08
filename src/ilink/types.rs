@@ -236,8 +236,8 @@ pub struct GetUpdatesRequest {
     pub get_updates_buf: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_info: Option<BaseInfo>,
-    /// Legacy field accepted for backwards compat with older clients; ignored by hub.
-    #[serde(skip)]
+    /// Long-poll seconds (0 = return immediately if no messages). Defaults to 30 on Hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
 }
 
