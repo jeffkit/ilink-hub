@@ -5,19 +5,19 @@ use crate::ilink::types::WeixinMessage;
 /// Whether to append the origin footer to outbound client replies.
 ///
 /// - **Default** (env unset or empty, or any other non-reserved value): append only when
-///   `registered_client_count > 1` (multiple registered backends).
+///   **more than one client is online** (multiple active backends).
 /// - `ILINKHUB_OUTBOUND_ORIGIN_LABEL=0` / `false` / `no` / `off` — never append.
 /// - `ILINKHUB_OUTBOUND_ORIGIN_LABEL=1` / `true` / `yes` / `on` — always append (even with one client).
 pub fn should_append_outbound_origin_label(
-    registered_client_count: usize,
+    online_client_count: usize,
     env_val: Option<&str>,
 ) -> bool {
     let v = env_val.map(str::trim).filter(|s| !s.is_empty());
     match v.map(|s| s.to_ascii_lowercase()).as_deref() {
-        None => registered_client_count > 1,
+        None => online_client_count > 1,
         Some("0" | "false" | "no" | "off") => false,
         Some("1" | "true" | "yes" | "on") => true,
-        Some(_) => registered_client_count > 1,
+        Some(_) => online_client_count > 1,
     }
 }
 

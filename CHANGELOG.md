@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.15] — 2026-06-08
+
+### Hub — 多轮对话 session 连续性
+
+**修复**
+
+- **同一微信用户多轮对话**：微信/iLink 每条消息可能携带新的 `context_token`；Hub 现在按 `peer_user_id`（群聊则按 `group_id`）复用稳定的虚拟 `vctx`，Claude `--resume` 等 backend session ID 可跨消息保留。
+- **Hub 重启恢复**：冷启动时从数据库查找该用户已有的 backend session 并预热内存映射。
+- **回复来源脚注**：默认仅在 **同时在线的后端 ≥ 2** 时追加 `— 工作区名` 行（不再因历史离线注册项误触发）。
+
 ## [0.1.14] — 2026-06-08
 
 ### Bridge — Claude Code 可靠性

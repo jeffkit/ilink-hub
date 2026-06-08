@@ -21,7 +21,7 @@ pub use outbound_label::{
     should_append_outbound_origin_label,
 };
 pub use pairing::PairingRegistry;
-pub use queue::{ClientQueue, ContextTokenMap, InMemoryQueue, MessageQueue};
+pub use queue::{conversation_key, ClientQueue, ContextTokenMap, InMemoryQueue, MessageQueue};
 pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
@@ -146,11 +146,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             };
 
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+            let group_id = msg.group_id.clone();
 
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone(), peer_user_id.clone())
-            };
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &peer_user_id,
+                group_id.as_deref(),
+            )
+            .await;
 
             let store = state.store.clone();
             let vctx_clone = vctx.clone();
@@ -238,12 +242,16 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             };
 
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+            let group_id = msg.group_id.clone();
 
             for vtoken in &online {
-                let vctx = {
-                    let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(real_ctx.clone(), peer_user_id.clone())
-                };
+                let vctx = resolve_vctx_for_message(
+                    &state,
+                    &real_ctx,
+                    &peer_user_id,
+                    group_id.as_deref(),
+                )
+                .await;
 
                 let store = state.store.clone();
                 let vctx_clone = vctx.clone();
@@ -351,10 +359,13 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     .collect::<Vec<_>>()
             };
             for vtoken in &online {
-                let vctx = {
-                    let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.map(real_ctx.clone(), from_user_id.clone())
-                };
+                let vctx = resolve_vctx_for_message(
+                    &state,
+                    &real_ctx,
+                    &from_user_id,
+                    msg.group_id.as_deref(),
+                )
+                .await;
                 let mut m = msg.clone();
                 let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
                 m.context_token = Some(vctx.clone());
@@ -386,10 +397,13 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         HubCommand::Help => build_help_text(),
 
         HubCommand::SessionList => {
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone(), from_user_id.clone())
-            };
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &from_user_id,
+                msg.group_id.as_deref(),
+            )
+            .await;
             let active = state
                 .store
                 .get_active_session_name(&vctx)
@@ -419,10 +433,13 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionNew(ref session_name, ref initial_uuid) => {
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone(), from_user_id.clone())
-            };
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &from_user_id,
+                msg.group_id.as_deref(),
+            )
+            .await;
             match state
                 .store
                 .set_backend_session(&vctx, session_name, initial_uuid)
@@ -445,10 +462,13 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionUse(ref session_name) => {
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone(), from_user_id.clone())
-            };
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &from_user_id,
+                msg.group_id.as_deref(),
+            )
+            .await;
             // Ensure the session exists (auto-create slot with empty UUID if not)
             let ensure_result: Result<(), String> =
                 match state.store.get_backend_session(&vctx, session_name).await {
@@ -476,10 +496,13 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionDelete(ref session_name) => {
-            let vctx = {
-                let mut ctx_map = state.ctx_map.lock().await;
-                ctx_map.map(real_ctx.clone(), from_user_id.clone())
-            };
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &from_user_id,
+                msg.group_id.as_deref(),
+            )
+            .await;
             let active = state
                 .store
                 .get_active_session_name(&vctx)
@@ -538,6 +561,50 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 
 // ─── Hub extension helper ─────────────────────────────────────────────────────
 
+/// Resolve (or create) a stable virtual context token for this conversation.
+///
+/// WeChat/iLink may send a new `real_ctx` on every inbound message even in the same DM.
+/// Reusing one vctx per peer/group keeps backend session IDs (Claude `--resume`, etc.)
+/// attached across turns.
+async fn resolve_vctx_for_message(
+    state: &HubState,
+    real_ctx: &str,
+    peer_user_id: &str,
+    group_id: Option<&str>,
+) -> String {
+    let conv_key = conversation_key(peer_user_id, group_id);
+
+    let needs_seed = if let Some(ref key) = conv_key {
+        let ctx_map = state.ctx_map.lock().await;
+        !ctx_map.has_conversation(key)
+    } else {
+        false
+    };
+
+    if needs_seed {
+        if let Some(ref key) = conv_key {
+            if key.starts_with("peer:") {
+                if let Ok(Some(vctx)) = state.store.find_vctx_for_peer(peer_user_id).await {
+                    let mut ctx_map = state.ctx_map.lock().await;
+                    ctx_map.seed_conversation(
+                        key.clone(),
+                        vctx,
+                        real_ctx.to_string(),
+                        peer_user_id.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut ctx_map = state.ctx_map.lock().await;
+    ctx_map.map(
+        real_ctx.to_string(),
+        peer_user_id.to_string(),
+        group_id,
+    )
+}
+
 /// Build `HubExt` for an outbound message by looking up the active session for the given vctx.
 async fn build_hub_ext_for_vctx(store: &Store, vctx: &str) -> Option<HubExt> {
     let session_name = store
@@ -578,7 +645,7 @@ fn build_help_text() -> String {
      /session use <名称> — 切换到指定 session\n\
      /session delete <名称> — 删除指定 session\n\n\
      引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
-     多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅一个注册后端时默认不加）；可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
+     多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅**同时在线**的后端多于一个时默认追加；历史注册但离线的客户端不计入）。可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
      关于 iLink Hub：\n\
      本服务是一个消息路由中枢，可将您的微信消息转发给已接入的 AI 助手后端进行处理。\n\n\
      管理员接入指南：\n\

@@ -22,24 +22,78 @@ const MAX_QUEUE_SIZE: usize = 200;
 /// Maps virtual context tokens (issued to clients) to real context tokens
 /// (from actual iLink upstream). Clients never see the real tokens.
 /// Also stores the peer_user_id (WeChat sender) so the hub can set `to_user_id` on replies.
+///
+/// WeChat may issue a **new** `real_ctx` on every inbound message even in the same DM.
+/// `conv_to_v` keeps one stable virtual token per conversation so backend session IDs
+/// (e.g. Claude `--resume`) survive across messages.
 #[derive(Debug, Default)]
 pub struct ContextTokenMap {
     v_to_real: HashMap<String, String>,
     real_to_v: HashMap<String, String>,
     v_to_peer: HashMap<String, String>,
+    /// Stable vctx per conversation (`peer:<id>` or `group:<id>`).
+    conv_to_v: HashMap<String, String>,
+}
+
+/// Conversation identity for session continuity (DM vs group).
+pub fn conversation_key(peer_user_id: &str, group_id: Option<&str>) -> Option<String> {
+    if let Some(g) = group_id.filter(|s| !s.is_empty()) {
+        return Some(format!("group:{g}"));
+    }
+    if !peer_user_id.is_empty() {
+        return Some(format!("peer:{peer_user_id}"));
+    }
+    None
 }
 
 impl ContextTokenMap {
-    pub fn map(&mut self, real_token: String, peer_user_id: String) -> String {
+    pub fn has_conversation(&self, conv_key: &str) -> bool {
+        self.conv_to_v.contains_key(conv_key)
+    }
+
+    /// Seed a known conversation → vctx mapping (e.g. after DB warm-up on hub restart).
+    pub fn seed_conversation(
+        &mut self,
+        conv_key: String,
+        vctx: String,
+        real_ctx: String,
+        peer_user_id: String,
+    ) {
+        self.conv_to_v.insert(conv_key, vctx.clone());
+        self.seed_full(vctx, real_ctx, peer_user_id);
+    }
+
+    pub fn map(
+        &mut self,
+        real_token: String,
+        peer_user_id: String,
+        group_id: Option<&str>,
+    ) -> String {
+        if let Some(conv_key) = conversation_key(&peer_user_id, group_id) {
+            if let Some(vtoken) = self.conv_to_v.get(&conv_key) {
+                let vtoken = vtoken.clone();
+                self.v_to_real.insert(vtoken.clone(), real_token.clone());
+                self.real_to_v.insert(real_token, vtoken.clone());
+                if !peer_user_id.is_empty() {
+                    self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+                }
+                return vtoken;
+            }
+        }
+
         if let Some(vtoken) = self.real_to_v.get(&real_token) {
             if !peer_user_id.is_empty() {
                 self.v_to_peer.insert(vtoken.clone(), peer_user_id);
             }
             return vtoken.clone();
         }
+
         let vtoken = format!("vctx_{}", Uuid::new_v4().simple());
         self.v_to_real.insert(vtoken.clone(), real_token.clone());
         self.real_to_v.insert(real_token, vtoken.clone());
+        if let Some(conv_key) = conversation_key(&peer_user_id, group_id) {
+            self.conv_to_v.insert(conv_key, vtoken.clone());
+        }
         if !peer_user_id.is_empty() {
             self.v_to_peer.insert(vtoken.clone(), peer_user_id);
         }
@@ -86,18 +140,28 @@ mod context_map_tests {
     #[test]
     fn map_creates_stable_virtual_for_same_real() {
         let mut m = ContextTokenMap::default();
-        let v1 = m.map("real-ctx".into(), "user1".into());
-        let v2 = m.map("real-ctx".into(), "user1".into());
+        let v1 = m.map("real-ctx".into(), "user1".into(), None);
+        let v2 = m.map("real-ctx".into(), "user1".into(), None);
         assert_eq!(v1, v2);
         assert_eq!(m.resolve(&v1), Some("real-ctx"));
         assert_eq!(m.resolve_full(&v1), Some(("real-ctx", "user1")));
     }
 
     #[test]
+    fn map_reuses_vctx_for_same_peer_even_when_real_ctx_changes() {
+        let mut m = ContextTokenMap::default();
+        let peer = "user@im.wechat";
+        let v1 = m.map("ctx-msg-1".into(), peer.into(), None);
+        let v2 = m.map("ctx-msg-2".into(), peer.into(), None);
+        assert_eq!(v1, v2);
+        assert_eq!(m.resolve(&v2), Some("ctx-msg-2"));
+    }
+
+    #[test]
     fn map_different_real_gets_different_virtual() {
         let mut m = ContextTokenMap::default();
-        let va = m.map("ctx-a".into(), "u".into());
-        let vb = m.map("ctx-b".into(), "u".into());
+        let va = m.map("ctx-a".into(), "u".into(), None);
+        let vb = m.map("ctx-b".into(), "v".into(), None);
         assert_ne!(va, vb);
     }
 

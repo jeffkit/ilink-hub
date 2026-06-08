@@ -264,7 +264,7 @@ pub async fn sendmessage(
             (
                 reg.get_by_vtoken(&vtoken)
                     .map(|i| (i.name.clone(), i.label.clone())),
-                reg.all_clients().len(),
+                reg.online_clients().len(),
             )
         };
 

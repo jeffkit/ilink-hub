@@ -367,7 +367,7 @@ impl Store {
         Ok(vctx)
     }
 
-    /// Persist a known vctx→real_ctx mapping (idempotent: skips if already present).
+    /// Persist a known vctx→real_ctx mapping (upsert: refreshes real_ctx when vctx is reused).
     pub async fn persist_context_token(
         &self,
         vctx: &str,
@@ -378,7 +378,9 @@ impl Store {
             r#"
             INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
             VALUES ($1, $2, $3)
-            ON CONFLICT (vctx) DO NOTHING
+            ON CONFLICT (vctx) DO UPDATE SET
+                real_ctx = excluded.real_ctx,
+                peer_user_id = excluded.peer_user_id
             "#,
         )
         .bind(vctx)
@@ -387,6 +389,38 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Find an existing virtual context token for a WeChat peer, preferring one that
+    /// already has a persisted backend session (for hub restart / cold cache warm-up).
+    pub async fn find_vctx_for_peer(&self, peer_user_id: &str) -> Result<Option<String>> {
+        if peer_user_id.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            r#"
+            SELECT c.vctx FROM context_token_map c
+            LEFT JOIN backend_sessions b
+              ON b.vctx = c.vctx AND b.session_name = 'default'
+            WHERE c.peer_user_id = $1
+              AND b.backend_session_id IS NOT NULL
+              AND b.backend_session_id != ''
+            LIMIT 1
+            "#,
+        )
+        .bind(peer_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(row) = row {
+            return Ok(Some(row.get("vctx")));
+        }
+        let row = sqlx::query(
+            "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
+        )
+        .bind(peer_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get("vctx")))
     }
 
     pub async fn resolve_context_token(&self, vctx: &str) -> Result<Option<String>> {
