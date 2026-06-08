@@ -19,11 +19,11 @@ export default defineConfig({
 
     nav: [
       { text: '快速入门', link: '/guide/getting-started' },
-      { text: '本地 CLI', link: '/bridge/USAGE' },
+      { text: '接入 Claude Code', link: '/guide/claude-code' },
       { text: '配置参考', link: '/reference/configuration' },
       { text: 'API 参考', link: '/reference/api' },
       {
-        text: 'v0.1.10',
+        text: 'v0.1.11',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -46,11 +46,13 @@ export default defineConfig({
         ],
       },
       {
-        text: '本地 CLI Bridge',
+        text: '接入 AI',
         items: [
-          { text: '使用指引（多 CLI）', link: '/bridge/USAGE' },
-          { text: '5 分钟上手', link: '/bridge/quick-try' },
+          { text: '接入 Claude Code ✨', link: '/guide/claude-code' },
+          { text: '5 分钟上手（echo）', link: '/bridge/quick-try' },
+          { text: '多 CLI / 多项目', link: '/bridge/USAGE' },
           { text: '功能与配置', link: '/bridge/README' },
+          { text: '开发自定义 Profile', link: '/bridge/profile-spec' },
         ],
       },
       {

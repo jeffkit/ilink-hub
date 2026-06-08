@@ -173,7 +173,12 @@ Hub 状态：在线
 
 ## 下一步
 
+::: tip 想直接用微信和 Claude Code 对话？
+→ **[接入 Claude Code](/guide/claude-code)**：从安装到发出第一条消息，一页走完。
+:::
+
 - [了解微信命令](/reference/commands) — 学习 `/list`、`/use` 等命令
-- [本地 CLI Bridge：5 分钟上手](/bridge/quick-try) — 用虚拟 Token 把微信文本交给本机 `echo` / Claude / Codex 等
+- [5 分钟上手（echo）](/bridge/quick-try) — 先用 echo 验证链路
+- [多 CLI / 多项目](/bridge/USAGE) — Cursor Agent、Codex 等接入方式
 - [Docker 部署](/deployment/docker) — 更稳定的生产环境部署方式
 - [安全建议](/deployment/security) — 如何保护你的 Hub 实例
