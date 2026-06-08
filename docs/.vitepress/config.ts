@@ -52,7 +52,14 @@ export default defineConfig({
           { text: '5 分钟上手（echo）', link: '/bridge/quick-try' },
           { text: '多 CLI / 多项目', link: '/bridge/USAGE' },
           { text: '功能与配置', link: '/bridge/README' },
-          { text: '开发自定义 Profile', link: '/bridge/profile-spec' },
+        ],
+      },
+      {
+        text: '开发自定义 Profile',
+        items: [
+          { text: 'P0 协议规范', link: '/bridge/profile-spec' },
+          { text: 'Node.js 开发教程', link: '/bridge/develop-nodejs' },
+          { text: 'Python 开发教程', link: '/bridge/develop-python' },
         ],
       },
       {
