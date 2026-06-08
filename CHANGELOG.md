@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.14] — 2026-06-08
+
+### Bridge — Claude Code 可靠性
+
+**修复**
+
+- **YAML `cwd` 支持 `~`**：profile 的 `cwd: ~/projects/foo` 现在会正确展开为用户主目录，避免 spawn 报 `No such file or directory`。
+- **`type: claude-code` 自调用**：内置 profile 子进程使用 `current_exe()` 而非依赖 PATH 中的 `ilink-hub-bridge`。
+- **Claude 非零 exit 仍解析回复**：当 `claude --output-format json` 因模型错误等返回 exit 1 但 stdout 含 JSON `result` 时，将结果文本转发到微信，而非只显示 `command exited with status 1`。
+- **Bridge vtoken 校验与自动重注册**（v0.1.13 起）：Hub 拒绝无效 token 时 bridge 自动删凭证并重新 `/hub/register`。
+
+**说明**
+
+- Profile YAML 的 `env.ILINK_CLAUDE_MODEL` 会注入到 `claude-code` 子进程；用于覆盖 Claude Code 默认模型（例如不可用的第三方模型）。
+
 ## [0.1.11] — 2026-06-08
 
 ### Bridge — P0 Exec Protocol & Profile SDK

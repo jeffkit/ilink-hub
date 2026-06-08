@@ -63,6 +63,9 @@ profiles:
     timeout_secs: 600           # 单次调用超时（秒），复杂任务可调大
     max_reply_chars: 8000       # 微信单条上限（超长自动截断）
     truncation_suffix: "\n\n…（内容已截断，可缩小问题范围或分多条发送）"
+    # 若 Claude Code 默认模型不可用，可指定模型（sonnet / opus / haiku 等）：
+    # env:
+    #   ILINK_CLAUDE_MODEL: sonnet
     # 若尚未 claude login，可在此注入 API Key（勿提交到 git）：
     # env:
     #   ANTHROPIC_API_KEY: "sk-ant-..."

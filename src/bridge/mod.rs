@@ -31,6 +31,7 @@ use crate::ilink::types::{
     BaseInfo, GetUpdatesRequest, GetUpdatesResponse, SendMessageRequest, SendMessageResponse,
     WeixinMessage,
 };
+use crate::paths::expand_user_path;
 
 enum GetUpdatesOutcome {
     Ok(GetUpdatesResponse),
@@ -295,12 +296,15 @@ async fn run_cli(
         .map(|a| apply_placeholders(a, message, session_id, session_name))
         .collect();
 
-    let mut cmd = Command::new(&cfg.command);
+    let command = resolve_spawn_command(&cfg.command);
+
+    let mut cmd = Command::new(&command);
     cmd.args(&args);
     cmd.kill_on_drop(true);
 
     if let Some(dir) = &cfg.cwd {
-        cmd.current_dir(apply_placeholders(dir, message, session_id, session_name));
+        let dir = expand_user_path(&apply_placeholders(dir, message, session_id, session_name));
+        cmd.current_dir(&dir);
     }
 
     // P0: always inject ILINK_* env vars so any profile script/SDK can read them without
@@ -329,7 +333,7 @@ async fn run_cli(
 
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("failed to spawn `{}`", cfg.command))?;
+        .with_context(|| format!("failed to spawn `{command}`"))?;
 
     if matches!(cfg.stdin, StdinMode::Message) {
         let mut stdin = child
@@ -393,6 +397,17 @@ fn apply_placeholders(template: &str, message: &str, session_id: &str, session_n
         .replace("{{SESSION_NAME}}", session_name)
 }
 
+/// Resolve the executable for built-in self-invocation (`ilink-hub-bridge profile …`).
+/// Falls back to the bare command name when `current_exe` is unavailable.
+fn resolve_spawn_command(command: &str) -> String {
+    if command == "ilink-hub-bridge" {
+        if let Ok(exe) = std::env::current_exe() {
+            return exe.to_string_lossy().into_owned();
+        }
+    }
+    command.to_string()
+}
+
 fn truncate_chars(s: &str, max_chars: usize, suffix: &str) -> String {
     let count = s.chars().count();
     if count <= max_chars {
@@ -443,5 +458,18 @@ mod tests {
     fn truncate_respects_chars() {
         let s = truncate_chars("abcde", 4, "…");
         assert_eq!(s, "abc…");
+    }
+
+    #[test]
+    fn resolve_spawn_command_uses_current_exe_for_self_invoke() {
+        let resolved = resolve_spawn_command("ilink-hub-bridge");
+        if let Ok(exe) = std::env::current_exe() {
+            assert_eq!(resolved, exe.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn resolve_spawn_command_passthrough_other_commands() {
+        assert_eq!(resolve_spawn_command("claude"), "claude");
     }
 }
