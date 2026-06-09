@@ -92,7 +92,8 @@ body {
   display: flex;
   flex-direction: column;
   min-height: 100vh;
-  max-width: 480px;
+  width: 100%;
+  max-width: 1120px;
   margin: 0 auto;
   padding: 0.85rem 0.95rem 0;
 }
@@ -190,6 +191,7 @@ body {
   flex-direction: column;
   gap: 0.7rem;
   padding: 0.9rem 0;
+  min-width: 0;
 }
 
 /* ---------- Hero status ---------- */
@@ -903,6 +905,7 @@ body {
 .form-row {
   display: flex;
   gap: 0.5rem;
+  min-width: 0;
 }
 
 .field {
@@ -920,7 +923,8 @@ body {
 }
 
 .form input[type="text"],
-.form input[type="number"] {
+.form input[type="number"],
+.form select {
   width: 100%;
   padding: 0.5rem 0.6rem;
   font-size: 0.82rem;
@@ -938,9 +942,14 @@ body {
 }
 
 .form input[type="text"]:focus,
-.form input[type="number"]:focus {
+.form input[type="number"]:focus,
+.form select:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.form select {
+  min-height: 2.15rem;
 }
 
 .btn-block {
@@ -1006,6 +1015,18 @@ body {
   border: 1px solid var(--border);
 }
 
+.bridge-card .addr-row {
+  align-items: flex-start;
+}
+
+.bridge-card .addr-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+
 .bridge-state {
   flex: 0 0 auto;
   padding: 0.22rem 0.5rem;
@@ -1038,18 +1059,25 @@ body {
   flex-wrap: wrap;
 }
 
+.bridge-actions .btn {
+  min-width: max-content;
+}
+
 .bridge-manager-grid {
   display: grid;
-  grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.4fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.75rem;
   margin-top: 0.75rem;
+  min-width: 0;
 }
 
 .bridge-profile-list {
   display: flex;
   flex-direction: column;
   gap: 0.45rem;
-  min-height: 260px;
+  min-height: 9rem;
+  max-height: 18rem;
+  overflow: auto;
   padding: 0.55rem;
   border: 1px solid var(--border);
   border-radius: 14px;
@@ -1065,6 +1093,15 @@ body {
   color: var(--text);
   background: var(--surface);
   cursor: pointer;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease,
+    transform 0.08s ease;
+}
+
+.bridge-profile-item:hover {
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
 }
 
 .bridge-profile-item.active {
@@ -1080,6 +1117,9 @@ body {
 
 .profile-title {
   font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .profile-meta,
@@ -1095,10 +1135,26 @@ body {
   border-radius: 12px;
   background: var(--surface);
   border: 1px solid var(--border);
+  min-width: 0;
 }
 
 .bridge-profile-editor {
   margin-top: 0;
+}
+
+.bridge-profile-editor .form-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
+}
+
+.bridge-profile-editor .field-wide,
+.bridge-profile-editor .bridge-command-row {
+  grid-column: 1 / -1;
+}
+
+.bridge-profile-editor .bridge-command-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
 }
 
 .check-row {
@@ -1120,7 +1176,7 @@ body {
 
 .yaml-editor {
   width: 100%;
-  min-height: 220px;
+  min-height: clamp(9rem, 28vh, 15rem);
   resize: vertical;
   padding: 0.65rem;
   border-radius: 10px;
@@ -1136,6 +1192,83 @@ body {
 .yaml-editor:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+@media (min-width: 760px) {
+  body[data-active-tab="bridge"] .bridge-unified {
+    padding: 0.9rem;
+  }
+
+  body[data-active-tab="bridge"] .bridge-manager-grid {
+    grid-template-columns: minmax(14rem, 0.78fr) minmax(0, 1.55fr);
+    align-items: stretch;
+  }
+
+  body[data-active-tab="bridge"] .bridge-profile-list {
+    max-height: min(28rem, calc(100vh - 21rem));
+  }
+
+  body[data-active-tab="bridge"] .bridge-form {
+    padding: 0.8rem;
+  }
+}
+
+@media (min-width: 980px) {
+  body[data-active-tab="bridge"] .bridge-manager-grid {
+    grid-template-columns: minmax(16rem, 0.72fr) minmax(0, 1.65fr);
+    gap: 0.9rem;
+  }
+
+  body[data-active-tab="bridge"] .bridge-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    column-gap: 0.75rem;
+    align-items: end;
+  }
+
+  body[data-active-tab="bridge"] .bridge-card .addr-label,
+  body[data-active-tab="bridge"] .bridge-card .addr-row {
+    grid-column: 1;
+  }
+
+  body[data-active-tab="bridge"] .bridge-card .bridge-actions {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    justify-content: flex-end;
+    margin-top: 0;
+  }
+
+  body[data-active-tab="bridge"] .bridge-card .form-msg,
+  body[data-active-tab="bridge"] .bridge-card .hero-sub {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 520px) {
+  .app {
+    padding-inline: 0.75rem;
+  }
+
+  .form-row {
+    flex-direction: column;
+  }
+
+  .be-header {
+    align-items: flex-start;
+  }
+
+  .bridge-card .addr-row {
+    align-items: center;
+  }
+
+  .bridge-actions .btn-sm {
+    flex: 1 1 calc(50% - 0.45rem);
+  }
+
+  .check-row {
+    align-items: flex-start;
+    line-height: 1.4;
+  }
 }
 
 /* ---------- Steps + commands ---------- */

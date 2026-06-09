@@ -15,9 +15,9 @@
       {
         "label": "main",
         "title": "iLink Hub",
-        "width": 440,
-        "height": 660,
-        "minWidth": 380,
+        "width": 980,
+        "height": 720,
+        "minWidth": 390,
         "minHeight": 560,
         "resizable": true
       }

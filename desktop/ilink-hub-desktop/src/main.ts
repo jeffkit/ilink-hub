@@ -816,6 +816,7 @@ function setActiveTab(which: "home" | "backends" | "bridge") {
   const isHome = which === "home";
   const isBackends = which === "backends";
   const isBridge = which === "bridge";
+  document.body.dataset.activeTab = which;
   tabHome.setAttribute("aria-selected", String(isHome));
   tabBack.setAttribute("aria-selected", String(isBackends));
   tabBridge.setAttribute("aria-selected", String(isBridge));
@@ -828,6 +829,7 @@ function setActiveTab(which: "home" | "backends" | "bridge") {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
+  document.body.dataset.activeTab = "home";
   void refreshHubInfo();
 
   $("#tab-home")?.addEventListener("click", () => setActiveTab("home"));
