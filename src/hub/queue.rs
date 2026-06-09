@@ -69,8 +69,25 @@ impl ContextTokenMap {
         peer_user_id: String,
         group_id: Option<&str>,
     ) -> String {
-        if let Some(conv_key) = conversation_key(&peer_user_id, group_id) {
-            if let Some(vtoken) = self.conv_to_v.get(&conv_key) {
+        self.map_scoped(real_token, peer_user_id, group_id, None)
+    }
+
+    /// Like `map`, but scopes the stable vctx to a specific client (`client_scope`).
+    /// Used in broadcast so each backend gets its own independent vctx.
+    pub fn map_scoped(
+        &mut self,
+        real_token: String,
+        peer_user_id: String,
+        group_id: Option<&str>,
+        client_scope: Option<&str>,
+    ) -> String {
+        let conv_key = conversation_key(&peer_user_id, group_id).map(|k| match client_scope {
+            Some(scope) => format!("{k}@{scope}"),
+            None => k,
+        });
+
+        if let Some(ref key) = conv_key {
+            if let Some(vtoken) = self.conv_to_v.get(key) {
                 let vtoken = vtoken.clone();
                 self.v_to_real.insert(vtoken.clone(), real_token.clone());
                 self.real_to_v.insert(real_token, vtoken.clone());
@@ -81,18 +98,21 @@ impl ContextTokenMap {
             }
         }
 
-        if let Some(vtoken) = self.real_to_v.get(&real_token) {
-            if !peer_user_id.is_empty() {
-                self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+        // For unscoped calls, also check the real_to_v index.
+        if client_scope.is_none() {
+            if let Some(vtoken) = self.real_to_v.get(&real_token) {
+                if !peer_user_id.is_empty() {
+                    self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+                }
+                return vtoken.clone();
             }
-            return vtoken.clone();
         }
 
         let vtoken = format!("vctx_{}", Uuid::new_v4().simple());
         self.v_to_real.insert(vtoken.clone(), real_token.clone());
         self.real_to_v.insert(real_token, vtoken.clone());
-        if let Some(conv_key) = conversation_key(&peer_user_id, group_id) {
-            self.conv_to_v.insert(conv_key, vtoken.clone());
+        if let Some(key) = conv_key {
+            self.conv_to_v.insert(key, vtoken.clone());
         }
         if !peer_user_id.is_empty() {
             self.v_to_peer.insert(vtoken.clone(), peer_user_id);

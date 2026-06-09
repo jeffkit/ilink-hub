@@ -34,6 +34,10 @@ impl RateLimiter {
             return false;
         }
         bucket.push(now);
+        // Evict keys that have had no events in the last window to bound memory.
+        if inner.buckets.len() > 10_000 {
+            inner.buckets.retain(|_, v| !v.is_empty());
+        }
         true
     }
 }

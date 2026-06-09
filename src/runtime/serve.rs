@@ -13,8 +13,8 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
-use crate::hub::{spawn_dispatcher, spawn_health_checker, HubState, InMemoryQueue, MessageQueue};
-use crate::ilink::{LoginClient, QrLoginUiEvent, UpstreamClient};
+use crate::hub::{spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, HubState, InMemoryQueue, MessageQueue};
+use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
 use crate::store::Store;
 
@@ -63,11 +63,17 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     let store = Arc::new(Store::connect(&database_url).await?);
 
     let (token, base_url) =
-        resolve_token(token_arg, ilink_base_url, store.clone(), qr_login_ui).await?;
+        resolve_token(token_arg, ilink_base_url.clone(), store.clone(), qr_login_ui.clone())
+            .await?;
 
-    let upstream = Arc::new(UpstreamClient::new(token, Some(base_url)));
+    let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend();
-    let state = HubState::new(upstream.clone(), store.clone(), queue);
+    let state = HubState::new(
+        upstream.clone(),
+        store.clone(),
+        queue,
+        shutdown_rx.clone(),
+    );
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
@@ -76,14 +82,20 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     spawn_dispatcher(state.clone(), rx);
 
     spawn_health_checker(state.clone());
+    spawn_quote_index_evictor(state.clone());
 
     {
         let upstream_clone = upstream.clone();
         let tx_clone = tx.clone();
         let shutdown_rx_clone = shutdown_rx.clone();
+        let renewal = Some(SessionRenewal {
+            store: store.clone(),
+            ilink_base_url: ilink_base_url.or(Some(base_url)),
+            qr_login_ui,
+        });
         tokio::spawn(async move {
             upstream_clone
-                .run_polling_loop(tx_clone, shutdown_rx_clone)
+                .run_polling_loop(tx_clone, shutdown_rx_clone, renewal)
                 .await;
         });
     }
@@ -157,14 +169,14 @@ async fn resolve_token(
     };
 
     if let Some(token) = candidate {
-        let client = UpstreamClient::new(token.clone(), Some(base.clone()));
-        if client.validate_session().await {
+        if UpstreamClient::is_well_formed_bot_token(&token) {
             if from_cli {
                 store.save_credentials(&token, &base).await?;
             }
+            info!("using iLink token without startup session probe");
             return Ok((token, base));
         }
-        warn!("iLink token invalid or expired");
+        warn!("iLink token malformed");
         if !quiet_ui {
             println!();
             println!("⚠️  未检测到有效的 iLink 微信登录态，请扫描下方二维码完成登录。");
@@ -179,10 +191,19 @@ async fn resolve_token(
         }
     }
 
+    perform_qr_login(ilink_base_url, store, qr_login_ui, &default_base).await
+}
+
+async fn perform_qr_login(
+    ilink_base_url: Option<String>,
+    store: Arc<Store>,
+    qr_login_ui: Option<mpsc::UnboundedSender<QrLoginUiEvent>>,
+    default_base: &str,
+) -> Result<(String, String)> {
     let login_base = ilink_base_url.clone();
     let login_client = LoginClient::new(ilink_base_url);
     let token = login_client.login_with_qr_ui(qr_login_ui).await?;
-    let base = login_base.unwrap_or(default_base);
+    let base = login_base.unwrap_or_else(|| default_base.to_string());
     store.save_credentials(&token, &base).await?;
     info!("iLink login successful, token saved");
     Ok((token, base))

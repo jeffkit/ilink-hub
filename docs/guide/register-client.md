@@ -41,8 +41,8 @@ ilink-hub register \
 ⚠️  请妥善保存虚拟 Token，之后无法从 Hub 查回明文。
 ```
 
-::: warning Token 安全
-虚拟 Token 只在注册时返回一次明文。之后 Hub 只存储其哈希值。如果丢失，需要重新注册（旧 Token 会失效）。
+::: tip 忘记 Token 了？
+可以在 Web 管理面板（`/hub/ui`）的客户端列表里查看已注册客户端的 Token，也可以重新注册一个同名客户端获取新 Token（旧 Token 会被覆盖）。
 :::
 
 ## 通过 Web UI 注册

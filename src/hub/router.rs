@@ -64,10 +64,12 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     }) {
         let rest = rest.trim();
         let mut parts = rest.splitn(2, ' ');
-        let name = parts.next().unwrap_or("default").trim().to_string();
+        let name = parts.next().unwrap_or("").trim().to_string();
         let uuid = parts.next().unwrap_or("").trim().to_string();
         let name = if name.is_empty() {
-            "default".to_string()
+            // 无参数时生成带时间戳的唯一名称，避免覆盖已有的 "default" session
+            let ts = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+            format!("session-{ts}")
         } else {
             name
         };
@@ -97,7 +99,12 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
 
 #[derive(Debug, Clone)]
 pub enum RoutingDecision {
-    ForwardTo(String),
+    /// Route to a specific backend vtoken, optionally pinning to a specific session.
+    ForwardTo {
+        vtoken: String,
+        /// When set (from a quote-reply), override the active session lookup with this session.
+        session_override: Option<String>,
+    },
     Broadcast,
     HubInternal(HubCommand),
 }
@@ -150,7 +157,7 @@ impl Router {
         let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
         if let Some(vtoken) = self.get_route(from_user_id) {
             debug!(from_user_id, vtoken, "routing message");
-            RoutingDecision::ForwardTo(vtoken.to_string())
+            RoutingDecision::ForwardTo { vtoken: vtoken.to_string(), session_override: None }
         } else {
             RoutingDecision::Broadcast
         }
@@ -200,7 +207,7 @@ mod tests {
         };
         assert!(matches!(
             r.route(&msg),
-            RoutingDecision::ForwardTo(ref v) if v == "default_vt"
+            RoutingDecision::ForwardTo { ref vtoken, .. } if vtoken == "default_vt"
         ));
     }
 
@@ -220,11 +227,13 @@ mod tests {
             parse_hub_command("/session new feature-b some-uuid-123"),
             Some(HubCommand::SessionNew("feature-b".to_string(), "some-uuid-123".to_string()))
         );
-        // bare /session new → name defaults to "default"
-        assert_eq!(
-            parse_hub_command("/session new"),
-            Some(HubCommand::SessionNew("default".to_string(), "".to_string()))
-        );
+        // bare /session new → name is a timestamp-based unique name like "session-20260609-123456"
+        if let Some(HubCommand::SessionNew(name, uuid)) = parse_hub_command("/session new") {
+            assert!(name.starts_with("session-"), "expected timestamp name, got: {name}");
+            assert_eq!(uuid, "");
+        } else {
+            panic!("/session new should parse as SessionNew");
+        }
     }
 
     #[test]

@@ -1,34 +1,81 @@
 # 常见问题 FAQ
 
+## 基本问题
+
+### Q: 这个工具能做什么？
+
+让你用**一个微信账号**同时连接多个 AI 工具（Claude Code、Recursive、OpenClaw 等），并在微信里随时切换。无需改 AI 工具的代码，只需修改服务器地址。
+
+### Q: 我需要懂编程才能用吗？
+
+不一定。有两种使用方式：
+
+- **桌面应用**（[下载地址](/guide/installation#desktop)）：双击安装，图形界面，不需要终端
+- **命令行版本**：需要会打开终端、执行基础命令
+
+如果只是想在微信里和 Claude 聊天，推荐先用桌面版。
+
+### Q: 使用前需要准备什么？
+
+必须有一个**已开通 iLink（ClawBot）的微信账号**。这是微信官方的 AI 机器人接口，需要在 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，通常 1-3 个工作日审核。
+
+普通微信账号**不能**直接使用，必须先开通 iLink。
+
+### Q: 支持群聊消息吗？
+
+取决于微信 iLink API 本身的能力。iLink Hub 会透明转发所有消息类型，只要原始 iLink API 支持的，Hub 都会转发。
+
+### Q: 有图形界面版本吗？
+
+有。提供 macOS、Windows、Linux 的桌面应用，见[桌面应用安装说明](/guide/installation#desktop)。
+
+### Q: 开源协议是什么？可以商用吗？
+
+MIT 协议，免费商用。详见 [LICENSE](https://github.com/jeffkit/ilink-hub/blob/main/LICENSE)。
+
+---
+
 ## 安装与启动
 
-### Q: 下载的二进制无法运行，提示「无法验证开发者」（macOS）
+### Q: macOS 提示「无法验证开发者」，无法打开
 
-macOS Gatekeeper 会阻止未签名的第三方二进制。在终端运行：
+这是 macOS Gatekeeper 的安全限制。有两种解决方式：
 
+**桌面版**：右键点击应用 → 「打开」，然后在弹出对话框里点「打开」。
+
+**命令行版**：在终端运行：
 ```bash
 xattr -rd com.apple.quarantine /usr/local/bin/ilink-hub
 ```
 
 ### Q: Linux 运行报错「glibc version not found」
 
-当前预编译二进制要求 glibc 2.17+（CentOS 7+、Ubuntu 16.04+）。如果你的系统更老，建议：
-- 使用 Docker 方式（不依赖宿主 glibc）
+当前预编译二进制要求 glibc 2.17+（CentOS 7+、Ubuntu 16.04+）。如果你的系统版本更老：
+- 推荐使用 Docker 方式（不依赖宿主 glibc）
 - 或从源码编译
 
 ### Q: 启动后无法访问 8765 端口
 
 1. 检查防火墙/安全组是否开放 8765 端口
-2. 确认监听地址是 `0.0.0.0:8765`（而不是 `127.0.0.1:8765`）
+2. 确认监听地址是 `0.0.0.0:8765`（而不是 `127.0.0.1:8765`）——后者只允许本机访问
 3. 验证 Hub 是否正常运行：`curl http://localhost:8765/health`
 
 ---
 
 ## 登录问题
 
-### Q: QR 码扫码后提示「此二维码已过期」
+### Q: 二维码扫了没有反应
 
-iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub serve`（会再次出码），或执行 `ilink-hub login` 仅更新凭证。
+- 确认用的是**已开通 iLink 的微信账号**，普通账号无法授权
+- 二维码有效期约 2 分钟，超时后重新运行命令
+- 扫码后手机上应该会弹出授权确认页，点确认才算完成
+
+### Q: 二维码不显示或显示乱码
+
+终端不支持 Unicode 块字符。解决方式：
+- macOS 推荐使用 iTerm2 或系统自带的「终端」应用
+- Windows 推荐使用 Windows Terminal
+- Docker 场景下用 `docker compose logs -f` 查看容器日志
 
 ### Q: 登录成功但 Hub 启动后提示「upstream connection failed」
 
@@ -44,27 +91,27 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub
 ### Q: 客户端显示在线但收不到消息
 
 1. 在微信发送 `/list` 确认该客户端是否为当前活跃路由
-2. 如果不是，发送 `/use <client-name>` 切换
+2. 如果不是，发送 `/use <客户端名称>` 切换
 3. 检查客户端日志是否有连接错误
-
-### Q: 消息到了但回复失败（sendmessage 报错）
-
-通常是 `context_token` 过期（微信 context_token 有时间限制）。这是正常现象，用户重新发消息后 Hub 会生成新的映射。
 
 ### Q: 多个客户端同时在线，消息为什么只发给一个？
 
-这是设计行为。iLink Hub 同一时间只有一个「活跃客户端」接收消息，用微信命令 `/use <name>` 切换。如需同时发给所有客户端，用 `/broadcast <消息>`。
+这是设计行为。Hub 同一时间只有一个「活跃客户端」接收消息，用微信命令 `/use <名称>` 切换。如需同时发给所有客户端，用 `/broadcast <消息内容>`。
+
+### Q: 消息到了但回复失败（sendmessage 报错）
+
+通常是 `context_token` 过期（微信的会话令牌有时间限制）。这是正常现象，用户重新发消息后 Hub 会自动生成新的映射。
 
 ### Q: `ilink-hub-bridge` 一直在线但微信发文字没反应 {#bridge-no-msg}
 
-1. 确认已对该后端执行 `/use <注册时用的 name>`，且 `/list` 里该客户端为 **在线**  
-2. 看 bridge 终端：是否有 `getupdates` 报错、或 `spawn` / 超时日志  
-3. 配置里 `require_text: true` 时，纯图片/语音不会触发 CLI；先发纯文本试 `echo` 链路（见 [5 分钟上手](/bridge/quick-try)）  
-4. Hub URL / Token 是否与 `ilink-hub register` 输出一致（勿多空格）
+1. 确认已对该后端执行 `/use <注册时用的名称>`，且 `/list` 里该客户端为**在线**
+2. 查看 bridge 终端：是否有报错、或超时日志
+3. 配置里 `require_text: true` 时，纯图片/语音不会触发 CLI；先发纯文本测试
+4. Hub 地址和 Token 是否与注册时输出的一致（注意不要多空格）
 
 ### Q: 注册时提示「name already exists」
 
-客户端名称已存在。要么选一个不同的名称，要么先删除旧客户端（通过 Web UI 或 API）。
+客户端名称已存在。要么换一个名称，要么先在 Web UI 或命令行删除旧客户端。
 
 ---
 
@@ -72,11 +119,11 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub
 
 ### Q: 数据库文件在哪里？
 
-由 `DATABASE_URL` 决定。未设置时，Hub 默认使用 **`~/.ilink-hub/ilink-hub.db`**（SQLite）。Docker 部署示例中常为卷内的 **`/data/ilink-hub.db`**。
+由 `DATABASE_URL` 决定。未设置时默认使用 **`~/.ilink-hub/ilink-hub.db`**（SQLite）。Docker 部署示例中常为卷内的 **`/data/ilink-hub.db`**。
 
-### Q: 可以迁移从 SQLite 到 PostgreSQL 吗？
+### Q: 可以从 SQLite 迁移到 PostgreSQL 吗？
 
-目前需要重新登录和重新注册客户端（数据迁移工具尚未提供）。建议在一开始就选好数据库类型。
+目前需要重新登录和重新注册客户端（尚未提供数据迁移工具）。建议从一开始就选好数据库类型。
 
 ---
 
@@ -84,28 +131,12 @@ iLink 登录二维码有效期较短（约 2 分钟）。重新启动 `ilink-hub
 
 ### Q: Hub 会因为消息队列满而崩溃吗？
 
-不会。每个客户端的消息队列有上限（默认 200 条），超出时最旧的消息会被丢弃（head-drop 策略），并增加 `ilink_hub_messages_dropped_total` 计数器。服务不会崩溃。
+不会。每个客户端的消息队列上限为 200 条，超出时最旧的消息会被丢弃（不影响新消息），服务不会崩溃。
 
-### Q: Hub 崩溃后重启会丢失消息吗？
+### Q: Hub 重启后会丢失消息吗？
 
-内存中的消息队列会丢失（尚未完成的、等待客户端取走的消息）。但 Token 映射、客户端注册等状态已持久化，重启后不需要重新配置。
+内存中尚未被客户端取走的消息会丢失，但客户端注册、路由设置、会话映射等状态已持久化到数据库，重启后无需重新配置。
 
 ### Q: 多个 Hub 实例可以同时运行吗？
 
-目前不支持多实例（多个实例都会尝试独占真实的 iLink 连接）。单实例 Hub 已足够大多数用途。
-
----
-
-## 其他
-
-### Q: 支持群聊消息吗？
-
-取决于微信 iLink API 本身的能力。iLink Hub 透明代理所有消息类型，只要原始 iLink API 支持的，Hub 都会转发。
-
-### Q: 有 Windows 的 GUI 版本吗？
-
-目前只有命令行工具。Web 管理面板（`/hub/ui`）可以在浏览器中操作，部分管理功能可以通过浏览器完成。
-
-### Q: 开源协议是什么？可以商用吗？
-
-MIT 协议，可以免费商用。详见 [LICENSE](https://github.com/jeffkit/ilink-hub/blob/main/LICENSE)。
+目前不支持（多个实例都会抢占同一个真实 iLink 连接）。单实例已足够大多数使用场景。

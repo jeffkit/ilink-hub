@@ -3,18 +3,28 @@
 
 use anyhow::Result;
 use reqwest::Client;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tracing::{debug, error, info, warn};
 
+use crate::store::Store;
+
+use super::login::{LoginClient, QrLoginUiEvent};
 use super::types::*;
+
+/// Context for renewing an expired iLink session from the upstream polling loop.
+pub struct SessionRenewal {
+    pub store: Arc<Store>,
+    pub ilink_base_url: Option<String>,
+    pub qr_login_ui: Option<UnboundedSender<QrLoginUiEvent>>,
+}
 
 pub struct UpstreamClient {
     client: Client,
     base_url: String,
-    token: String,
+    token: RwLock<String>,
     pub polls_ok: AtomicU64,
     pub polls_err: AtomicU64,
 }
@@ -28,15 +38,25 @@ impl UpstreamClient {
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
-            token,
+            token: RwLock::new(token),
             polls_ok: AtomicU64::new(0),
             polls_err: AtomicU64::new(0),
         }
     }
 
+    /// Local format check only — does not contact iLink.
+    pub fn is_well_formed_bot_token(token: &str) -> bool {
+        !token.is_empty() && token.contains(':')
+    }
+
+    pub fn set_token(&self, token: String) {
+        *self.token.write().expect("upstream token lock poisoned") = token;
+    }
+
     /// Extracts the bot ID from the token (`botid@im.bot:secretkey` → `botid@im.bot`).
-    pub fn bot_id(&self) -> &str {
-        self.token.split(':').next().unwrap_or("")
+    pub fn bot_id(&self) -> String {
+        let token = self.token.read().expect("upstream token lock poisoned");
+        token.split(':').next().unwrap_or("").to_string()
     }
 
     /// Calls `notifystart` — required before the bot can send messages.
@@ -69,9 +89,10 @@ impl UpstreamClient {
             "AuthorizationType",
             HeaderValue::from_static("ilink_bot_token"),
         );
+        let token = self.token.read().expect("upstream token lock poisoned");
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", *token)).unwrap(),
         );
         headers.insert(
             "X-WECHAT-UIN",
@@ -80,31 +101,17 @@ impl UpstreamClient {
         headers
     }
 
-    /// Quick session check — returns false when token is missing, malformed, or expired.
-    pub async fn validate_session(&self) -> bool {
-        if self.token.is_empty() || !self.token.contains(':') {
-            return false;
-        }
-        match self.get_updates(String::new()).await {
-            Ok(resp) => {
-                let code = resp.errcode.or(resp.ret);
-                match code {
-                    None | Some(0) => true,
-                    Some(-14) => false,
-                    Some(_) => false,
-                }
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Long-poll for new messages.
-    pub async fn get_updates(&self, get_updates_buf: String) -> Result<GetUpdatesResponse> {
+    /// Long-poll for new messages. Pass `timeout: Some(0)` for an immediate probe (e.g. session check).
+    pub async fn get_updates(
+        &self,
+        get_updates_buf: String,
+        timeout: Option<u32>,
+    ) -> Result<GetUpdatesResponse> {
         let url = format!("{}/ilink/bot/getupdates", self.base_url);
         let req_body = GetUpdatesRequest {
             get_updates_buf,
             base_info: Some(BaseInfo::default()),
-            timeout: None,
+            timeout,
         };
         let resp = self
             .client
@@ -201,9 +208,11 @@ impl UpstreamClient {
         self: Arc<Self>,
         tx: broadcast::Sender<WeixinMessage>,
         shutdown: tokio::sync::watch::Receiver<bool>,
+        renewal: Option<SessionRenewal>,
     ) {
         let mut get_updates_buf = String::new();
         let mut backoff_secs = 1u64;
+        let renewing = Arc::new(AtomicBool::new(false));
 
         info!("iLink upstream polling started");
 
@@ -219,7 +228,7 @@ impl UpstreamClient {
                 return;
             }
 
-            let result = self.get_updates(get_updates_buf.clone()).await;
+            let result = self.get_updates(get_updates_buf.clone(), None).await;
 
             match result {
                 Ok(resp) if resp.ret == Some(0) || resp.errcode.is_none() => {
@@ -251,6 +260,27 @@ impl UpstreamClient {
                         errmsg = ?resp.errmsg,
                         "iLink upstream returned error"
                     );
+                    if code == -14 {
+                        if let Some(ref renewal_ctx) = renewal {
+                            if renewing
+                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                .is_ok()
+                            {
+                                match renew_expired_session(self.clone(), renewal_ctx).await {
+                                    Ok(()) => {
+                                        backoff_secs = 1;
+                                        get_updates_buf.clear();
+                                        renewing.store(false, Ordering::SeqCst);
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        error!(error = %e, "iLink session renewal failed");
+                                        renewing.store(false, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
@@ -262,5 +292,49 @@ impl UpstreamClient {
                 }
             }
         }
+    }
+}
+
+async fn renew_expired_session(
+    upstream: Arc<UpstreamClient>,
+    renewal: &SessionRenewal,
+) -> Result<()> {
+    let quiet_ui = renewal.qr_login_ui.is_some();
+    if !quiet_ui {
+        println!();
+        println!("⚠️  iLink 微信登录态已过期，请扫描下方二维码重新登录。");
+        println!();
+    }
+    warn!("iLink session expired (-14), starting QR re-login");
+
+    let login_client = LoginClient::new(renewal.ilink_base_url.clone());
+    let token = login_client
+        .login_with_qr_ui(renewal.qr_login_ui.clone())
+        .await?;
+    let base = renewal
+        .ilink_base_url
+        .clone()
+        .unwrap_or_else(|| ILINK_BASE_URL.to_string());
+
+    renewal.store.save_credentials(&token, &base).await?;
+    upstream.set_token(token);
+    info!("iLink session renewed, token saved");
+
+    match upstream.notify_start().await {
+        Ok(_) => info!("iLink notifystart successful after renewal"),
+        Err(e) => warn!(error = %e, "notifystart failed after renewal — outbound messages may not work"),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpstreamClient;
+
+    #[test]
+    fn well_formed_bot_token() {
+        assert!(UpstreamClient::is_well_formed_bot_token("bot@im.bot:secret"));
+        assert!(!UpstreamClient::is_well_formed_bot_token(""));
+        assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
     }
 }

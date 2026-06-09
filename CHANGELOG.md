@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+## [0.1.18] — 2026-06-09
+
+### Hub — 安全与稳定性修复
+
+**修复**
+
+- **死锁修复**：`register_client_in_hub` 与 `unregister_client_in_hub` 存在锁顺序反转（ABBA 死锁），并发 Admin 操作时 Hub 会静默挂死。统一锁获取顺序为 registry → router，消除双锁嵌套。
+- **鉴权绕过修复**：`sendtyping`、`getuploadurl`、`getconfig` 未校验 vtoken 是否已注册，任意 Bearer token 均可绕过访问控制。现统一应用 registry 注册表校验。
+- **`upsert_client` vtoken 冲突静默失效**：重启后新 vtoken 写不进数据库，内存与 DB 永久不一致。已修复 `ON CONFLICT` 子句，加入 `SET vtoken = EXCLUDED.vtoken`。
+- **Broadcast 共享 vctx**：广播多后端时所有后端收到同一 `context_token`，只有最后一个回复生效。现为每个后端按 `conv_key@vtoken` 分配独立 vctx。
+- **上下文缓存预热加载最旧记录**：`list_recent_context_tokens` 缺少 `ORDER BY`，重启后加载的是最旧 500 条而非最近活跃会话。已改为 `ORDER BY rowid DESC LIMIT 500`。
+- **Health checker 不响应 shutdown**：后台协程未监听 shutdown channel。现改用 `tokio::select!` 监听 shutdown 信号，支持 Tauri 桌面版重启场景。
+- **Admin token 每次请求读 env var**：改用 `OnceLock` 只初始化一次；未设置时启动时打印 `warn!` 告警。
+- **TOCTOU 竞态修复**：`resolve_vctx_for_message` 三次加锁释放存在竞态窗口。现改为锁外做 DB 查询，单次加锁内完成 check + seed + map。
+- **`QuoteRouteIndex` 热路径 O(N) 扫描**：`evict_expired()` 移入独立后台任务 `spawn_quote_index_evictor`，每 5 分钟执行一次。
+- **`RateLimiter` buckets 无界增长**：bucket 总数超 10,000 时触发清理，防止公网 relay 长期运行内存泄漏。
+- **删除 `validate_session` 死代码**：该方法已不在启动路径调用。
+
+### 文档 — 面向非技术用户的全面改写
+
+**改进**
+
+- **首页分流**：主按钮明确区分「不懂代码下载桌面版」和「会用终端快速开始」。
+- **iLink 前置条件说明**：首页和关键页面均加入「什么是 iLink、如何申请」的说明。
+- **桌面版提升为安装方式一**：原为「方式五」，现提至首位。
+- **CPU 类型判断指引**：安装和快速开始页加入 Apple Silicon vs Intel 的判断方法。
+- **每步加失败处理**：快速开始每个步骤新增折叠的「失败了怎么办」提示块。
+- **删除错误描述**：`register-client.md` 中「Hub 只存哈希值」的错误说明已删除。
+- **FAQ 重新排序**：新增「基本问题」分类，高频问题提至最前，更新桌面版 GUI 答案。
+- **侧边栏重组**：第一组改为「开始使用」，顶部导航加「下载桌面版」入口。
+
+### Hub — 加速启动与停机
+
+**修复**
+
+- **启动加速**：DB/CLI 中格式合法的 token 不再在启动时调用 `getupdates` 探测，Hub 可在 1 秒内监听；会话有效性改由 upstream polling 负责。token 过期（`-14`）时在 polling 中自动触发二维码重登。
+- **停机 `getupdates` 长轮询**：收到 Ctrl+C / shutdown 信号后立即返回空结果，不再阻塞最多 30 秒；Axum graceful shutdown 可在亚秒级完成。
+
+### Hub — Admin UI 编辑 workspace
+
+**新增**
+
+- **Admin UI**：每个 Connected Workspace 卡片支持 **Edit**，可修改 `name` 与 `label`（在线/离线均可）。
+- **`PATCH /hub/clients/{name}`**：更新客户端名称与标签；重名时返回 `409`。
+
 ## [0.1.17] — 2026-06-08
 
 ### Hub — 管理后台删除离线后端

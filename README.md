@@ -233,6 +233,8 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 |--------|------|-------------|
 | `POST` | `/hub/register` | Register a new backend client |
 | `GET` | `/hub/clients` | List all registered clients (includes vtoken) |
+| `PATCH` | `/hub/clients/{name}` | Update a client's name and label |
+| `DELETE` | `/hub/clients/{name}` | Delete an offline client |
 | `GET` | `/hub/ui` | Web admin panel (browser UI) |
 | `GET` | `/metrics` | Prometheus-format metrics |
 | `GET` | `/health` | Health check |

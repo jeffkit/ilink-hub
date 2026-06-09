@@ -10,9 +10,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
-use crate::hub::HubState;
+use crate::hub::{HubState, MessageQueue};
 use crate::ilink::types::*;
 use crate::server::pairing::register_client_in_hub;
 
@@ -29,13 +30,29 @@ fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Returns the configured admin token, reading env once per process.
+/// Returns `None` if not set or empty (no auth required — suitable for private nets).
+fn admin_token() -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            let t = std::env::var("ILINK_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+            if t.is_none() {
+                tracing::warn!(
+                    "ILINK_ADMIN_TOKEN is not set — admin endpoints are unprotected. \
+                     Set this variable in production."
+                );
+            }
+            t
+        })
+        .as_deref()
+}
+
 fn check_admin_auth(headers: &HeaderMap) -> bool {
-    let Ok(required) = std::env::var("ILINK_ADMIN_TOKEN") else {
+    let Some(required) = admin_token() else {
         return true;
     };
-    if required.is_empty() {
-        return true;
-    }
     let provided = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -134,14 +151,17 @@ pub async fn getupdates(
 
     // Use timeout from legacy field if provided, otherwise 30s
     let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
-    let _ = state
-        .queue
-        .wait_notify(&vtoken, poll_secs)
-        .await
-        .unwrap_or_else(|e| {
-            error!(error = %e, vtoken = %vtoken, "wait_notify failed");
-            false
-        });
+    let mut shutdown_rx = state.shutdown.clone();
+    let notified = wait_notify_or_shutdown(
+        state.queue.as_ref(),
+        &mut shutdown_rx,
+        &vtoken,
+        poll_secs,
+    )
+    .await;
+    if !notified && *state.shutdown.borrow() {
+        debug!(vtoken = %vtoken, "getupdates returning early due to shutdown");
+    }
 
     let messages = state.queue.drain(&vtoken).await.unwrap_or_else(|e| {
         error!(error = %e, vtoken = %vtoken, "queue drain failed");
@@ -268,6 +288,12 @@ pub async fn sendmessage(
             )
         };
 
+        let active_session = state
+            .store
+            .get_active_session_name(&vctx)
+            .await
+            .ok();
+
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
         if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {
             if let Some((ref name, ref label)) = client_meta {
@@ -275,6 +301,7 @@ pub async fn sendmessage(
                     msg,
                     name,
                     label.as_deref(),
+                    active_session.as_deref(),
                 );
             }
         }
@@ -282,7 +309,7 @@ pub async fn sendmessage(
         if let Some(cid) = msg.client_id.as_deref().filter(|s| !s.is_empty()) {
             if let Some((name, label)) = client_meta {
                 let mut q = state.quote_index.lock().await;
-                q.register_pending_client(cid, vtoken.clone(), name, label);
+                q.register_pending_client(cid, vtoken.clone(), name, label, active_session);
             }
         }
     }
@@ -306,9 +333,16 @@ pub async fn sendtyping(
     headers: HeaderMap,
     Json(req): Json<SendTypingRequest>,
 ) -> Json<serde_json::Value> {
-    let Some(_vtoken) = extract_vtoken(&headers) else {
+    let Some(vtoken) = extract_vtoken(&headers) else {
         return Json(serde_json::json!({"ret": 401, "errmsg": "Missing Authorization"}));
     };
+    {
+        let registry = state.registry.read().await;
+        if registry.get_by_vtoken(&vtoken).is_none() {
+            warn!(vtoken = %vtoken, "sendtyping rejected: unknown virtual token");
+            return Json(serde_json::json!({"ret": 401, "errmsg": UNKNOWN_VTOKEN_MSG}));
+        }
+    }
 
     let _ = state.upstream.send_typing(req).await;
     Json(serde_json::json!({"ret": 0}))
@@ -321,13 +355,24 @@ pub async fn getconfig(
     headers: HeaderMap,
     Json(mut req): Json<GetConfigRequest>,
 ) -> Json<GetConfigResponse> {
-    let Some(_vtoken) = extract_vtoken(&headers) else {
+    let Some(vtoken) = extract_vtoken(&headers) else {
         return Json(GetConfigResponse {
             ret: Some(401),
             typing_ticket: None,
             errmsg: Some("Missing Authorization".to_string()),
         });
     };
+    {
+        let registry = state.registry.read().await;
+        if registry.get_by_vtoken(&vtoken).is_none() {
+            warn!(vtoken = %vtoken, "getconfig rejected: unknown virtual token");
+            return Json(GetConfigResponse {
+                ret: Some(401),
+                typing_ticket: None,
+                errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+            });
+        }
+    }
 
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
@@ -362,7 +407,7 @@ pub async fn getuploadurl(
     headers: HeaderMap,
     Json(req): Json<GetUploadUrlRequest>,
 ) -> Json<GetUploadUrlResponse> {
-    let Some(_vtoken) = extract_vtoken(&headers) else {
+    let Some(vtoken) = extract_vtoken(&headers) else {
         return Json(GetUploadUrlResponse {
             ret: 401,
             upload_url: None,
@@ -370,6 +415,18 @@ pub async fn getuploadurl(
             errmsg: Some("Missing Authorization".to_string()),
         });
     };
+    {
+        let registry = state.registry.read().await;
+        if registry.get_by_vtoken(&vtoken).is_none() {
+            warn!(vtoken = %vtoken, "getuploadurl rejected: unknown virtual token");
+            return Json(GetUploadUrlResponse {
+                ret: 401,
+                upload_url: None,
+                media_id: None,
+                errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+            });
+        }
+    }
 
     match state.upstream.get_upload_url(req).await {
         Ok(resp) => Json(resp),
@@ -414,14 +471,22 @@ pub async fn admin_clients(
     )
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AdminUpdateClientRequest {
+    pub name: String,
+    pub label: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
-pub struct AdminDeleteClientResponse {
+pub struct AdminClientMutationResponse {
     pub ret: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub errmsg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
+
+pub type AdminDeleteClientResponse = AdminClientMutationResponse;
 
 pub async fn admin_delete_client(
     State(state): State<Arc<HubState>>,
@@ -485,6 +550,92 @@ pub async fn admin_delete_client(
                 Json(AdminDeleteClientResponse {
                     ret: 500,
                     errmsg: Some("Failed to delete client".to_string()),
+                    name: None,
+                }),
+            )
+        }
+    }
+}
+
+pub async fn admin_update_client(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+    axum::extract::Path(old_name): axum::extract::Path<String>,
+    Json(req): Json<AdminUpdateClientRequest>,
+) -> (StatusCode, Json<AdminClientMutationResponse>) {
+    if !check_admin_auth(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(AdminClientMutationResponse {
+                ret: 401,
+                errmsg: Some("Unauthorized".to_string()),
+                name: None,
+            }),
+        );
+    }
+
+    let old_name = old_name.trim();
+    if old_name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AdminClientMutationResponse {
+                ret: 400,
+                errmsg: Some("Client name is required".to_string()),
+                name: None,
+            }),
+        );
+    }
+
+    match crate::server::pairing::update_client_in_hub(
+        state.as_ref(),
+        old_name,
+        &req.name,
+        req.label,
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(AdminClientMutationResponse {
+                ret: 0,
+                errmsg: None,
+                name: Some(req.name.trim().to_string()),
+            }),
+        ),
+        Err(crate::server::pairing::UpdateClientError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(AdminClientMutationResponse {
+                ret: 404,
+                errmsg: Some(format!("Client `{old_name}` not found")),
+                name: None,
+            }),
+        ),
+        Err(crate::server::pairing::UpdateClientError::NameTaken) => (
+            StatusCode::CONFLICT,
+            Json(AdminClientMutationResponse {
+                ret: 409,
+                errmsg: Some(format!(
+                    "Client name `{}` is already taken",
+                    req.name.trim()
+                )),
+                name: None,
+            }),
+        ),
+        Err(crate::server::pairing::UpdateClientError::InvalidName) => (
+            StatusCode::BAD_REQUEST,
+            Json(AdminClientMutationResponse {
+                ret: 400,
+                errmsg: Some("Client name cannot be empty".to_string()),
+                name: None,
+            }),
+        ),
+        Err(crate::server::pairing::UpdateClientError::Store(e)) => {
+            error!(error = %e, %old_name, "failed to update client in store");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminClientMutationResponse {
+                    ret: 500,
+                    errmsg: Some("Failed to update client".to_string()),
                     name: None,
                 }),
             )
@@ -585,4 +736,82 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     }
 
     (StatusCode::OK, out)
+}
+
+/// Wait for a queue notification or hub shutdown, whichever comes first.
+async fn wait_notify_or_shutdown(
+    queue: &dyn MessageQueue,
+    shutdown: &mut watch::Receiver<bool>,
+    vtoken: &str,
+    poll_secs: u64,
+) -> bool {
+    if *shutdown.borrow() {
+        return false;
+    }
+
+    tokio::select! {
+        biased;
+        _ = wait_shutdown_signal(shutdown) => false,
+        notified = async {
+            queue.wait_notify(vtoken, poll_secs).await.unwrap_or_else(|e| {
+                error!(error = %e, vtoken = %vtoken, "wait_notify failed");
+                false
+            })
+        } => notified,
+    }
+}
+
+async fn wait_shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod shutdown_poll_tests {
+    use super::{wait_notify_or_shutdown, wait_shutdown_signal};
+    use crate::hub::queue::InMemoryQueue;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn wait_notify_or_shutdown_returns_when_shutdown_signaled() {
+        let queue = Arc::new(InMemoryQueue::new());
+        let (tx, rx) = watch::channel(false);
+        let mut shutdown_rx = rx.clone();
+
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+
+        let start = Instant::now();
+        let notified =
+            wait_notify_or_shutdown(queue.as_ref(), &mut shutdown_rx, "v1", 30).await;
+        handle.await.unwrap();
+
+        assert!(!notified);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "expected fast return on shutdown, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_shutdown_signal_returns_immediately_when_already_shutting_down() {
+        let (_tx, rx) = watch::channel(true);
+        let mut shutdown_rx = rx;
+
+        let start = Instant::now();
+        wait_shutdown_signal(&mut shutdown_rx).await;
+
+        assert!(start.elapsed() < Duration::from_millis(50));
+    }
 }

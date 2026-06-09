@@ -6,11 +6,12 @@
 
 ## 你需要准备
 
-| 条件 | 检查方法 |
-|------|---------|
-| 已开通 iLink（ClawBot）的微信账号 | 向 ClawBot 服务商确认 |
-| macOS / Linux（Windows 参考下方说明） | — |
-| Node.js 18+（用于安装 Claude Code） | `node --version` |
+| 条件 | 说明 |
+|------|------|
+| 已开通 iLink（ClawBot）的微信账号 | 在 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，1-3 个工作日审核 |
+| macOS 或 Linux 电脑 | Windows 可用但部分步骤略有不同，见下方说明 |
+| Node.js 18 或更高版本 | 终端运行 `node --version` 检查；没有的话去 [nodejs.org](https://nodejs.org) 下载 LTS 版 |
+| Anthropic API Key 或 Claude 账号 | 在 [console.anthropic.com](https://console.anthropic.com) 获取 |
 
 ---
 

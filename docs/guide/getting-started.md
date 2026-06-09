@@ -1,27 +1,34 @@
 # 快速开始
 
-本指南带你在 5 分钟内完成 iLink Hub 的安装、启动和客户端接入。
+本指南带你完成 iLink Hub 的安装、启动和客户端接入。
 
-> **路径说明**：默认数据库为 **`~/.ilink-hub/ilink-hub.db`**（可用 `DATABASE_URL` 覆盖）；bridge 默认配置为 **`~/.ilink-hub/ilink-hub-bridge.yaml`**，凭证为 **`~/.ilink-hub/bridge-credentials.json`**。与 AI 客户端相关的 URL 一般为 `http://<hub 主机>:8765`，管理面板为 `http://<hub 主机>:8765/hub/ui`。
+::: tip 不想用终端？
+直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。
+:::
 
-## 前提条件
+::: warning 使用前确认
+你需要一个**已开通 iLink（ClawBot）的微信账号**。还没有？前往 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，通常 1-3 个工作日审核完成。
+:::
 
-- 一个已开通 iLink API 的微信账号（ClawBot）
-- macOS / Linux / Windows 机器（可访问外网）
-- 可选：Docker（最简单的部署方式）
+---
 
 ## 第一步：安装 iLink Hub
 
-根据你的系统选择一种安装方式：
+根据你的系统选择安装方式。
+
+**不知道自己是哪种 Mac？** 点击屏幕左上角苹果图标 → 「关于本机」，看「芯片」一栏：
+- 写着 **Apple M1 / M2 / M3 / M4** → 选 Apple Silicon
+- 写着 **Intel** → 选 Intel
 
 ::: code-group
 
-```bash [Homebrew（macOS 推荐）]
+```bash [macOS（Homebrew，推荐）]
+# 如果没有 Homebrew，先安装：https://brew.sh
 brew tap jeffkit/tap
 brew install ilink-hub
 ```
 
-```bash [macOS Apple Silicon (M 系列)]
+```bash [macOS Apple Silicon（M 系列）]
 curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-macos-aarch64
 chmod +x ilink-hub
 sudo mv ilink-hub /usr/local/bin/
@@ -39,13 +46,9 @@ chmod +x ilink-hub
 sudo mv ilink-hub /usr/local/bin/
 ```
 
-```bash [Cargo（需要 Rust）]
-cargo install ilink-hub
-```
-
 :::
 
-> **Windows 用户**：从 [Releases 页面](https://github.com/jeffkit/ilink-hub/releases) 下载 `ilink-hub-windows-x86_64.exe`。
+> **Windows 用户**：从 [Releases 页面](https://github.com/jeffkit/ilink-hub/releases) 下载 `ilink-hub-windows-x86_64.exe`，重命名为 `ilink-hub.exe` 并放到 PATH 中。
 
 验证安装成功：
 
@@ -53,100 +56,139 @@ cargo install ilink-hub
 ilink-hub --version
 ```
 
-## 第二步：启动 Hub（首次会自动出码登录）
+看到版本号（如 `ilink-hub 0.1.17`）就说明安装成功了。
 
-直接启动即可，**不必**先单独执行 `ilink-hub login`：
+::: details 提示「command not found」怎么办？
+- **Homebrew 安装**：运行 `brew doctor` 检查环境
+- **手动下载**：确认已执行 `chmod +x` 和 `sudo mv` 两步
+- **所有方式**：尝试重新打开终端窗口
+:::
+
+---
+
+## 第二步：启动 Hub（首次会出二维码扫码登录）
 
 ```bash
 ilink-hub serve --addr 0.0.0.0:8765
 ```
 
-启动时 Hub 会按顺序解析真实 iLink Token：`ILINK_TOKEN` / `--token` → 数据库中已保存的凭证 → 若仍没有或已失效，则**在当前终端打印二维码**，用**已开通 iLink API 的微信**扫码后 Token 会写入数据库，随后服务继续运行。
+**首次启动**，Hub 会自动在终端显示一个二维码：
 
 ```
 首次启动需要绑定微信机器人，请扫描下方二维码登录。
-（终端中的二维码块字符）
-…
+
+█████████████████████
+█ ▄▄▄▄▄ █▀▀▀▀▀█ ▄▄▄▄▄ █
+█ █   █ █ ▄▄▄ █ █   █ █
+...（二维码字符）
+
+```
+
+用你**已开通 iLink 的微信账号**扫码，手机上确认授权后，终端会显示：
+
+```
 iLink login successful, token saved
-```
-
-若你只想更新 Token、不想拉起 HTTP 服务，可改用独立子命令（见 [QR 码登录](./login.md)）。
-
-服务启动后，你会看到类似输出：
-
-```
 INFO ilink_hub: iLink Hub listening
-INFO ilink_hub: … Admin / pairing …
 ```
 
-::: tip 后台运行
-使用 `nohup ilink-hub serve --addr 0.0.0.0:8765 &` 或者 systemd/screen 在后台保持运行。
+Hub 启动成功。**保持这个终端窗口开着**，关掉就停止服务了。
+
+::: details 二维码扫了没反应？
+- 确认用的是**已开通 iLink 的微信账号**，普通微信账号无法授权
+- 二维码有效期约 2 分钟，超时后重新运行命令即可
+- 手机扫码后如果没有跳出授权页，检查手机网络是否正常
 :::
 
-::: tip 本机 Hub + 手机扫码
-若 Hub 跑在本机、需要手机扫配对页，默认会走 **ilinkhub.ai** 中继，无需先跑隧道。详见 [手机扫码配对](./pairing-tunnel.md)。
+::: details 提示「Address already in use」？
+端口 8765 被占用了。换一个端口：
+```bash
+ilink-hub serve --addr 0.0.0.0:8766
+```
 :::
+
+::: tip 想在后台运行？
+```bash
+nohup ilink-hub serve --addr 0.0.0.0:8765 > ilink-hub.log 2>&1 &
+```
+日志会写入 `ilink-hub.log`。生产环境推荐用 [Docker 部署](/deployment/docker)。
+:::
+
+---
 
 ## 第三步：打开 Web 管理面板
 
-在浏览器中访问：
+Hub 启动后，在浏览器访问：
 
 ```
 http://localhost:8765/hub/ui
 ```
 
-你会看到 iLink Hub 的管理界面，可以在这里注册客户端并复制配置。
+你会看到管理界面。这里可以查看运行状态、注册 AI 客户端、复制配置。
+
+::: details 打不开页面？
+- 确认 Hub 还在运行（终端没有报错）
+- 如果 Hub 不在本机，把 `localhost` 换成实际 IP 地址
+- 检查防火墙是否放行了 8765 端口
+:::
+
+---
 
 ## 第四步：注册 AI 客户端
 
-每个需要接入的 AI 后端都需要注册一次，获取一个专属的虚拟 Token。
+每个需要接入的 AI 工具都需要注册一次，获取一个专属的**虚拟凭证（Token）**。
 
-**通过 CLI 注册：**
+**方式一：通过 Web 界面注册（推荐）**
+
+在 `/hub/ui` 管理面板点击「注册新客户端」，填写名称即可。注册完成后直接复制配置。
+
+**方式二：通过命令行注册**
 
 ```bash
 ilink-hub register \
-  --hub-url http://your-hub.example.com:8765 \
-  --name mac-home \
-  --label "Mac 本机"
+  --hub-url http://localhost:8765 \
+  --name my-claude \
+  --label "我的 Claude"
 ```
 
-**或通过 Web UI 注册**（在 `/hub/ui` 页面点击「注册新客户端」）
-
-注册成功后会输出：
+注册成功后会显示：
 
 ```
 ✓ 客户端注册成功！
 
-客户端名称：mac-home
-虚拟 Token：vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+  名称：my-claude
+  虚拟 Token：vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 请将以下配置添加到你的 AI 客户端：
-  WEIXIN_BASE_URL=http://your-hub.example.com:8765
+  WEIXIN_BASE_URL=http://localhost:8765
   WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-## 第五步：配置 AI 客户端
+> **请保存好这个 Token**。如果忘记了，可以在 Web 管理面板的客户端列表里查看。
 
-将上一步获得的配置填入你的 AI 客户端：
+---
+
+## 第五步：配置你的 AI 工具
+
+把上一步的两行配置填入你的 AI 工具：
 
 ::: code-group
 
-```toml [Recursive (~/.recursive/config.toml)]
+```toml [Recursive（~/.recursive/config.toml）]
 [weixin]
-base_url = "http://your-hub.example.com:8765"
+base_url = "http://localhost:8765"
 token = "vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-```bash [环境变量（通用）]
-export WEIXIN_BASE_URL=http://your-hub.example.com:8765
+```bash [环境变量（大多数工具通用）]
+export WEIXIN_BASE_URL=http://localhost:8765
 export WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-```json [OpenClaw (~/.openclaw/openclaw.json)]
+```json [OpenClaw（~/.openclaw/openclaw.json）]
 {
   "channels": {
     "weixin": {
-      "base_url": "http://your-hub.example.com:8765",
+      "base_url": "http://localhost:8765",
       "token": "vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     }
   }
@@ -155,30 +197,43 @@ export WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 :::
 
+---
+
 ## 完成！测试一下
 
-在微信中发送 `/status`，如果 Hub 正常运行，你会收到类似回复：
+在微信里发送 `/status`，正常情况下会收到回复：
 
 ```
-Hub 状态：在线
-已注册客户端：2
-在线客户端：1（mac-home）
+iLink Hub 状态：1/1 个客户端在线
 ```
 
-::: tip 想立刻接本机命令行？
-跟做 [本地 CLI Bridge：5 分钟上手](/bridge/quick-try)（用 `echo` 走通 Hub → Token → 回微信），无需先装 Recursive / OpenClaw。
+再发一条普通消息，看看你的 AI 工具是否收到并回复。
+
+::: details AI 工具没收到消息？
+1. 确认 AI 工具正在运行，没有报错
+2. 在微信发 `/list`，查看客户端是否显示「在线」
+3. 如果显示「离线」，重启 AI 工具
+4. 如果注册了多个客户端，用 `/use my-claude` 切换到对应的那个
 :::
+
+---
+
+## 常用微信命令
+
+接入成功后，在微信里可以用这些命令管理 Hub：
+
+| 命令 | 作用 |
+|------|------|
+| `/list` | 查看所有已注册的 AI 及在线状态 |
+| `/use <名称>` | 切换当前使用的 AI（如 `/use my-claude`） |
+| `/status` | 查看 Hub 整体状态 |
+| `/help` | 显示帮助 |
 
 ---
 
 ## 下一步
 
-::: tip 想直接用微信和 Claude Code 对话？
-→ **[接入 Claude Code](/guide/claude-code)**：从安装到发出第一条消息，一页走完。
-:::
-
-- [了解微信命令](/reference/commands) — 学习 `/list`、`/use` 等命令
-- [5 分钟上手（echo）](/bridge/quick-try) — 先用 echo 验证链路
-- [多 CLI / 多项目](/bridge/USAGE) — Cursor Agent、Codex 等接入方式
-- [Docker 部署](/deployment/docker) — 更稳定的生产环境部署方式
-- [安全建议](/deployment/security) — 如何保护你的 Hub 实例
+- [接入 Claude Code](/guide/claude-code) — 完整教程：从安装到对话
+- [5 分钟上手（echo）](/bridge/quick-try) — 先用 echo 命令验证完整链路
+- [Docker 部署](/deployment/docker) — 服务器上 7×24 小时稳定运行
+- [常见问题 FAQ](/guide/faq) — 遇到问题先查这里

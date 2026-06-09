@@ -89,17 +89,17 @@ pub async fn register_client_in_hub(
     name: String,
     label: Option<String>,
 ) -> String {
-    let vtoken = {
+    // Lock order: registry → router (always).
+    let (vtoken, is_first) = {
         let mut registry = state.registry.write().await;
-        registry.register(name.clone(), label.clone())
+        let vtoken = registry.register(name.clone(), label.clone());
+        let is_first = registry.all_clients().len() == 1;
+        (vtoken, is_first)
     };
 
-    {
+    if is_first {
         let mut router = state.router.lock().await;
-        let registry = state.registry.read().await;
-        if registry.all_clients().len() == 1 {
-            router.set_default(vtoken.clone());
-        }
+        router.set_default(vtoken.clone());
     }
 
     if let Err(e) = state
@@ -134,12 +134,15 @@ pub async fn unregister_client_in_hub(state: &HubState, name: &str) -> Result<()
         client.vtoken.clone()
     };
 
-    {
+    // Lock order: registry → router (always). Drop registry before acquiring router.
+    let new_default = {
         let mut registry = state.registry.write().await;
         if !registry.remove(name) {
             return Err(UnregisterClientError::NotFound);
         }
-        let new_default = registry.pick_default_after_remove(&vtoken);
+        registry.pick_default_after_remove(&vtoken)
+    };
+    {
         let mut router = state.router.lock().await;
         router.remove_routes_for_vtoken(&vtoken, new_default);
     }
@@ -161,6 +164,52 @@ pub async fn unregister_client_in_hub(state: &HubState, name: &str) -> Result<()
 
     info!(client = %name, vtoken = %vtoken, "admin deleted offline client");
     Ok(())
+}
+
+#[derive(Debug)]
+pub enum UpdateClientError {
+    NotFound,
+    NameTaken,
+    InvalidName,
+    Store(anyhow::Error),
+}
+
+/// Update a registered client's name and label in memory and DB.
+pub async fn update_client_in_hub(
+    state: &HubState,
+    old_name: &str,
+    new_name: &str,
+    label: Option<String>,
+) -> Result<String, UpdateClientError> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err(UpdateClientError::InvalidName);
+    }
+
+    let label_for_store = label.clone();
+    let vtoken = {
+        let mut registry = state.registry.write().await;
+        registry
+            .update_client(old_name, new_name, label)
+            .map_err(|e| match e {
+                crate::hub::registry::UpdateClientError::NotFound => UpdateClientError::NotFound,
+                crate::hub::registry::UpdateClientError::NameTaken => UpdateClientError::NameTaken,
+            })?
+    };
+
+    state
+        .store
+        .update_client_by_vtoken(&vtoken, new_name, label_for_store.as_deref())
+        .await
+        .map_err(UpdateClientError::Store)?;
+
+    info!(
+        old_name = %old_name,
+        new_name = %new_name,
+        vtoken = %vtoken,
+        "admin updated client"
+    );
+    Ok(vtoken)
 }
 
 fn build_pairing_qr_response(code: String) -> GetQrcodeResponse {

@@ -30,6 +30,12 @@ impl ClientInfo {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateClientError {
+    NotFound,
+    NameTaken,
+}
+
 #[derive(Debug)]
 pub struct ClientRegistry {
     /// vtoken → ClientInfo
@@ -126,6 +132,38 @@ impl ClientRegistry {
         }
     }
 
+    /// Update a client's name and/or label. Returns the client's vtoken on success.
+    pub fn update_client(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+        label: Option<String>,
+    ) -> Result<String, UpdateClientError> {
+        let vtoken = self
+            .by_name
+            .get(old_name)
+            .cloned()
+            .ok_or(UpdateClientError::NotFound)?;
+
+        if new_name != old_name && self.by_name.contains_key(new_name) {
+            return Err(UpdateClientError::NameTaken);
+        }
+
+        let info = self
+            .by_vtoken
+            .get_mut(&vtoken)
+            .ok_or(UpdateClientError::NotFound)?;
+
+        if new_name != old_name {
+            self.by_name.remove(old_name);
+            info.name = new_name.to_string();
+            self.by_name.insert(new_name.to_string(), vtoken.clone());
+        }
+
+        info.label = label;
+        Ok(vtoken)
+    }
+
     /// Remove routing entries that pointed at `vtoken`. Clears default if it matched.
     /// Returns the new default vtoken, if any.
     pub fn pick_default_after_remove(&self, removed_vtoken: &str) -> Option<String> {
@@ -179,5 +217,27 @@ mod tests {
         assert_eq!(c.name, "echo");
         assert_eq!(c.label.as_deref(), Some("echo test"));
         assert!(reg.get_by_vtoken(&c.vtoken).is_some());
+    }
+
+    #[test]
+    fn update_client_renames_and_updates_label() {
+        let mut reg = ClientRegistry::new();
+        let vtoken = reg.register("old".into(), Some("old label".into()));
+        reg.update_client("old", "new", Some("new label".into())).unwrap();
+        assert!(reg.get_by_name("old").is_none());
+        let c = reg.get_by_name("new").expect("renamed");
+        assert_eq!(c.vtoken, vtoken);
+        assert_eq!(c.label.as_deref(), Some("new label"));
+    }
+
+    #[test]
+    fn update_client_rejects_duplicate_name() {
+        let mut reg = ClientRegistry::new();
+        reg.register("a".into(), None);
+        reg.register("b".into(), None);
+        assert_eq!(
+            reg.update_client("a", "b", None),
+            Err(UpdateClientError::NameTaken)
+        );
     }
 }

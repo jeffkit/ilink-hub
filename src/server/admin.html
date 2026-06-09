@@ -82,7 +82,27 @@
     .client-meta .name { font-weight: 600; font-size: 15px; }
     .client-meta .label { font-size: 12px; color: var(--muted); }
 
-    .client-actions { display: flex; gap: 8px; flex-direction: column; align-items: flex-end; }
+    .client-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      flex-direction: row;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
+    .client-edit {
+      grid-column: 1 / -1;
+      display: none;
+      gap: 10px;
+      padding-top: 4px;
+      border-top: 1px solid var(--border);
+    }
+    .client-card.editing .client-edit { display: grid; }
+    .client-card.editing .client-view { display: none; }
+
+    .client-edit .field { min-width: 0; }
+    .client-edit .form-row { align-items: flex-end; }
 
     .vtoken-row {
       grid-column: 1 / -1;
@@ -296,6 +316,7 @@
 const HUB_URL = window.location.origin;
 let adminToken = localStorage.getItem('ilink_admin_token') || '';
 let lastRegEnv = '';
+let editingClient = null;
 
 function authHeaders() {
   const h = { 'Content-Type': 'application/json' };
@@ -330,31 +351,92 @@ function renderClients(clients) {
     grid.innerHTML = '<div class="empty">No clients registered yet — register one below.</div>';
     return;
   }
-  grid.innerHTML = clients.map(c => `
-    <div class="client-card">
+  grid.innerHTML = clients.map(c => {
+    const isEditing = editingClient && editingClient.oldName === c.name;
+    const editName = isEditing ? editingClient.name : c.name;
+    const editLabel = isEditing ? (editingClient.label ?? '') : (c.label || '');
+    return `
+    <div class="client-card${isEditing ? ' editing' : ''}" data-client-name="${esc(c.name)}">
       <div class="status-dot ${c.online ? 'online' : 'offline'}"></div>
-      <div class="client-meta">
+      <div class="client-meta client-view">
         <div class="name">${esc(c.name)}</div>
-        ${c.label ? `<div class="label">${esc(c.label)}</div>` : ''}
+        ${c.label ? `<div class="label">${esc(c.label)}</div>` : '<div class="label" style="color:var(--muted)">No label</div>'}
       </div>
-      <div class="client-actions">
+      <div class="client-actions client-view">
         <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'}">
           ${c.online ? '🟢 online' : '⚫ offline'}
         </span>
-        ${c.online ? '' : `<button class="btn btn-danger btn-sm" onclick="deleteClient(${JSON.stringify(c.name)})">Delete</button>`}
+        <button class="btn btn-ghost btn-sm" data-action="edit">Edit</button>
+        ${c.online ? '' : '<button class="btn btn-danger btn-sm" data-action="delete">Delete</button>'}
+      </div>
+      <div class="client-edit">
+        <div class="form-row">
+          <div class="field">
+            <label>Name</label>
+            <input type="text" data-field="name" value="${esc(editName)}" />
+          </div>
+          <div class="field">
+            <label>Label (optional)</label>
+            <input type="text" data-field="label" value="${esc(editLabel)}" placeholder="Mac Home — Claude" />
+          </div>
+          <div style="display:flex;gap:6px;align-self:flex-end">
+            <button class="btn btn-primary btn-sm" data-action="save">Save</button>
+            <button class="btn btn-ghost btn-sm" data-action="cancel">Cancel</button>
+          </div>
+        </div>
       </div>
       <div class="vtoken-row">
         <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_TOKEN</span>
         <span class="vtoken-value">${esc(c.vtoken || '—')}</span>
-        ${c.vtoken ? `<button class="btn btn-ghost btn-sm" onclick="copyText('${esc(c.vtoken)}')">Copy</button>` : ''}
+        ${c.vtoken ? `<button class="btn btn-ghost btn-sm" data-action="copy-vtoken" data-copy="${esc(c.vtoken)}">Copy</button>` : ''}
       </div>
       <div class="vtoken-row">
         <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_BASE_URL</span>
         <span class="vtoken-value">${esc(HUB_URL)}</span>
-        <button class="btn btn-ghost btn-sm" onclick="copyText('${esc(HUB_URL)}')">Copy</button>
+        <button class="btn btn-ghost btn-sm" data-action="copy-hub-url">Copy</button>
       </div>
     </div>
-  `).join('');
+  `;
+  }).join('');
+}
+
+function startEditClient(name, label) {
+  editingClient = { oldName: name, name, label: label || '' };
+  loadClients();
+}
+
+function cancelEditClient() {
+  editingClient = null;
+  loadClients();
+}
+
+async function saveEditClient(card) {
+  const oldName = card.dataset.clientName;
+  const name = card.querySelector('[data-field="name"]').value.trim();
+  const label = card.querySelector('[data-field="label"]').value.trim();
+
+  if (!name) {
+    showToast('Name is required');
+    return;
+  }
+
+  try {
+    const r = await fetch('/hub/clients/' + encodeURIComponent(oldName), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify({ name, label: label || null }),
+    });
+    const data = await r.json();
+    if (data.ret !== 0) {
+      showToast('Update failed: ' + (data.errmsg || 'unknown error'));
+      return;
+    }
+    editingClient = null;
+    showToast('Updated ' + name);
+    await loadClients();
+  } catch (e) {
+    showToast('Error: ' + e.message);
+  }
 }
 
 async function deleteClient(name) {
@@ -433,9 +515,47 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+document.getElementById('clients-grid').addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const card = btn.closest('.client-card');
+  if (!card) return;
+
+  const action = btn.dataset.action;
+  const name = card.dataset.clientName;
+
+  if (action === 'edit') {
+    const labelEl = card.querySelector('.client-meta .label');
+    const label = labelEl && !labelEl.textContent.startsWith('No label')
+      ? labelEl.textContent
+      : '';
+    startEditClient(name, label);
+    return;
+  }
+  if (action === 'cancel') {
+    cancelEditClient();
+    return;
+  }
+  if (action === 'save') {
+    saveEditClient(card);
+    return;
+  }
+  if (action === 'delete') {
+    deleteClient(name);
+    return;
+  }
+  if (action === 'copy-vtoken') {
+    copyText(btn.dataset.copy || '');
+    return;
+  }
+  if (action === 'copy-hub-url') {
+    copyText(HUB_URL);
+  }
+});
+
 // Init
 loadClients();
-setInterval(loadClients, 10000);
+setInterval(() => { if (!editingClient) loadClients(); }, 10000);
 </script>
 </body>
 </html>

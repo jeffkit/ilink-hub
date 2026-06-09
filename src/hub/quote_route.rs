@@ -25,7 +25,10 @@ pub fn merge_routing_with_quote(
         return base;
     }
     match quoted {
-        Some(QuoteOrigin::Client { vtoken, .. }) => RoutingDecision::ForwardTo(vtoken),
+        Some(QuoteOrigin::Client { vtoken, session_name, .. }) => RoutingDecision::ForwardTo {
+            vtoken,
+            session_override: session_name,
+        },
         Some(QuoteOrigin::Hub { cmd }) => RoutingDecision::HubInternal(cmd),
         None => base,
     }
@@ -39,6 +42,8 @@ pub enum QuoteOrigin {
         vtoken: String,
         name: String,
         label: Option<String>,
+        /// The session that was active when this message was sent.
+        session_name: Option<String>,
     },
     /// Hub-generated reply (e.g. `/list`); re-run the same hub action.
     Hub { cmd: HubCommand },
@@ -75,11 +80,11 @@ impl QuoteRouteIndex {
         vtoken: String,
         name: String,
         label: Option<String>,
+        session_name: Option<String>,
     ) {
         if client_id.is_empty() {
             return;
         }
-        self.evict_expired();
         self.pending_by_client_id.insert(
             client_id.to_string(),
             PendingOutbound {
@@ -87,6 +92,7 @@ impl QuoteRouteIndex {
                     vtoken,
                     name,
                     label,
+                    session_name,
                 },
                 deadline: Instant::now() + PENDING_TTL,
             },
@@ -97,7 +103,6 @@ impl QuoteRouteIndex {
         if client_id.is_empty() {
             return;
         }
-        self.evict_expired();
         self.pending_by_client_id.insert(
             client_id.to_string(),
             PendingOutbound {
@@ -109,7 +114,6 @@ impl QuoteRouteIndex {
 
     /// Call for upstream messages that look like bot-side copies (`message_type == 2`).
     pub fn observe_upstream_bot_message(&mut self, msg: &crate::ilink::types::WeixinMessage) {
-        self.evict_expired();
         let client_id = match msg.client_id.as_deref() {
             Some(s) if !s.is_empty() => s,
             _ => return,
@@ -148,7 +152,6 @@ impl QuoteRouteIndex {
         &mut self,
         msg: &crate::ilink::types::WeixinMessage,
     ) -> Option<QuoteOrigin> {
-        self.evict_expired();
         for key in collect_quoted_msg_keys(msg) {
             if let Some(entry) = self.by_msg_key.get(&key) {
                 if Instant::now() <= entry.deadline {
@@ -159,7 +162,7 @@ impl QuoteRouteIndex {
         None
     }
 
-    fn evict_expired(&mut self) {
+    pub fn evict_expired(&mut self) {
         let now = Instant::now();
         self.pending_by_client_id.retain(|_, p| now <= p.deadline);
         self.by_msg_key.retain(|_, v| now <= v.deadline);
@@ -259,16 +262,18 @@ mod tests {
 
     #[test]
     fn merge_quote_overrides_forward() {
-        let base = RoutingDecision::ForwardTo("default_vt".into());
+        let base = RoutingDecision::ForwardTo { vtoken: "default_vt".into(), session_override: None };
         let q = QuoteOrigin::Client {
             vtoken: "quoted_vt".into(),
             name: "n".into(),
             label: None,
+            session_name: Some("feature-a".into()),
         };
         let out = merge_routing_with_quote(base, Some(q));
         assert!(matches!(
             out,
-            RoutingDecision::ForwardTo(ref v) if v == "quoted_vt"
+            RoutingDecision::ForwardTo { ref vtoken, ref session_override }
+                if vtoken == "quoted_vt" && session_override.as_deref() == Some("feature-a")
         ));
     }
 
@@ -280,15 +285,16 @@ mod tests {
                 vtoken: "vt".into(),
                 name: "n".into(),
                 label: None,
+                session_name: None,
             }),
         );
-        assert!(matches!(out, RoutingDecision::ForwardTo(ref v) if v == "vt"));
+        assert!(matches!(out, RoutingDecision::ForwardTo { ref vtoken, .. } if vtoken == "vt"));
     }
 
     #[test]
     fn merge_hub_internal_from_quote() {
         let out = merge_routing_with_quote(
-            RoutingDecision::ForwardTo("x".into()),
+            RoutingDecision::ForwardTo { vtoken: "x".into(), session_override: None },
             Some(QuoteOrigin::Hub {
                 cmd: HubCommand::List,
             }),
@@ -308,6 +314,7 @@ mod tests {
                 vtoken: "vt".into(),
                 name: "n".into(),
                 label: None,
+                session_name: None,
             }),
         );
         assert!(matches!(
@@ -318,9 +325,9 @@ mod tests {
 
     #[test]
     fn merge_no_quote_keeps_forward() {
-        let base = RoutingDecision::ForwardTo("keep".into());
+        let base = RoutingDecision::ForwardTo { vtoken: "keep".into(), session_override: None };
         let out = merge_routing_with_quote(base, None);
-        assert!(matches!(out, RoutingDecision::ForwardTo(ref v) if v == "keep"));
+        assert!(matches!(out, RoutingDecision::ForwardTo { ref vtoken, .. } if vtoken == "keep"));
     }
 
     #[test]
@@ -358,7 +365,7 @@ mod tests {
     #[test]
     fn resolve_without_ref_returns_none() {
         let mut idx = QuoteRouteIndex::default();
-        idx.register_pending_client("c1", "vt".into(), "n".into(), None);
+        idx.register_pending_client("c1", "vt".into(), "n".into(), None, None);
         let user = WeixinMessage {
             item_list: Some(vec![MessageItem {
                 item_type: Some(1),
@@ -380,6 +387,7 @@ mod tests {
             "vhub_abc".into(),
             "echo".into(),
             Some("echo test".into()),
+            Some("feature-a".into()),
         );
         let echo = WeixinMessage {
             message_type: Some(2),
@@ -415,9 +423,10 @@ mod tests {
         };
         let origin = idx.resolve_user_quote(&user).expect("resolve");
         match origin {
-            QuoteOrigin::Client { vtoken, name, .. } => {
+            QuoteOrigin::Client { vtoken, name, session_name, .. } => {
                 assert_eq!(vtoken, "vhub_abc");
                 assert_eq!(name, "echo");
+                assert_eq!(session_name.as_deref(), Some("feature-a"));
             }
             QuoteOrigin::Hub { .. } => panic!("expected client"),
         }

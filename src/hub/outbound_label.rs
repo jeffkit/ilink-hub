@@ -29,13 +29,23 @@ pub fn format_outbound_origin_line(name: &str, label: Option<&str>) -> String {
     }
 }
 
-/// Appends `\n\n— {line}` to the first text item, if present.
+/// Full footer line: `workspace [· session]` where session is omitted when it equals "default".
+pub fn format_outbound_footer(name: &str, label: Option<&str>, session_name: Option<&str>) -> String {
+    let workspace = format_outbound_origin_line(name, label);
+    match session_name.map(str::trim).filter(|s| !s.is_empty() && *s != "default") {
+        Some(s) => format!("{workspace} · {s}"),
+        None => workspace,
+    }
+}
+
+/// Appends `\n\n— {workspace [· session]}` to the first text item, if present.
 pub fn append_outbound_origin_footer_to_first_text_item(
     msg: &mut WeixinMessage,
     name: &str,
     label: Option<&str>,
+    session_name: Option<&str>,
 ) {
-    let line = format_outbound_origin_line(name, label);
+    let line = format_outbound_footer(name, label, session_name);
     let Some(items) = msg.item_list.as_mut() else {
         return;
     };
@@ -117,7 +127,16 @@ mod tests {
             }]),
             ..Default::default()
         };
-        append_outbound_origin_footer_to_first_text_item(&mut msg, "w", Some("lbl"));
+        append_outbound_origin_footer_to_first_text_item(&mut msg, "w", Some("lbl"), None);
         assert_eq!(msg.text(), Some("body\n\n— w · lbl"));
+    }
+
+    #[test]
+    fn format_footer_with_session() {
+        assert_eq!(format_outbound_footer("echo", None, Some("feature-a")), "echo · feature-a");
+        assert_eq!(format_outbound_footer("echo", Some("lbl"), Some("feature-a")), "echo · lbl · feature-a");
+        // "default" session is suppressed
+        assert_eq!(format_outbound_footer("echo", None, Some("default")), "echo");
+        assert_eq!(format_outbound_footer("echo", None, None), "echo");
     }
 }

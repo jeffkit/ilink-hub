@@ -149,12 +149,15 @@ impl Store {
     // ─── Clients ─────────────────────────────────────────────────────────────
 
     pub async fn upsert_client(&self, vtoken: &str, name: &str, label: Option<&str>) -> Result<()> {
+        // ON CONFLICT (name): update vtoken so a post-restart re-registration with a new
+        // vtoken wins, keeping DB and in-memory registry consistent.
         sqlx::query(
             r#"
             INSERT INTO clients (vtoken, name, label)
             VALUES ($1, $2, $3)
             ON CONFLICT (name) DO UPDATE
-              SET label = EXCLUDED.label,
+              SET vtoken = EXCLUDED.vtoken,
+                  label = EXCLUDED.label,
                   last_seen = CURRENT_TIMESTAMP
             "#,
         )
@@ -210,6 +213,21 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_client_by_vtoken(
+        &self,
+        vtoken: &str,
+        name: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE clients SET name = $2, label = $3 WHERE vtoken = $1")
+            .bind(vtoken)
+            .bind(name)
+            .bind(label)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn clear_routes_for_vtoken(&self, vtoken: &str) -> Result<()> {
@@ -459,15 +477,15 @@ impl Store {
         Ok(row.map(|r| (r.get("real_ctx"), r.get("peer_user_id"))))
     }
 
-    /// Load recent context_token mappings for in-memory cache warm-up.
-    /// Returns up to `limit` entries as `(vctx, real_ctx, peer_user_id)`.
+    /// Load the most recent context_token mappings for in-memory cache warm-up.
+    /// Returns up to `limit` entries ordered by rowid DESC (newest first).
     pub async fn list_recent_context_tokens(
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, String)>> {
         let rows = sqlx::query(
             "SELECT vctx, real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
-             FROM context_token_map LIMIT $1",
+             FROM context_token_map ORDER BY rowid DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)

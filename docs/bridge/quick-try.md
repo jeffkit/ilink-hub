@@ -9,8 +9,8 @@
 
 ## 你需要
 
-- 已开通 **微信 iLink（ClawBot）** 的账号  
-- macOS 上已安装 [Homebrew](https://brew.sh/)
+- 已开通 **微信 iLink（ClawBot）** 的账号（在 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，还没有的话先去申请）
+- macOS 上已安装 [Homebrew](https://brew.sh/)（没有的话在终端运行 `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` 安装）
 
 ---
 

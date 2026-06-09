@@ -8,7 +8,7 @@ pub mod router;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
@@ -65,6 +65,8 @@ pub struct HubState {
     pub quote_index: Mutex<QuoteRouteIndex>,
     pub store: Arc<Store>,
     pub metrics: Metrics,
+    /// Shared with Axum graceful shutdown; long-poll handlers exit early when this becomes `true`.
+    pub shutdown: watch::Receiver<bool>,
 }
 
 impl HubState {
@@ -72,6 +74,7 @@ impl HubState {
         upstream: Arc<UpstreamClient>,
         store: Arc<Store>,
         queue: Arc<dyn MessageQueue>,
+        shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
         Arc::new(Self {
             upstream,
@@ -83,8 +86,29 @@ impl HubState {
             quote_index: Mutex::new(QuoteRouteIndex::default()),
             store,
             metrics: Metrics::new(),
+            shutdown,
         })
     }
+}
+
+// ─── Quote index background eviction ─────────────────────────────────────────
+
+pub fn spawn_quote_index_evictor(state: Arc<HubState>) {
+    let mut shutdown = state.shutdown.clone();
+    tokio::spawn(async move {
+        const EVICT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() { return; }
+                }
+                _ = tokio::time::sleep(EVICT_INTERVAL) => {
+                    state.quote_index.lock().await.evict_expired();
+                }
+            }
+        }
+    });
 }
 
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
@@ -136,7 +160,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         RoutingDecision::HubInternal(cmd) => {
             handle_hub_command(state, msg, cmd).await;
         }
-        RoutingDecision::ForwardTo(vtoken) => {
+        RoutingDecision::ForwardTo { vtoken, session_override } => {
             let real_ctx = match msg.context_token.clone() {
                 Some(ctx) if !ctx.is_empty() => ctx,
                 _ => {
@@ -153,6 +177,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 &real_ctx,
                 &peer_user_id,
                 group_id.as_deref(),
+                None,
             )
             .await;
 
@@ -167,7 +192,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             });
 
-            let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
+            let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, session_override).await;
 
             msg.context_token = Some(vctx);
             msg.ilink_hub_ext = hub_ext;
@@ -250,6 +275,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     &real_ctx,
                     &peer_user_id,
                     group_id.as_deref(),
+                    Some(vtoken.as_str()),
                 )
                 .await;
 
@@ -267,7 +293,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 });
 
                 let mut msg_clone = msg.clone();
-                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, None).await;
                 msg_clone.context_token = Some(vctx);
                 msg_clone.ilink_hub_ext = hub_ext;
                 state
@@ -364,10 +390,11 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     &real_ctx,
                     &from_user_id,
                     msg.group_id.as_deref(),
+                    Some(vtoken.as_str()),
                 )
                 .await;
                 let mut m = msg.clone();
-                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx).await;
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, None).await;
                 m.context_token = Some(vctx.clone());
                 m.ilink_hub_ext = hub_ext;
                 // Replace text content in item_list
@@ -402,6 +429,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 &real_ctx,
                 &from_user_id,
                 msg.group_id.as_deref(),
+                None,
             )
             .await;
             let active = state
@@ -438,6 +466,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 &real_ctx,
                 &from_user_id,
                 msg.group_id.as_deref(),
+                None,
             )
             .await;
             match state
@@ -446,15 +475,26 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 .await
             {
                 Ok(()) => {
-                    if initial_uuid.is_empty() {
-                        format!(
-                            "✅ 已创建 session `{session_name}`。\n下次对话时后端会写入 UUID。\n发送 `/session use {session_name}` 切换到此 session。"
-                        )
-                    } else {
-                        format!(
-                            "✅ 已创建 session `{session_name}`，UUID: `{}`。\n发送 `/session use {session_name}` 切换到此 session。",
-                            &initial_uuid[..initial_uuid.len().min(12)]
-                        )
+                    let switch_result = state
+                        .store
+                        .set_active_session_name(&vctx, session_name)
+                        .await;
+                    match switch_result {
+                        Ok(()) => {
+                            if initial_uuid.is_empty() {
+                                format!(
+                                    "✅ 已创建并切换到 session `{session_name}`。\n下次对话时后端会写入 UUID。"
+                                )
+                            } else {
+                                format!(
+                                    "✅ 已创建并切换到 session `{session_name}`，UUID: `{}`。",
+                                    &initial_uuid[..initial_uuid.len().min(12)]
+                                )
+                            }
+                        }
+                        Err(e) => format!(
+                            "✅ 已创建 session `{session_name}`，但切换失败：{e}"
+                        ),
                     }
                 }
                 Err(e) => format!("❌ 创建 session 失败：{e}"),
@@ -467,6 +507,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 &real_ctx,
                 &from_user_id,
                 msg.group_id.as_deref(),
+                None,
             )
             .await;
             // Ensure the session exists (auto-create slot with empty UUID if not)
@@ -501,6 +542,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 &real_ctx,
                 &from_user_id,
                 msg.group_id.as_deref(),
+                None,
             )
             .await;
             let active = state
@@ -566,52 +608,72 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 /// WeChat/iLink may send a new `real_ctx` on every inbound message even in the same DM.
 /// Reusing one vctx per peer/group keeps backend session IDs (Claude `--resume`, etc.)
 /// attached across turns.
+///
+/// `client_scope` is `Some(vtoken)` in broadcast, creating per-client vctx entries so
+/// each backend gets an independent context token instead of sharing one.
 async fn resolve_vctx_for_message(
     state: &HubState,
     real_ctx: &str,
     peer_user_id: &str,
     group_id: Option<&str>,
+    client_scope: Option<&str>,
 ) -> String {
-    let conv_key = conversation_key(peer_user_id, group_id);
+    let conv_key = conversation_key(peer_user_id, group_id).map(|k| match client_scope {
+        Some(scope) => format!("{k}@{scope}"),
+        None => k,
+    });
 
-    let needs_seed = if let Some(ref key) = conv_key {
-        let ctx_map = state.ctx_map.lock().await;
-        !ctx_map.has_conversation(key)
+    // For unscoped DM routing only: check once under the lock whether we need a DB seed.
+    // Do the DB lookup outside the lock (it's async/slow), then re-acquire to seed+map
+    // atomically so no other task can race in between.
+    let db_vctx = if client_scope.is_none() {
+        let needs_seed = if let Some(ref key) = conv_key {
+            !state.ctx_map.lock().await.has_conversation(key)
+        } else {
+            false
+        };
+        if needs_seed && conv_key.as_deref().map(|k| k.starts_with("peer:")).unwrap_or(false) {
+            state.store.find_vctx_for_peer(peer_user_id).await.ok().flatten()
+        } else {
+            None
+        }
     } else {
-        false
+        None
     };
 
-    if needs_seed {
-        if let Some(ref key) = conv_key {
-            if key.starts_with("peer:") {
-                if let Ok(Some(vctx)) = state.store.find_vctx_for_peer(peer_user_id).await {
-                    let mut ctx_map = state.ctx_map.lock().await;
-                    ctx_map.seed_conversation(
-                        key.clone(),
-                        vctx,
-                        real_ctx.to_string(),
-                        peer_user_id.to_string(),
-                    );
-                }
-            }
+    let mut ctx_map = state.ctx_map.lock().await;
+    if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
+        // Only seed if nothing else raced in while we held the lock released.
+        if !ctx_map.has_conversation(key) {
+            ctx_map.seed_conversation(
+                key.clone(),
+                vctx,
+                real_ctx.to_string(),
+                peer_user_id.to_string(),
+            );
         }
     }
-
-    let mut ctx_map = state.ctx_map.lock().await;
-    ctx_map.map(
+    ctx_map.map_scoped(
         real_ctx.to_string(),
         peer_user_id.to_string(),
         group_id,
+        client_scope,
     )
 }
 
-/// Build `HubExt` for an outbound message by looking up the active session for the given vctx.
-async fn build_hub_ext_for_vctx(store: &Store, vctx: &str) -> Option<HubExt> {
-    let session_name = store
-        .get_active_session_name(vctx)
-        .await
-        .ok()
-        .unwrap_or_else(|| "default".to_string());
+/// Build `HubExt` for an outbound message.
+///
+/// When `session_override` is provided (from a quote-reply), that session is used directly
+/// instead of the current active session, so the message is routed to the correct conversation.
+async fn build_hub_ext_for_vctx(store: &Store, vctx: &str, session_override: Option<String>) -> Option<HubExt> {
+    let session_name = match session_override {
+        Some(name) if !name.is_empty() => name,
+        _ => store
+            .get_active_session_name(vctx)
+            .await
+            .ok()
+            .unwrap_or_else(|| "default".to_string()),
+    };
 
     let session_id = store
         .get_backend_session(vctx, &session_name)

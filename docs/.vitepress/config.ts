@@ -18,12 +18,12 @@ export default defineConfig({
     siteTitle: 'iLink Hub',
 
     nav: [
-      { text: '快速入门', link: '/guide/getting-started' },
+      { text: '下载桌面版', link: '/guide/installation#desktop' },
+      { text: '快速开始', link: '/guide/getting-started' },
       { text: '接入 Claude Code', link: '/guide/claude-code' },
-      { text: '配置参考', link: '/reference/configuration' },
-      { text: 'API 参考', link: '/reference/api' },
+      { text: '常见问题', link: '/guide/faq' },
       {
-        text: 'v0.1.11',
+        text: 'v0.1.17',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -33,31 +33,36 @@ export default defineConfig({
 
     sidebar: [
       {
-        text: '入门指南',
+        text: '开始使用',
         items: [
           { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
-          { text: '快速开始', link: '/guide/getting-started' },
-          { text: '安装', link: '/guide/installation' },
-          { text: '桌面应用（下载）', link: '/guide/installation#desktop' },
-          { text: 'QR 码登录（可选）', link: '/guide/login' },
-          { text: '注册客户端', link: '/guide/register-client' },
-          { text: '手机扫码配对', link: '/guide/pairing-tunnel' },
-          { text: '配置 AI 客户端', link: '/guide/client-config' },
+          { text: '下载桌面应用', link: '/guide/installation#desktop' },
+          { text: '快速开始（命令行）', link: '/guide/getting-started' },
+          { text: '所有安装方式', link: '/guide/installation' },
         ],
       },
       {
-        text: '接入 AI',
+        text: '接入 AI 工具',
         items: [
           { text: '接入 Claude Code ✨', link: '/guide/claude-code' },
-          { text: '5 分钟上手（echo）', link: '/bridge/quick-try' },
+          { text: '5 分钟上手（echo 验证）', link: '/bridge/quick-try' },
           { text: '多 CLI / 多项目', link: '/bridge/USAGE' },
           { text: '功能与配置', link: '/bridge/README' },
         ],
       },
       {
+        text: '配置指南',
+        items: [
+          { text: '注册客户端', link: '/guide/register-client' },
+          { text: '配置 AI 客户端', link: '/guide/client-config' },
+          { text: '手机扫码配对', link: '/guide/pairing-tunnel' },
+          { text: 'QR 码登录', link: '/guide/login' },
+        ],
+      },
+      {
         text: '开发自定义 Profile',
         items: [
-          { text: 'P0 协议规范', link: '/bridge/profile-spec' },
+          { text: 'Profile 协议规范', link: '/bridge/profile-spec' },
           { text: 'Node.js 开发教程', link: '/bridge/develop-nodejs' },
           { text: 'Python 开发教程', link: '/bridge/develop-python' },
         ],
@@ -82,8 +87,8 @@ export default defineConfig({
         text: '其他',
         items: [
           { text: '常见问题 FAQ', link: '/guide/faq' },
+          { text: 'SDK 兼容性说明', link: '/guide/sdk-compatibility' },
           { text: '与同类项目对比', link: '/guide/comparison' },
-          { text: 'SDK 兼容性与推进动态', link: '/guide/sdk-compatibility' },
         ],
       },
     ],
