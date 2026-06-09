@@ -1,6 +1,6 @@
 {
   "name": "ilink-bridge-profile",
-  "version": "0.1.0",
+  "version": "0.1.18",
   "description": "iLink Hub Bridge Profile SDK — write one async function, get a cross-platform P0-compliant profile",
   "main": "src/index.js",
   "types": "src/index.d.ts",
