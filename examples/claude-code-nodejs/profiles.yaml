@@ -1,0 +1,48 @@
+# Claude Code Bridge Profile — Node.js SDK 版本
+#
+# 功能：
+#   · 通过 Node.js SDK 调用 Claude Code CLI
+#   · 支持多轮对话（--resume）及 session 失效自动降级
+#   · 支持 /new 前缀强制开启新会话
+#
+# 前提条件：
+#   1. 安装 Node.js 18+
+#   2. 在本目录安装依赖：npm install
+#   3. Claude Code CLI 已安装：npm install -g @anthropic-ai/claude-code
+#   4. 已登录：claude login  或  export ANTHROPIC_API_KEY=sk-ant-...
+#
+# 本地测试（不启动 bridge）：
+#   ILINK_MESSAGE="你好" ILINK_SESSION_ID="" node handler.js
+#
+# 启动 bridge：
+#   ilink-hub-bridge --config profiles.yaml
+#
+profiles:
+  claude:
+    script: ./handler.js      # bridge 自动用 node 运行
+    cwd: /path/to/your/project  # ← 改为你的项目目录（claude 会在此目录下运行）
+    timeout_secs: 600
+    max_reply_chars: 8000
+    # 可选：通过 CLAUDE_MODEL 指定模型（不设则使用 claude 的默认配置）
+    # env:
+    #   CLAUDE_MODEL: sonnet   # 或 haiku、opus 等
+
+  claude-new:                 # /new 前缀强制开新会话
+    script: ./handler.js
+    cwd: /path/to/your/project
+    timeout_secs: 600
+    max_reply_chars: 8000
+    env:
+      ILINK_SESSION_ID: ""    # 覆盖自动注入，强制新会话
+      # CLAUDE_MODEL: sonnet  # 可选：同上
+
+routing:
+  strategy: prefix
+  default_profile: claude
+  prefix_rules:
+    - prefix: "/new "
+      profile: claude-new
+
+skip_bot_messages: true
+require_text: true
+send_error_reply: true

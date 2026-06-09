@@ -1,6 +1,6 @@
 [package]
 name = "ilink-hub-desktop"
-version = "0.1.10"
+version = "0.1.11"
 description = "Desktop shell for iLink Hub (Tauri)"
 authors = ["jeffkit <bbmyth@gmail.com>"]
 edition = "2021"

@@ -57,6 +57,7 @@ export default defineConfig({
               { text: 'Profile 协议规范', link: '/bridge/profile-spec' },
               { text: 'Node.js 开发教程', link: '/bridge/develop-nodejs' },
               { text: 'Python 开发教程', link: '/bridge/develop-python' },
+              { text: '完整示例（Claude/Cursor/Codex）', link: '/bridge/sdk-examples' },
             ],
           },
         ],

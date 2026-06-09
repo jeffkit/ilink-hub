@@ -17,6 +17,7 @@ docs/.vitepress/cache
 
 # Examples
 examples/**/target
+examples/**/node_modules/
 examples/**/.wechatbot-hub-credentials.json
 
 # SDK build artifacts

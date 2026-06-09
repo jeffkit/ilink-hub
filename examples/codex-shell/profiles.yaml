@@ -1,0 +1,35 @@
+# Codex Bridge Profile — Shell 版本
+#
+# 功能：
+#   · 通过 Shell 脚本调用 Codex CLI（codex exec）
+#   · 使用 --json 输出模式解析回复文本和 session_id
+#   · 支持多轮对话（exec resume <session_id>）
+#
+# 前提条件：
+#   1. Codex CLI 已安装并在 PATH 中（安装见 https://openai.com/codex-cli）
+#        codex --version    # 验证
+#   2. 已认证：codex login  或  export OPENAI_API_KEY=sk-...
+#   3. jq 已安装（brew install jq 或 sudo apt install jq）
+#   4. chmod +x handler.sh（首次使用）
+#
+# 本地测试（不启动 bridge）：
+#   ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ILINK_CWD="$(pwd)" bash handler.sh
+#
+# 启动 bridge：
+#   ilink-hub-bridge --config profiles.yaml
+#
+profiles:
+  codex:
+    script: ./handler.sh      # bridge 自动用 bash 运行
+    cwd: /path/to/your/project  # ← 改为你的项目目录（codex 会在此目录下运行）
+    timeout_secs: 600
+    max_reply_chars: 8000
+    cli_session_first_line_prefix: "ILINK_SESSION:"
+
+routing:
+  strategy: fixed
+  default_profile: codex
+
+skip_bot_messages: true
+require_text: true
+send_error_reply: true

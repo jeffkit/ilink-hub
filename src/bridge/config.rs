@@ -42,7 +42,10 @@ pub struct BridgeMultiYaml {
     #[serde(default = "default_true")]
     pub send_error_reply: bool,
     pub profiles: HashMap<String, BridgeProfile>,
-    pub routing: BridgeRoutingYaml,
+    /// Optional: if omitted, routing defaults to `fixed` with the profile named
+    /// `claude` (if present), then `default`, then the first alphabetically.
+    #[serde(default)]
+    pub routing: Option<BridgeRoutingYaml>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
@@ -256,13 +259,32 @@ impl BridgeApp {
                 );
             }
         }
-        if !profiles.contains_key(&m.routing.default_profile) {
+
+        // Resolve routing: if omitted, auto-detect fixed routing using a sensible default.
+        let routing_cfg = m.routing.unwrap_or_else(|| {
+            let default = if profiles.contains_key("claude") {
+                "claude".to_string()
+            } else if profiles.contains_key("default") {
+                "default".to_string()
+            } else {
+                let mut keys: Vec<&String> = profiles.keys().collect();
+                keys.sort();
+                keys[0].clone()
+            };
+            BridgeRoutingYaml {
+                strategy: RoutingStrategy::Fixed,
+                default_profile: default,
+                prefix_rules: vec![],
+            }
+        });
+
+        if !profiles.contains_key(&routing_cfg.default_profile) {
             anyhow::bail!(
                 "routing.default_profile `{}` is not a key in `profiles`",
-                m.routing.default_profile
+                routing_cfg.default_profile
             );
         }
-        for (i, rule) in m.routing.prefix_rules.iter().enumerate() {
+        for (i, rule) in routing_cfg.prefix_rules.iter().enumerate() {
             if rule.prefix.is_empty() {
                 anyhow::bail!("routing.prefix_rules[{i}]: `prefix` must not be empty");
             }
@@ -273,16 +295,15 @@ impl BridgeApp {
                 );
             }
         }
-        if m.routing.strategy == RoutingStrategy::Prefix && m.routing.prefix_rules.is_empty() {
+        if routing_cfg.strategy == RoutingStrategy::Prefix && routing_cfg.prefix_rules.is_empty() {
             anyhow::bail!("routing.strategy: `prefix` requires at least one `prefix_rules` entry (or use `fixed`)");
         }
 
-        let routing = match m.routing.strategy {
-            RoutingStrategy::Fixed => RoutingState::Fixed(m.routing.default_profile.clone()),
+        let routing = match routing_cfg.strategy {
+            RoutingStrategy::Fixed => RoutingState::Fixed(routing_cfg.default_profile.clone()),
             RoutingStrategy::Prefix => RoutingState::Prefix {
-                default: m.routing.default_profile.clone(),
-                rules: m
-                    .routing
+                default: routing_cfg.default_profile.clone(),
+                rules: routing_cfg
                     .prefix_rules
                     .iter()
                     .map(|r| (r.prefix.clone(), r.profile.clone()))

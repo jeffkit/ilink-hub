@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2082,7 +2082,7 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub-desktop"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "ilink-hub",

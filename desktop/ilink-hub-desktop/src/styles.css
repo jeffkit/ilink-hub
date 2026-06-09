@@ -794,12 +794,23 @@ body {
 
 .client-item {
   display: flex;
-  align-items: center;
-  gap: 0.6rem;
+  flex-direction: column;
+  gap: 0;
   padding: 0.5rem 0.55rem;
   border-radius: 10px;
   background: var(--surface-2);
   border: 1px solid var(--border);
+}
+
+.client-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+}
+
+.client-item.is-editing .client-view {
+  display: none;
 }
 
 .client-avatar {
@@ -870,7 +881,14 @@ body {
 }
 
 /* ---------- Client per-row actions ---------- */
-.client-copy {
+.client-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.client-action {
   flex: 0 0 auto;
   display: grid;
   place-items: center;
@@ -881,17 +899,62 @@ body {
   color: var(--muted);
   background: var(--surface);
   border: 1px solid var(--border);
-  transition: color 0.15s ease, background 0.15s ease;
+  transition: color 0.15s ease, background 0.15s ease, border-color 0.15s ease;
 }
 
-.client-copy:hover {
+.client-action svg {
+  pointer-events: none;
+}
+
+.client-action:hover {
   color: var(--accent);
   background: var(--accent-soft);
 }
 
-.client-copy.copied {
+.client-action.client-delete:hover {
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
+.client-action.copied {
   color: var(--ok);
   background: var(--ok-soft);
+}
+
+.client-edit {
+  display: none;
+  width: 100%;
+  gap: 0.5rem;
+  padding-top: 0.45rem;
+  border-top: 1px solid var(--border);
+  margin-top: 0.45rem;
+}
+
+.client-item.is-editing .client-edit {
+  display: grid;
+}
+
+.client-edit-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.45rem;
+}
+
+.client-edit-field .field-label {
+  font-size: 0.68rem;
+}
+
+.client-edit-field input {
+  width: 100%;
+  font-size: 0.78rem;
+  padding: 0.38rem 0.45rem;
+}
+
+.client-edit-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
 }
 
 /* ---------- Register form ---------- */
@@ -1147,14 +1210,67 @@ body {
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr));
 }
 
-.bridge-profile-editor .field-wide,
-.bridge-profile-editor .bridge-command-row {
+.bridge-profile-editor .field-wide {
   grid-column: 1 / -1;
 }
 
-.bridge-profile-editor .bridge-command-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 14rem), 1fr));
+/* Environment variables section */
+.bridge-env-section {
+  margin-top: 0.6rem;
+}
+
+.env-vars-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.35rem;
+}
+
+.env-vars-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.env-var-row {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.env-var-row .env-key {
+  flex: 0 0 38%;
+  min-width: 0;
+}
+
+.env-var-row .env-equals {
+  flex-shrink: 0;
+  color: var(--faint);
+  font-size: 0.85rem;
+  padding: 0 0.1rem;
+}
+
+.env-var-row .env-val {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.env-var-row .btn-remove-env {
+  flex-shrink: 0;
+  padding: 0.1rem 0.4rem;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--faint);
+}
+
+.env-var-row .btn-remove-env:hover {
+  color: var(--danger);
+}
+
+.btn-xs {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+  border-radius: 6px;
 }
 
 .check-row {
@@ -1559,6 +1675,23 @@ body {
 .modal-card h3 {
   margin: 0 0 0.25rem;
   font-size: 1rem;
+}
+
+.modal-card-sm {
+  text-align: left;
+}
+
+.confirm-message {
+  margin: 0.35rem 0 0.9rem;
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.45rem;
 }
 
 .modal-lead {

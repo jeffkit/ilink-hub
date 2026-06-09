@@ -40,6 +40,25 @@ type RegisterResult = {
   error: string | null;
 };
 
+type DeleteClientResult = {
+  ok: boolean;
+  authRequired: boolean;
+  error: string | null;
+};
+
+type UpdateClientResult = {
+  ok: boolean;
+  name: string | null;
+  authRequired: boolean;
+  error: string | null;
+};
+
+type EditingClient = {
+  oldName: string;
+  name: string;
+  label: string;
+};
+
 type BridgeStatusPayload = {
   configured: boolean;
   path: string;
@@ -70,6 +89,8 @@ type BridgeChildStatus = {
   lastError: string | null;
 };
 
+type EnvVar = { key: string; value: string };
+
 type BridgeProfileFile = {
   id: string;
   path: string;
@@ -86,6 +107,7 @@ type BridgeProfileFile = {
   model: string | null;
   command: string | null;
   args: string[];
+  envVars: EnvVar[];
 };
 
 type BridgeProfilesPayload = {
@@ -118,6 +140,8 @@ let bridgeCredentialsDir = "";
 let bridgeProfiles: BridgeProfileFile[] = [];
 let selectedBridgeProfileId: string | null = null;
 let bridgeAutoStartAttempted = false;
+let editingClient: EditingClient | null = null;
+let confirmResolver: ((ok: boolean) => void) | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let clientPollTimer: ReturnType<typeof setInterval> | null = null;
 let bridgePollTimer: ReturnType<typeof setInterval> | null = null;
@@ -155,6 +179,96 @@ function toast(msg: string) {
   el.classList.add("show");
   if (toastTimer) clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove("show"), 2200);
+}
+
+function closeConfirmModal(ok: boolean) {
+  $("#confirm-modal")?.setAttribute("hidden", "");
+  if (confirmResolver) {
+    confirmResolver(ok);
+    confirmResolver = null;
+  }
+}
+
+function openConfirmModal(message: string, title = "请确认"): Promise<boolean> {
+  return new Promise((resolve) => {
+    const modal = $<HTMLElement>("#confirm-modal");
+    const msg = $<HTMLElement>("#confirm-message");
+    const titleEl = $<HTMLElement>("#confirm-title");
+    if (!modal || !msg) {
+      resolve(false);
+      return;
+    }
+    if (titleEl) titleEl.textContent = title;
+    msg.textContent = message;
+    confirmResolver = resolve;
+    modal.removeAttribute("hidden");
+  });
+}
+
+const actionIcon = {
+  edit: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" />
+  </svg>`,
+  copy: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>`,
+  delete: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <path d="M3 6h18" />
+    <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+    <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+    <path d="M10 11v6" />
+    <path d="M14 11v6" />
+  </svg>`,
+} as const;
+
+function renderClientItem(c: HubClientRow): string {
+  const isEditing = editingClient?.oldName === c.name;
+  const editName = isEditing ? editingClient!.name : c.name;
+  const editLabel = isEditing ? editingClient!.label : (c.label ?? "");
+  return `
+      <li class="client-item${c.online ? " is-online" : ""}${isEditing ? " is-editing" : ""}" data-client-name="${esc(c.name)}">
+        <div class="client-row client-view">
+          <span class="client-avatar" aria-hidden="true">${initial(c.name)}</span>
+          <span class="client-main">
+            <span class="client-name">${esc(c.name)}</span>
+            ${c.label ? `<span class="client-label">${esc(c.label)}</span>` : ""}
+          </span>
+          <span class="client-badge ${c.online ? "online" : "offline"}">${c.online ? "在线" : "离线"}</span>
+          <div class="client-actions">
+            <button type="button" class="client-action client-edit-btn" data-action="edit" title="编辑名称与备注" aria-label="编辑 ${esc(c.name)}">
+              ${actionIcon.edit}
+            </button>
+            <button type="button" class="client-action client-copy" data-action="copy" data-vtoken="${esc(c.vtoken)}" title="复制连接配置" aria-label="复制连接配置">
+              ${actionIcon.copy}
+            </button>
+            ${
+              c.online
+                ? ""
+                : `<button type="button" class="client-action client-delete" data-action="delete" title="删除离线后端" aria-label="删除离线后端 ${esc(c.name)}">
+              ${actionIcon.delete}
+            </button>`
+            }
+          </div>
+        </div>
+        <div class="client-edit">
+          <div class="client-edit-fields">
+            <label class="field client-edit-field">
+              <span class="field-label">名称</span>
+              <input type="text" data-field="name" value="${esc(editName)}" autocomplete="off" spellcheck="false" />
+            </label>
+            <label class="field client-edit-field">
+              <span class="field-label">备注</span>
+              <input type="text" data-field="label" value="${esc(editLabel)}" placeholder="可选" autocomplete="off" />
+            </label>
+          </div>
+          <div class="client-edit-actions">
+            <button type="button" class="btn btn-primary btn-sm" data-action="save">保存</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-action="cancel">取消</button>
+          </div>
+        </div>
+      </li>`;
 }
 
 async function copyToClipboard(text: string, okMsg = "已复制"): Promise<boolean> {
@@ -505,28 +619,50 @@ async function autoStartBridgeIfReady() {
   }
 }
 
-function defaultArgsForTemplate(template: string): string[] {
-  if (template === "codex") return ["exec", "{{MESSAGE}}"];
-  return ["-p", "{{MESSAGE}}"];
+// ─── Env-var row helpers ──────────────────────────────────────────────────────
+
+function addEnvVarRow(key = "", value = "") {
+  const list = $<HTMLElement>("#bridge-env-vars");
+  if (!list) return;
+  const row = document.createElement("div");
+  row.className = "env-var-row";
+  row.innerHTML = `
+    <input type="text" class="env-key" placeholder="KEY" autocomplete="off" spellcheck="false" />
+    <span class="env-equals">=</span>
+    <input type="text" class="env-val" placeholder="value" autocomplete="off" spellcheck="false" />
+    <button type="button" class="btn btn-ghost btn-xs btn-remove-env" title="删除" aria-label="删除环境变量">×</button>
+  `;
+  (row.querySelector(".env-key") as HTMLInputElement).value = key;
+  (row.querySelector(".env-val") as HTMLInputElement).value = value;
+  row.querySelector(".btn-remove-env")?.addEventListener("click", () => row.remove());
+  list.appendChild(row);
 }
 
-function commandForTemplate(template: string): string {
-  if (template === "cursor") return "agent";
-  if (template === "codex") return "codex";
-  if (template === "gemini") return "gemini";
-  return "";
+function clearEnvVars() {
+  const list = $<HTMLElement>("#bridge-env-vars");
+  if (list) list.innerHTML = "";
 }
+
+function getEnvVars(): EnvVar[] {
+  const rows = document.querySelectorAll<HTMLDivElement>("#bridge-env-vars .env-var-row");
+  const result: EnvVar[] = [];
+  rows.forEach((row) => {
+    const key = (row.querySelector<HTMLInputElement>(".env-key")?.value ?? "").trim();
+    const value = (row.querySelector<HTMLInputElement>(".env-val")?.value ?? "").trim();
+    if (key) result.push({ key, value });
+  });
+  return result;
+}
+
+// ─── Template visibility ──────────────────────────────────────────────────────
 
 function setTemplateVisibility() {
   const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
-  const commandRow = $<HTMLElement>(".bridge-command-row");
-  const modelRow = $<HTMLElement>(".bridge-model-row");
-  const newRow = $<HTMLElement>(".bridge-new-session-row");
+  const isCustom = template === "custom";
+  const presetFields = $<HTMLElement>(".bridge-preset-fields");
   const yamlField = $<HTMLElement>(".bridge-yaml-field");
-  if (commandRow) commandRow.hidden = template === "claude" || template === "custom";
-  if (modelRow) modelRow.hidden = template !== "claude";
-  if (newRow) newRow.hidden = template !== "claude";
-  if (yamlField) yamlField.hidden = template !== "custom";
+  if (presetFields) presetFields.hidden = isCustom;
+  if (yamlField) yamlField.hidden = !isCustom;
 }
 
 function fillBridgeProfileEditor(p: BridgeProfileFile) {
@@ -534,12 +670,11 @@ function fillBridgeProfileEditor(p: BridgeProfileFile) {
   $<HTMLInputElement>("#bridge-profile-id")!.value = p.id;
   $<HTMLSelectElement>("#bridge-template")!.value = p.template;
   $<HTMLInputElement>("#bridge-cwd")!.value = p.cwd ?? "";
-  $<HTMLInputElement>("#bridge-timeout")!.value = String(p.timeoutSecs || 600);
-  $<HTMLInputElement>("#bridge-max-reply")!.value = String(p.maxReplyChars || 8000);
-  $<HTMLInputElement>("#bridge-model")!.value = p.model ?? "";
-  $<HTMLInputElement>("#bridge-command")!.value = p.command || commandForTemplate(p.template);
-  $<HTMLInputElement>("#bridge-args")!.value = JSON.stringify(p.args.length ? p.args : defaultArgsForTemplate(p.template));
   $<HTMLTextAreaElement>("#bridge-yaml")!.value = p.yaml || "";
+  clearEnvVars();
+  for (const ev of p.envVars ?? []) {
+    addEnvVarRow(ev.key, ev.value);
+  }
   setTemplateVisibility();
   renderBridgeProfiles();
 }
@@ -549,41 +684,21 @@ function newBridgeProfile() {
   $<HTMLInputElement>("#bridge-profile-id")!.value = "";
   $<HTMLSelectElement>("#bridge-template")!.value = "claude";
   $<HTMLInputElement>("#bridge-cwd")!.value = "";
-  $<HTMLInputElement>("#bridge-timeout")!.value = "600";
-  $<HTMLInputElement>("#bridge-max-reply")!.value = "8000";
-  $<HTMLInputElement>("#bridge-model")!.value = "";
-  $<HTMLInputElement>("#bridge-command")!.value = "";
-  $<HTMLInputElement>("#bridge-args")!.value = JSON.stringify(defaultArgsForTemplate("claude"));
   $<HTMLTextAreaElement>("#bridge-yaml")!.value = "";
+  clearEnvVars();
   setTemplateVisibility();
   renderBridgeProfiles();
 }
 
 async function saveBridgeProfile() {
   const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
-  const argsText = $<HTMLInputElement>("#bridge-args")?.value.trim() || "[]";
-  let args: string[] = [];
-  try {
-    args = JSON.parse(argsText);
-    if (!Array.isArray(args) || args.some((x) => typeof x !== "string")) {
-      throw new Error("args must be string[]");
-    }
-  } catch {
-    setBridgeMessage("参数必须是 JSON 字符串数组，例如 [\"-p\", \"{{MESSAGE}}\"]");
-    return;
-  }
   const req = {
     originalId: selectedBridgeProfileId,
     id: $<HTMLInputElement>("#bridge-profile-id")?.value.trim() ?? "",
     template,
     cwd: $<HTMLInputElement>("#bridge-cwd")?.value.trim() ?? "",
-    timeoutSecs: Number($<HTMLInputElement>("#bridge-timeout")?.value || "600"),
-    maxReplyChars: Number($<HTMLInputElement>("#bridge-max-reply")?.value || "8000"),
-    model: $<HTMLInputElement>("#bridge-model")?.value.trim() || null,
-    command: $<HTMLInputElement>("#bridge-command")?.value.trim() || commandForTemplate(template),
-    args,
+    envVars: getEnvVars(),
     yaml: $<HTMLTextAreaElement>("#bridge-yaml")?.value ?? "",
-    includeNewSession: $<HTMLInputElement>("#bridge-include-new")?.checked ?? true,
   };
   try {
     const saved = await invoke<BridgeProfileFile>("bridge_save_profile", { req });
@@ -658,25 +773,7 @@ async function refreshClients() {
     counter.hidden = false;
     counter.textContent = `${online} 在线 / 共 ${clients.length}`;
     listEl.hidden = false;
-    listEl.innerHTML = clients
-      .map(
-        (c) => `
-      <li class="client-item${c.online ? " is-online" : ""}">
-        <span class="client-avatar" aria-hidden="true">${initial(c.name)}</span>
-        <span class="client-main">
-          <span class="client-name">${esc(c.name)}</span>
-          ${c.label ? `<span class="client-label">${esc(c.label)}</span>` : ""}
-        </span>
-        <span class="client-badge ${c.online ? "online" : "offline"}">${c.online ? "在线" : "离线"}</span>
-        <button type="button" class="client-copy" data-vtoken="${esc(c.vtoken)}" title="复制连接配置" aria-label="复制连接配置">
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="9" y="9" width="11" height="11" rx="2" />
-            <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-          </svg>
-        </button>
-      </li>`,
-      )
-      .join("");
+    listEl.innerHTML = clients.map((c) => renderClientItem(c)).join("");
   } catch (e) {
     renderClientsEmpty(`无法读取后端列表：${String(e)}`);
   }
@@ -750,6 +847,65 @@ async function refreshHubInfo() {
     setHubState("error", "与程序内部通信失败");
     setError(String(e));
     clearStatsUi();
+  }
+}
+
+function startEditClient(name: string, label: string | null) {
+  editingClient = { oldName: name, name, label: label ?? "" };
+  void refreshClients();
+}
+
+function cancelEditClient() {
+  editingClient = null;
+  void refreshClients();
+}
+
+async function saveEditClient(item: HTMLLIElement) {
+  const oldName = item.dataset.clientName;
+  if (!oldName) return;
+  const name = item.querySelector<HTMLInputElement>('[data-field="name"]')?.value.trim() ?? "";
+  const label = item.querySelector<HTMLInputElement>('[data-field="label"]')?.value.trim() ?? "";
+  if (!name) {
+    toast("请填写后端名称");
+    return;
+  }
+  try {
+    const res = await invoke<UpdateClientResult>("hub_update_client", {
+      oldName,
+      name,
+      label: label || null,
+    });
+    if (!res.ok) {
+      toast(res.error ?? "更新失败");
+      return;
+    }
+    editingClient = null;
+    toast(`已更新为「${res.name ?? name}」`);
+    await refreshClients();
+    await refreshStats();
+  } catch (e) {
+    toast(`更新失败：${String(e)}`);
+  }
+}
+
+async function deleteOfflineClient(name: string) {
+  const ok = await openConfirmModal(
+    `确定删除离线后端「${name}」？删除后需重新注册才能再次接入。`,
+    "删除离线后端",
+  );
+  if (!ok) return;
+  try {
+    const res = await invoke<DeleteClientResult>("hub_delete_client", { name });
+    if (!res.ok) {
+      toast(res.error ?? "删除失败");
+      return;
+    }
+    if (editingClient?.oldName === name) editingClient = null;
+    toast("已删除离线后端");
+    await refreshClients();
+    await refreshStats();
+  } catch (e) {
+    toast(`删除失败：${String(e)}`);
   }
 }
 
@@ -867,14 +1023,8 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#btn-new-profile")?.addEventListener("click", () => newBridgeProfile());
   $("#btn-save-profile")?.addEventListener("click", () => void saveBridgeProfile());
   $("#btn-delete-profile")?.addEventListener("click", () => void deleteBridgeProfile());
-  $("#bridge-template")?.addEventListener("change", () => {
-    const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
-    const command = $<HTMLInputElement>("#bridge-command");
-    const args = $<HTMLInputElement>("#bridge-args");
-    if (command) command.value = commandForTemplate(template);
-    if (args) args.value = JSON.stringify(defaultArgsForTemplate(template));
-    setTemplateVisibility();
-  });
+  $("#bridge-template")?.addEventListener("change", () => setTemplateVisibility());
+  $("#btn-add-env-var")?.addEventListener("click", () => addEnvVarRow());
   $("#bridge-profile-list")?.addEventListener("click", (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".bridge-profile-item");
     const id = btn?.dataset.profileId;
@@ -886,15 +1036,51 @@ window.addEventListener("DOMContentLoaded", () => {
   $("#btn-bridge-stop")?.addEventListener("click", () => void stopBridge());
   $("#btn-bridge-restart")?.addEventListener("click", () => void restartBridge());
 
+  $("#confirm-modal")?.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    const action = target.closest<HTMLElement>("[data-confirm]")?.dataset.confirm;
+    if (action === "ok") closeConfirmModal(true);
+    else if (action === "cancel") closeConfirmModal(false);
+  });
+
   $("#client-list")?.addEventListener("click", async (e) => {
-    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".client-copy");
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>("[data-action]");
     if (!btn) return;
-    const vtoken = btn.dataset.vtoken;
-    if (!vtoken) return;
-    const ok = await copyToClipboard(envFor(vtoken), "连接配置已复制");
-    if (ok) {
-      btn.classList.add("copied");
-      setTimeout(() => btn.classList.remove("copied"), 1200);
+    const item = btn.closest<HTMLLIElement>(".client-item");
+    if (!item) return;
+    const action = btn.dataset.action;
+    const clientName = item.dataset.clientName;
+    if (!clientName) return;
+
+    if (action === "copy") {
+      const vtoken = btn.dataset.vtoken;
+      if (!vtoken) return;
+      const ok = await copyToClipboard(envFor(vtoken), "连接配置已复制");
+      if (ok) {
+        btn.classList.add("copied");
+        setTimeout(() => btn.classList.remove("copied"), 1200);
+      }
+      return;
+    }
+
+    if (action === "edit") {
+      const label = item.querySelector<HTMLElement>(".client-label")?.textContent ?? null;
+      startEditClient(clientName, label);
+      return;
+    }
+
+    if (action === "cancel") {
+      cancelEditClient();
+      return;
+    }
+
+    if (action === "save") {
+      await saveEditClient(item);
+      return;
+    }
+
+    if (action === "delete") {
+      await deleteOfflineClient(clientName);
     }
   });
 

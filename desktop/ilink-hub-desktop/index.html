@@ -202,62 +202,46 @@
                     <input type="text" id="bridge-profile-id" placeholder="claude-work" autocomplete="off" spellcheck="false" />
                   </label>
                   <label class="field">
-                    <span class="field-label">快捷模板</span>
+                    <span class="field-label">模板</span>
                     <select id="bridge-template">
                       <option value="claude">Claude Code</option>
                       <option value="cursor">Cursor Agent</option>
                       <option value="codex">Codex</option>
                       <option value="gemini">Gemini</option>
-                      <option value="custom">Custom YAML</option>
+                      <option value="custom">自定义 YAML</option>
                     </select>
                   </label>
                 </div>
-                <div class="form-row">
-                  <label class="field field-wide">
-                    <span class="field-label">项目目录</span>
-                    <input type="text" id="bridge-cwd" placeholder="/Users/you/projects/my-agent" autocomplete="off" spellcheck="false" />
-                  </label>
+
+                <!-- Preset template fields (claude / codex / cursor / gemini) -->
+                <div class="bridge-preset-fields">
+                  <div class="form-row">
+                    <label class="field field-wide">
+                      <span class="field-label">项目目录</span>
+                      <input type="text" id="bridge-cwd" placeholder="/Users/you/projects/my-project" autocomplete="off" spellcheck="false" />
+                    </label>
+                  </div>
+                  <div class="bridge-env-section">
+                    <div class="env-vars-header">
+                      <span class="field-label">环境变量（可选）</span>
+                      <button type="button" id="btn-add-env-var" class="btn btn-ghost btn-xs">+ 添加</button>
+                    </div>
+                    <div id="bridge-env-vars" class="env-vars-list"></div>
+                  </div>
                 </div>
-                <div class="form-row bridge-command-row">
-                  <label class="field">
-                    <span class="field-label">命令</span>
-                    <input type="text" id="bridge-command" placeholder="agent / codex / gemini" autocomplete="off" spellcheck="false" />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">参数（JSON 数组）</span>
-                    <input type="text" id="bridge-args" placeholder='["-p", "{{MESSAGE}}"]' autocomplete="off" spellcheck="false" />
-                  </label>
-                </div>
-                <div class="form-row">
-                  <label class="field">
-                    <span class="field-label">超时时间（秒）</span>
-                    <input type="number" id="bridge-timeout" min="1" step="1" value="600" />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">最长回复字符数</span>
-                    <input type="number" id="bridge-max-reply" min="1" step="100" value="8000" />
-                  </label>
-                </div>
-                <div class="form-row bridge-model-row">
-                  <label class="field field-wide">
-                    <span class="field-label">模型（Claude 可选）</span>
-                    <input type="text" id="bridge-model" placeholder="例如 sonnet；留空使用 CLI 默认值" autocomplete="off" spellcheck="false" />
-                  </label>
-                </div>
-                <label class="check-row bridge-new-session-row">
-                  <input type="checkbox" id="bridge-include-new" checked />
-                  <span>为 Claude Code 生成 <code>/new</code> 临时会话路由</span>
+
+                <!-- Custom YAML editor -->
+                <label class="field field-wide bridge-yaml-field" hidden>
+                  <span class="field-label">YAML</span>
+                  <textarea id="bridge-yaml" class="yaml-editor" spellcheck="false" placeholder="在此输入完整的 Bridge 配置 YAML。"></textarea>
                 </label>
-                <label class="field field-wide bridge-yaml-field">
-                  <span class="field-label">高级 YAML</span>
-                  <textarea id="bridge-yaml" class="yaml-editor" spellcheck="false" placeholder="Custom YAML 或模板生成结果会显示在这里。"></textarea>
-                </label>
+
                 <div class="bridge-actions">
-                  <button type="button" id="btn-save-profile" class="btn btn-primary btn-sm">保存 Profile</button>
+                  <button type="button" id="btn-save-profile" class="btn btn-primary btn-sm">保存</button>
                   <button type="button" id="btn-delete-profile" class="btn btn-ghost btn-sm">删除</button>
                 </div>
-                <p class="register-hint" id="bridge-template-hint">
-                  每个 YAML 文件会注册成一个独立 workspace；保存后 manager 会自动扫描并启动。
+                <p class="register-hint">
+                  每个 profile 文件独立注册为一个 workspace；保存后 manager 自动扫描并启动。
                 </p>
               </div>
             </div>
@@ -295,6 +279,18 @@
           <button type="button" id="qr-copy" class="btn btn-ghost btn-sm">复制备用链接</button>
         </div>
         <p class="modal-foot">二维码不显示时，可复制链接发到手机微信里打开。</p>
+      </div>
+    </div>
+
+    <div id="confirm-modal" class="modal" hidden aria-modal="true" role="dialog">
+      <div class="modal-backdrop" data-confirm="cancel"></div>
+      <div class="modal-card modal-card-sm">
+        <h3 id="confirm-title">请确认</h3>
+        <p id="confirm-message" class="confirm-message"></p>
+        <div class="modal-actions">
+          <button type="button" id="confirm-cancel" class="btn btn-ghost btn-sm" data-confirm="cancel">取消</button>
+          <button type="button" id="confirm-ok" class="btn btn-danger btn-sm" data-confirm="ok">确认</button>
+        </div>
       </div>
     </div>
 

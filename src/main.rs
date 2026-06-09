@@ -108,6 +108,7 @@ async fn main() -> Result<()> {
                     database_url,
                     on_listening: None,
                     qr_login_ui: None,
+                    on_hub_state: None,
                 },
                 shutdown_rx,
             )

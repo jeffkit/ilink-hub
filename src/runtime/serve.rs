@@ -32,6 +32,8 @@ pub struct ServeOptions {
     pub on_listening: Option<tokio::sync::oneshot::Sender<String>>,
     /// Optional channel for WeChat QR login UI (desktop); [`None`] keeps terminal-only flow.
     pub qr_login_ui: Option<mpsc::UnboundedSender<QrLoginUiEvent>>,
+    /// After [`HubState`] is created, sends a clone for embedders that need in-process admin APIs.
+    pub on_hub_state: Option<tokio::sync::oneshot::Sender<Arc<HubState>>>,
 }
 
 impl fmt::Debug for ServeOptions {
@@ -43,6 +45,7 @@ impl fmt::Debug for ServeOptions {
             .field("database_url", &self.database_url)
             .field("on_listening", &self.on_listening.is_some())
             .field("qr_login_ui", &self.qr_login_ui.is_some())
+            .field("on_hub_state", &self.on_hub_state.is_some())
             .finish()
     }
 }
@@ -59,6 +62,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         database_url,
         on_listening,
         qr_login_ui,
+        on_hub_state,
     } = opts;
 
     info!(%addr, %database_url, "iLink Hub starting");
@@ -76,6 +80,10 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend();
     let state = HubState::new(upstream.clone(), store.clone(), queue, shutdown_rx.clone());
+
+    if let Some(tx) = on_hub_state {
+        let _ = tx.send(state.clone());
+    }
 
     load_clients_from_db(state.clone(), store.clone()).await;
 

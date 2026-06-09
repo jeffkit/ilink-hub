@@ -660,8 +660,8 @@ fn bridge_child_args(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> V
 }
 
 fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> Result<Child> {
-    let exe = std::env::current_exe().context("resolve current ilink-hub-bridge executable")?;
-    let mut cmd = Command::new(exe);
+    let exe = super::resolve_bridge_executable();
+    let mut cmd = Command::new(&exe);
     cmd.args(bridge_child_args(opts, spec));
 
     // Manager children must get independent identities derived from their profile file.

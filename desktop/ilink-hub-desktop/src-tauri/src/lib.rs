@@ -406,6 +406,136 @@ async fn hub_register(
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteClientResult {
+    pub ok: bool,
+    pub auth_required: bool,
+    pub error: Option<String>,
+}
+
+fn delete_client_err(auth_required: bool, error: impl Into<String>) -> DeleteClientResult {
+    DeleteClientResult {
+        ok: false,
+        auth_required,
+        error: Some(error.into()),
+    }
+}
+
+fn hub_state_from_app(app: &tauri::AppHandle) -> Result<Arc<ilink_hub::HubState>, DeleteClientResult> {
+    let Some(ctrl) = app.try_state::<HubController>() else {
+        return Err(delete_client_err(false, "Hub 未初始化"));
+    };
+    let Some(state) = ctrl.hub_state.lock().ok().and_then(|g| g.clone()) else {
+        return Err(delete_client_err(false, "服务尚未就绪，请稍候再试"));
+    };
+    Ok(state)
+}
+
+#[tauri::command]
+async fn hub_delete_client(app: tauri::AppHandle, name: String) -> DeleteClientResult {
+    use ilink_hub::server::pairing::{unregister_client_in_hub, UnregisterClientError};
+
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return delete_client_err(false, "请指定要删除的后端名称");
+    }
+
+    let state = match hub_state_from_app(&app) {
+        Ok(s) => s,
+        Err(err) => return err,
+    };
+
+    match unregister_client_in_hub(state.as_ref(), &name).await {
+        Ok(()) => DeleteClientResult {
+            ok: true,
+            auth_required: false,
+            error: None,
+        },
+        Err(UnregisterClientError::NotFound) => {
+            delete_client_err(false, format!("未找到后端「{name}」"))
+        }
+        Err(UnregisterClientError::StillOnline) => delete_client_err(
+            false,
+            format!("后端「{name}」仍在线，请先停止对应进程后再删除"),
+        ),
+        Err(UnregisterClientError::Store(e)) => {
+            delete_client_err(false, format!("删除失败: {e}"))
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateClientResult {
+    pub ok: bool,
+    pub name: Option<String>,
+    pub auth_required: bool,
+    pub error: Option<String>,
+}
+
+fn update_client_err(auth_required: bool, error: impl Into<String>) -> UpdateClientResult {
+    UpdateClientResult {
+        ok: false,
+        name: None,
+        auth_required,
+        error: Some(error.into()),
+    }
+}
+
+#[tauri::command]
+async fn hub_update_client(
+    app: tauri::AppHandle,
+    old_name: String,
+    name: String,
+    label: Option<String>,
+) -> UpdateClientResult {
+    use ilink_hub::server::pairing::{update_client_in_hub, UpdateClientError};
+
+    let old_name = old_name.trim().to_string();
+    let name = name.trim().to_string();
+    if old_name.is_empty() {
+        return update_client_err(false, "请指定要修改的后端名称");
+    }
+    if name.is_empty() {
+        return update_client_err(false, "请填写后端名称");
+    }
+    let label = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+
+    let state = match hub_state_from_app(&app) {
+        Ok(s) => s,
+        Err(err) => {
+            return UpdateClientResult {
+                ok: false,
+                name: None,
+                auth_required: err.auth_required,
+                error: err.error,
+            };
+        }
+    };
+
+    match update_client_in_hub(state.as_ref(), &old_name, &name, label).await {
+        Ok(_) => UpdateClientResult {
+            ok: true,
+            name: Some(name),
+            auth_required: false,
+            error: None,
+        },
+        Err(UpdateClientError::NotFound) => {
+            update_client_err(false, format!("未找到后端「{old_name}」"))
+        }
+        Err(UpdateClientError::NameTaken) => {
+            update_client_err(false, format!("名称「{name}」已被占用"))
+        }
+        Err(UpdateClientError::InvalidName) => {
+            update_client_err(false, "后端名称不能为空")
+        }
+        Err(UpdateClientError::Store(e)) => update_client_err(false, format!("更新失败: {e}")),
+    }
+}
+
 #[derive(Clone, Default)]
 struct BridgeRuntime {
     state: String,
@@ -460,10 +590,16 @@ pub struct BridgeStatusPayload {
 #[serde(rename_all = "camelCase")]
 pub struct SaveClaudeProfileRequest {
     pub cwd: String,
-    pub timeout_secs: u64,
-    pub max_reply_chars: usize,
-    pub model: Option<String>,
-    pub include_new_session: Option<bool>,
+    #[serde(default)]
+    pub env_vars: Option<Vec<EnvVar>>,
+}
+
+/// One environment variable entry (key + value pair) for a Bridge profile.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvVar {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(serde::Serialize)]
@@ -484,6 +620,8 @@ pub struct DesktopBridgeProfileFile {
     pub model: Option<String>,
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// All user-defined environment variables from the primary profile.
+    pub env_vars: Vec<EnvVar>,
 }
 
 #[derive(serde::Serialize)]
@@ -501,14 +639,12 @@ pub struct SaveBridgeProfileRequest {
     pub original_id: Option<String>,
     pub id: String,
     pub template: String,
+    /// Working directory (required for preset templates).
     pub cwd: String,
-    pub timeout_secs: u64,
-    pub max_reply_chars: usize,
-    pub model: Option<String>,
-    pub command: Option<String>,
-    pub args: Option<Vec<String>>,
+    /// Environment variables (optional; used by all preset templates).
+    pub env_vars: Option<Vec<EnvVar>>,
+    /// Raw YAML (only used when template == "custom").
     pub yaml: Option<String>,
-    pub include_new_session: Option<bool>,
 }
 
 fn yaml_quote(s: &str) -> String {
@@ -527,89 +663,68 @@ fn yaml_quote(s: &str) -> String {
     out
 }
 
-fn build_claude_profile_yaml(req: &SaveClaudeProfileRequest) -> Result<String, String> {
-    let cwd = req.cwd.trim();
+/// Render the `env:` YAML block for a list of `EnvVar` entries.
+///
+/// `indent` is the number of leading spaces before the `env:` key.
+/// Returns an empty string when `env_vars` is empty or all keys are blank.
+fn env_vars_yaml(env_vars: &[EnvVar], indent: usize) -> String {
+    let valid: Vec<&EnvVar> = env_vars
+        .iter()
+        .filter(|e| !e.key.trim().is_empty())
+        .collect();
+    if valid.is_empty() {
+        return String::new();
+    }
+    let pad = " ".repeat(indent);
+    let inner = " ".repeat(indent + 2);
+    let mut out = format!("{pad}env:\n");
+    for e in valid {
+        out.push_str(&format!(
+            "{inner}{}: {}\n",
+            e.key.trim(),
+            yaml_quote(e.value.trim())
+        ));
+    }
+    out
+}
+
+/// Build the minimal `claude-code` profile YAML.
+///
+/// Generates a single-profile file; routing is auto-detected by the parser when omitted.
+fn build_claude_profile_yaml(cwd: &str, env_vars: &[EnvVar]) -> Result<String, String> {
+    let cwd = cwd.trim();
     if cwd.is_empty() {
         return Err("请填写项目目录".into());
     }
-    if req.timeout_secs == 0 {
-        return Err("超时时间必须大于 0 秒".into());
-    }
-    if req.max_reply_chars == 0 {
-        return Err("最大回复长度必须大于 0".into());
-    }
-
-    let model = req
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let model_env = model
-        .map(|m| format!("    env:\n      ILINK_CLAUDE_MODEL: {}\n", yaml_quote(m)))
-        .unwrap_or_default();
-    let model_env_new = model
-        .map(|m| format!("      ILINK_CLAUDE_MODEL: {}\n", yaml_quote(m)))
-        .unwrap_or_default();
-
-    if !req.include_new_session.unwrap_or(true) {
-        return Ok(format!(
-            r#"profiles:
-  claude:
-    type: claude-code
-    cwd: {cwd}
-    timeout_secs: {timeout_secs}
-    max_reply_chars: {max_reply_chars}
-    truncation_suffix: "\n\n...(内容已截断，可缩小问题范围或分多条发送)"
-{model_env}
-routing:
-  strategy: fixed
-  default_profile: claude
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
-"#,
-            cwd = yaml_quote(cwd),
-            timeout_secs = req.timeout_secs,
-            max_reply_chars = req.max_reply_chars,
-            model_env = model_env,
-        ));
-    }
-
+    let env_section = env_vars_yaml(env_vars, 4);
     Ok(format!(
-        r#"profiles:
-  claude:
-    type: claude-code
-    cwd: {cwd}
-    timeout_secs: {timeout_secs}
-    max_reply_chars: {max_reply_chars}
-    truncation_suffix: "\n\n...(内容已截断，可缩小问题范围或分多条发送)"
-{model_env}
-  claude_new:
-    type: claude-code
-    cwd: {cwd}
-    timeout_secs: {timeout_secs}
-    max_reply_chars: {max_reply_chars}
-    truncation_suffix: "\n\n...(内容已截断)"
-    env:
-      ILINK_SESSION_ID: ""
-{model_env_new}
-routing:
-  strategy: prefix
-  default_profile: claude
-  prefix_rules:
-    - prefix: "/new "
-      profile: claude_new
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
-"#,
+        "profiles:\n  claude:\n    type: claude-code\n    cwd: {cwd}\n{env_section}",
         cwd = yaml_quote(cwd),
-        timeout_secs = req.timeout_secs,
-        max_reply_chars = req.max_reply_chars,
-        model_env = model_env,
-        model_env_new = model_env_new,
+        env_section = env_section,
+    ))
+}
+
+/// Build a minimal flat single-profile YAML for CLI tools (codex, cursor agent, gemini, …).
+fn build_simple_command_yaml(
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    env_vars: &[EnvVar],
+) -> Result<String, String> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Err("请填写项目目录".into());
+    }
+    if command.trim().is_empty() {
+        return Err("请填写命令".into());
+    }
+    let env_section = env_vars_yaml(env_vars, 0);
+    Ok(format!(
+        "command: {command}\nargs: {args}\ncwd: {cwd}\nstdin: none\n{env_section}",
+        command = yaml_quote(command.trim()),
+        args = yaml_string_array(args),
+        cwd = yaml_quote(cwd),
+        env_section = env_section,
     ))
 }
 
@@ -645,90 +760,28 @@ fn yaml_string_array(items: &[String]) -> String {
     format!("[{quoted}]")
 }
 
-fn build_command_profile_yaml(
-    command: &str,
-    args: &[String],
-    cwd: &str,
-    timeout_secs: u64,
-    max_reply_chars: usize,
-) -> Result<String, String> {
-    let cwd = cwd.trim();
-    if cwd.is_empty() {
-        return Err("请填写项目目录".into());
-    }
-    if command.trim().is_empty() {
-        return Err("请填写命令".into());
-    }
-    if timeout_secs == 0 {
-        return Err("超时时间必须大于 0 秒".into());
-    }
-    if max_reply_chars == 0 {
-        return Err("最大回复长度必须大于 0".into());
-    }
-    Ok(format!(
-        r#"command: {command}
-args: {args}
-stdin: none
-cwd: {cwd}
-timeout_secs: {timeout_secs}
-max_reply_chars: {max_reply_chars}
-"#,
-        command = yaml_quote(command.trim()),
-        args = yaml_string_array(args),
-        cwd = yaml_quote(cwd),
-        timeout_secs = timeout_secs,
-        max_reply_chars = max_reply_chars
-    ))
-}
-
 fn build_bridge_profile_yaml(req: &SaveBridgeProfileRequest) -> Result<String, String> {
+    let env_vars = req.env_vars.as_deref().unwrap_or(&[]);
     match req.template.as_str() {
-        "claude" => build_claude_profile_yaml(&SaveClaudeProfileRequest {
-            cwd: req.cwd.clone(),
-            timeout_secs: req.timeout_secs,
-            max_reply_chars: req.max_reply_chars,
-            model: req.model.clone(),
-            include_new_session: req.include_new_session,
-        }),
-        "cursor" => {
-            let args = req
-                .args
-                .clone()
-                .unwrap_or_else(|| vec!["-p".into(), "{{MESSAGE}}".into()]);
-            build_command_profile_yaml(
-                req.command.as_deref().unwrap_or("agent"),
-                &args,
-                &req.cwd,
-                req.timeout_secs,
-                req.max_reply_chars,
-            )
-        }
-        "codex" => {
-            let args = req
-                .args
-                .clone()
-                .unwrap_or_else(|| vec!["exec".into(), "{{MESSAGE}}".into()]);
-            build_command_profile_yaml(
-                req.command.as_deref().unwrap_or("codex"),
-                &args,
-                &req.cwd,
-                req.timeout_secs,
-                req.max_reply_chars,
-            )
-        }
-        "gemini" => {
-            let args = req
-                .args
-                .clone()
-                .unwrap_or_else(|| vec!["-p".into(), "{{MESSAGE}}".into()]);
-            build_command_profile_yaml(
-                req.command.as_deref().unwrap_or("gemini"),
-                &args,
-                &req.cwd,
-                req.timeout_secs,
-                req.max_reply_chars,
-            )
-        }
+        "claude" => build_claude_profile_yaml(&req.cwd, env_vars),
+        "cursor" => build_simple_command_yaml(
+            "agent",
+            &["-p".into(), "{{MESSAGE}}".into()],
+            &req.cwd,
+            env_vars,
+        ),
+        "codex" => build_simple_command_yaml(
+            "codex",
+            &["exec".into(), "{{MESSAGE}}".into()],
+            &req.cwd,
+            env_vars,
+        ),
+        "gemini" => build_simple_command_yaml(
+            "gemini",
+            &["-p".into(), "{{MESSAGE}}".into()],
+            &req.cwd,
+            env_vars,
+        ),
         "custom" => {
             let yaml = req
                 .yaml
@@ -772,6 +825,20 @@ fn summarize_bridge_profile_file(
                 .profile("claude")
                 .or_else(|| app.profile("default"))
                 .or_else(|| app.profile(app.default_profile_name()));
+            let env_vars = profile
+                .map(|p| {
+                    let mut vars: Vec<EnvVar> = p
+                        .env
+                        .iter()
+                        .map(|(k, v)| EnvVar {
+                            key: k.clone(),
+                            value: v.clone(),
+                        })
+                        .collect();
+                    vars.sort_by(|a, b| a.key.cmp(&b.key));
+                    vars
+                })
+                .unwrap_or_default();
             DesktopBridgeProfileFile {
                 id,
                 path: path.display().to_string(),
@@ -792,6 +859,7 @@ fn summarize_bridge_profile_file(
                 model: profile.and_then(|p| p.env.get("ILINK_CLAUDE_MODEL").cloned()),
                 command: profile.map(|p| p.command.clone()),
                 args: profile.map(|p| p.args.clone()).unwrap_or_default(),
+                env_vars,
             }
         }
         Err(e) => DesktopBridgeProfileFile {
@@ -810,6 +878,7 @@ fn summarize_bridge_profile_file(
             model: None,
             command: None,
             args: vec![],
+            env_vars: vec![],
         },
     }
 }
@@ -910,7 +979,8 @@ async fn bridge_save_claude_profile(
     let Some(ctrl) = app.try_state::<BridgeController>() else {
         return Err("Bridge 未初始化".into());
     };
-    let yaml = build_claude_profile_yaml(&req)?;
+    let env_vars = req.env_vars.unwrap_or_default();
+    let yaml = build_claude_profile_yaml(&req.cwd, &env_vars)?;
     ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).map_err(|e| e.to_string())?;
     if let Some(parent) = ctrl.config_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -1024,6 +1094,7 @@ async fn bridge_profiles(app: tauri::AppHandle) -> BridgeProfilesPayload {
                 model: None,
                 command: None,
                 args: vec![],
+                env_vars: vec![],
             }),
         }
     }
@@ -1225,7 +1296,27 @@ fn bridge_stop(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn bridge_restart(app: tauri::AppHandle) -> Result<(), String> {
-    bridge_stop(app.clone())?;
+    // Signal the old manager to stop and take its task handle WITHOUT aborting it.
+    // Aborting the outer wrapper task does not abort the inner BridgeManager tokio task;
+    // that task keeps running and still holds Child handles with kill_on_drop(true).
+    // If we immediately start a new manager before the old one finishes stop_all(),
+    // the old manager's cleanup races against the new manager's freshly-started children
+    // and SIGKILLs them, causing an infinite restart loop.
+    let old_task = {
+        let Some(ctrl) = app.try_state::<BridgeController>() else {
+            return Err("Bridge 未初始化".into());
+        };
+        if let Some(manager) = ctrl.manager.lock().map_err(|e| e.to_string())?.take() {
+            manager.stop();
+        }
+        let task = ctrl.task.lock().map_err(|e| e.to_string())?.take();
+        task
+    };
+    // Wait for the old manager to fully shut down (stop_all completes, task exits).
+    // A 10-second timeout prevents a hang if something goes wrong during shutdown.
+    if let Some(task) = old_task {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), task).await;
+    }
     start_bridge_task(&app)
 }
 
@@ -1234,21 +1325,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_profile_wizard_generates_valid_bridge_yaml() {
-        let yaml = build_claude_profile_yaml(&SaveClaudeProfileRequest {
-            cwd: "/tmp/my project".into(),
-            timeout_secs: 600,
-            max_reply_chars: 8000,
-            model: Some("sonnet".into()),
-            include_new_session: Some(true),
-        })
-        .unwrap();
+    fn claude_profile_wizard_generates_minimal_yaml() {
+        let yaml = build_claude_profile_yaml("/tmp/my project", &[]).unwrap();
         let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
 
         assert_eq!(app.default_profile_name(), "claude");
-        assert_eq!(app.routing_label(), "prefix");
+        assert_eq!(app.routing_label(), "fixed");
         let profile = app.profile("claude").unwrap();
         assert_eq!(profile.cwd.as_deref(), Some("/tmp/my project"));
+        assert!(app.profile("claude_new").is_none());
+    }
+
+    #[test]
+    fn claude_profile_with_env_vars() {
+        let env_vars = vec![EnvVar {
+            key: "ILINK_CLAUDE_MODEL".into(),
+            value: "sonnet".into(),
+        }];
+        let yaml = build_claude_profile_yaml("/tmp/project", &env_vars).unwrap();
+        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
+        let profile = app.profile("claude").unwrap();
         assert_eq!(
             profile.env.get("ILINK_CLAUDE_MODEL").map(String::as_str),
             Some("sonnet")
@@ -1257,31 +1353,8 @@ mod tests {
 
     #[test]
     fn claude_profile_wizard_requires_cwd() {
-        let err = build_claude_profile_yaml(&SaveClaudeProfileRequest {
-            cwd: " ".into(),
-            timeout_secs: 600,
-            max_reply_chars: 8000,
-            model: None,
-            include_new_session: Some(true),
-        })
-        .unwrap_err();
-
+        let err = build_claude_profile_yaml(" ", &[]).unwrap_err();
         assert!(err.contains("项目目录"));
-    }
-
-    #[test]
-    fn claude_profile_wizard_can_disable_new_session_route() {
-        let yaml = build_claude_profile_yaml(&SaveClaudeProfileRequest {
-            cwd: "/tmp/my project".into(),
-            timeout_secs: 600,
-            max_reply_chars: 8000,
-            model: None,
-            include_new_session: Some(false),
-        })
-        .unwrap();
-        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
-        assert_eq!(app.routing_label(), "fixed");
-        assert!(app.profile("claude_new").is_none());
     }
 
     #[test]
@@ -1296,13 +1369,8 @@ mod tests {
                 id: format!("{template}-demo"),
                 template: template.into(),
                 cwd: "/tmp/project".into(),
-                timeout_secs: 600,
-                max_reply_chars: 8000,
-                model: None,
-                command: None,
-                args: None,
+                env_vars: None,
                 yaml: None,
-                include_new_session: None,
             })
             .unwrap();
             let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
@@ -1311,6 +1379,29 @@ mod tests {
             assert_eq!(profile.cwd.as_deref(), Some("/tmp/project"));
         }
     }
+
+    #[test]
+    fn command_profile_with_env_vars() {
+        let env_vars = vec![EnvVar {
+            key: "MY_TOKEN".into(),
+            value: "abc123".into(),
+        }];
+        let yaml = build_bridge_profile_yaml(&SaveBridgeProfileRequest {
+            original_id: None,
+            id: "codex-demo".into(),
+            template: "codex".into(),
+            cwd: "/tmp/project".into(),
+            env_vars: Some(env_vars),
+            yaml: None,
+        })
+        .unwrap();
+        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
+        let profile = app.profile("default").unwrap();
+        assert_eq!(
+            profile.env.get("MY_TOKEN").map(String::as_str),
+            Some("abc123")
+        );
+    }
 }
 
 struct HubController {
@@ -1318,6 +1409,7 @@ struct HubController {
     requested_addr: String,
     database_path: PathBuf,
     listening_addr: Arc<Mutex<Option<String>>>,
+    hub_state: Arc<Mutex<Option<Arc<ilink_hub::HubState>>>>,
 }
 
 /// Match Docker/README style: `sqlite:/absolute/path` (see `store::ensure_sqlite_file`).
@@ -1389,11 +1481,19 @@ pub fn run() {
             let ilink_base_url = std::env::var("ILINK_BASE_URL").ok();
 
             let (tx_bind, rx_bind) = tokio::sync::oneshot::channel::<String>();
+            let (tx_state, rx_state) = tokio::sync::oneshot::channel::<Arc<ilink_hub::HubState>>();
             let listening_addr = Arc::new(Mutex::new(None::<String>));
+            let hub_state = Arc::new(Mutex::new(None::<Arc<ilink_hub::HubState>>));
             let listening_for_task = listening_addr.clone();
+            let hub_state_for_task = hub_state.clone();
             let app_for_bind = app.handle().clone();
 
             tauri::async_runtime::spawn(async move {
+                if let Ok(state) = rx_state.await {
+                    if let Ok(mut g) = hub_state_for_task.lock() {
+                        *g = Some(state);
+                    }
+                }
                 if let Ok(s) = rx_bind.await {
                     if let Ok(mut g) = listening_for_task.lock() {
                         *g = Some(s.clone());
@@ -1418,14 +1518,19 @@ pub fn run() {
                 database_url,
                 on_listening: Some(tx_bind),
                 qr_login_ui: Some(qr_tx),
+                on_hub_state: Some(tx_state),
             };
 
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let app_handle = app.handle().clone();
+            let hub_state_for_shutdown = hub_state.clone();
 
             tauri::async_runtime::spawn(async move {
                 match ilink_hub::run_serve(opts, shutdown_rx).await {
                     Ok(()) => {
+                        if let Ok(mut g) = hub_state_for_shutdown.lock() {
+                            *g = None;
+                        }
                         let _ = app_handle.emit("hub-stopped", ());
                     }
                     Err(e) => {
@@ -1440,6 +1545,7 @@ pub fn run() {
                 requested_addr: requested_addr.clone(),
                 database_path: db_path,
                 listening_addr,
+                hub_state,
             });
             app.manage(BridgeController {
                 task: Mutex::new(None),
@@ -1484,6 +1590,8 @@ pub fn run() {
             hub_clients,
             hub_stats,
             hub_register,
+            hub_delete_client,
+            hub_update_client,
             bridge_config,
             bridge_save_claude_profile,
             bridge_save_yaml,
