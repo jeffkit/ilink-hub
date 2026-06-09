@@ -3,9 +3,13 @@ name: ilink-hub-setup
 description: >-
   This skill should be used when the user wants to install ilink-hub, set up ilink-hub-bridge,
   configure a WeChat bot connection, or get started with the full iLink Hub system end-to-end.
+  Also covers the "bridge only" scenario where the user only installs ilink-hub-bridge locally
+  and connects to a remote Hub (no local ilink-hub needed).
   Triggers on: "安装 ilink-hub", "安装 bridge", "配置 ilink", "设置微信机器人", "接入 iLink",
   "ilink-hub 怎么装", "bridge 怎么配置", "如何开始使用 ilink", "setup ilink-hub", "install ilink-hub",
-  "configure bridge", "get started with ilink", "ilink 新手入门", "帮我装一下 ilink".
+  "configure bridge", "get started with ilink", "ilink 新手入门", "帮我装一下 ilink",
+  "只装 bridge", "只安装 bridge", "连远程 hub", "bridge only", "bridge manager", "本地不装 hub",
+  "only install bridge", "connect to remote hub", "bridge without hub".
 version: 0.1.0
 source: https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
 ---
@@ -47,11 +51,14 @@ source: https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
 
 ---
 
-## Step 2：安装 ilink-hub
+## Step 2：安装
 
-根据操作系统选择安装方式：
+根据路径选择安装内容：
 
-### macOS（Homebrew，推荐）
+- **路径 A（本机 Hub + Bridge）**：需要安装 `ilink-hub` 和 `ilink-hub-bridge`
+- **路径 B（仅 Bridge，连远程 Hub）**：只需安装 `ilink-hub-bridge`，本机无需 `ilink-hub`
+
+### 路径 A：macOS（Homebrew，推荐）
 
 ```bash
 # 若未安装 Homebrew：https://brew.sh
@@ -61,7 +68,7 @@ brew install ilink-hub
 
 安装后同时得到 `ilink-hub`、`ilink-hub-bridge`、`ilink-relay` 三个命令。
 
-### macOS 直接下载
+### 路径 A：macOS / Linux 直接下载（完整安装）
 
 ```bash
 # Apple Silicon（M 系列芯片）
@@ -75,21 +82,43 @@ curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download
 curl -Lo ilink-hub-bridge https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-bridge-macos-x86_64
 chmod +x ilink-hub ilink-hub-bridge
 sudo mv ilink-hub ilink-hub-bridge /usr/local/bin/
-```
 
-### Linux x86_64
-
-```bash
+# Linux x86_64
 curl -Lo ilink-hub https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-linux-x86_64
 curl -Lo ilink-hub-bridge https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-bridge-linux-x86_64
 chmod +x ilink-hub ilink-hub-bridge
 sudo mv ilink-hub ilink-hub-bridge /usr/local/bin/
 ```
 
+### 路径 B：只安装 ilink-hub-bridge（连远程 Hub）
+
+```bash
+# Apple Silicon（M 系列芯片）
+curl -Lo ilink-hub-bridge https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-bridge-macos-aarch64
+chmod +x ilink-hub-bridge
+sudo mv ilink-hub-bridge /usr/local/bin/
+
+# Intel Mac
+curl -Lo ilink-hub-bridge https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-bridge-macos-x86_64
+chmod +x ilink-hub-bridge
+sudo mv ilink-hub-bridge /usr/local/bin/
+
+# Linux x86_64
+curl -Lo ilink-hub-bridge https://github.com/jeffkit/ilink-hub/releases/latest/download/ilink-hub-bridge-linux-x86_64
+chmod +x ilink-hub-bridge
+sudo mv ilink-hub-bridge /usr/local/bin/
+```
+
+> Homebrew 也可以：`brew tap jeffkit/tap && brew install ilink-hub` 会同时装上 bridge，`ilink-hub` 本身不会自动启动，不影响使用。
+
 ### 验证安装
 
 ```bash
+# 路径 A
 ilink-hub --version
+ilink-hub-bridge --version
+
+# 路径 B（只有 bridge）
 ilink-hub-bridge --version
 ```
 
@@ -220,9 +249,9 @@ Hub 回复所有已注册客户端，找到你的 bridge（名如 `local-MacBook
 
 完成以上步骤后逐项确认：
 
-- [ ] `ilink-hub --version` 有输出
-- [ ] `curl http://127.0.0.1:8765/health` 返回 `{"status":"ok"}`（或远程 Hub 可达）
 - [ ] `ilink-hub-bridge --version` 有输出
+- [ ] （路径 A）`ilink-hub --version` 有输出
+- [ ] `curl <HUB_URL>/health` 返回 `{"status":"ok"}`（路径 A 用 `http://127.0.0.1:8765`，路径 B 用远程 Hub 地址）
 - [ ] Manager 日志中出现 `connected to hub, polling for messages`
 - [ ] 微信 `/list` 显示 bridge 客户端在线
 - [ ] 微信发一条普通文字，本机 CLI 被触发，收到回复
