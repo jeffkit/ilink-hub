@@ -10,6 +10,9 @@ desktop/ilink-hub-desktop/node_modules/
 desktop/ilink-hub-desktop/dist/
 desktop/ilink-hub-desktop/src-tauri/target/
 
+# skills symlink (local dev convenience, source is in docs/public/skills/)
+/skills
+
 # Docs
 docs/node_modules
 docs/.vitepress/dist
