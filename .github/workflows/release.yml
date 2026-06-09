@@ -277,23 +277,42 @@ jobs:
         working-directory: sdk/node
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check if sdk/node source changed
+        id: sdk_changed
+        run: |
+          if git diff --quiet HEAD~1 HEAD -- src/; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
 
       - name: Setup Node.js
+        if: steps.sdk_changed.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Install dependencies (if any)
+        if: steps.sdk_changed.outputs.changed == 'true'
         run: npm install --ignore-scripts 2>/dev/null || true
 
       - name: Run tests
+        if: steps.sdk_changed.outputs.changed == 'true'
         run: npm test
 
       - name: Publish
+        if: steps.sdk_changed.outputs.changed == 'true'
         run: npm publish --access public || true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Skip (no source changes)
+        if: steps.sdk_changed.outputs.changed == 'false'
+        run: echo "sdk/node/src/ unchanged since last commit — skipping npm publish"
 
   # ─── GitHub Release ───────────────────────────────────────────────────────
   create-release:
