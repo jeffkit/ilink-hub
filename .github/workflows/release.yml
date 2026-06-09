@@ -386,3 +386,103 @@ jobs:
             ilink-hub register --name my-ai              # register a backend
             # open http://your-hub:8765/hub/ui           # web admin panel
             ```
+
+  # ─── Update Homebrew Tap ─────────────────────────────────────────────────
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: [create-release]
+    steps:
+      - name: Download macOS binaries from release
+        run: |
+          VERSION="${{ github.ref_name }}"
+          BASE="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
+          curl -fsSLo ilink-hub-macos-aarch64        "${BASE}/ilink-hub-macos-aarch64"
+          curl -fsSLo ilink-hub-macos-x86_64         "${BASE}/ilink-hub-macos-x86_64"
+          curl -fsSLo ilink-hub-bridge-macos-aarch64 "${BASE}/ilink-hub-bridge-macos-aarch64"
+          curl -fsSLo ilink-hub-bridge-macos-x86_64  "${BASE}/ilink-hub-bridge-macos-x86_64"
+
+      - name: Compute SHA256
+        id: sha
+        run: |
+          echo "arm64=$(sha256sum ilink-hub-macos-aarch64        | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "x86=$(sha256sum   ilink-hub-macos-x86_64         | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "arm64_bridge=$(sha256sum ilink-hub-bridge-macos-aarch64 | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "x86_bridge=$(sha256sum   ilink-hub-bridge-macos-x86_64  | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: jeffkit/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Formula
+        env:
+          VERSION: ${{ github.ref_name }}
+          ARM64:        ${{ steps.sha.outputs.arm64 }}
+          X86:          ${{ steps.sha.outputs.x86 }}
+          ARM64_BRIDGE: ${{ steps.sha.outputs.arm64_bridge }}
+          X86_BRIDGE:   ${{ steps.sha.outputs.x86_bridge }}
+        run: |
+          VER="${VERSION#v}"
+          FORMULA="homebrew-tap/Formula/ilink-hub.rb"
+          cat > "$FORMULA" <<RUBY
+          # typed: false
+          # frozen_string_literal: true
+
+          class IlinkHub < Formula
+            desc "iLink-compatible multiplexer hub for WeChat ClawBot — connect one WeChat account to multiple AI agent backends"
+            homepage "https://jeffkit.github.io/ilink-hub/"
+            version "${VER}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-macos-aarch64"
+                sha256 "${ARM64}"
+
+                resource "ilink_hub_bridge" do
+                  url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-bridge-macos-aarch64"
+                  sha256 "${ARM64_BRIDGE}"
+                end
+              else
+                url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-macos-x86_64"
+                sha256 "${X86}"
+
+                resource "ilink_hub_bridge" do
+                  url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-bridge-macos-x86_64"
+                  sha256 "${X86_BRIDGE}"
+                end
+              end
+            end
+
+            def install
+              if OS.mac? && Hardware::CPU.arm?
+                bin.install "ilink-hub-macos-aarch64" => "ilink-hub"
+                resource("ilink_hub_bridge").stage do
+                  bin.install "ilink-hub-bridge-macos-aarch64" => "ilink-hub-bridge"
+                end
+              elsif OS.mac?
+                bin.install "ilink-hub-macos-x86_64" => "ilink-hub"
+                resource("ilink_hub_bridge").stage do
+                  bin.install "ilink-hub-bridge-macos-x86_64" => "ilink-hub-bridge"
+                end
+              end
+            end
+
+            test do
+              assert_match "ilink-hub", shell_output("#{bin}/ilink-hub --version")
+              assert_match "ilink-hub-bridge", shell_output("#{bin}/ilink-hub-bridge --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push
+        working-directory: homebrew-tap
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ilink-hub.rb
+          git diff --cached --quiet || git commit -m "chore: bump ilink-hub to ${{ github.ref_name }}"
+          git push
