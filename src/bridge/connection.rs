@@ -125,49 +125,6 @@ pub async fn validate_hub_token(hub_url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    #[test]
-    fn hub_response_token_rejected_detects_401() {
-        assert!(hub_response_token_rejected(
-            reqwest::StatusCode::UNAUTHORIZED,
-            None
-        ));
-        assert!(hub_response_token_rejected(
-            reqwest::StatusCode::OK,
-            Some(401)
-        ));
-        assert!(!hub_response_token_rejected(
-            reqwest::StatusCode::OK,
-            Some(0)
-        ));
-    }
-
-    #[test]
-    fn default_auto_client_name_uses_config_stem() {
-        let name = default_auto_client_name(Some(Path::new("/Users/me/ilink-claude.yaml")));
-        assert!(name.starts_with("local-"));
-        assert!(name.ends_with("-ilink-claude"));
-    }
-
-    #[test]
-    fn sanitize_client_name_segment_replaces_invalid_chars() {
-        assert_eq!(sanitize_client_name_segment("My Mac.local"), "My-Mac-local");
-    }
-
-    #[test]
-    fn auto_client_name_prefers_explicit_then_saved() {
-        assert_eq!(
-            auto_client_name(Some("custom"), Some("saved"), None),
-            "custom"
-        );
-        assert_eq!(auto_client_name(None, Some("saved"), None), "saved");
-    }
-}
-
 async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!("{}/hub/register", hub_url.trim().trim_end_matches('/'));
@@ -391,5 +348,48 @@ pub async fn resolve_hub_connection(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn hub_response_token_rejected_detects_401() {
+        assert!(hub_response_token_rejected(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None
+        ));
+        assert!(hub_response_token_rejected(
+            reqwest::StatusCode::OK,
+            Some(401)
+        ));
+        assert!(!hub_response_token_rejected(
+            reqwest::StatusCode::OK,
+            Some(0)
+        ));
+    }
+
+    #[test]
+    fn default_auto_client_name_uses_config_stem() {
+        let name = default_auto_client_name(Some(Path::new("/Users/me/ilink-claude.yaml")));
+        assert!(name.starts_with("local-"));
+        assert!(name.ends_with("-ilink-claude"));
+    }
+
+    #[test]
+    fn sanitize_client_name_segment_replaces_invalid_chars() {
+        assert_eq!(sanitize_client_name_segment("My Mac.local"), "My-Mac-local");
+    }
+
+    #[test]
+    fn auto_client_name_prefers_explicit_then_saved() {
+        assert_eq!(
+            auto_client_name(Some("custom"), Some("saved"), None),
+            "custom"
+        );
+        assert_eq!(auto_client_name(None, Some("saved"), None), "saved");
     }
 }

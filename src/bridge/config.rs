@@ -373,31 +373,31 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
         "py" => {
             p.command = "python3".to_string();
             let mut args = vec![script_path];
-            args.extend(p.args.drain(..));
+            args.append(&mut p.args);
             p.args = args;
         }
         "js" | "mjs" | "cjs" => {
             p.command = "node".to_string();
             let mut args = vec![script_path];
-            args.extend(p.args.drain(..));
+            args.append(&mut p.args);
             p.args = args;
         }
         "ts" => {
             p.command = "npx".to_string();
             let mut args = vec!["tsx".to_string(), script_path];
-            args.extend(p.args.drain(..));
+            args.append(&mut p.args);
             p.args = args;
         }
         "sh" | "bash" => {
             p.command = "bash".to_string();
             let mut args = vec![script_path];
-            args.extend(p.args.drain(..));
+            args.append(&mut p.args);
             p.args = args;
         }
         "rb" => {
             p.command = "ruby".to_string();
             let mut args = vec![script_path];
-            args.extend(p.args.drain(..));
+            args.append(&mut p.args);
             p.args = args;
         }
         _ => {

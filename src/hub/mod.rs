@@ -442,7 +442,8 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 .unwrap_or_else(|_| "default".to_string());
             match state.store.list_backend_sessions(&vctx).await {
                 Ok(sessions) if sessions.is_empty() => {
-                    format!("当前对话尚无 session 记录。\n发送 `/session new <名称>` 创建一个 session。")
+                    "当前对话尚无 session 记录。\n发送 `/session new <名称>` 创建一个 session。"
+                        .to_string()
                 }
                 Ok(sessions) => {
                     let mut lines = vec!["**当前对话的 sessions：**".to_string()];

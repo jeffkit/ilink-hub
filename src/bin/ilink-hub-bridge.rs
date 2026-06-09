@@ -146,33 +146,31 @@ async fn main() -> Result<()> {
                 info!(%hub_url, "using Hub base URL for downstream");
 
                 let mut handle = tokio::spawn(run_bridge(hub_url, token, app.clone()));
-                loop {
-                    tokio::select! {
-                        _ = tokio::signal::ctrl_c() => {
-                            handle.abort();
-                            let _ = handle.await;
-                            info!("exit");
-                            return Ok(());
-                        }
-                        result = &mut handle => {
-                            match result {
-                                Ok(BridgeStop::TokenRejected) if using_explicit_token => {
-                                    anyhow::bail!(
-                                        "Hub 拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
-                                         请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
-                                    );
-                                }
-                                Ok(BridgeStop::TokenRejected) => {
-                                    warn!(
-                                        path = %cred_path.display(),
-                                        "hub token revoked at runtime; removing credentials and re-registering"
-                                    );
-                                    let _ = tokio::fs::remove_file(&cred_path).await;
-                                    continue 'reconnect;
-                                }
-                                Err(e) => {
-                                    return Err(e).context("bridge task panicked or failed");
-                                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        handle.abort();
+                        let _ = handle.await;
+                        info!("exit");
+                        return Ok(());
+                    }
+                    result = &mut handle => {
+                        match result {
+                            Ok(BridgeStop::TokenRejected) if using_explicit_token => {
+                                anyhow::bail!(
+                                    "Hub 拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
+                                     请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
+                                );
+                            }
+                            Ok(BridgeStop::TokenRejected) => {
+                                warn!(
+                                    path = %cred_path.display(),
+                                    "hub token revoked at runtime; removing credentials and re-registering"
+                                );
+                                let _ = tokio::fs::remove_file(&cred_path).await;
+                                continue 'reconnect;
+                            }
+                            Err(e) => {
+                                return Err(e).context("bridge task panicked or failed");
                             }
                         }
                     }
