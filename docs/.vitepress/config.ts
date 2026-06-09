@@ -23,7 +23,7 @@ export default defineConfig({
       { text: 'Bridge', link: '/bridge/' },
       { text: '常见问题', link: '/guide/faq' },
       {
-        text: 'v0.1.19',
+        text: 'v0.1.20',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
