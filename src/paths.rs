@@ -28,6 +28,23 @@ pub fn default_bridge_credentials_path() -> PathBuf {
     data_dir().join("bridge-credentials.json")
 }
 
+/// Root for the bridge manager plugin-style profile layout: `~/.ilink-hub-bridge`.
+pub fn bridge_manager_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".ilink-hub-bridge")
+}
+
+/// Default bridge manager profiles directory: `~/.ilink-hub-bridge/profiles`.
+pub fn default_bridge_profiles_dir() -> PathBuf {
+    bridge_manager_dir().join("profiles")
+}
+
+/// Default bridge manager credentials directory: `~/.ilink-hub-bridge/credentials`.
+pub fn default_bridge_manager_credentials_dir() -> PathBuf {
+    bridge_manager_dir().join("credentials")
+}
+
 /// Expand a leading `~` or `$HOME` in a config path (YAML `cwd`, `script`, etc.).
 /// Returns the input unchanged when home is unavailable or no expansion applies.
 pub fn expand_user_path(path: &str) -> String {
@@ -77,6 +94,16 @@ mod tests {
         assert_eq!(
             default_bridge_credentials_path(),
             base.join("bridge-credentials.json")
+        );
+    }
+
+    #[test]
+    fn bridge_manager_defaults_live_under_manager_dir() {
+        let base = bridge_manager_dir();
+        assert_eq!(default_bridge_profiles_dir(), base.join("profiles"));
+        assert_eq!(
+            default_bridge_manager_credentials_dir(),
+            base.join("credentials")
         );
     }
 

@@ -27,7 +27,9 @@ use ilink_hub::bridge::{
     builtin, default_local_credential_path, resolve_hub_connection, run_bridge, BridgeApp,
     BridgeStop,
 };
-use ilink_hub::paths::default_bridge_config_path;
+use ilink_hub::paths::{
+    default_bridge_config_path, default_bridge_manager_credentials_dir, default_bridge_profiles_dir,
+};
 
 #[derive(Parser)]
 #[command(name = "ilink-hub-bridge")]
@@ -88,6 +90,32 @@ enum Commands {
         #[arg(value_name = "TYPE")]
         profile_type: String,
     },
+    /// Discover profile YAML files and supervise one bridge workspace per file.
+    ///
+    /// Each `*.yaml` / `*.yml` file keeps the existing bridge YAML format. The manager derives a
+    /// stable workspace/register name from the file stem and stores a separate credential JSON per
+    /// file, so every child bridge registers as an independent Hub backend.
+    Manager {
+        /// Directory containing bridge profile YAML files.
+        #[arg(long, default_value_os_t = default_bridge_profiles_dir())]
+        profiles_dir: PathBuf,
+
+        /// Directory for per-profile bridge credential JSON files.
+        #[arg(long, default_value_os_t = default_bridge_manager_credentials_dir())]
+        credentials_dir: PathBuf,
+
+        /// Seconds between profile directory scans.
+        #[arg(long, default_value_t = 5)]
+        scan_interval_secs: u64,
+
+        /// Minimum seconds before restarting an exited child bridge.
+        #[arg(long, default_value_t = 5)]
+        restart_backoff_secs: u64,
+
+        /// Maximum seconds for exponential child restart backoff.
+        #[arg(long, default_value_t = 60)]
+        max_restart_backoff_secs: u64,
+    },
 }
 
 fn explicit_token(cli: &Cli) -> Option<&str> {
@@ -113,6 +141,35 @@ async fn main() -> Result<()> {
             // Run as a built-in profile subprocess (P0 exec protocol).
             // No Hub connection needed — just read env vars and write to stdout.
             builtin::run_builtin_profile(profile_type).await
+        }
+        Some(Commands::Manager {
+            profiles_dir,
+            credentials_dir,
+            scan_interval_secs,
+            restart_backoff_secs,
+            max_restart_backoff_secs,
+        }) => {
+            if explicit_token(&cli).is_some()
+                || cli.cred_file.is_some()
+                || cli.register_name.is_some()
+                || cli.pair
+            {
+                tracing::warn!(
+                    "manager mode ignores --token/WEIXIN_TOKEN, --cred-file, --register-name, and --pair; \
+                     each profile gets an independent auto-registered child bridge"
+                );
+            }
+            let mut opts = ilink_hub::bridge::manager::BridgeManagerOptions::new(
+                cli.hub_url.clone(),
+                profiles_dir.clone(),
+                credentials_dir.clone(),
+            );
+            opts.scan_interval = std::time::Duration::from_secs((*scan_interval_secs).max(1));
+            opts.restart_backoff = std::time::Duration::from_secs((*restart_backoff_secs).max(1));
+            opts.max_restart_backoff =
+                std::time::Duration::from_secs((*max_restart_backoff_secs).max(1));
+            opts.force_register = cli.force_register;
+            ilink_hub::bridge::manager::run_bridge_manager(opts).await
         }
         None => {
             // Default mode: connect to Hub and long-poll for messages.

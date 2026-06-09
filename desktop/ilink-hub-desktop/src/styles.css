@@ -919,7 +919,8 @@ body {
   color: var(--faint);
 }
 
-.form input[type="text"] {
+.form input[type="text"],
+.form input[type="number"] {
   width: 100%;
   padding: 0.5rem 0.6rem;
   font-size: 0.82rem;
@@ -931,11 +932,13 @@ body {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.form input[type="text"]::placeholder {
+.form input[type="text"]::placeholder,
+.form input[type="number"]::placeholder {
   color: var(--faint);
 }
 
-.form input[type="text"]:focus {
+.form input[type="text"]:focus,
+.form input[type="number"]:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
@@ -992,6 +995,147 @@ body {
   line-height: 1.55;
   white-space: pre;
   overflow-x: auto;
+}
+
+/* ---------- Bridge ---------- */
+.bridge-card {
+  margin-top: 0.65rem;
+  padding: 0.65rem;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.bridge-state {
+  flex: 0 0 auto;
+  padding: 0.22rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--idle);
+  background: var(--idle-soft);
+}
+
+.bridge-state[data-state="running"] {
+  color: var(--ok);
+  background: var(--ok-soft);
+}
+
+.bridge-state[data-state="starting"] {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.bridge-state[data-state="error"] {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.bridge-actions {
+  display: flex;
+  gap: 0.45rem;
+  margin-top: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.bridge-manager-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.85fr) minmax(320px, 1.4fr);
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.bridge-profile-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  min-height: 260px;
+  padding: 0.55rem;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--surface-2) 86%, transparent);
+}
+
+.bridge-profile-item {
+  width: 100%;
+  text-align: left;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  color: var(--text);
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.bridge-profile-item.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.profile-title,
+.profile-meta,
+.profile-detail {
+  display: block;
+}
+
+.profile-title {
+  font-weight: 700;
+}
+
+.profile-meta,
+.profile-detail,
+.bridge-empty {
+  margin-top: 0.18rem;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.bridge-form {
+  padding: 0.65rem;
+  border-radius: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.bridge-profile-editor {
+  margin-top: 0;
+}
+
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  margin: 0.35rem 0 0.7rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.field-wide {
+  flex-basis: 100%;
+}
+
+.bridge-advanced {
+  margin-top: 0.15rem;
+}
+
+.yaml-editor {
+  width: 100%;
+  min-height: 220px;
+  resize: vertical;
+  padding: 0.65rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  outline: none;
+  color: var(--text);
+  background: var(--surface-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
+.yaml-editor:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 /* ---------- Steps + commands ---------- */

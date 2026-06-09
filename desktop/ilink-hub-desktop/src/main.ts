@@ -40,6 +40,61 @@ type RegisterResult = {
   error: string | null;
 };
 
+type BridgeStatusPayload = {
+  configured: boolean;
+  path: string;
+  state: "starting" | "running" | "stopped" | "error" | string;
+  running: boolean;
+  error: string | null;
+  manager: BridgeManagerStatus | null;
+};
+
+type BridgeManagerStatus = {
+  state: string;
+  profilesTotal: number;
+  running: number;
+  restarting: number;
+  children: BridgeChildStatus[];
+  lastError: string | null;
+};
+
+type BridgeChildStatus = {
+  id: string;
+  configPath: string;
+  registerName: string;
+  state: string;
+  pid: number | null;
+  uptimeSecs: number | null;
+  restartAttempts: number;
+  nextRestartSecs: number | null;
+  lastError: string | null;
+};
+
+type BridgeProfileFile = {
+  id: string;
+  path: string;
+  valid: boolean;
+  error: string | null;
+  template: string;
+  yaml: string;
+  profiles: string[];
+  defaultProfile: string | null;
+  routing: string | null;
+  cwd: string | null;
+  timeoutSecs: number;
+  maxReplyChars: number;
+  model: string | null;
+  command: string | null;
+  args: string[];
+};
+
+type BridgeProfilesPayload = {
+  profilesDir: string;
+  credentialsDir: string;
+  profiles: BridgeProfileFile[];
+  error: string | null;
+};
+
 type QrReady = { kind: "ready"; image: string; link: string };
 type QrStatus = { kind: "status"; message: string };
 type QrDone = { kind: "done" };
@@ -57,8 +112,15 @@ const STATE_LABEL: Record<HubState, string> = {
 let lastQrLink = "";
 let hubBaseUrl = "";
 let lastRegEnv = "";
+let bridgeConfigPath = "";
+let bridgeProfilesDir = "";
+let bridgeCredentialsDir = "";
+let bridgeProfiles: BridgeProfileFile[] = [];
+let selectedBridgeProfileId: string | null = null;
+let bridgeAutoStartAttempted = false;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
 let clientPollTimer: ReturnType<typeof setInterval> | null = null;
+let bridgePollTimer: ReturnType<typeof setInterval> | null = null;
 
 function $<T extends HTMLElement>(sel: string): T | null {
   return document.querySelector<T>(sel);
@@ -108,6 +170,17 @@ async function copyToClipboard(text: string, okMsg = "已复制"): Promise<boole
 
 function setError(msg: string | null) {
   const el = $<HTMLElement>("#error-line");
+  if (!el) return;
+  if (msg) {
+    el.textContent = msg;
+    el.hidden = false;
+  } else {
+    el.hidden = true;
+  }
+}
+
+function setBridgeMessage(msg: string | null) {
+  const el = $<HTMLElement>("#bridge-msg");
   if (!el) return;
   if (msg) {
     el.textContent = msg;
@@ -253,6 +326,288 @@ async function refreshStats() {
   }
 }
 
+function bridgeStateLabel(state: BridgeStatusPayload["state"]): string {
+  if (state === "running") return "运行中";
+  if (state === "starting") return "启动中";
+  if (state === "error") return "出错";
+  return "未启动";
+}
+
+function applyBridgeStatus(s: BridgeStatusPayload) {
+  bridgeConfigPath = s.path || bridgeConfigPath;
+  const stateEl = $<HTMLElement>("#bridge-state");
+  const pathEl = $<HTMLElement>("#bridge-config-path");
+  const startBtn = $<HTMLButtonElement>("#btn-bridge-start");
+  const restartBtn = $<HTMLButtonElement>("#btn-bridge-restart");
+  const stopBtn = $<HTMLButtonElement>("#btn-bridge-stop");
+
+  if (stateEl) {
+    stateEl.textContent = bridgeStateLabel(s.state);
+    stateEl.dataset.state = s.state;
+  }
+  if (pathEl && s.path) pathEl.textContent = s.path;
+  if (startBtn) startBtn.disabled = s.running || !hubBaseUrl;
+  if (restartBtn) restartBtn.disabled = !hubBaseUrl || !s.configured;
+  if (stopBtn) stopBtn.disabled = !s.running;
+  const list = $<HTMLElement>("#bridge-profile-list");
+  if (list) list.dataset.managerStatus = JSON.stringify(s.manager ?? null);
+  if (s.error) setBridgeMessage(s.error);
+  renderBridgeProfiles();
+}
+
+async function refreshBridgeStatus() {
+  try {
+    const status = await invoke<BridgeStatusPayload>("bridge_status");
+    applyBridgeStatus(status);
+  } catch (e) {
+    setBridgeMessage(`读取 Bridge 状态失败：${String(e)}`);
+  }
+}
+
+function startBridgePolling() {
+  if (bridgePollTimer !== null) return;
+  void refreshBridgeStatus();
+  bridgePollTimer = setInterval(() => void refreshBridgeStatus(), 3000);
+}
+
+function stopBridgePolling() {
+  if (bridgePollTimer !== null) {
+    clearInterval(bridgePollTimer);
+    bridgePollTimer = null;
+  }
+}
+
+function templateLabel(template: string): string {
+  if (template === "claude") return "Claude Code";
+  if (template === "cursor") return "Cursor";
+  if (template === "codex") return "Codex";
+  if (template === "gemini") return "Gemini";
+  return "Custom YAML";
+}
+
+function currentManagerChild(id: string): BridgeChildStatus | null {
+  // The latest status is reflected through the DOM polling path; this helper is filled by render.
+  const statusJson = $<HTMLElement>("#bridge-profile-list")?.dataset.managerStatus;
+  if (!statusJson) return null;
+  try {
+    const status = JSON.parse(statusJson) as BridgeManagerStatus;
+    if (!status || !Array.isArray(status.children)) return null;
+    return status.children.find((c) => c.id === id) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function renderBridgeProfiles() {
+  const list = $<HTMLElement>("#bridge-profile-list");
+  const summary = $<HTMLElement>("#bridge-summary");
+  if (!list) return;
+  if (!bridgeProfiles.length) {
+    list.innerHTML = `<div class="bridge-empty">还没有 profile。点击「新建 Profile」开始。</div>`;
+    if (summary) summary.textContent = `Profiles 目录：${bridgeProfilesDir || "—"}`;
+    return;
+  }
+  list.innerHTML = bridgeProfiles
+    .map((p) => {
+      const child = currentManagerChild(p.id);
+      const state = !p.valid ? "invalid" : child?.state ?? "stopped";
+      const detail = child
+        ? `pid ${child.pid ?? "—"} · ${child.uptimeSecs ?? 0}s · 重启 ${child.restartAttempts}`
+        : p.valid
+          ? "等待 manager 扫描"
+          : p.error || "配置无效";
+      return `<button type="button" class="bridge-profile-item ${p.id === selectedBridgeProfileId ? "active" : ""}" data-profile-id="${esc(p.id)}">
+        <span class="profile-title">${esc(p.id)}</span>
+        <span class="profile-meta">${esc(templateLabel(p.template))} · ${esc(state)}</span>
+        <span class="profile-detail">${esc(detail)}</span>
+      </button>`;
+    })
+    .join("");
+  if (summary) {
+    summary.textContent = `${bridgeProfiles.length} 个 profile；目录 ${bridgeProfilesDir || "—"}；凭证 ${bridgeCredentialsDir || "—"}`;
+  }
+}
+
+function applyBridgeProfiles(payload: BridgeProfilesPayload) {
+  bridgeProfilesDir = payload.profilesDir;
+  bridgeCredentialsDir = payload.credentialsDir;
+  bridgeConfigPath = payload.profilesDir;
+  const pathEl = $<HTMLElement>("#bridge-config-path");
+  if (pathEl) pathEl.textContent = payload.profilesDir || "—";
+  bridgeProfiles = payload.profiles;
+  if (payload.error) setBridgeMessage(payload.error);
+  if (!selectedBridgeProfileId || !bridgeProfiles.some((p) => p.id === selectedBridgeProfileId)) {
+    selectedBridgeProfileId = bridgeProfiles[0]?.id ?? null;
+  }
+  renderBridgeProfiles();
+  const selected = bridgeProfiles.find((p) => p.id === selectedBridgeProfileId);
+  if (selected) fillBridgeProfileEditor(selected);
+  else newBridgeProfile();
+}
+
+async function refreshBridgeConfig() {
+  try {
+    const profiles = await invoke<BridgeProfilesPayload>("bridge_profiles");
+    applyBridgeProfiles(profiles);
+    await refreshBridgeStatus();
+  } catch (e) {
+    setBridgeMessage(`读取 Bridge 配置失败：${String(e)}`);
+  }
+}
+
+async function startBridge(silent = false) {
+  try {
+    await invoke("bridge_start");
+    if (!silent) toast("Bridge 已启动");
+    setBridgeMessage(null);
+  } catch (e) {
+    if (!silent) setBridgeMessage(String(e));
+  } finally {
+    await refreshBridgeStatus();
+  }
+}
+
+async function stopBridge() {
+  try {
+    await invoke("bridge_stop");
+    toast("Bridge 已停止");
+    setBridgeMessage(null);
+  } catch (e) {
+    setBridgeMessage(String(e));
+  } finally {
+    await refreshBridgeStatus();
+  }
+}
+
+async function restartBridge() {
+  try {
+    await invoke("bridge_restart");
+    toast("Bridge 已重启");
+    setBridgeMessage(null);
+  } catch (e) {
+    setBridgeMessage(String(e));
+  } finally {
+    await refreshBridgeStatus();
+  }
+}
+
+async function autoStartBridgeIfReady() {
+  if (bridgeAutoStartAttempted || !hubBaseUrl) return;
+  bridgeAutoStartAttempted = true;
+  try {
+    const payload = await invoke<BridgeProfilesPayload>("bridge_profiles");
+    applyBridgeProfiles(payload);
+    if (payload.profiles.some((p) => p.valid)) {
+      await startBridge(true);
+    }
+  } catch {
+    // The Bridge page shows detailed errors when the user opens it.
+  }
+}
+
+function defaultArgsForTemplate(template: string): string[] {
+  if (template === "codex") return ["exec", "{{MESSAGE}}"];
+  return ["-p", "{{MESSAGE}}"];
+}
+
+function commandForTemplate(template: string): string {
+  if (template === "cursor") return "agent";
+  if (template === "codex") return "codex";
+  if (template === "gemini") return "gemini";
+  return "";
+}
+
+function setTemplateVisibility() {
+  const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
+  const commandRow = $<HTMLElement>(".bridge-command-row");
+  const modelRow = $<HTMLElement>(".bridge-model-row");
+  const newRow = $<HTMLElement>(".bridge-new-session-row");
+  const yamlField = $<HTMLElement>(".bridge-yaml-field");
+  if (commandRow) commandRow.hidden = template === "claude" || template === "custom";
+  if (modelRow) modelRow.hidden = template !== "claude";
+  if (newRow) newRow.hidden = template !== "claude";
+  if (yamlField) yamlField.hidden = template !== "custom";
+}
+
+function fillBridgeProfileEditor(p: BridgeProfileFile) {
+  selectedBridgeProfileId = p.id;
+  $<HTMLInputElement>("#bridge-profile-id")!.value = p.id;
+  $<HTMLSelectElement>("#bridge-template")!.value = p.template;
+  $<HTMLInputElement>("#bridge-cwd")!.value = p.cwd ?? "";
+  $<HTMLInputElement>("#bridge-timeout")!.value = String(p.timeoutSecs || 600);
+  $<HTMLInputElement>("#bridge-max-reply")!.value = String(p.maxReplyChars || 8000);
+  $<HTMLInputElement>("#bridge-model")!.value = p.model ?? "";
+  $<HTMLInputElement>("#bridge-command")!.value = p.command || commandForTemplate(p.template);
+  $<HTMLInputElement>("#bridge-args")!.value = JSON.stringify(p.args.length ? p.args : defaultArgsForTemplate(p.template));
+  $<HTMLTextAreaElement>("#bridge-yaml")!.value = p.yaml || "";
+  setTemplateVisibility();
+  renderBridgeProfiles();
+}
+
+function newBridgeProfile() {
+  selectedBridgeProfileId = null;
+  $<HTMLInputElement>("#bridge-profile-id")!.value = "";
+  $<HTMLSelectElement>("#bridge-template")!.value = "claude";
+  $<HTMLInputElement>("#bridge-cwd")!.value = "";
+  $<HTMLInputElement>("#bridge-timeout")!.value = "600";
+  $<HTMLInputElement>("#bridge-max-reply")!.value = "8000";
+  $<HTMLInputElement>("#bridge-model")!.value = "";
+  $<HTMLInputElement>("#bridge-command")!.value = "";
+  $<HTMLInputElement>("#bridge-args")!.value = JSON.stringify(defaultArgsForTemplate("claude"));
+  $<HTMLTextAreaElement>("#bridge-yaml")!.value = "";
+  setTemplateVisibility();
+  renderBridgeProfiles();
+}
+
+async function saveBridgeProfile() {
+  const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
+  const argsText = $<HTMLInputElement>("#bridge-args")?.value.trim() || "[]";
+  let args: string[] = [];
+  try {
+    args = JSON.parse(argsText);
+    if (!Array.isArray(args) || args.some((x) => typeof x !== "string")) {
+      throw new Error("args must be string[]");
+    }
+  } catch {
+    setBridgeMessage("参数必须是 JSON 字符串数组，例如 [\"-p\", \"{{MESSAGE}}\"]");
+    return;
+  }
+  const req = {
+    originalId: selectedBridgeProfileId,
+    id: $<HTMLInputElement>("#bridge-profile-id")?.value.trim() ?? "",
+    template,
+    cwd: $<HTMLInputElement>("#bridge-cwd")?.value.trim() ?? "",
+    timeoutSecs: Number($<HTMLInputElement>("#bridge-timeout")?.value || "600"),
+    maxReplyChars: Number($<HTMLInputElement>("#bridge-max-reply")?.value || "8000"),
+    model: $<HTMLInputElement>("#bridge-model")?.value.trim() || null,
+    command: $<HTMLInputElement>("#bridge-command")?.value.trim() || commandForTemplate(template),
+    args,
+    yaml: $<HTMLTextAreaElement>("#bridge-yaml")?.value ?? "",
+    includeNewSession: $<HTMLInputElement>("#bridge-include-new")?.checked ?? true,
+  };
+  try {
+    const saved = await invoke<BridgeProfileFile>("bridge_save_profile", { req });
+    selectedBridgeProfileId = saved.id;
+    toast("Profile 已保存");
+    await refreshBridgeConfig();
+  } catch (e) {
+    setBridgeMessage(String(e));
+  }
+}
+
+async function deleteBridgeProfile() {
+  if (!selectedBridgeProfileId) return;
+  if (!window.confirm(`删除 profile「${selectedBridgeProfileId}」？`)) return;
+  try {
+    await invoke("bridge_delete_profile", { id: selectedBridgeProfileId });
+    selectedBridgeProfileId = null;
+    toast("Profile 已删除");
+    await refreshBridgeConfig();
+  } catch (e) {
+    setBridgeMessage(String(e));
+  }
+}
+
 function renderClientsEmpty(note: string) {
   const statusEl = $("#clients-status");
   const listEl = $<HTMLUListElement>("#client-list");
@@ -356,7 +711,10 @@ function applyHubInfo(info: HubInfo) {
     bindHint?.setAttribute("hidden", "");
     if (btnStop) btnStop.disabled = false;
     startClientPolling();
+    startBridgePolling();
     void refreshStats();
+    void refreshBridgeConfig();
+    void autoStartBridgeIfReady();
   } else {
     hubBaseUrl = "";
     if (hubUrlEl) hubUrlEl.textContent = "—";
@@ -372,6 +730,7 @@ function applyHubInfo(info: HubInfo) {
     bindHint?.removeAttribute("hidden");
     if (btnStop) btnStop.disabled = false;
     stopClientPolling();
+    stopBridgePolling();
     clearStatsUi();
     renderClientsEmpty("服务就绪后将自动刷新列表。");
   }
@@ -445,20 +804,27 @@ async function registerBackend() {
   }
 }
 
-function setActiveTab(which: "home" | "backends") {
+function setActiveTab(which: "home" | "backends" | "bridge") {
   const tabHome = $<HTMLButtonElement>("#tab-home");
   const tabBack = $<HTMLButtonElement>("#tab-backends");
+  const tabBridge = $<HTMLButtonElement>("#tab-bridge");
   const panelHome = $<HTMLElement>("#panel-home");
   const panelBack = $<HTMLElement>("#panel-backends");
-  if (!tabHome || !tabBack || !panelHome || !panelBack) return;
+  const panelBridge = $<HTMLElement>("#panel-bridge");
+  if (!tabHome || !tabBack || !tabBridge || !panelHome || !panelBack || !panelBridge) return;
 
   const isHome = which === "home";
+  const isBackends = which === "backends";
+  const isBridge = which === "bridge";
   tabHome.setAttribute("aria-selected", String(isHome));
-  tabBack.setAttribute("aria-selected", String(!isHome));
+  tabBack.setAttribute("aria-selected", String(isBackends));
+  tabBridge.setAttribute("aria-selected", String(isBridge));
   panelHome.hidden = !isHome;
-  panelBack.hidden = isHome;
+  panelBack.hidden = !isBackends;
+  panelBridge.hidden = !isBridge;
 
-  if (!isHome) void refreshClients();
+  if (isBackends) void refreshClients();
+  if (isBridge) void refreshBridgeConfig();
 }
 
 window.addEventListener("DOMContentLoaded", () => {
@@ -466,6 +832,7 @@ window.addEventListener("DOMContentLoaded", () => {
 
   $("#tab-home")?.addEventListener("click", () => setActiveTab("home"));
   $("#tab-backends")?.addEventListener("click", () => setActiveTab("backends"));
+  $("#tab-bridge")?.addEventListener("click", () => setActiveTab("bridge"));
 
   $("#btn-copy-hub-url")?.addEventListener("click", async (e) => {
     if (!hubBaseUrl) return;
@@ -491,6 +858,32 @@ window.addEventListener("DOMContentLoaded", () => {
     if (lastRegEnv) void copyToClipboard(lastRegEnv, "连接配置已复制");
   });
 
+  $("#btn-copy-bridge-path")?.addEventListener("click", () => {
+    if (bridgeConfigPath) void copyToClipboard(bridgeConfigPath, "配置路径已复制");
+  });
+
+  $("#btn-new-profile")?.addEventListener("click", () => newBridgeProfile());
+  $("#btn-save-profile")?.addEventListener("click", () => void saveBridgeProfile());
+  $("#btn-delete-profile")?.addEventListener("click", () => void deleteBridgeProfile());
+  $("#bridge-template")?.addEventListener("change", () => {
+    const template = $<HTMLSelectElement>("#bridge-template")?.value ?? "claude";
+    const command = $<HTMLInputElement>("#bridge-command");
+    const args = $<HTMLInputElement>("#bridge-args");
+    if (command) command.value = commandForTemplate(template);
+    if (args) args.value = JSON.stringify(defaultArgsForTemplate(template));
+    setTemplateVisibility();
+  });
+  $("#bridge-profile-list")?.addEventListener("click", (e) => {
+    const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".bridge-profile-item");
+    const id = btn?.dataset.profileId;
+    if (!id) return;
+    const profile = bridgeProfiles.find((p) => p.id === id);
+    if (profile) fillBridgeProfileEditor(profile);
+  });
+  $("#btn-bridge-start")?.addEventListener("click", () => void startBridge());
+  $("#btn-bridge-stop")?.addEventListener("click", () => void stopBridge());
+  $("#btn-bridge-restart")?.addEventListener("click", () => void restartBridge());
+
   $("#client-list")?.addEventListener("click", async (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>(".client-copy");
     if (!btn) return;
@@ -509,6 +902,7 @@ window.addEventListener("DOMContentLoaded", () => {
     );
     if (!ok) return;
     try {
+      await invoke("bridge_stop");
       await invoke("stop_hub");
       setHubState("stopped", "已发送停止指令…");
       const btnStop = $<HTMLButtonElement>("#btn-stop");
@@ -527,7 +921,9 @@ window.addEventListener("DOMContentLoaded", () => {
     setHubState("error", "启动失败或服务已异常退出");
     hideQrModal();
     stopClientPolling();
+    stopBridgePolling();
     clearStatsUi();
+    void refreshBridgeStatus();
     void refreshHubInfo();
   });
 
@@ -538,7 +934,9 @@ window.addEventListener("DOMContentLoaded", () => {
     $("#hero-hub-url")?.setAttribute("hidden", "");
     hideQrModal();
     stopClientPolling();
+    stopBridgePolling();
     clearStatsUi();
+    void refreshBridgeStatus();
     renderClientsEmpty("服务已停止。");
   });
 

@@ -141,6 +141,43 @@ ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 
 完整示例：[multi-profile.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/multi-profile.example.yaml)。
 
+### Profile 目录（manager 模式，每个文件一个 workspace）
+
+如果你希望 bridge profile 像插件一样自由增删，可以使用 manager 模式：
+
+```bash
+ilink-hub-bridge manager
+```
+
+默认目录：
+
+| 用途 | 路径 |
+|------|------|
+| profile YAML | `~/.ilink-hub-bridge/profiles/*.yaml` / `*.yml` |
+| 每个 profile 的凭证 | `~/.ilink-hub-bridge/credentials/<profile>.json` |
+
+每个 YAML 文件仍然使用现有 bridge YAML 格式，不需要新增字段。manager 会按文件名派生 workspace / register name，例如：
+
+```text
+~/.ilink-hub-bridge/profiles/claude-work.yaml  →  workspace: claude-work
+~/.ilink-hub-bridge/profiles/codex-demo.yml    →  workspace: codex-demo
+```
+
+manager 只做进程管理：它会为每个有效 YAML 启动一个真实的 `ilink-hub-bridge --config ...` 子进程，并使用独立 `--cred-file` 和 `--register-name`。子进程异常退出后会退避重启；文件被修改会重启对应子进程；文件被删除会停止对应子进程。
+
+可选参数：
+
+| 参数 | 说明 |
+|------|------|
+| `--profiles-dir <dir>` | 覆盖 profile 目录 |
+| `--credentials-dir <dir>` | 覆盖每个 profile 的凭证目录 |
+| `--scan-interval-secs <n>` | 扫描目录间隔，默认 5 秒 |
+| `--restart-backoff-secs <n>` | 子进程退出后的最小重启间隔，默认 5 秒 |
+| `--max-restart-backoff-secs <n>` | 子进程反复退出时的指数退避上限，默认 60 秒 |
+| `--force-register` | 透传给每个子 bridge，用于清理损坏凭证后重新注册 |
+
+注意：manager 模式会忽略 `--token` / `WEIXIN_TOKEN`、`--cred-file`、`--register-name` 和 `--pair`，避免多个 profile 意外共享同一个 workspace 身份。Hub 如开启管理鉴权，仍可通过 `ILINK_ADMIN_TOKEN` 让每个子 bridge 自动注册。
+
 ## 配置字段（单 Profile 根级，或 `profiles.<name>` 内）
 
 | 字段 | 类型 | 默认 | 说明 |
@@ -150,7 +187,7 @@ ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 | `stdin` | `none` / `message` | `none` | `message` 时将用户消息全文以 UTF-8 写入子进程 stdin |
 | `cwd` | string | 不设置 | 子进程工作目录。可与 CLI 一样使用下方**占位符**（例如按 `{{SESSION_ID}}` 分目录；目录需已存在或由你的脚本创建） |
 | `env` | map | `{}` | 额外环境变量（值支持占位符） |
-| `timeout_secs` | number | `300` | 单条消息等待子进程的最长时间（秒） |
+| `timeout_secs` | number | `1800` | 单条消息等待子进程的最长时间（秒） |
 | `max_reply_chars` | number | `8000` | 回复按 **Unicode 字符数** 截断上限 |
 | `truncation_suffix` | string | `…(输出已截断)` | 超长时在末尾追加的提示 |
 | `skip_bot_messages` | bool | `true` | 忽略 `message_type == 2`（机器人侧消息），避免回路 |

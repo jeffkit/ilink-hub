@@ -3,7 +3,7 @@
 本指南带你完成 iLink Hub 的安装、启动和客户端接入。
 
 ::: tip 不想用终端？
-直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。
+直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。桌面端的「Bridge」页也可以创建 Claude Code Profile、启动 / 停止 Bridge，并沿用 `~/.ilink-hub/ilink-hub-bridge.yaml`。
 :::
 
 ::: warning 使用前确认
