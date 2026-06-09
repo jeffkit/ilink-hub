@@ -594,9 +594,7 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// Resolve the executable for built-in self-invocation (`ilink-hub-bridge profile …`).
 fn resolve_spawn_command(command: &str) -> String {
     if command == "ilink-hub-bridge" {
-        return resolve_bridge_executable()
-            .to_string_lossy()
-            .into_owned();
+        return resolve_bridge_executable().to_string_lossy().into_owned();
     }
     command.to_string()
 }
