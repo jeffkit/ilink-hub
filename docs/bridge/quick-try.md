@@ -9,7 +9,7 @@
 
 ## 你需要
 
-- 微信中已开启 **ClawBot（龙虾插件）**（更新微信到最新版，进入「我 → 设置 → 插件」开启；若没有则运行 `npx -y @tencent-weixin/openclaw-weixin-cli@latest install`）
+- 微信中已开启 **ClawBot（龙虾插件）**（更新微信到最新版，进入「我 → 设置 → 插件」开启）
 - macOS 上已安装 [Homebrew](https://brew.sh/)（没有的话在终端运行 `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"` 安装）
 
 ---

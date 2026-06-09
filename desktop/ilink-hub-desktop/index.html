@@ -24,6 +24,7 @@
       <div class="tabbar" role="tablist" aria-label="主功能">
         <button type="button" class="tab" role="tab" id="tab-home" aria-controls="panel-home" aria-selected="true">首页</button>
         <button type="button" class="tab" role="tab" id="tab-backends" aria-controls="panel-backends" aria-selected="false">后端</button>
+        <button type="button" class="tab" role="tab" id="tab-bridge" aria-controls="panel-bridge" aria-selected="false">Bridge</button>
       </div>
 
       <main class="content">
@@ -79,6 +80,15 @@
               <code>ILINK_HUB_ADDR=127.0.0.1:8770</code> 后重启本应用。
             </p>
           </section>
+
+          <footer class="actions">
+            <button type="button" id="btn-stop" class="btn btn-danger btn-block" disabled>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+              停止服务
+            </button>
+          </footer>
         </div>
 
         <div id="panel-backends" class="tab-panel" role="tabpanel" aria-labelledby="tab-backends" hidden>
@@ -151,17 +161,112 @@
           </section>
         </div>
 
+        <div id="panel-bridge" class="tab-panel" role="tabpanel" aria-labelledby="tab-bridge" hidden>
+          <section class="block bridge-unified">
+            <header class="be-header">
+              <div class="be-header-main">
+                <h2 class="be-title">Bridge Profiles</h2>
+                <p class="be-lead">把多个本机 CLI profile 作为独立 workspace 接入 Hub。</p>
+              </div>
+              <span class="bridge-state" id="bridge-state">未启动</span>
+            </header>
+
+            <div class="bridge-card">
+              <span class="addr-label">Profiles 目录</span>
+              <div class="addr-row">
+                <code id="bridge-config-path" class="addr-value">—</code>
+                <button type="button" id="btn-copy-bridge-path" class="icon-btn" title="复制路径" aria-label="复制 Bridge 配置路径">
+                  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <rect x="9" y="9" width="11" height="11" rx="2" />
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+                  </svg>
+                </button>
+              </div>
+              <p id="bridge-summary" class="hero-sub">尚未读取配置。</p>
+              <p id="bridge-msg" class="form-msg" hidden></p>
+              <div class="bridge-actions">
+                <button type="button" id="btn-new-profile" class="btn btn-primary btn-sm">新建 Profile</button>
+                <button type="button" id="btn-bridge-start" class="btn btn-primary btn-sm">启动</button>
+                <button type="button" id="btn-bridge-restart" class="btn btn-ghost btn-sm">重启</button>
+                <button type="button" id="btn-bridge-stop" class="btn btn-ghost btn-sm">停止</button>
+              </div>
+            </div>
+
+            <div class="bridge-manager-grid">
+              <aside class="bridge-profile-list" id="bridge-profile-list" aria-label="Bridge profile 列表"></aside>
+
+              <div class="form bridge-form bridge-profile-editor">
+                <div class="form-row">
+                  <label class="field">
+                    <span class="field-label">Workspace 名</span>
+                    <input type="text" id="bridge-profile-id" placeholder="claude-work" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">快捷模板</span>
+                    <select id="bridge-template">
+                      <option value="claude">Claude Code</option>
+                      <option value="cursor">Cursor Agent</option>
+                      <option value="codex">Codex</option>
+                      <option value="gemini">Gemini</option>
+                      <option value="custom">Custom YAML</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="form-row">
+                  <label class="field field-wide">
+                    <span class="field-label">项目目录</span>
+                    <input type="text" id="bridge-cwd" placeholder="/Users/you/projects/my-agent" autocomplete="off" spellcheck="false" />
+                  </label>
+                </div>
+                <div class="form-row bridge-command-row">
+                  <label class="field">
+                    <span class="field-label">命令</span>
+                    <input type="text" id="bridge-command" placeholder="agent / codex / gemini" autocomplete="off" spellcheck="false" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">参数（JSON 数组）</span>
+                    <input type="text" id="bridge-args" placeholder='["-p", "{{MESSAGE}}"]' autocomplete="off" spellcheck="false" />
+                  </label>
+                </div>
+                <div class="form-row">
+                  <label class="field">
+                    <span class="field-label">超时时间（秒）</span>
+                    <input type="number" id="bridge-timeout" min="1" step="1" value="600" />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">最长回复字符数</span>
+                    <input type="number" id="bridge-max-reply" min="1" step="100" value="8000" />
+                  </label>
+                </div>
+                <div class="form-row bridge-model-row">
+                  <label class="field field-wide">
+                    <span class="field-label">模型（Claude 可选）</span>
+                    <input type="text" id="bridge-model" placeholder="例如 sonnet；留空使用 CLI 默认值" autocomplete="off" spellcheck="false" />
+                  </label>
+                </div>
+                <label class="check-row bridge-new-session-row">
+                  <input type="checkbox" id="bridge-include-new" checked />
+                  <span>为 Claude Code 生成 <code>/new</code> 临时会话路由</span>
+                </label>
+                <label class="field field-wide bridge-yaml-field">
+                  <span class="field-label">高级 YAML</span>
+                  <textarea id="bridge-yaml" class="yaml-editor" spellcheck="false" placeholder="Custom YAML 或模板生成结果会显示在这里。"></textarea>
+                </label>
+                <div class="bridge-actions">
+                  <button type="button" id="btn-save-profile" class="btn btn-primary btn-sm">保存 Profile</button>
+                  <button type="button" id="btn-delete-profile" class="btn btn-ghost btn-sm">删除</button>
+                </div>
+                <p class="register-hint" id="bridge-template-hint">
+                  每个 YAML 文件会注册成一个独立 workspace；保存后 manager 会自动扫描并启动。
+                </p>
+              </div>
+            </div>
+          </section>
+        </div>
+
         <p id="error-line" class="error" hidden></p>
       </main>
 
-      <footer class="actions">
-        <button type="button" id="btn-stop" class="btn btn-danger btn-block" disabled>
-          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <rect x="6" y="6" width="12" height="12" rx="2" />
-          </svg>
-          停止服务
-        </button>
-      </footer>
     </div>
 
     <div id="qr-modal" class="modal" hidden aria-modal="true" role="dialog">

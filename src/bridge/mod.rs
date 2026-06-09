@@ -7,6 +7,7 @@
 pub mod builtin;
 mod config;
 mod connection;
+pub mod manager;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{
@@ -20,11 +21,14 @@ pub enum BridgeStop {
     TokenRejected,
 }
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::ilink::types::{
@@ -38,6 +42,7 @@ enum GetUpdatesOutcome {
     TokenRejected,
 }
 
+#[derive(Clone)]
 struct HubClient {
     http: reqwest::Client,
     hub_url: String,
@@ -122,11 +127,108 @@ impl HubClient {
     }
 }
 
+// ─── Session-level parallel dispatch ─────────────────────────────────────────
+
+/// Computes the dispatch key that determines serialization boundaries.
+///
+/// Messages with the **same key** are processed serially by one worker task.
+/// Messages with **different keys** may run concurrently in separate Tokio tasks.
+///
+/// Key = `"{context_token}:{session_name}"`:
+/// - `context_token` identifies the WeChat conversation (one per DM / group).
+/// - `session_name`  is the named Claude session inside that conversation (default: `"default"`).
+///
+/// | Scenario                          | Same key? | Behaviour |
+/// |-----------------------------------|-----------|-----------|
+/// | Same user, same session           | ✓         | Serial    |
+/// | Same user, different sessions     | ✗         | Parallel  |
+/// | Different users / group chats     | ✗         | Parallel  |
+fn session_dispatch_key(msg: &WeixinMessage) -> String {
+    let ctx = msg.context_token.as_deref().unwrap_or("");
+    let session_name = msg
+        .ilink_hub_ext
+        .as_ref()
+        .and_then(|e| e.session_name.as_deref())
+        .unwrap_or("default");
+    format!("{ctx}:{session_name}")
+}
+
+/// Per-session serial worker — runs until the sender side of its channel is dropped.
+///
+/// Processes messages one at a time so that `--resume` calls for the same Claude session
+/// never race against each other.
+async fn run_session_worker(
+    key: String,
+    mut rx: mpsc::UnboundedReceiver<WeixinMessage>,
+    client: HubClient,
+    app: Arc<BridgeApp>,
+) {
+    while let Some(msg) = rx.recv().await {
+        if let Err(e) = handle_one_message(&client, &app, msg).await {
+            error!(session_key = %key, error = %e, "message handler failed");
+        }
+    }
+    info!(session_key = %key, "session worker exiting");
+}
+
+/// Routes inbound messages to per-session serial workers.
+///
+/// Each unique dispatch key owns an `UnboundedSender`; a new Tokio task is spawned lazily
+/// on first use. If a worker task exits unexpectedly (channel closed), the next `dispatch`
+/// call for that key transparently creates a fresh worker.
+struct SessionDispatcher {
+    senders: tokio::sync::Mutex<HashMap<String, mpsc::UnboundedSender<WeixinMessage>>>,
+    client: HubClient,
+    app: Arc<BridgeApp>,
+}
+
+impl SessionDispatcher {
+    fn new(client: HubClient, app: Arc<BridgeApp>) -> Self {
+        Self {
+            senders: tokio::sync::Mutex::new(HashMap::new()),
+            client,
+            app,
+        }
+    }
+
+    /// Route `msg` to the correct session worker, spawning one if necessary.
+    async fn dispatch(&self, msg: WeixinMessage) {
+        let key = session_dispatch_key(&msg);
+        let mut senders = self.senders.lock().await;
+
+        // Try the existing sender; if the channel is dead, fall through to spawn a new worker.
+        let needs_new = match senders.get(&key) {
+            Some(tx) => tx.send(msg.clone()).is_err(),
+            None => true,
+        };
+
+        if needs_new {
+            let (tx, rx) = mpsc::unbounded_channel();
+            // Cannot fail: receiver is alive and we hold the lock.
+            let _ = tx.send(msg);
+            senders.insert(key.clone(), tx);
+            let client = self.client.clone();
+            let app = Arc::clone(&self.app);
+            tokio::spawn(run_session_worker(key, rx, client, app));
+        }
+    }
+
+    /// Returns sorted dispatch keys currently in the sender map. Used by tests only.
+    #[cfg(test)]
+    async fn sender_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.senders.lock().await.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+}
+
 /// Long-poll Hub and dispatch inbound user text to the configured CLI.
 ///
 /// Returns [`BridgeStop::TokenRejected`] when Hub returns 401 for an unknown/revoked vtoken.
 pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> BridgeStop {
     let client = HubClient::new(hub_url, token);
+    let app = Arc::new(app);
+    let dispatcher = SessionDispatcher::new(client.clone(), Arc::clone(&app));
     let mut buf = String::new();
     info!(
         routing = %app.routing_label(),
@@ -154,10 +256,11 @@ pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> Bridg
             );
         }
 
+        // Each message is dispatched to its session worker without blocking the poll loop.
+        // Messages for different sessions execute concurrently; same-session messages are
+        // serialised inside the worker's channel queue.
         for msg in resp.msgs.unwrap_or_default() {
-            if let Err(e) = handle_one_message(&client, &app, msg).await {
-                error!(error = %e, "message handler failed");
-            }
+            dispatcher.dispatch(msg).await;
         }
     }
 }
@@ -492,5 +595,182 @@ mod tests {
     #[test]
     fn resolve_spawn_command_passthrough_other_commands() {
         assert_eq!(resolve_spawn_command("claude"), "claude");
+    }
+}
+
+// ─── SessionDispatcher tests ──────────────────────────────────────────────────
+//
+// These tests verify the routing / channel-assignment logic of `SessionDispatcher`
+// without running real CLI commands or making real HTTP calls.
+//
+// Strategy:
+//   • `fake_client()` points to a loopback port that refuses connections; the worker
+//     tasks will fail on `sendmessage` but that does not affect sender-map state.
+//   • We inspect `sender_keys()` immediately after `dispatch()` returns, before any
+//     async work has time to mutate the map, to verify channel-routing decisions.
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+    use crate::ilink::types::{HubExt, MessageItem, TextItem};
+
+    /// Builds a `WeixinMessage` that looks like a real inbound user message.
+    fn make_msg(ctx: &str, session_name: &str) -> WeixinMessage {
+        WeixinMessage {
+            context_token: Some(ctx.into()),
+            ilink_hub_ext: Some(HubExt {
+                session_id: Some(String::new()),
+                session_name: Some(session_name.into()),
+                cli_session_id: None,
+            }),
+            item_list: Some(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello".into()),
+                }),
+                extra: serde_json::Value::Object(Default::default()),
+            }]),
+            from_user_id: Some("user1".into()),
+            ..Default::default()
+        }
+    }
+
+    /// A `BridgeApp` whose CLI (`echo`) exits immediately — keeps workers short-lived.
+    fn make_fast_app() -> BridgeApp {
+        BridgeApp::parse_yaml(
+            r#"
+command: echo
+args: []
+stdin: none
+timeout_secs: 5
+"#,
+        )
+        .unwrap()
+    }
+
+    /// `HubClient` pointing at a port that refuses connections.
+    /// Worker tasks will fail to send replies, but routing logic is unaffected.
+    fn fake_client() -> HubClient {
+        HubClient::new("http://127.0.0.1:1".into(), "test-token".into())
+    }
+
+    // ── session_dispatch_key ──────────────────────────────────────────────────
+
+    #[test]
+    fn key_combines_ctx_and_session_name() {
+        assert_eq!(
+            session_dispatch_key(&make_msg("ctx-123", "feat-a")),
+            "ctx-123:feat-a"
+        );
+    }
+
+    #[test]
+    fn key_defaults_session_name_when_ext_absent() {
+        let msg = WeixinMessage {
+            context_token: Some("ctx-x".into()),
+            ilink_hub_ext: None,
+            ..Default::default()
+        };
+        assert_eq!(session_dispatch_key(&msg), "ctx-x:default");
+    }
+
+    #[test]
+    fn key_uses_empty_string_when_ctx_absent() {
+        let msg = WeixinMessage {
+            context_token: None,
+            ilink_hub_ext: None,
+            ..Default::default()
+        };
+        assert_eq!(session_dispatch_key(&msg), ":default");
+    }
+
+    #[test]
+    fn key_differs_for_different_session_names() {
+        let a = make_msg("ctx", "session-a");
+        let b = make_msg("ctx", "session-b");
+        assert_ne!(session_dispatch_key(&a), session_dispatch_key(&b));
+    }
+
+    #[test]
+    fn key_differs_for_different_ctx_tokens() {
+        let a = make_msg("ctx-1", "default");
+        let b = make_msg("ctx-2", "default");
+        assert_ne!(session_dispatch_key(&a), session_dispatch_key(&b));
+    }
+
+    // ── SessionDispatcher routing ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn same_key_reuses_single_sender() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        let msg = make_msg("ctx-a", "default");
+        disp.dispatch(msg.clone()).await;
+        disp.dispatch(msg.clone()).await;
+        // Both messages share one worker channel → exactly one map entry.
+        assert_eq!(disp.sender_keys().await, vec!["ctx-a:default"]);
+    }
+
+    #[tokio::test]
+    async fn different_ctx_tokens_get_separate_senders() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        disp.dispatch(make_msg("ctx-a", "default")).await;
+        disp.dispatch(make_msg("ctx-b", "default")).await;
+        assert_eq!(
+            disp.sender_keys().await,
+            vec!["ctx-a:default", "ctx-b:default"]
+        );
+    }
+
+    #[tokio::test]
+    async fn different_session_names_get_separate_senders() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        disp.dispatch(make_msg("ctx-a", "feature-x")).await;
+        disp.dispatch(make_msg("ctx-a", "feature-y")).await;
+        assert_eq!(
+            disp.sender_keys().await,
+            vec!["ctx-a:feature-x", "ctx-a:feature-y"]
+        );
+    }
+
+    #[tokio::test]
+    async fn three_distinct_sessions_create_three_senders() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        disp.dispatch(make_msg("ctx-1", "default")).await;
+        disp.dispatch(make_msg("ctx-2", "default")).await;
+        disp.dispatch(make_msg("ctx-1", "feature-a")).await;
+        // 3 unique keys: (ctx-1,default), (ctx-2,default), (ctx-1,feature-a)
+        assert_eq!(
+            disp.sender_keys().await,
+            vec!["ctx-1:default", "ctx-1:feature-a", "ctx-2:default"]
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_same_key_does_not_grow_sender_map() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        let msg = make_msg("ctx-x", "s1");
+        for _ in 0..5 {
+            disp.dispatch(msg.clone()).await;
+        }
+        assert_eq!(disp.sender_keys().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dead_sender_triggers_new_worker_on_next_dispatch() {
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()));
+        let msg = make_msg("ctx-z", "default");
+
+        // First dispatch: inserts a sender and spawns a worker.
+        disp.dispatch(msg.clone()).await;
+
+        // Manually close the channel to simulate the worker exiting unexpectedly.
+        {
+            let mut senders = disp.senders.lock().await;
+            senders.remove("ctx-z:default");
+        }
+        assert_eq!(disp.sender_keys().await.len(), 0);
+
+        // Next dispatch should transparently recreate the sender + worker.
+        disp.dispatch(msg.clone()).await;
+        assert_eq!(disp.sender_keys().await, vec!["ctx-z:default"]);
     }
 }

@@ -61,10 +61,6 @@ iLink Hub 依赖微信官方内置的 **ClawBot** 功能，**无需申请审核*
 **开启步骤：**
 1. 将微信更新到最新版本（iOS 8.0.70+ / Android 8.0.68+）
 2. 进入「我 → 设置 → 插件」，找到 ClawBot 并开启
-3. 若插件列表里暂时没有，在终端运行以下命令手动安装：
-   ```bash
-   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
-   ```
 
 > 没有开启 ClawBot，Hub 无法连接微信。开启后再继续后面的步骤。
 

@@ -104,7 +104,7 @@ pub struct BridgeProfile {
 }
 
 fn default_timeout_secs() -> u64 {
-    300
+    1800
 }
 
 fn default_max_reply_chars() -> usize {
@@ -332,6 +332,17 @@ impl BridgeApp {
         let mut v: Vec<&str> = self.profiles.keys().map(|s| s.as_str()).collect();
         v.sort();
         v
+    }
+
+    pub fn profile(&self, name: &str) -> Option<&BridgeProfile> {
+        self.profiles.get(name)
+    }
+
+    pub fn default_profile_name(&self) -> &str {
+        match &self.routing {
+            RoutingState::Fixed(name) => name,
+            RoutingState::Prefix { default, .. } => default,
+        }
     }
 
     pub fn routing_label(&self) -> &'static str {

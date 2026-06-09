@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub"
-version = "0.1.10"
+version = "0.1.18"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2085,7 +2085,6 @@ name = "ilink-hub-desktop"
 version = "0.1.10"
 dependencies = [
  "anyhow",
- "dirs 5.0.1",
  "ilink-hub",
  "reqwest 0.12.28",
  "serde",
