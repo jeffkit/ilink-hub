@@ -1204,7 +1204,7 @@ fn start_bridge_task(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn bridge_start(app: tauri::AppHandle) -> Result<(), String> {
+async fn bridge_start(app: tauri::AppHandle) -> Result<(), String> {
     start_bridge_task(&app)
 }
 
@@ -1224,7 +1224,7 @@ fn bridge_stop(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn bridge_restart(app: tauri::AppHandle) -> Result<(), String> {
+async fn bridge_restart(app: tauri::AppHandle) -> Result<(), String> {
     bridge_stop(app.clone())?;
     start_bridge_task(&app)
 }
