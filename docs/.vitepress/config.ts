@@ -23,7 +23,7 @@ export default defineConfig({
       { text: 'Bridge', link: '/bridge/' },
       { text: '常见问题', link: '/guide/faq' },
       {
-        text: 'v0.1.18',
+        text: 'v0.1.19',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -50,6 +50,7 @@ export default defineConfig({
           { text: '接入 Claude Code ✨', link: '/guide/claude-code' },
           { text: '使用指引（多 CLI / 多项目）', link: '/bridge/USAGE' },
           { text: '功能与配置参考', link: '/bridge/README' },
+          { text: '连接远程 Hub（SSH / launchd）', link: '/bridge/remote-hub' },
           {
             text: '开发自定义 Profile',
             collapsed: true,
@@ -75,6 +76,7 @@ export default defineConfig({
         text: '部署',
         items: [
           { text: 'Docker 部署', link: '/deployment/docker' },
+          { text: 'Linux / VPS 部署（systemd）', link: '/deployment/linux-systemd' },
           { text: '安全建议', link: '/deployment/security' },
         ],
       },

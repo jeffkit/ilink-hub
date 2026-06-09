@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.19] — 2026-06-09
+
+### Login — QR 登录稳定性修复
+
+**修复**
+
+- **QR 登录超时过短**：`get_qrcode_status` 是长轮询接口，服务端会持有连接约 30 秒后返回。原 `reqwest` 客户端超时恰好也是 30 秒，导致请求被客户端提前断开，轮询循环报错退出，服务器端（大陆外）尤为明显。现将客户端超时从 30 秒提高至 120 秒。
+- **网络错误未重试**：`send().await` 出现网络层错误时会将错误向上传播，终止整个 QR 登录流程。现改为捕获错误、打印 `warn!` 并在 2 秒后重试，与解析错误处理一致。
+- **轮询次数与时间窗口调整**：`MAX_ATTEMPTS` 从 120 调整为 60，配合每次最长 120 秒的超时，总等待窗口约 30 分钟，足够用户扫码。
+
+### 文档 — 服务器部署与 Bridge 远程连接
+
+**新增**
+
+- **Linux / VPS 部署（systemd）**：新增 `docs/deployment/linux-systemd.md`，覆盖从源码编译、创建 systemd 服务、首次微信登录（Token 复用 / 终端扫码 / 本地代扫）到版本更新全流程。
+- **Bridge 连接远程 Hub**：新增 `docs/bridge/remote-hub.md`，覆盖公网直连、SSH 端口转发、macOS launchd 持久化（SSH 隧道 + Bridge Manager 双服务）及 Linux systemd 持久化方案，含 PATH 配置注意事项和排查命令。
+
 ## [0.1.18] — 2026-06-09
 
 ### Hub — 安全与稳定性修复

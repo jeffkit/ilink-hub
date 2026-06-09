@@ -30,7 +30,7 @@ impl LoginClient {
     pub fn new(base_url: Option<String>) -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(30))
+                .timeout(Duration::from_secs(120))
                 .build()
                 .expect("http client"),
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
@@ -110,29 +110,30 @@ impl LoginClient {
             self.base_url, key
         );
         let mut attempts = 0u32;
-        const MAX_ATTEMPTS: u32 = 120; // 2 minutes
+        // Each poll may be a long-poll (~30s server hold); allow up to 60 retries (~30min window).
+        const MAX_ATTEMPTS: u32 = 60;
 
         loop {
             if attempts >= MAX_ATTEMPTS {
-                return Err(anyhow!("QR login timed out (120s)"));
+                return Err(anyhow!("QR login timed out after {} attempts", MAX_ATTEMPTS));
             }
             attempts += 1;
 
             tokio::time::sleep(Duration::from_secs(1)).await;
 
-            let resp = match self
-                .client
-                .get(&url)
-                .send()
-                .await?
-                .json::<QrcodeStatusResponse>()
-                .await
-            {
-                Ok(r) => r,
+            let resp = match self.client.get(&url).send().await {
                 Err(e) => {
-                    warn!(error = %e, "error polling qrcode status");
+                    warn!(error = %e, "network error polling qrcode status, retrying");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
+                Ok(r) => match r.json::<QrcodeStatusResponse>().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!(error = %e, "error parsing qrcode status response, retrying");
+                        continue;
+                    }
+                },
             };
 
             match resp.status.as_deref() {
