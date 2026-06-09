@@ -54,15 +54,19 @@ iLink Hub ← 唯一和微信通信的程序
 
 ## 使用前必须准备的东西
 
-### 微信 iLink（ClawBot）账号
+### 开启微信 ClawBot（龙虾插件）
 
-iLink Hub 本身免费开源，但它依赖**微信官方的 iLink 接口**，这个接口需要单独申请。
+iLink Hub 依赖微信官方内置的 **ClawBot** 功能，**无需申请审核**，更新微信即可开启。
 
-- **申请地址**：[ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com)
-- **审核时间**：通常 1-3 个工作日
-- **费用**：申请本身免费，具体服务条款以微信官方为准
+**开启步骤：**
+1. 将微信更新到最新版本（iOS 8.0.70+ / Android 8.0.68+）
+2. 进入「我 → 设置 → 插件」，找到 ClawBot 并开启
+3. 若插件列表里暂时没有，在终端运行以下命令手动安装：
+   ```bash
+   npx -y @tencent-weixin/openclaw-weixin-cli@latest install
+   ```
 
-> 还没有申请？先去申请，审核通过后再回来继续。没有 iLink 账号，Hub 无法连接微信。
+> 没有开启 ClawBot，Hub 无法连接微信。开启后再继续后面的步骤。
 
 ### 一台可以运行程序的机器
 

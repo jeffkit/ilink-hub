@@ -44,11 +44,11 @@ features:
 
 ## 使用前，你需要准备一件事
 
-iLink Hub 依赖微信官方的 **iLink（ClawBot）接口**——这是微信开放给 AI 工具的专属通道，需要单独申请开通。
+iLink Hub 依赖微信官方的 **ClawBot（龙虾插件）** 功能——这是微信内置的 AI 插件通道，**无需申请，更新微信即可使用**。
 
-> **还没有 iLink 账号？** 前往 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 按照官方指引申请，通常需要 1-3 个工作日审核。
+> **还没开启 ClawBot？** 将微信更新到最新版本，进入「我 → 设置 → 插件」找到 ClawBot 并开启即可。若插件列表里暂时没有，可运行 `npx -y @tencent-weixin/openclaw-weixin-cli@latest install` 手动安装。
 
-已经有 iLink 账号了？选择下面适合你的方式开始：
+已经开启了？选择下面适合你的方式开始：
 
 | 我的情况 | 推荐路径 |
 |----------|---------|

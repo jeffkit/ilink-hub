@@ -7,7 +7,7 @@
 :::
 
 ::: warning 使用前确认
-你需要一个**已开通 iLink（ClawBot）的微信账号**。还没有？前往 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，通常 1-3 个工作日审核完成。
+你需要在微信中开启 **ClawBot（龙虾插件）**。更新微信到最新版，进入「我 → 设置 → 插件」开启即可，无需申请审核。若插件列表里没有，运行 `npx -y @tencent-weixin/openclaw-weixin-cli@latest install` 手动安装。
 :::
 
 ---

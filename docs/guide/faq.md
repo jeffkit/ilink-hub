@@ -17,9 +17,9 @@
 
 ### Q: 使用前需要准备什么？
 
-必须有一个**已开通 iLink（ClawBot）的微信账号**。这是微信官方的 AI 机器人接口，需要在 [ilinkai.weixin.qq.com](https://ilinkai.weixin.qq.com) 申请，通常 1-3 个工作日审核。
+需要在微信中开启 **ClawBot（龙虾插件）**。**无需申请审核**，更新微信到最新版，进入「我 → 设置 → 插件」找到 ClawBot 开启即可。若插件列表里暂时没有，运行 `npx -y @tencent-weixin/openclaw-weixin-cli@latest install` 手动安装。
 
-普通微信账号**不能**直接使用，必须先开通 iLink。
+ClawBot 是微信官方内置功能，2026 年 3 月上线，目前灰度推送中，部分用户需用命令行安装。
 
 ### Q: 支持群聊消息吗？
 
