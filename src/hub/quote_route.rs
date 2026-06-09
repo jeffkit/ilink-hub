@@ -25,7 +25,11 @@ pub fn merge_routing_with_quote(
         return base;
     }
     match quoted {
-        Some(QuoteOrigin::Client { vtoken, session_name, .. }) => RoutingDecision::ForwardTo {
+        Some(QuoteOrigin::Client {
+            vtoken,
+            session_name,
+            ..
+        }) => RoutingDecision::ForwardTo {
             vtoken,
             session_override: session_name,
         },
@@ -262,7 +266,10 @@ mod tests {
 
     #[test]
     fn merge_quote_overrides_forward() {
-        let base = RoutingDecision::ForwardTo { vtoken: "default_vt".into(), session_override: None };
+        let base = RoutingDecision::ForwardTo {
+            vtoken: "default_vt".into(),
+            session_override: None,
+        };
         let q = QuoteOrigin::Client {
             vtoken: "quoted_vt".into(),
             name: "n".into(),
@@ -294,7 +301,10 @@ mod tests {
     #[test]
     fn merge_hub_internal_from_quote() {
         let out = merge_routing_with_quote(
-            RoutingDecision::ForwardTo { vtoken: "x".into(), session_override: None },
+            RoutingDecision::ForwardTo {
+                vtoken: "x".into(),
+                session_override: None,
+            },
             Some(QuoteOrigin::Hub {
                 cmd: HubCommand::List,
             }),
@@ -325,7 +335,10 @@ mod tests {
 
     #[test]
     fn merge_no_quote_keeps_forward() {
-        let base = RoutingDecision::ForwardTo { vtoken: "keep".into(), session_override: None };
+        let base = RoutingDecision::ForwardTo {
+            vtoken: "keep".into(),
+            session_override: None,
+        };
         let out = merge_routing_with_quote(base, None);
         assert!(matches!(out, RoutingDecision::ForwardTo { ref vtoken, .. } if vtoken == "keep"));
     }
@@ -423,7 +436,12 @@ mod tests {
         };
         let origin = idx.resolve_user_quote(&user).expect("resolve");
         match origin {
-            QuoteOrigin::Client { vtoken, name, session_name, .. } => {
+            QuoteOrigin::Client {
+                vtoken,
+                name,
+                session_name,
+                ..
+            } => {
                 assert_eq!(vtoken, "vhub_abc");
                 assert_eq!(name, "echo");
                 assert_eq!(session_name.as_deref(), Some("feature-a"));

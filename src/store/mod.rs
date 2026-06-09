@@ -352,12 +352,10 @@ impl Store {
 
     /// Get the active session name for a vctx (defaults to "default").
     pub async fn get_active_session_name(&self, vctx: &str) -> Result<String> {
-        let row = sqlx::query(
-            "SELECT active_session_name FROM context_token_map WHERE vctx = $1",
-        )
-        .bind(vctx)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT active_session_name FROM context_token_map WHERE vctx = $1")
+            .bind(vctx)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row
             .map(|r| r.get::<String, _>("active_session_name"))
             .filter(|s| !s.is_empty())
@@ -366,13 +364,11 @@ impl Store {
 
     /// Set the active session name for a vctx.
     pub async fn set_active_session_name(&self, vctx: &str, session_name: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE context_token_map SET active_session_name = $1 WHERE vctx = $2",
-        )
-        .bind(session_name)
-        .bind(vctx)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE context_token_map SET active_session_name = $1 WHERE vctx = $2")
+            .bind(session_name)
+            .bind(vctx)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -448,12 +444,10 @@ impl Store {
         if let Some(row) = row {
             return Ok(Some(row.get("vctx")));
         }
-        let row = sqlx::query(
-            "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
-        )
-        .bind(peer_user_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1")
+            .bind(peer_user_id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|r| r.get("vctx")))
     }
 

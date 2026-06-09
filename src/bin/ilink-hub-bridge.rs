@@ -37,7 +37,12 @@ use ilink_hub::paths::default_bridge_config_path;
 )]
 struct Cli {
     /// Hub base URL (same as WEIXIN_BASE_URL for other backends).
-    #[arg(long, env = "WEIXIN_BASE_URL", default_value = "http://127.0.0.1:8765", global = true)]
+    #[arg(
+        long,
+        env = "WEIXIN_BASE_URL",
+        default_value = "http://127.0.0.1:8765",
+        global = true
+    )]
     hub_url: String,
 
     /// Virtual token. Omit to use saved local credentials, auto-register, or `--pair` QR flow.

@@ -4,9 +4,9 @@
 //!
 //! Used by the `ilink-hub-bridge` binary; see `docs/bridge/README.md`.
 
+pub mod builtin;
 mod config;
 mod connection;
-pub mod builtin;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{
@@ -240,9 +240,22 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
 
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
-    match run_cli(profile, &payload, &session_for_cli, &session_name_for_cli, &from_user, &ctx).await {
+    match run_cli(
+        profile,
+        &payload,
+        &session_for_cli,
+        &session_name_for_cli,
+        &from_user,
+        &ctx,
+    )
+    .await
+    {
         Ok((raw_body, cli_session)) => {
-            let body = truncate_chars(&raw_body, profile.max_reply_chars, &profile.truncation_suffix);
+            let body = truncate_chars(
+                &raw_body,
+                profile.max_reply_chars,
+                &profile.truncation_suffix,
+            );
             let req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
             client.sendmessage(req).await.context("sendmessage reply")?;
         }
@@ -390,7 +403,12 @@ async fn run_cli(
 /// - `{{MESSAGE}}` — the user's text (prefix stripped when using prefix routing)
 /// - `{{SESSION_ID}}` — Hub-persisted backend session UUID (e.g. for `claude --resume`)
 /// - `{{SESSION_NAME}}` — human-readable session name (e.g. `"feature-a"`, default `"default"`)
-fn apply_placeholders(template: &str, message: &str, session_id: &str, session_name: &str) -> String {
+fn apply_placeholders(
+    template: &str,
+    message: &str,
+    session_id: &str,
+    session_name: &str,
+) -> String {
     template
         .replace("{{MESSAGE}}", message)
         .replace("{{SESSION_ID}}", session_id)
@@ -424,7 +442,12 @@ mod tests {
     #[test]
     fn placeholders_message_session_id_and_name() {
         assert_eq!(
-            apply_placeholders("{{MESSAGE}}|{{SESSION_ID}}|{{SESSION_NAME}}", "hi", "sid-9", "feat-a"),
+            apply_placeholders(
+                "{{MESSAGE}}|{{SESSION_ID}}|{{SESSION_NAME}}",
+                "hi",
+                "sid-9",
+                "feat-a"
+            ),
             "hi|sid-9|feat-a"
         );
     }
@@ -439,10 +462,8 @@ mod tests {
 
     #[test]
     fn split_cli_session_first_line() {
-        let (body, sid) = split_cli_session_from_stdout(
-            "ILINK_SESSION:",
-            "ILINK_SESSION:uuid-1\nhello\n",
-        );
+        let (body, sid) =
+            split_cli_session_from_stdout("ILINK_SESSION:", "ILINK_SESSION:uuid-1\nhello\n");
         assert_eq!(sid.as_deref(), Some("uuid-1"));
         assert_eq!(body, "hello");
     }

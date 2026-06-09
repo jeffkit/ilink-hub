@@ -54,7 +54,12 @@ async fn local_credential_state(path: &Path) -> Result<LocalCredState> {
     }
 }
 
-async fn write_credentials(path: &Path, hub_url: &str, vtoken: &str, client_name: &str) -> Result<()> {
+async fn write_credentials(
+    path: &Path,
+    hub_url: &str,
+    vtoken: &str,
+    client_name: &str,
+) -> Result<()> {
     let saved_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| format!("{}Z", d.as_secs()))
@@ -131,8 +136,14 @@ mod tests {
             reqwest::StatusCode::UNAUTHORIZED,
             None
         ));
-        assert!(hub_response_token_rejected(reqwest::StatusCode::OK, Some(401)));
-        assert!(!hub_response_token_rejected(reqwest::StatusCode::OK, Some(0)));
+        assert!(hub_response_token_rejected(
+            reqwest::StatusCode::OK,
+            Some(401)
+        ));
+        assert!(!hub_response_token_rejected(
+            reqwest::StatusCode::OK,
+            Some(0)
+        ));
     }
 
     #[test]
@@ -212,7 +223,10 @@ fn auto_client_name(
 /// Default Hub client name for auto-register: `local-<hostname>` or `local-<hostname>-<config-stem>`.
 pub fn default_auto_client_name(config_path: Option<&Path>) -> String {
     let host = sanitize_client_name_segment(&local_hostname());
-    match config_path.and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
+    match config_path
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+    {
         Some(stem) if !stem.is_empty() => {
             let stem = sanitize_client_name_segment(stem);
             format!("local-{host}-{stem}")
@@ -311,12 +325,10 @@ pub async fn resolve_hub_connection(
     let hub = hub_url.trim().trim_end_matches('/').to_string();
 
     if let Some(tok) = explicit_token.map(str::trim).filter(|s| !s.is_empty()) {
-        validate_hub_token(&hub, tok)
-            .await
-            .with_context(|| {
-                "WEIXIN_TOKEN / --token 未被当前 Hub 接受（未注册或已失效）。\
+        validate_hub_token(&hub, tok).await.with_context(|| {
+            "WEIXIN_TOKEN / --token 未被当前 Hub 接受（未注册或已失效）。\
                  请用 `ilink-hub register` 或 `ilink-hub-bridge --force-register` 重新注册。"
-            })?;
+        })?;
         return Ok((hub, tok.to_string()));
     }
 
@@ -364,26 +376,12 @@ pub async fn resolve_hub_connection(
             }
         }
         LocalCredState::Missing => {
-            auto_register_and_save(
-                &path,
-                &hub,
-                register_client_name,
-                None,
-                config_path,
-            )
-            .await
+            auto_register_and_save(&path, &hub, register_client_name, None, config_path).await
         }
         LocalCredState::ExistsUnusable => {
             if force_register {
                 let _ = tokio::fs::remove_file(&path).await;
-                auto_register_and_save(
-                    &path,
-                    &hub,
-                    register_client_name,
-                    None,
-                    config_path,
-                )
-                .await
+                auto_register_and_save(&path, &hub, register_client_name, None, config_path).await
             } else {
                 anyhow::bail!(
                     "凭证文件 {} 已存在但无法使用（内容损坏或 token 为空）。\

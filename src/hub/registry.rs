@@ -223,7 +223,8 @@ mod tests {
     fn update_client_renames_and_updates_label() {
         let mut reg = ClientRegistry::new();
         let vtoken = reg.register("old".into(), Some("old label".into()));
-        reg.update_client("old", "new", Some("new label".into())).unwrap();
+        reg.update_client("old", "new", Some("new label".into()))
+            .unwrap();
         assert!(reg.get_by_name("old").is_none());
         let c = reg.get_by_name("new").expect("renamed");
         assert_eq!(c.vtoken, vtoken);

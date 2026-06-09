@@ -37,7 +37,9 @@ fn admin_token() -> Option<&'static str> {
     static TOKEN: OnceLock<Option<String>> = OnceLock::new();
     TOKEN
         .get_or_init(|| {
-            let t = std::env::var("ILINK_ADMIN_TOKEN").ok().filter(|s| !s.is_empty());
+            let t = std::env::var("ILINK_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty());
             if t.is_none() {
                 tracing::warn!(
                     "ILINK_ADMIN_TOKEN is not set — admin endpoints are unprotected. \
@@ -152,13 +154,8 @@ pub async fn getupdates(
     // Use timeout from legacy field if provided, otherwise 30s
     let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
     let mut shutdown_rx = state.shutdown.clone();
-    let notified = wait_notify_or_shutdown(
-        state.queue.as_ref(),
-        &mut shutdown_rx,
-        &vtoken,
-        poll_secs,
-    )
-    .await;
+    let notified =
+        wait_notify_or_shutdown(state.queue.as_ref(), &mut shutdown_rx, &vtoken, poll_secs).await;
     if !notified && *state.shutdown.borrow() {
         debug!(vtoken = %vtoken, "getupdates returning early due to shutdown");
     }
@@ -288,11 +285,7 @@ pub async fn sendmessage(
             )
         };
 
-        let active_session = state
-            .store
-            .get_active_session_name(&vctx)
-            .await
-            .ok();
+        let active_session = state.store.get_active_session_name(&vctx).await.ok();
 
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
         if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {
@@ -792,8 +785,7 @@ mod shutdown_poll_tests {
         });
 
         let start = Instant::now();
-        let notified =
-            wait_notify_or_shutdown(queue.as_ref(), &mut shutdown_rx, "v1", 30).await;
+        let notified = wait_notify_or_shutdown(queue.as_ref(), &mut shutdown_rx, "v1", 30).await;
         handle.await.unwrap();
 
         assert!(!notified);

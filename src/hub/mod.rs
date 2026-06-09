@@ -160,7 +160,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         RoutingDecision::HubInternal(cmd) => {
             handle_hub_command(state, msg, cmd).await;
         }
-        RoutingDecision::ForwardTo { vtoken, session_override } => {
+        RoutingDecision::ForwardTo {
+            vtoken,
+            session_override,
+        } => {
             let real_ctx = match msg.context_token.clone() {
                 Some(ctx) if !ctx.is_empty() => ctx,
                 _ => {
@@ -448,12 +451,17 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                         let uuid_hint = if s.backend_session_id.is_empty() {
                             "（尚无 UUID，下次对话时由后端写入）".to_string()
                         } else {
-                            format!("`{}`", &s.backend_session_id[..s.backend_session_id.len().min(12)])
+                            format!(
+                                "`{}`",
+                                &s.backend_session_id[..s.backend_session_id.len().min(12)]
+                            )
                         };
                         lines.push(format!("• `{}`{} — {}", s.session_name, marker, uuid_hint));
                     }
                     lines.push(format!("\n当前活跃：`{}`", active));
-                    lines.push("\n用 `/session use <名称>` 切换，`/session new <名称>` 新建。".to_string());
+                    lines.push(
+                        "\n用 `/session use <名称>` 切换，`/session new <名称>` 新建。".to_string(),
+                    );
                     lines.join("\n")
                 }
                 Err(e) => format!("❌ 查询 session 失败：{e}"),
@@ -492,9 +500,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                                 )
                             }
                         }
-                        Err(e) => format!(
-                            "✅ 已创建 session `{session_name}`，但切换失败：{e}"
-                        ),
+                        Err(e) => format!("✅ 已创建 session `{session_name}`，但切换失败：{e}"),
                     }
                 }
                 Err(e) => format!("❌ 创建 session 失败：{e}"),
@@ -632,8 +638,18 @@ async fn resolve_vctx_for_message(
         } else {
             false
         };
-        if needs_seed && conv_key.as_deref().map(|k| k.starts_with("peer:")).unwrap_or(false) {
-            state.store.find_vctx_for_peer(peer_user_id).await.ok().flatten()
+        if needs_seed
+            && conv_key
+                .as_deref()
+                .map(|k| k.starts_with("peer:"))
+                .unwrap_or(false)
+        {
+            state
+                .store
+                .find_vctx_for_peer(peer_user_id)
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         }
@@ -665,7 +681,11 @@ async fn resolve_vctx_for_message(
 ///
 /// When `session_override` is provided (from a quote-reply), that session is used directly
 /// instead of the current active session, so the message is routed to the correct conversation.
-async fn build_hub_ext_for_vctx(store: &Store, vctx: &str, session_override: Option<String>) -> Option<HubExt> {
+async fn build_hub_ext_for_vctx(
+    store: &Store,
+    vctx: &str,
+    session_override: Option<String>,
+) -> Option<HubExt> {
     let session_name = match session_override {
         Some(name) if !name.is_empty() => name,
         _ => store

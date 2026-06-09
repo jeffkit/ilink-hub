@@ -157,7 +157,10 @@ impl Router {
         let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
         if let Some(vtoken) = self.get_route(from_user_id) {
             debug!(from_user_id, vtoken, "routing message");
-            RoutingDecision::ForwardTo { vtoken: vtoken.to_string(), session_override: None }
+            RoutingDecision::ForwardTo {
+                vtoken: vtoken.to_string(),
+                session_override: None,
+            }
         } else {
             RoutingDecision::Broadcast
         }
@@ -213,23 +216,38 @@ mod tests {
 
     #[test]
     fn parse_session_list_command() {
-        assert_eq!(parse_hub_command("/session list"), Some(HubCommand::SessionList));
-        assert_eq!(parse_hub_command("/session ls"), Some(HubCommand::SessionList));
+        assert_eq!(
+            parse_hub_command("/session list"),
+            Some(HubCommand::SessionList)
+        );
+        assert_eq!(
+            parse_hub_command("/session ls"),
+            Some(HubCommand::SessionList)
+        );
     }
 
     #[test]
     fn parse_session_new_command() {
         assert_eq!(
             parse_hub_command("/session new feature-a"),
-            Some(HubCommand::SessionNew("feature-a".to_string(), "".to_string()))
+            Some(HubCommand::SessionNew(
+                "feature-a".to_string(),
+                "".to_string()
+            ))
         );
         assert_eq!(
             parse_hub_command("/session new feature-b some-uuid-123"),
-            Some(HubCommand::SessionNew("feature-b".to_string(), "some-uuid-123".to_string()))
+            Some(HubCommand::SessionNew(
+                "feature-b".to_string(),
+                "some-uuid-123".to_string()
+            ))
         );
         // bare /session new → name is a timestamp-based unique name like "session-20260609-123456"
         if let Some(HubCommand::SessionNew(name, uuid)) = parse_hub_command("/session new") {
-            assert!(name.starts_with("session-"), "expected timestamp name, got: {name}");
+            assert!(
+                name.starts_with("session-"),
+                "expected timestamp name, got: {name}"
+            );
             assert_eq!(uuid, "");
         } else {
             panic!("/session new should parse as SessionNew");

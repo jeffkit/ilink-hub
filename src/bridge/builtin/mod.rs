@@ -14,8 +14,6 @@ mod claude_code;
 pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
     match profile_type {
         "claude-code" => claude_code::run().await,
-        other => anyhow::bail!(
-            "unknown built-in profile type `{other}`; supported: claude-code"
-        ),
+        other => anyhow::bail!("unknown built-in profile type `{other}`; supported: claude-code"),
     }
 }

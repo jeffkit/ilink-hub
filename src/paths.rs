@@ -83,7 +83,10 @@ mod tests {
     #[test]
     fn expand_user_path_tilde() {
         let home = dirs::home_dir().expect("home");
-        assert_eq!(expand_user_path("~/foo"), home.join("foo").to_string_lossy());
+        assert_eq!(
+            expand_user_path("~/foo"),
+            home.join("foo").to_string_lossy()
+        );
         assert_eq!(expand_user_path("~"), home.to_string_lossy());
     }
 }

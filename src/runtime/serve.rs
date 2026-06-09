@@ -13,7 +13,10 @@ use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
-use crate::hub::{spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, HubState, InMemoryQueue, MessageQueue};
+use crate::hub::{
+    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, HubState, InMemoryQueue,
+    MessageQueue,
+};
 use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
 use crate::store::Store;
@@ -62,18 +65,17 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let store = Arc::new(Store::connect(&database_url).await?);
 
-    let (token, base_url) =
-        resolve_token(token_arg, ilink_base_url.clone(), store.clone(), qr_login_ui.clone())
-            .await?;
+    let (token, base_url) = resolve_token(
+        token_arg,
+        ilink_base_url.clone(),
+        store.clone(),
+        qr_login_ui.clone(),
+    )
+    .await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend();
-    let state = HubState::new(
-        upstream.clone(),
-        store.clone(),
-        queue,
-        shutdown_rx.clone(),
-    );
+    let state = HubState::new(upstream.clone(), store.clone(), queue, shutdown_rx.clone());
 
     load_clients_from_db(state.clone(), store.clone()).await;
 

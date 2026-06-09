@@ -53,10 +53,7 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-async fn call_claude(
-    message: &str,
-    session_id: &str,
-) -> Result<(String, Option<String>)> {
+async fn call_claude(message: &str, session_id: &str) -> Result<(String, Option<String>)> {
     let mut args: Vec<String> = vec![
         "--output-format".into(),
         "json".into(),
@@ -87,7 +84,9 @@ async fn call_claude(
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let child = cmd.spawn().context("failed to spawn `claude`; ensure it is installed and in PATH")?;
+    let child = cmd
+        .spawn()
+        .context("failed to spawn `claude`; ensure it is installed and in PATH")?;
     let output = child.wait_with_output().await.context("wait for claude")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -98,7 +97,10 @@ async fn call_claude(
     if let Ok((text, sid)) = parse_claude_json_output(&stdout) {
         if !text.trim().is_empty() {
             if !output.status.success() {
-                eprintln!("[claude-code] claude exited {:?} but returned result text", output.status.code());
+                eprintln!(
+                    "[claude-code] claude exited {:?} but returned result text",
+                    output.status.code()
+                );
             }
             return Ok((text, sid));
         }
@@ -130,8 +132,8 @@ fn parse_claude_json_output(stdout: &str) -> Result<(String, Option<String>)> {
 
     // Search for the result object
     for obj in items.into_iter().rev() {
-        let is_result = obj.msg_type.as_deref() == Some("result")
-            || obj.subtype.as_deref() == Some("success");
+        let is_result =
+            obj.msg_type.as_deref() == Some("result") || obj.subtype.as_deref() == Some("success");
         if is_result || obj.result.is_some() {
             let text = obj.result.unwrap_or_default();
             return Ok((text, obj.session_id));
@@ -172,7 +174,8 @@ mod tests {
 
     #[test]
     fn parse_result_object() {
-        let json = r#"{"type":"result","subtype":"success","result":"Hello!","session_id":"sess-abc"}"#;
+        let json =
+            r#"{"type":"result","subtype":"success","result":"Hello!","session_id":"sess-abc"}"#;
         let (text, sid) = parse_claude_json_output(json).unwrap();
         assert_eq!(text, "Hello!");
         assert_eq!(sid.as_deref(), Some("sess-abc"));

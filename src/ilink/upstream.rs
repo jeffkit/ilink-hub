@@ -322,7 +322,9 @@ async fn renew_expired_session(
 
     match upstream.notify_start().await {
         Ok(_) => info!("iLink notifystart successful after renewal"),
-        Err(e) => warn!(error = %e, "notifystart failed after renewal — outbound messages may not work"),
+        Err(e) => {
+            warn!(error = %e, "notifystart failed after renewal — outbound messages may not work")
+        }
     }
     Ok(())
 }
@@ -333,7 +335,9 @@ mod tests {
 
     #[test]
     fn well_formed_bot_token() {
-        assert!(UpstreamClient::is_well_formed_bot_token("bot@im.bot:secret"));
+        assert!(UpstreamClient::is_well_formed_bot_token(
+            "bot@im.bot:secret"
+        ));
         assert!(!UpstreamClient::is_well_formed_bot_token(""));
         assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
     }

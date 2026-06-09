@@ -122,7 +122,10 @@ pub enum UnregisterClientError {
 
 /// Remove a registered backend client from memory, DB, routing, and its message queue.
 /// Only offline clients can be deleted.
-pub async fn unregister_client_in_hub(state: &HubState, name: &str) -> Result<(), UnregisterClientError> {
+pub async fn unregister_client_in_hub(
+    state: &HubState,
+    name: &str,
+) -> Result<(), UnregisterClientError> {
     let vtoken = {
         let registry = state.registry.read().await;
         let Some(client) = registry.get_by_name(name) else {

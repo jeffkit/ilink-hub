@@ -30,9 +30,16 @@ pub fn format_outbound_origin_line(name: &str, label: Option<&str>) -> String {
 }
 
 /// Full footer line: `workspace [· session]` where session is omitted when it equals "default".
-pub fn format_outbound_footer(name: &str, label: Option<&str>, session_name: Option<&str>) -> String {
+pub fn format_outbound_footer(
+    name: &str,
+    label: Option<&str>,
+    session_name: Option<&str>,
+) -> String {
     let workspace = format_outbound_origin_line(name, label);
-    match session_name.map(str::trim).filter(|s| !s.is_empty() && *s != "default") {
+    match session_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default")
+    {
         Some(s) => format!("{workspace} · {s}"),
         None => workspace,
     }
@@ -133,10 +140,19 @@ mod tests {
 
     #[test]
     fn format_footer_with_session() {
-        assert_eq!(format_outbound_footer("echo", None, Some("feature-a")), "echo · feature-a");
-        assert_eq!(format_outbound_footer("echo", Some("lbl"), Some("feature-a")), "echo · lbl · feature-a");
+        assert_eq!(
+            format_outbound_footer("echo", None, Some("feature-a")),
+            "echo · feature-a"
+        );
+        assert_eq!(
+            format_outbound_footer("echo", Some("lbl"), Some("feature-a")),
+            "echo · lbl · feature-a"
+        );
         // "default" session is suppressed
-        assert_eq!(format_outbound_footer("echo", None, Some("default")), "echo");
+        assert_eq!(
+            format_outbound_footer("echo", None, Some("default")),
+            "echo"
+        );
         assert_eq!(format_outbound_footer("echo", None, None), "echo");
     }
 }
