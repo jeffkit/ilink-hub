@@ -36,6 +36,7 @@ pub struct UpstreamClient {
     token: RwLock<String>,
     pub polls_ok: AtomicU64,
     pub polls_err: AtomicU64,
+    pub relogin_attempts: AtomicU64,
 }
 
 impl UpstreamClient {
@@ -50,6 +51,7 @@ impl UpstreamClient {
             token: RwLock::new(token),
             polls_ok: AtomicU64::new(0),
             polls_err: AtomicU64::new(0),
+            relogin_attempts: AtomicU64::new(0),
         }
     }
 
@@ -285,6 +287,7 @@ impl UpstreamClient {
 
             if manual_relogin {
                 info!("manual re-login triggered from admin UI");
+                self.relogin_attempts.fetch_add(1, Ordering::Relaxed);
                 if let Some(ref renewal_ctx) = renewal {
                     set_status(renewal_ctx, crate::hub::ilink_status::LOGGING_IN);
                     match renew_expired_session(self.clone(), renewal_ctx).await {
@@ -344,6 +347,7 @@ impl UpstreamClient {
                                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                                 .is_ok()
                             {
+                                self.relogin_attempts.fetch_add(1, Ordering::Relaxed);
                                 match renew_expired_session(self.clone(), renewal_ctx).await {
                                     Ok(()) => {
                                         set_status(renewal_ctx, crate::hub::ilink_status::CONNECTED);

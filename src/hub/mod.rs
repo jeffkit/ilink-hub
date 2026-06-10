@@ -45,6 +45,12 @@ pub struct Metrics {
     /// User-side (or command) messages taken from upstream and passed into routing
     /// (excludes bot-side echo copies with `message_type == 2`).
     pub upstream_user_messages: AtomicU64,
+    /// Total sendmessage calls from backend clients.
+    pub sendmessage_total: AtomicU64,
+    /// sendmessage calls that were rejected (unknown token, missing context, etc.).
+    pub sendmessage_errors: AtomicU64,
+    /// Number of QR re-login attempts triggered (manual or automatic).
+    pub relogin_attempts: AtomicU64,
 }
 
 impl Metrics {
@@ -53,6 +59,9 @@ impl Metrics {
             messages_dispatched: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
             upstream_user_messages: AtomicU64::new(0),
+            sendmessage_total: AtomicU64::new(0),
+            sendmessage_errors: AtomicU64::new(0),
+            relogin_attempts: AtomicU64::new(0),
         }
     }
 }

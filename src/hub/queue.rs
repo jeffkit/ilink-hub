@@ -120,6 +120,11 @@ impl ContextTokenMap {
         vtoken
     }
 
+    /// Number of virtual context token entries currently held in memory.
+    pub fn len(&self) -> usize {
+        self.v_to_real.len()
+    }
+
     pub fn resolve(&self, vtoken: &str) -> Option<&str> {
         self.v_to_real.get(vtoken).map(String::as_str)
     }

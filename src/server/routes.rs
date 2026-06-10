@@ -224,7 +224,16 @@ pub async fn sendmessage(
     headers: HeaderMap,
     Json(mut req): Json<SendMessageRequest>,
 ) -> Json<SendMessageResponse> {
+    state
+        .metrics
+        .sendmessage_total
+        .fetch_add(1, Ordering::Relaxed);
+
     let Some(vtoken) = extract_vtoken(&headers) else {
+        state
+            .metrics
+            .sendmessage_errors
+            .fetch_add(1, Ordering::Relaxed);
         return Json(SendMessageResponse::err(
             401,
             "Missing Authorization header",
@@ -236,6 +245,10 @@ pub async fn sendmessage(
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "sendmessage rejected: unknown virtual token");
+            state
+                .metrics
+                .sendmessage_errors
+                .fetch_add(1, Ordering::Relaxed);
             return Json(SendMessageResponse::err(401, UNKNOWN_VTOKEN_MSG));
         }
     }
@@ -802,8 +815,13 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     let messages_dispatched = state.metrics.messages_dispatched.load(Ordering::Relaxed);
     let messages_dropped = state.metrics.messages_dropped.load(Ordering::Relaxed);
     let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
+    let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
+    let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
     let upstream_polls_ok = state.upstream.polls_ok.load(Ordering::Relaxed);
     let upstream_polls_err = state.upstream.polls_err.load(Ordering::Relaxed);
+    let relogin_attempts = state.upstream.relogin_attempts.load(Ordering::Relaxed);
+    let ilink_status = state.ilink_status.load(Ordering::Relaxed);
+    let ctx_map_size = state.ctx_map.read().await.len();
 
     let mut out = String::with_capacity(1024);
 
@@ -862,6 +880,26 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
             name, size
         ));
     }
+
+    out.push_str("# HELP ilink_hub_sendmessage_total Total sendmessage calls from backend clients\n");
+    out.push_str("# TYPE ilink_hub_sendmessage_total counter\n");
+    out.push_str(&format!("ilink_hub_sendmessage_total {}\n", sendmessage_total));
+
+    out.push_str("# HELP ilink_hub_sendmessage_errors_total sendmessage calls rejected (unknown token, missing context, etc.)\n");
+    out.push_str("# TYPE ilink_hub_sendmessage_errors_total counter\n");
+    out.push_str(&format!("ilink_hub_sendmessage_errors_total {}\n", sendmessage_errors));
+
+    out.push_str("# HELP ilink_hub_relogin_attempts_total Number of QR re-login attempts (manual or automatic)\n");
+    out.push_str("# TYPE ilink_hub_relogin_attempts_total counter\n");
+    out.push_str(&format!("ilink_hub_relogin_attempts_total {}\n", relogin_attempts));
+
+    out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
+    out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
+    out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
+
+    out.push_str("# HELP ilink_hub_ctx_map_size Number of virtual context token entries in memory cache\n");
+    out.push_str("# TYPE ilink_hub_ctx_map_size gauge\n");
+    out.push_str(&format!("ilink_hub_ctx_map_size {}\n", ctx_map_size));
 
     (StatusCode::OK, out)
 }
