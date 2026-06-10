@@ -193,21 +193,22 @@ pub fn default_auto_client_name(config_path: Option<&Path>) -> String {
 }
 
 fn local_hostname() -> String {
+    // Prefer env vars set by the shell or container runtime — no syscall needed.
     if let Ok(h) = std::env::var("HOSTNAME").or_else(|_| std::env::var("COMPUTERNAME")) {
         let h = h.trim();
         if !h.is_empty() {
             return h.to_string();
         }
     }
+    // Read hostname from the kernel's proc interface — no fork, no child process.
+    // Fallback chain: /proc/sys/kernel/hostname → /etc/hostname → "host".
     #[cfg(unix)]
     {
-        if let Ok(out) = std::process::Command::new("hostname").output() {
-            if out.status.success() {
-                if let Ok(h) = String::from_utf8(out.stdout) {
-                    let h = h.trim();
-                    if !h.is_empty() {
-                        return h.to_string();
-                    }
+        for path in &["/proc/sys/kernel/hostname", "/etc/hostname"] {
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                let h = contents.trim();
+                if !h.is_empty() {
+                    return h.to_string();
                 }
             }
         }

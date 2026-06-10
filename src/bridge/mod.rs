@@ -197,6 +197,11 @@ impl SessionDispatcher {
         let key = session_dispatch_key(&msg);
         let mut senders = self.senders.lock().await;
 
+        // Opportunistically evict dead senders to prevent unbounded map growth.
+        // Workers exit when their receiver is dropped; is_closed() detects this without
+        // scanning all entries on every dispatch — just drop whatever is already dead.
+        senders.retain(|_, tx| !tx.is_closed());
+
         // Try the existing sender; if the channel is dead, fall through to spawn a new worker.
         let needs_new = match senders.get(&key) {
             Some(tx) => tx.send(msg.clone()).is_err(),
@@ -346,6 +351,7 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
 
     match run_cli(
         profile,
+        profile_name,
         &payload,
         &session_for_cli,
         &session_name_for_cli,
@@ -360,7 +366,15 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
                 profile.max_reply_chars,
                 &profile.truncation_suffix,
             );
-            let req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
+            let mut req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
+            // Echo back session_name so the Hub uses the correct session for footer labeling
+            // even when the user switched sessions between sending the message and the AI reply
+            // arriving (race condition fix).
+            if let Some(ref mut msg) = req.msg {
+                use crate::ilink::types::HubExt;
+                let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                hub_ext.session_name = Some(session_name_for_cli.clone());
+            }
             client.sendmessage(req).await.context("sendmessage reply")?;
         }
         Err(e) => {
@@ -401,6 +415,7 @@ fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<
 
 async fn run_cli(
     cfg: &BridgeProfile,
+    profile_name: &str,
     message: &str,
     session_id: &str,
     session_name: &str,
@@ -434,7 +449,15 @@ async fn run_cli(
     cmd.env("ILINK_CONTEXT_TOKEN", context_token);
 
     for (k, v) in &cfg.env {
-        cmd.env(k, apply_placeholders(v, message, session_id, session_name));
+        let v = apply_placeholders(v, message, session_id, session_name);
+        let v = crate::bridge::config::expand_env_var_named(
+            &v,
+            &std::env::vars().collect(),
+            Some(profile_name),
+            Some(&format!("env.{k}")),
+        )
+        .with_context(|| format!("expand env var `{k}` for profile `{profile_name}`"))?;
+        cmd.env(k, v);
     }
 
     match cfg.stdin {
@@ -724,6 +747,7 @@ mod dispatcher_tests {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
+                voice_item: None,
             }]),
             from_user_id: Some("user1".into()),
             ..Default::default()

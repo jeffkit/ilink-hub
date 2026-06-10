@@ -5,7 +5,6 @@
 //! continue to live in the existing bridge implementation.
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -567,10 +566,19 @@ fn disambiguate_duplicate_ids(specs: &mut [BridgeProcessSpec], credentials_dir: 
     }
 }
 
+/// FNV-1a 32-bit hash — stable across Rust versions, no external dependencies.
+fn fnv1a32(bytes: &[u8]) -> u32 {
+    let mut h: u32 = 2166136261;
+    for &b in bytes {
+        h ^= b as u32;
+        h = h.wrapping_mul(16777619);
+    }
+    h
+}
+
 fn unique_profile_id(base: &str, path: &Path, seen: &HashSet<String>) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
-    let hash = format!("{:08x}", hasher.finish() as u32);
+    // FNV-1a 32-bit: no external dependency, stable across Rust versions and platforms.
+    let hash = format!("{:08x}", fnv1a32(path.to_string_lossy().as_bytes()));
     let max_base = 64usize.saturating_sub(hash.len() + 1);
     let mut prefix = base.chars().take(max_base).collect::<String>();
     if prefix.is_empty() {
