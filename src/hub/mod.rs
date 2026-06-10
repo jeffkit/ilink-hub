@@ -307,6 +307,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
             let group_id = msg.group_id.clone();
 
+            // Resolve vctx for every online vtoken first (requires ctx_map write lock
+            // per call — done sequentially to maintain lock ordering).
+            let mut vctx_by_vtoken: Vec<(String, String)> = Vec::with_capacity(online.len());
             for vtoken in &online {
                 let vctx = resolve_vctx_for_message(
                     &state,
@@ -316,25 +319,44 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     Some(vtoken.as_str()),
                 )
                 .await;
+                vctx_by_vtoken.push((vtoken.clone(), vctx));
+            }
 
+            // Batch-persist all vctx→real_ctx mappings in one transaction (fire-and-forget).
+            {
+                let persist_entries: Vec<(String, String, String)> = vctx_by_vtoken
+                    .iter()
+                    .map(|(_, vctx)| (vctx.clone(), real_ctx.clone(), peer_user_id.clone()))
+                    .collect();
                 let store = state.store.clone();
-                let vctx_clone = vctx.clone();
-                let real_ctx_clone = real_ctx.clone();
-                let peer_clone = peer_user_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = store
-                        .persist_context_token(&vctx_clone, &real_ctx_clone, &peer_clone)
-                        .await
-                    {
-                        warn!(error = %e, "failed to persist context_token mapping (broadcast)");
+                    if let Err(e) = store.persist_context_tokens_batch(&persist_entries).await {
+                        warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
                     }
                 });
+            }
+
+            // Batch-fetch HubExt session data for all (vctx, vtoken) pairs — 2 queries total
+            // instead of 2×N.
+            let pairs: Vec<(String, String)> = vctx_by_vtoken
+                .iter()
+                .map(|(vtoken, vctx)| (vctx.clone(), vtoken.clone()))
+                .collect();
+            let hub_ext_data = state.store.get_hub_ext_batch(&pairs).await.unwrap_or_default();
+
+            for (vtoken, vctx) in vctx_by_vtoken {
+                let hub_ext = hub_ext_data
+                    .get(&(vctx.clone(), vtoken.clone()))
+                    .map(|(session_name, session_id)| HubExt {
+                        session_id: session_id.clone(),
+                        session_name: Some(session_name.clone()),
+                        cli_session_id: None,
+                    });
 
                 let mut msg_clone = msg.clone();
-                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, vtoken, None).await;
                 msg_clone.context_token = Some(vctx);
                 msg_clone.ilink_hub_ext = hub_ext;
-                match state.queue.push(vtoken, msg_clone).await {
+                match state.queue.push(&vtoken, msg_clone).await {
                     Ok(false) => {
                         state
                             .metrics

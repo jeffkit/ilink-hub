@@ -410,6 +410,98 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Batch-fetch HubExt data for multiple (vctx, vtoken) pairs in two queries.
+    ///
+    /// Returns a map of `(vctx, vtoken) → (session_name, Option<backend_session_id>)`.
+    /// Used by the Broadcast path to avoid N×2 individual DB round-trips.
+    pub async fn get_hub_ext_batch(
+        &self,
+        pairs: &[(String, String)], // (vctx, vtoken)
+    ) -> Result<std::collections::HashMap<(String, String), (String, Option<String>)>> {
+        if pairs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Build placeholders: ($1,$2), ($3,$4), ...
+        let mut active_placeholders = Vec::with_capacity(pairs.len());
+        for i in 0..pairs.len() {
+            active_placeholders.push(format!("(${}, ${})", i * 2 + 1, i * 2 + 2));
+        }
+        let active_sql = format!(
+            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE (vctx, vtoken) IN ({})",
+            active_placeholders.join(", ")
+        );
+
+        let mut active_q = sqlx::query(&active_sql);
+        for (vctx, vtoken) in pairs {
+            active_q = active_q.bind(vctx).bind(vtoken);
+        }
+        let active_rows = active_q.fetch_all(&self.pool).await?;
+
+        // Build map: (vctx, vtoken) → session_name
+        let mut session_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &active_rows {
+            let vctx: String = row.get("vctx");
+            let vtoken: String = row.get("vtoken");
+            let name: String = row.get("session_name");
+            session_map.insert((vctx, vtoken), name);
+        }
+
+        // For each pair, use resolved or default session name, then batch-fetch backend IDs.
+        let resolved: Vec<(String, String, String)> = pairs
+            .iter()
+            .map(|(vctx, vtoken)| {
+                let name = session_map
+                    .get(&(vctx.clone(), vtoken.clone()))
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                (vctx.clone(), vtoken.clone(), name)
+            })
+            .collect();
+
+        let mut session_placeholders = Vec::with_capacity(resolved.len());
+        for i in 0..resolved.len() {
+            session_placeholders.push(format!(
+                "(${}, ${}, ${})",
+                i * 3 + 1,
+                i * 3 + 2,
+                i * 3 + 3
+            ));
+        }
+        let session_sql = format!(
+            "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \
+             WHERE (vctx, vtoken, session_name) IN ({})",
+            session_placeholders.join(", ")
+        );
+
+        let mut session_q = sqlx::query(&session_sql);
+        for (vctx, vtoken, name) in &resolved {
+            session_q = session_q.bind(vctx).bind(vtoken).bind(name);
+        }
+        let session_rows = session_q.fetch_all(&self.pool).await?;
+
+        let mut sid_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &session_rows {
+            let vctx: String = row.get("vctx");
+            let vtoken: String = row.get("vtoken");
+            let sid: String = row.get("backend_session_id");
+            sid_map.insert((vctx, vtoken), sid);
+        }
+
+        let mut result = std::collections::HashMap::new();
+        for (vctx, vtoken, session_name) in resolved {
+            let sid = sid_map
+                .get(&(vctx.clone(), vtoken.clone()))
+                .filter(|s| !s.trim().is_empty())
+                .cloned();
+            result.insert((vctx, vtoken), (session_name, sid));
+        }
+        Ok(result)
+    }
+
     /// Get the active session name for a (vctx, vtoken) pair (defaults to "default").
     pub async fn get_active_session_name(&self, vctx: &str, vtoken: &str) -> Result<String> {
         let row = sqlx::query(
@@ -496,6 +588,36 @@ impl Store {
         .bind(peer_user_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Persist multiple vctx→real_ctx mappings in a single transaction.
+    /// Used by the Broadcast dispatch path to avoid N separate round-trips.
+    pub async fn persist_context_tokens_batch(
+        &self,
+        entries: &[(String, String, String)], // (vctx, real_ctx, peer_user_id)
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (vctx, real_ctx, peer_user_id) in entries {
+            sqlx::query(
+                r#"
+                INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (vctx) DO UPDATE SET
+                    real_ctx = excluded.real_ctx,
+                    peer_user_id = excluded.peer_user_id
+                "#,
+            )
+            .bind(vctx)
+            .bind(real_ctx)
+            .bind(peer_user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
