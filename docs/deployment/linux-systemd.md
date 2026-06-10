@@ -133,6 +133,41 @@ sudo cp target/release/ilink-hub /opt/ilink-hub/ilink-hub
 sudo systemctl start ilink-hub
 ```
 
+## 从 macOS 交叉编译部署（服务器无 cargo 时）
+
+若服务器上没有 Rust 工具链（或安装麻烦），可以在 **macOS (arm64)** 本地交叉编译出 x86_64 Linux 静态二进制，再 scp 上传。
+
+> **背景**：直接 `cargo build --release` 产出的是 Mach-O arm64 二进制，上传到 x86_64 Linux 后 systemd 启动报 `status=203/EXEC`，无法执行。必须使用 musl 交叉编译。
+
+### 前置（一次性）
+
+```bash
+# 安装 musl cross toolchain
+brew install musl-cross
+
+# 添加 musl target
+rustup target add x86_64-unknown-linux-musl
+```
+
+### 每次部署
+
+```bash
+# 1. 交叉编译 Linux 静态链接二进制
+MUSL_PREFIX=$(brew --prefix musl-cross)/bin
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$MUSL_PREFIX/x86_64-linux-musl-gcc" \
+CC_x86_64_unknown_linux_musl="$MUSL_PREFIX/x86_64-linux-musl-gcc" \
+  cargo build --release --target x86_64-unknown-linux-musl
+
+# 2. 上传并替换（必须先 stop，运行中的二进制不能直接覆盖会报 Text file busy）
+scp target/x86_64-unknown-linux-musl/release/ilink-hub <server>:/tmp/ilink-hub-new
+ssh <server> "sudo systemctl stop ilink-hub && \
+  sudo cp /tmp/ilink-hub-new /opt/ilink-hub/ilink-hub && \
+  sudo chmod +x /opt/ilink-hub/ilink-hub && \
+  sudo systemctl start ilink-hub"
+```
+
+musl 产出的是静态链接二进制，无 glibc 版本依赖，可在任意 x86_64 Linux 上运行。
+
 ## 防火墙配置（可选）
 
 若服务器只允许 Bridge 通过 SSH 隧道访问，**不需要**对外开放 8765 端口。若需要公网直连（例如 Recursive / OpenClaw 客户端直接访问），请开放端口：

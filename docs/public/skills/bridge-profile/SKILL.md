@@ -37,7 +37,7 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 2. **用途**：接 Claude Code、自定义脚本/SDK，还是其他 CLI（Cursor、Codex）？
 3. **项目目录** `cwd`：在哪个目录下执行？
 4. **路由**：是否需要前缀路由（`/new`、`/ask` 等不同 profile）？
-5. **特殊 env**：API Key、BASE_URL、模型名等？
+5. **特殊 env**：API Key、BASE_URL、模型名等？**绝对不要把明文 key 写进 YAML**——见 [Secrets & 环境变量](#secrets--env-vars)。
 
 **快速路由：**
 - 接 Claude Code → [内置 claude-code YAML](#yaml-claude-code)
@@ -68,7 +68,7 @@ profiles:
     # 可选：
     # env:
     #   ILINK_CLAUDE_MODEL: sonnet
-    #   ANTHROPIC_API_KEY: "sk-ant-..."
+    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # 引用进程 env；不要写明文 key
 
 routing:
   strategy: fixed
@@ -144,7 +144,7 @@ profiles:
     timeout_secs: 60
     max_reply_chars: 8000
     env:
-      MY_API_KEY: "..."
+      MY_API_KEY: ${MY_API_KEY}    # 引用进程 env；不要写明文 key
 
 routing:
   strategy: fixed
@@ -288,7 +288,7 @@ profiles:
     script: /path/to/handler.py
     timeout_secs: 60
     env:
-      ANTHROPIC_API_KEY: "sk-ant-..."
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # 引用进程 env
 ```
 
 ---
@@ -364,7 +364,7 @@ profiles:
     script: /path/to/handler.js
     timeout_secs: 60
     env:
-      OPENAI_API_KEY: "..."
+      OPENAI_API_KEY: ${OPENAI_API_KEY}    # 引用进程 env
 ```
 
 ---
@@ -428,6 +428,47 @@ INFO ilink_hub::bridge::manager: starting child bridge profile=<name> ...
 
 客户端名格式：`local-<hostname>-<profile-stem>`
 （如 `my-claude.yaml` → `local-MacBook-my-claude`）
+
+---
+
+## Secrets & 环境变量 {#secrets--env-vars}
+
+**铁律：永远不要把明文 API key / token / password 写进 profile YAML。**
+
+`env:` 字段里的 `${VAR_NAME}` 会被原样作为字符串传给子进程（**当前没有自动展开**），
+所以 YAML 入 git 是安全的，但**运行时必须有同名 env var**——否则子进程收到的是字面字符串 `${VAR_NAME}`，请求会报 401。
+
+### 推荐做法（当前唯一支持的）
+
+```yaml
+profiles:
+  my-bot:
+    script: /path/to/handler.py
+    env:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+```
+
+启动 manager 之前先 export：
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+ilink-hub-bridge manager
+```
+
+或一行启动：
+
+```bash
+ANTHROPIC_API_KEY="sk-ant-..." ilink-hub-bridge manager
+```
+
+如果 manager 是 launchd / 守护进程启动的，进程 env 不一定有这些变量——那种场景下需要把
+`export` 写到 `~/.zshenv` / `~/.bash_profile`，或用专门的 env 加载器。
+
+### 计划中的特性
+
+`${VAR}` shell 插值（启动 manager 时从进程 env 自动展开）正在设计中，见
+`docs/bridge/env-interpolation-spec.md`（需求已写，待实现）。在特性上线前，
+**测试 YAML 时务必先确认子进程能拿到 key**（`env | grep KEY_NAME` 验证）。
 
 ---
 
