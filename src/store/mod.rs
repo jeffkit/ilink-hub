@@ -129,6 +129,15 @@ impl Store {
         .execute(&self.pool)
         .await;
 
+        // Soft migration: add unique index on real_ctx to support race-free upsert in
+        // map_context_token. Idempotent — CREATE UNIQUE INDEX IF NOT EXISTS is safe to re-run.
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+             ON context_token_map (real_ctx)",
+        )
+        .execute(&self.pool)
+        .await;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS backend_sessions (
@@ -137,6 +146,39 @@ impl Store {
                 backend_session_id TEXT NOT NULL DEFAULT '',
                 created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (vctx, session_name)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // v2: sessions are scoped per (vctx, vtoken), so each backend has its own
+        // independent session namespace for the same WeChat conversation.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+                vctx               TEXT NOT NULL,
+                vtoken             TEXT NOT NULL,
+                session_name       TEXT NOT NULL,
+                backend_session_id TEXT NOT NULL DEFAULT '',
+                created_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (vctx, vtoken, session_name)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Active session pointer per (vctx, vtoken) — which named session is currently
+        // selected for each (user, backend) pair.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS active_sessions (
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT NOT NULL,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (vctx, vtoken)
             )
             "#,
         )
@@ -281,24 +323,26 @@ impl Store {
         Ok(())
     }
 
-    // ─── Backend sessions (named sessions per virtual context token) ─────────
+    // ─── Backend sessions (named sessions per virtual context + backend token) ──
 
-    /// Upsert the backend session UUID for a named session.
+    /// Upsert the backend session UUID for a named session scoped to a specific backend.
     pub async fn set_backend_session(
         &self,
         vctx: &str,
+        vtoken: &str,
         session_name: &str,
         backend_session_id: &str,
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO backend_sessions (vctx, session_name, backend_session_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (vctx, session_name) DO UPDATE SET
+            INSERT INTO backend_sessions_v2 (vctx, vtoken, session_name, backend_session_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vctx, vtoken, session_name) DO UPDATE SET
                 backend_session_id = excluded.backend_session_id
             "#,
         )
         .bind(vctx)
+        .bind(vtoken)
         .bind(session_name)
         .bind(backend_session_id)
         .execute(&self.pool)
@@ -306,28 +350,37 @@ impl Store {
         Ok(())
     }
 
-    /// Get the backend session UUID for a named session.
+    /// Get the backend session UUID for a named session scoped to a specific backend.
     pub async fn get_backend_session(
         &self,
         vctx: &str,
+        vtoken: &str,
         session_name: &str,
     ) -> Result<Option<String>> {
         let row = sqlx::query(
-            "SELECT backend_session_id FROM backend_sessions WHERE vctx = $1 AND session_name = $2",
+            "SELECT backend_session_id FROM backend_sessions_v2 \
+             WHERE vctx = $1 AND vtoken = $2 AND session_name = $3",
         )
         .bind(vctx)
+        .bind(vtoken)
         .bind(session_name)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| r.get::<String, _>("backend_session_id")))
     }
 
-    /// List all named sessions for a vctx.
-    pub async fn list_backend_sessions(&self, vctx: &str) -> Result<Vec<BackendSessionRow>> {
+    /// List all named sessions for a (vctx, vtoken) pair — i.e. for one user × one backend.
+    pub async fn list_backend_sessions(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+    ) -> Result<Vec<BackendSessionRow>> {
         let rows = sqlx::query(
-            "SELECT session_name, backend_session_id FROM backend_sessions WHERE vctx = $1 ORDER BY session_name",
+            "SELECT session_name, backend_session_id FROM backend_sessions_v2 \
+             WHERE vctx = $1 AND vtoken = $2 ORDER BY session_name",
         )
         .bind(vctx)
+        .bind(vtoken)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -339,62 +392,87 @@ impl Store {
             .collect())
     }
 
-    /// Delete a named session.
-    pub async fn delete_backend_session(&self, vctx: &str, session_name: &str) -> Result<bool> {
-        let result =
-            sqlx::query("DELETE FROM backend_sessions WHERE vctx = $1 AND session_name = $2")
-                .bind(vctx)
-                .bind(session_name)
-                .execute(&self.pool)
-                .await?;
+    /// Delete a named session for a specific (vctx, vtoken) pair.
+    pub async fn delete_backend_session(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM backend_sessions_v2 WHERE vctx = $1 AND vtoken = $2 AND session_name = $3",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Get the active session name for a vctx (defaults to "default").
-    pub async fn get_active_session_name(&self, vctx: &str) -> Result<String> {
-        let row = sqlx::query("SELECT active_session_name FROM context_token_map WHERE vctx = $1")
-            .bind(vctx)
-            .fetch_optional(&self.pool)
-            .await?;
+    /// Get the active session name for a (vctx, vtoken) pair (defaults to "default").
+    pub async fn get_active_session_name(&self, vctx: &str, vtoken: &str) -> Result<String> {
+        let row = sqlx::query(
+            "SELECT session_name FROM active_sessions WHERE vctx = $1 AND vtoken = $2",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row
-            .map(|r| r.get::<String, _>("active_session_name"))
+            .map(|r| r.get::<String, _>("session_name"))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string()))
     }
 
-    /// Set the active session name for a vctx.
-    pub async fn set_active_session_name(&self, vctx: &str, session_name: &str) -> Result<()> {
-        sqlx::query("UPDATE context_token_map SET active_session_name = $1 WHERE vctx = $2")
-            .bind(session_name)
-            .bind(vctx)
-            .execute(&self.pool)
-            .await?;
+    /// Set the active session name for a (vctx, vtoken) pair (upsert).
+    pub async fn set_active_session_name(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO active_sessions (vctx, vtoken, session_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (vctx, vtoken) DO UPDATE SET
+                session_name = excluded.session_name,
+                updated_at   = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
     // ─── Context token map ────────────────────────────────────────────────────
 
     pub async fn map_context_token(&self, real_ctx: &str, peer_user_id: &str) -> Result<String> {
-        // Check existing mapping
-        let existing = sqlx::query("SELECT vctx FROM context_token_map WHERE real_ctx = $1")
-            .bind(real_ctx)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        if let Some(row) = existing {
-            return Ok(row.get("vctx"));
-        }
-
-        let vctx = format!("vctx_{}", Uuid::new_v4().simple());
+        // Race-free upsert: attempt to insert a fresh vctx for this real_ctx.
+        // If another task already inserted the same real_ctx concurrently, the unique
+        // index on real_ctx causes a conflict and we fall through to the SELECT below.
+        let candidate = format!("vctx_{}", Uuid::new_v4().simple());
         sqlx::query(
-            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id) VALUES ($1, $2, $3)",
+            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id) \
+             VALUES ($1, $2, $3) \
+             ON CONFLICT (real_ctx) DO NOTHING",
         )
-        .bind(&vctx)
+        .bind(&candidate)
         .bind(real_ctx)
         .bind(peer_user_id)
         .execute(&self.pool)
         .await?;
-        Ok(vctx)
+
+        // Whether we inserted or hit the conflict, the winner row is now in the table.
+        let row = sqlx::query("SELECT vctx FROM context_token_map WHERE real_ctx = $1")
+            .bind(real_ctx)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("vctx"))
     }
 
     /// Persist a known vctx→real_ctx mapping (upsert: refreshes real_ctx when vctx is reused).
@@ -430,7 +508,7 @@ impl Store {
         let row = sqlx::query(
             r#"
             SELECT c.vctx FROM context_token_map c
-            LEFT JOIN backend_sessions b
+            LEFT JOIN backend_sessions_v2 b
               ON b.vctx = c.vctx AND b.session_name = 'default'
             WHERE c.peer_user_id = $1
               AND b.backend_session_id IS NOT NULL
