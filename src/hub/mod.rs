@@ -343,15 +343,31 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             let registry = state.registry.read().await;
             let clients = registry.all_clients();
             if clients.is_empty() {
-                "No clients registered yet.".to_string()
+                "尚未注册任何后端客户端。".to_string()
             } else {
-                let mut lines = vec!["**Connected workspaces:**".to_string()];
+                let active_vtoken = {
+                    let router = state.router.lock().await;
+                    router.get_route(&from_user_id).map(str::to_string)
+                };
+                let active_name = active_vtoken.as_deref().and_then(|vt| {
+                    clients.iter().find(|c| c.vtoken == vt).map(|c| c.name.as_str())
+                });
+                let mut lines = vec!["**已注册的后端：**".to_string()];
                 for c in clients {
                     let status = if c.online { "🟢" } else { "🔴" };
                     let label = c.label.as_deref().unwrap_or(&c.name);
-                    lines.push(format!("{} `{}` — {}", status, c.name, label));
+                    let selected = if active_name == Some(c.name.as_str()) {
+                        " ✅"
+                    } else {
+                        ""
+                    };
+                    lines.push(format!("{} `{}`{} — {}", status, c.name, selected, label));
                 }
-                lines.push("\nUse `/use <name>` to switch.".to_string());
+                match active_name {
+                    Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
+                    None => lines.push("\n当前未选中（广播模式）".to_string()),
+                }
+                lines.push("用 `/use <名称>` 切换后端。".to_string());
                 lines.join("\n")
             }
         }
@@ -370,10 +386,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     warn!(error = %e, "failed to persist route to DB");
                 }
 
-                format!("✅ Switched to `{}`", name)
+                format!("✅ 已切换到 `{}`", name)
             } else {
                 format!(
-                    "❌ No client named `{}` found. Use `/list` to see available clients.",
+                    "❌ 未找到名为 `{}` 的后端。用 `/list` 查看可用后端。",
                     name
                 )
             }
