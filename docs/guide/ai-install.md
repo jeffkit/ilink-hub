@@ -1,6 +1,6 @@
 # 让 AI 帮你安装与配置
 
-> 最后更新：2026-06-09
+> 最后更新：2026-06-10
 
 不想看文档？让你的 AI 助手（Claude Code、Cursor 等）直接读取 iLink Hub 的安装 Skill，帮你完成全部配置。
 
@@ -14,8 +14,8 @@ iLink Hub 提供两个官方 Skill：
 
 | Skill | 用途 | 原始文件 |
 |-------|------|---------|
-| **ilink-hub-setup** | 安装 Hub、绑定微信、启动 bridge manager | [SKILL.md](/ilink-hub/skills/ilink-hub-setup/SKILL.md) |
-| **bridge-profile** | 创建/测试/发布 Profile，用 Python/JS SDK 开发自定义 handler | [SKILL.md](/ilink-hub/skills/bridge-profile/SKILL.md) |
+| **ilink-hub-setup** | 安装 Hub、绑定微信、启动 bridge manager | [SKILL.md](https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md) |
+| **bridge-profile** | 创建/测试/发布 Profile，用 Python/JS SDK 开发自定义 handler | [SKILL.md](https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md) |
 
 ---
 
@@ -37,7 +37,6 @@ AI 会获取最新的 Skill 内容，引导你完成全部步骤。
 把 Skill 安装到 `~/.claude/skills/`，以后直接用 `/ilink-hub-setup` 命令触发：
 
 ```bash
-# 创建 skill 目录并下载
 mkdir -p ~/.claude/skills/ilink-hub-setup
 curl -Lo ~/.claude/skills/ilink-hub-setup/SKILL.md \
   https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
@@ -57,6 +56,31 @@ curl -Lo ~/.claude/skills/bridge-profile/SKILL.md \
 
 ```
 /bridge-profile
+```
+
+---
+
+## 在 Cursor 中使用
+
+### 方式一：直接粘贴给 Cursor Agent
+
+在 Cursor 对话框里直接说：
+
+```
+请读取 https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md，
+然后帮我完成 ilink-hub 的安装与配置。
+```
+
+### 方式二：安装到 Cursor skills 目录
+
+```bash
+mkdir -p ~/.cursor/skills-cursor/ilink-hub-setup
+curl -Lo ~/.cursor/skills-cursor/ilink-hub-setup/SKILL.md \
+  https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
+
+mkdir -p ~/.cursor/skills-cursor/bridge-profile
+curl -Lo ~/.cursor/skills-cursor/bridge-profile/SKILL.md \
+  https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 ```
 
 ---

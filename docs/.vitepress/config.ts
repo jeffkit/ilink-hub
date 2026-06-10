@@ -18,6 +18,7 @@ export default defineConfig({
     siteTitle: 'iLink Hub',
 
     nav: [
+      { text: '让 AI 帮我安装 ✨', link: '/guide/ai-install' },
       { text: '下载桌面版', link: '/guide/installation#desktop' },
       { text: '快速开始', link: '/guide/getting-started' },
       { text: 'Bridge', link: '/bridge/' },
@@ -35,11 +36,11 @@ export default defineConfig({
       {
         text: '开始使用',
         items: [
-          { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
+          { text: '让 AI 帮你安装 ✨', link: '/guide/ai-install' },
           { text: '下载桌面应用', link: '/guide/installation#desktop' },
           { text: '快速开始（命令行）', link: '/guide/getting-started' },
           { text: '所有安装方式', link: '/guide/installation' },
-          { text: '让 AI 帮你安装 ✨', link: '/guide/ai-install' },
+          { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
         ],
       },
       {
