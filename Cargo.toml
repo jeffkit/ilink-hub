@@ -65,7 +65,7 @@ rand = "0.8"
 base64 = "0.22"
 
 # Storage — sqlx supports SQLite, PostgreSQL, MySQL via DATABASE_URL
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "mysql", "chrono", "uuid"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "mysql", "chrono", "uuid", "migrate"] }
 
 # Config
 config = "0.14"

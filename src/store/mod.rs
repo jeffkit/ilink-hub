@@ -29,7 +29,7 @@ impl Store {
 
         let pool = AnyPool::connect(url).await?;
         let store = Self { pool };
-        store.migrate().await?;
+        store.run_migrations().await?;
         Ok(store)
     }
 
@@ -63,128 +63,11 @@ impl Store {
         Ok(())
     }
 
-    async fn migrate(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS clients (
-                vtoken       TEXT PRIMARY KEY,
-                name         TEXT NOT NULL UNIQUE,
-                label        TEXT,
-                created_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                last_seen    TIMESTAMPTZ
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS routing_state (
-                from_user        TEXT PRIMARY KEY,
-                active_vtoken    TEXT NOT NULL,
-                updated_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS context_token_map (
-                vctx        TEXT PRIMARY KEY,
-                real_ctx    TEXT NOT NULL,
-                expires_at  TIMESTAMPTZ
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Soft migration: add peer_user_id if not present (idempotent).
-        let _ = sqlx::query(
-            "ALTER TABLE context_token_map ADD COLUMN peer_user_id TEXT NOT NULL DEFAULT ''",
-        )
-        .execute(&self.pool)
-        .await;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS bot_credentials (
-                id        INTEGER PRIMARY KEY,
-                token     TEXT NOT NULL,
-                base_url  TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Soft migration: add active_session_name to context_token_map if not present (idempotent).
-        let _ = sqlx::query(
-            "ALTER TABLE context_token_map ADD COLUMN active_session_name TEXT NOT NULL DEFAULT 'default'",
-        )
-        .execute(&self.pool)
-        .await;
-
-        // Soft migration: add unique index on real_ctx to support race-free upsert in
-        // map_context_token. Idempotent — CREATE UNIQUE INDEX IF NOT EXISTS is safe to re-run.
-        let _ = sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
-             ON context_token_map (real_ctx)",
-        )
-        .execute(&self.pool)
-        .await;
-
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS backend_sessions (
-                vctx             TEXT NOT NULL,
-                session_name     TEXT NOT NULL,
-                backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at       TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (vctx, session_name)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // v2: sessions are scoped per (vctx, vtoken), so each backend has its own
-        // independent session namespace for the same WeChat conversation.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
-                vctx               TEXT NOT NULL,
-                vtoken             TEXT NOT NULL,
-                session_name       TEXT NOT NULL,
-                backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at         TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (vctx, vtoken, session_name)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
-        // Active session pointer per (vctx, vtoken) — which named session is currently
-        // selected for each (user, backend) pair.
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS active_sessions (
-                vctx         TEXT NOT NULL,
-                vtoken       TEXT NOT NULL,
-                session_name TEXT NOT NULL DEFAULT 'default',
-                updated_at   TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (vctx, vtoken)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await?;
-
+    async fn run_migrations(&self) -> Result<()> {
+        sqlx::migrate!("./migrations")
+            .run(&self.pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("database migration failed: {e}"))?;
         Ok(())
     }
 
@@ -672,14 +555,14 @@ impl Store {
     }
 
     /// Load the most recent context_token mappings for in-memory cache warm-up.
-    /// Returns up to `limit` entries ordered by rowid DESC (newest first).
+    /// Returns up to `limit` entries ordered by created_at DESC (newest first).
     pub async fn list_recent_context_tokens(
         &self,
         limit: i64,
     ) -> Result<Vec<(String, String, String)>> {
         let rows = sqlx::query(
             "SELECT vctx, real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
-             FROM context_token_map ORDER BY rowid DESC LIMIT $1",
+             FROM context_token_map ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
