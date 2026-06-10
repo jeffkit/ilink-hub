@@ -225,6 +225,33 @@
       padding: 10px 14px; font-size: 12px; color: #f59e0b; margin-bottom: 18px;
       display: none;
     }
+
+    /* iLink upstream status */
+    #ilink-section .status-row {
+      display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
+    }
+    #ilink-status-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 13px; font-weight: 500; padding: 4px 12px;
+      border-radius: 20px; border: 1px solid var(--border);
+    }
+    #ilink-status-badge.connected  { border-color: #166534; color: var(--green); background: #052e16; }
+    #ilink-status-badge.needs_login,
+    #ilink-status-badge.unknown    { border-color: #7f1d1d; color: var(--red); background: #1f0808; }
+    #ilink-status-badge.logging_in { border-color: #1d4ed8; color: #93c5fd; background: #0c1a3a; }
+
+    #qr-area {
+      display: none;
+      flex-direction: column; align-items: flex-start; gap: 10px;
+      margin-top: 12px;
+    }
+    #qr-area.visible { display: flex; }
+    #qr-img {
+      width: 200px; height: 200px;
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: #fff;
+    }
+    #qr-hint { font-size: 12px; color: var(--muted); }
   </style>
 </head>
 <body>
@@ -243,6 +270,21 @@
     ⚠️ Admin token required — set <code>ILINK_ADMIN_TOKEN</code> env var and reload with
     <code>Authorization: Bearer &lt;token&gt;</code> header, or use a reverse proxy.
   </div>
+
+  <!-- iLink upstream status -->
+  <section id="ilink-section">
+    <h2>微信连接状态</h2>
+    <div class="form-card">
+      <div class="status-row">
+        <span id="ilink-status-badge" class="unknown">⬤ 获取中…</span>
+        <button class="btn btn-ghost btn-sm" id="relogin-btn" onclick="triggerRelogin()">重新绑定微信</button>
+      </div>
+      <div id="qr-area">
+        <img id="qr-img" src="" alt="WeChat QR Code" />
+        <span id="qr-hint">请用微信扫描上方二维码完成登录</span>
+      </div>
+    </div>
+  </section>
 
   <!-- Client list -->
   <section>
@@ -288,22 +330,42 @@
     <h2>WeChat Commands</h2>
     <div class="form-card">
       <table style="width:100%;border-collapse:collapse;font-size:13px">
-        <colgroup><col style="width:160px"/><col/></colgroup>
+        <colgroup><col style="width:220px"/><col/></colgroup>
         <tr style="border-bottom:1px solid var(--border)">
-          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/list</td>
-          <td style="padding:8px 0;color:var(--muted)">List all registered backends and their status</td>
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/list <span style="color:var(--muted);font-size:11px">· /ls</span></td>
+          <td style="padding:8px 0;color:var(--muted)">列出所有已注册后端及其状态</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border)">
-          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/use &lt;name&gt;</td>
-          <td style="padding:8px 0;color:var(--muted)">Switch active backend (e.g. <code style="font-family:monospace">/use mac-home</code>)</td>
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/use &lt;name&gt; <span style="color:var(--muted);font-size:11px">· /switch</span></td>
+          <td style="padding:8px 0;color:var(--muted)">切换当前活跃后端（如 <code style="font-family:monospace">/use mac-home</code>）</td>
         </tr>
         <tr style="border-bottom:1px solid var(--border)">
-          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/broadcast &lt;text&gt;</td>
-          <td style="padding:8px 0;color:var(--muted)">Send a message to all online backends</td>
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/broadcast &lt;text&gt; <span style="color:var(--muted);font-size:11px">· /all</span></td>
+          <td style="padding:8px 0;color:var(--muted)">向所有在线后端广播消息</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/status</td>
+          <td style="padding:8px 0;color:var(--muted)">查看 Hub 状态（在线/总客户端数）</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/help <span style="color:var(--muted);font-size:11px">· /?</span></td>
+          <td style="padding:8px 0;color:var(--muted)">显示帮助信息</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/session list <span style="color:var(--muted);font-size:11px">· /session ls</span></td>
+          <td style="padding:8px 0;color:var(--muted)">列出当前对话的所有 sessions</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/session new [name] [uuid]</td>
+          <td style="padding:8px 0;color:var(--muted)">新建 session（名称可选，省略则自动生成；可附带初始 UUID）</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/session use &lt;name&gt;</td>
+          <td style="padding:8px 0;color:var(--muted)">切换到指定 session</td>
         </tr>
         <tr>
-          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/status</td>
-          <td style="padding:8px 0;color:var(--muted)">Show Hub status (online/total clients)</td>
+          <td style="padding:8px 0;font-family:monospace;color:#a3e635">/session delete &lt;name&gt; <span style="color:var(--muted);font-size:11px">· /session rm · /session del</span></td>
+          <td style="padding:8px 0;color:var(--muted)">删除指定 session（不能删除当前活跃的）</td>
         </tr>
       </table>
     </div>
@@ -553,9 +615,111 @@ document.getElementById('clients-grid').addEventListener('click', (e) => {
   }
 });
 
-// Init
+// ─── iLink status + QR ───────────────────────────────────────────────────────
+
+let qrEventSource = null;
+
+async function loadIlinkStatus() {
+  try {
+    const r = await fetch('/hub/ilink/status', { headers: authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    setIlinkBadge(d.status);
+  } catch(e) {}
+}
+
+function setIlinkBadge(status) {
+  const badge = document.getElementById('ilink-status-badge');
+  badge.className = status;
+  const labels = {
+    connected: '🟢 已连接',
+    needs_login: '🔴 需要登录',
+    logging_in: '🔵 扫码中…',
+    unknown: '⬤ 未知',
+  };
+  badge.textContent = labels[status] || '⬤ ' + status;
+
+  const qrArea = document.getElementById('qr-area');
+  if (status === 'logging_in') {
+    qrArea.classList.add('visible');
+    startQrStream();
+  } else {
+    qrArea.classList.remove('visible');
+    stopQrStream();
+    if (status !== 'logging_in') {
+      document.getElementById('qr-img').src = '';
+    }
+  }
+}
+
+function startQrStream() {
+  if (qrEventSource) return;
+  const url = adminToken
+    ? `/hub/ilink/qr-stream?token=${encodeURIComponent(adminToken)}`
+    : `/hub/ilink/qr-stream`;
+  qrEventSource = new EventSource(url);
+  qrEventSource.onmessage = (e) => {
+    try {
+      const evt = JSON.parse(e.data);
+      if (evt.kind === 'ready') {
+        document.getElementById('qr-img').src = evt.image;
+        document.getElementById('qr-hint').textContent = '请用微信扫描上方二维码完成登录';
+      } else if (evt.kind === 'status') {
+        document.getElementById('qr-hint').textContent = evt.message;
+      } else if (evt.kind === 'done') {
+        stopQrStream();
+        document.getElementById('qr-area').classList.remove('visible');
+        setIlinkBadge('connected');
+        showToast('✅ 微信绑定成功！');
+      } else if (evt.kind === 'expired') {
+        stopQrStream();
+        document.getElementById('qr-img').src = '';
+        document.getElementById('qr-hint').textContent = '⚠️ 二维码已过期，请点击「重新绑定微信」重试';
+        showToast('二维码已过期，请重新绑定');
+      }
+    } catch(err) {}
+  };
+  qrEventSource.onerror = () => {
+    stopQrStream();
+  };
+}
+
+function stopQrStream() {
+  if (qrEventSource) {
+    qrEventSource.close();
+    qrEventSource = null;
+  }
+}
+
+async function triggerRelogin() {
+  document.getElementById('relogin-btn').disabled = true;
+  try {
+    const r = await fetch('/hub/ilink/relogin', {
+      method: 'POST',
+      headers: authHeaders(),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast('已触发重新登录，请等待二维码…');
+      setIlinkBadge('logging_in');
+    } else {
+      showToast('触发失败: ' + JSON.stringify(d));
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message);
+  } finally {
+    setTimeout(() => {
+      document.getElementById('relogin-btn').disabled = false;
+    }, 3000);
+  }
+}
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+
 loadClients();
+loadIlinkStatus();
 setInterval(() => { if (!editingClient) loadClients(); }, 10000);
+setInterval(loadIlinkStatus, 5000);
 </script>
 </body>
 </html>

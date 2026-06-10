@@ -19,6 +19,9 @@ pub enum QrLoginUiEvent {
     Status { message: String },
     #[serde(rename = "done")]
     Done,
+    /// Sent when the QR code expires or the login attempt times out.
+    #[serde(rename = "expired")]
+    Expired,
 }
 
 pub struct LoginClient {
@@ -77,7 +80,10 @@ impl LoginClient {
 
         let out = self.poll_qrcode_status(&key, ui.as_ref()).await;
         if let Some(tx) = &ui {
-            let _ = tx.send(QrLoginUiEvent::Done);
+            // Only send Done on success; Expired is sent by poll_qrcode_status on failure.
+            if out.is_ok() {
+                let _ = tx.send(QrLoginUiEvent::Done);
+            }
         }
         out
     }
@@ -115,6 +121,9 @@ impl LoginClient {
 
         loop {
             if attempts >= MAX_ATTEMPTS {
+                if let Some(tx) = ui {
+                    let _ = tx.send(QrLoginUiEvent::Expired);
+                }
                 return Err(anyhow!("QR login timed out after {} attempts", MAX_ATTEMPTS));
             }
             attempts += 1;
@@ -154,6 +163,9 @@ impl LoginClient {
                     return Err(anyhow!("login confirmed but no bot_token in response"));
                 }
                 Some("expired") => {
+                    if let Some(tx) = ui {
+                        let _ = tx.send(QrLoginUiEvent::Expired);
+                    }
                     return Err(anyhow!("QR code expired, please run login again"));
                 }
                 Some(status) => {
