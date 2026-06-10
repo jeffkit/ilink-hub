@@ -78,7 +78,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     .await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
-    let queue = build_queue_backend();
+    let queue = build_queue_backend()?;
     let state = HubState::new(upstream.clone(), store.clone(), queue, shutdown_rx.clone());
 
     if let Some(tx) = on_hub_state {
@@ -102,6 +102,10 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
             store: store.clone(),
             ilink_base_url: ilink_base_url.or(Some(base_url)),
             qr_login_ui,
+            qr_tx: Some(state.qr_tx.clone()),
+            qr_last_ready: Some(state.qr_last_ready.clone()),
+            ilink_status: Some(state.ilink_status.clone()),
+            relogin_rx: Some(state.relogin_tx.subscribe()),
         });
         tokio::spawn(async move {
             upstream_clone
@@ -159,15 +163,26 @@ async fn resolve_token(
 ) -> Result<(String, String)> {
     let quiet_ui = qr_login_ui.is_some();
     let default_base = "https://ilinkai.weixin.qq.com".to_string();
-    let from_cli = token_arg.is_some();
 
-    let (candidate, base) = if let Some(token) = token_arg {
+    // Priority: DB token > env/CLI token.
+    //
+    // The env/CLI token (ILINK_TOKEN) is treated as a bootstrap seed only — it is saved to DB
+    // the first time when the DB is empty, and from that point the DB token takes precedence.
+    //
+    // This prevents ILINK_TOKEN from overwriting a QR-renewed session token on every restart.
+    // Without this, the stale env token overwrites the DB after every restart, forcing a fresh
+    // QR scan each time the service is restarted.
+    let db_creds = store.load_credentials().await?;
+    let db_is_empty = db_creds.is_none();
+
+    let (candidate, base) = if let Some((token, base)) = db_creds {
+        info!("loaded bot token from database");
+        (Some(token), base)
+    } else if let Some(token) = token_arg {
+        // DB is empty; use the env/CLI token as the initial bootstrap seed.
         let base = ilink_base_url
             .clone()
             .unwrap_or_else(|| default_base.clone());
-        (Some(token), base)
-    } else if let Some((token, base)) = store.load_credentials().await? {
-        info!("loaded bot token from database");
         (Some(token), base)
     } else {
         (
@@ -180,7 +195,8 @@ async fn resolve_token(
 
     if let Some(token) = candidate {
         if UpstreamClient::is_well_formed_bot_token(&token) {
-            if from_cli {
+            if db_is_empty {
+                // Bootstrap: persist the env/CLI token so future restarts load from DB.
                 store.save_credentials(&token, &base).await?;
             }
             info!("using iLink token without startup session probe");
@@ -255,7 +271,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_recent_context_tokens(500).await {
         Ok(entries) => {
             let count = entries.len();
-            let mut ctx_map = state.ctx_map.lock().await;
+            let mut ctx_map = state.ctx_map.write().await;
             for (vctx, real_ctx, peer_user_id) in entries {
                 ctx_map.seed_full(vctx, real_ctx, peer_user_id);
             }
@@ -271,28 +287,29 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
 ///
 /// Supported values:
 /// - `"memory"` or unset — in-memory queue (default)
-/// - `"redis"` — not yet implemented; falls back to memory with a warning
-/// - anything else — falls back to memory with an error log
-fn build_queue_backend() -> Arc<dyn MessageQueue> {
+///
+/// Any other value (including `"redis"`, which is not yet implemented) returns `Err` so
+/// the process fails fast rather than silently using memory and losing messages on restart.
+fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
     match std::env::var("ILINK_QUEUE_BACKEND")
         .as_deref()
         .unwrap_or("")
     {
         "memory" | "" => {
             info!(backend = "memory", "queue backend initialized");
-            Arc::new(InMemoryQueue::new())
+            Ok(Arc::new(InMemoryQueue::new()))
         }
         "redis" => {
-            tracing::warn!("Redis queue backend is not yet implemented; falling back to memory");
-            Arc::new(InMemoryQueue::new())
+            anyhow::bail!(
+                "ILINK_QUEUE_BACKEND=redis is not yet implemented. \
+                 Use 'memory' or leave unset."
+            )
         }
         other => {
-            tracing::error!(
-                backend = other,
-                "Unknown ILINK_QUEUE_BACKEND; supported values: 'memory'. \
-                 (redis: planned, not yet available). Falling back to memory."
-            );
-            Arc::new(InMemoryQueue::new())
+            anyhow::bail!(
+                "Unknown ILINK_QUEUE_BACKEND value {:?}. Supported values: 'memory'.",
+                other
+            )
         }
     }
 }
