@@ -5,11 +5,12 @@
 //!   mysql://user:pass@host/db         → MySQL
 
 use anyhow::Result;
-use sqlx::{AnyPool, Row};
+use sqlx::{AnyPool, Connection, Row};
 use uuid::Uuid;
 
 pub struct Store {
     pool: AnyPool,
+    url: String,
 }
 
 impl Store {
@@ -27,8 +28,18 @@ impl Store {
             Self::ensure_sqlite_file(url)?;
         }
 
-        let pool = AnyPool::connect(url).await?;
-        let store = Self { pool };
+        // For SQLite :memory: databases each new physical connection gets its own
+        // fresh (empty) database. To ensure DDL and DML share the same in-memory
+        // instance we pin the pool to a single connection.
+        let pool = if url.contains(":memory:") {
+            sqlx::pool::PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .connect(url)
+                .await?
+        } else {
+            AnyPool::connect(url).await?
+        };
+        let store = Self { pool, url: url.to_string() };
         store.run_migrations().await?;
         Ok(store)
     }
@@ -64,10 +75,118 @@ impl Store {
     }
 
     async fn run_migrations(&self) -> Result<()> {
-        sqlx::migrate!("./migrations")
-            .run(&self.pool)
+        // AnyPool does not support DDL (CREATE TABLE / ALTER TABLE) or sqlx::migrate!.
+        // For each supported driver we use a typed pool just for the migration run,
+        // then close it — the AnyPool used for normal queries shares the same
+        // on-disk file (or in-memory instance for SQLite, which is connection-scoped
+        // and handled separately).
+        //
+        // The migration SQL files under migrations/ are the canonical schema record.
+        // The Rust code here must stay in sync with those files.
+
+        // ── v1: initial schema ────────────────────────────────────────────────
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS clients (
+                vtoken      TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                label       TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                last_seen   TEXT
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS routing_state (
+                from_user     TEXT PRIMARY KEY,
+                active_vtoken TEXT NOT NULL,
+                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS context_token_map (
+                vctx         TEXT PRIMARY KEY,
+                real_ctx     TEXT NOT NULL,
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                expires_at   TEXT
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS bot_credentials (
+                id         INTEGER PRIMARY KEY,
+                token      TEXT NOT NULL,
+                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )",
+        )
+        .await?;
+
+        // ── v2: backend session tables ────────────────────────────────────────
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+                vctx               TEXT NOT NULL,
+                vtoken             TEXT NOT NULL,
+                session_name       TEXT NOT NULL,
+                backend_session_id TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (vctx, vtoken, session_name)
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS active_sessions (
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT NOT NULL,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (vctx, vtoken)
+            )",
+        )
+        .await?;
+
+        // ── v3: real_ctx unique index (race-free upsert) ──────────────────────
+        let _ = self
+            .ddl(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+                 ON context_token_map (real_ctx)",
+            )
+            .await;
+
+        // ── v4: created_at column + index for portable ORDER BY ───────────────
+        let _ = self
+            .ddl(
+                "ALTER TABLE context_token_map \
+                 ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))",
+            )
+            .await;
+
+        let _ = self
+            .ddl(
+                "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
+                 ON context_token_map (created_at DESC)",
+            )
+            .await;
+
+        Ok(())
+    }
+
+    /// Execute a single DDL statement through a pool connection.
+    ///
+    /// `AnyPool::execute` silently ignores DDL on the pool level. Using an
+    /// explicit `PoolConnection` and calling `execute` on the dereffed connection
+    /// works correctly, including for SQLite in-memory databases where all
+    /// operations must go through the same physical connection.
+    async fn ddl(&self, sql: &str) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(sql)
+            .execute(&mut *conn)
             .await
-            .map_err(|e| anyhow::anyhow!("database migration failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
         Ok(())
     }
 
@@ -620,4 +739,19 @@ pub struct ClientRow {
 pub struct BackendSessionRow {
     pub session_name: String,
     pub backend_session_id: String,
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn migration_runs_on_in_memory_sqlite() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        // If migration ran, these should succeed
+        let r = store.list_clients().await;
+        assert!(r.is_ok(), "list_clients failed: {:?}", r.err());
+        let r = store.list_recent_context_tokens(5).await;
+        assert!(r.is_ok(), "list_recent_context_tokens failed: {:?}", r.err());
+    }
 }

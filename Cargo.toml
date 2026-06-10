@@ -82,3 +82,5 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
