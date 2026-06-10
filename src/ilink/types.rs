@@ -73,6 +73,14 @@ pub struct TextItem {
     pub text: Option<String>,
 }
 
+/// Voice content inside a MessageItem (type=3).
+/// `text` is the ASR transcript provided by WeChat, may be absent if recognition failed.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VoiceItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
 /// One item inside a WeixinMessage's item_list.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageItem {
@@ -81,7 +89,9 @@ pub struct MessageItem {
     pub item_type: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text_item: Option<TextItem>,
-    /// All other item fields (image_item, voice_item, file_item, video_item, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_item: Option<VoiceItem>,
+    /// All other item fields (image_item, file_item, video_item, etc.)
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
@@ -152,12 +162,17 @@ pub struct HubExt {
 }
 
 impl WeixinMessage {
-    /// Extract the text content from the first text MessageItem.
+    /// Extract displayable text: prefers text_item, falls back to voice_item ASR transcript.
     pub fn text(&self) -> Option<&str> {
-        self.item_list
-            .as_ref()?
+        let items = self.item_list.as_ref()?;
+        items
             .iter()
             .find_map(|item| item.text_item.as_ref()?.text.as_deref())
+            .or_else(|| {
+                items
+                    .iter()
+                    .find_map(|item| item.voice_item.as_ref()?.text.as_deref())
+            })
     }
 
     /// Build a text reply to this message.
@@ -171,6 +186,7 @@ impl WeixinMessage {
             item_list: Some(vec![MessageItem {
                 item_type: Some(msg_type::TEXT),
                 text_item: Some(TextItem { text: Some(text) }),
+                voice_item: None,
                 extra: serde_json::Value::Object(Default::default()),
             }]),
             ..Default::default()

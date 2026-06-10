@@ -205,6 +205,7 @@ mod tests {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -289,6 +290,7 @@ mod tests {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
+                voice_item: None,
             }]),
             ..Default::default()
         };

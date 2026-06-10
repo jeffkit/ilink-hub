@@ -131,6 +131,7 @@ mod tests {
                     text: Some("body".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
+                voice_item: None,
             }]),
             ..Default::default()
         };

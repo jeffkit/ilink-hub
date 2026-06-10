@@ -122,6 +122,23 @@ impl QuoteRouteIndex {
             Some(s) if !s.is_empty() => s,
             _ => return,
         };
+        // Diagnostic: log the echo structure so we can verify create_time_ms alignment with ref_msg.
+        {
+            let top_create_ms = msg.create_time_ms;
+            let top_message_id = msg.message_id;
+            let item_fields: Vec<_> = msg.item_list.as_deref().unwrap_or(&[]).iter().map(|item| {
+                let msg_id = item.extra.get("msg_id").and_then(|v| v.as_str()).unwrap_or("(none)").to_string();
+                let create_ms = item.extra.get("create_time_ms").and_then(|v| v.as_i64());
+                (msg_id, create_ms)
+            }).collect();
+            tracing::debug!(
+                client_id,
+                top_message_id,
+                top_create_ms,
+                ?item_fields,
+                "bot echo observed"
+            );
+        }
         let Some(pending) = self.pending_by_client_id.remove(client_id) else {
             return;
         };
@@ -256,6 +273,7 @@ mod tests {
                     text: Some("再来一次".into()),
                 }),
                 extra,
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -356,6 +374,7 @@ mod tests {
                     text: Some("b".into()),
                 }),
                 extra: serde_json::json!({ "msg_id": "v1:orphan" }),
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -369,6 +388,7 @@ mod tests {
                 extra: serde_json::json!({
                     "ref_msg": { "message_item": { "msg_id": "v1:orphan" } }
                 }),
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -386,6 +406,7 @@ mod tests {
                     text: Some("hi".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -412,6 +433,7 @@ mod tests {
                     text: Some("bot said".into()),
                 }),
                 extra: serde_json::json!({ "msg_id": "v1:item-1" }),
+                voice_item: None,
             }]),
             ..Default::default()
         };
@@ -431,6 +453,7 @@ mod tests {
                         }
                     }
                 }),
+                voice_item: None,
             }]),
             ..Default::default()
         };
