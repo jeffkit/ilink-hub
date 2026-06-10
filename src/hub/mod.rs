@@ -1,4 +1,5 @@
 pub mod health;
+pub mod messages;
 pub mod outbound_label;
 pub mod pairing;
 pub mod queue;
@@ -6,14 +7,22 @@ pub mod quote_route;
 pub mod registry;
 pub mod router;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
-use crate::ilink::UpstreamClient;
+use crate::ilink::{QrLoginUiEvent, UpstreamClient};
 use crate::store::Store;
+
+/// iLink upstream connection status codes stored in `HubState::ilink_status`.
+pub mod ilink_status {
+    pub const UNKNOWN: u8 = 0;
+    pub const CONNECTED: u8 = 1;
+    pub const NEEDS_LOGIN: u8 = 2;
+    pub const LOGGING_IN: u8 = 3;
+}
 
 pub use health::spawn_health_checker;
 pub use outbound_label::{
@@ -25,6 +34,8 @@ pub use queue::{conversation_key, ClientQueue, ContextTokenMap, InMemoryQueue, M
 pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
+
+pub use ilink_status as IlinkStatus;
 
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
@@ -59,7 +70,7 @@ pub struct HubState {
     pub registry: RwLock<ClientRegistry>,
     pub pairing: RwLock<PairingRegistry>,
     pub queue: Arc<dyn MessageQueue>,
-    pub ctx_map: Mutex<ContextTokenMap>,
+    pub ctx_map: RwLock<ContextTokenMap>,
     pub router: Mutex<Router>,
     /// Quote-reply → backend / hub command (see [`quote_route`]).
     pub quote_index: Mutex<QuoteRouteIndex>,
@@ -67,6 +78,14 @@ pub struct HubState {
     pub metrics: Metrics,
     /// Shared with Axum graceful shutdown; long-poll handlers exit early when this becomes `true`.
     pub shutdown: watch::Receiver<bool>,
+    /// Current iLink upstream status (see [`ilink_status`] constants).
+    pub ilink_status: Arc<AtomicU8>,
+    /// Broadcasts QR login UI events to SSE subscribers.
+    pub qr_tx: broadcast::Sender<QrLoginUiEvent>,
+    /// Last QR Ready event — replayed to new SSE subscribers that connect after it was sent.
+    pub qr_last_ready: Arc<Mutex<Option<QrLoginUiEvent>>>,
+    /// Signals the polling loop to initiate a fresh QR re-login.
+    pub relogin_tx: broadcast::Sender<()>,
 }
 
 impl HubState {
@@ -76,17 +95,23 @@ impl HubState {
         queue: Arc<dyn MessageQueue>,
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
+        let (qr_tx, _) = broadcast::channel(16);
+        let (relogin_tx, _) = broadcast::channel(4);
         Arc::new(Self {
             upstream,
             registry: RwLock::new(ClientRegistry::new()),
             pairing: RwLock::new(PairingRegistry::new()),
             queue,
-            ctx_map: Mutex::new(ContextTokenMap::default()),
+            ctx_map: RwLock::new(ContextTokenMap::default()),
             router: Mutex::new(Router::new(None)),
             quote_index: Mutex::new(QuoteRouteIndex::default()),
             store,
             metrics: Metrics::new(),
             shutdown,
+            ilink_status: Arc::new(AtomicU8::new(ilink_status::UNKNOWN)),
+            qr_tx,
+            qr_last_ready: Arc::new(Mutex::new(None)),
+            relogin_tx,
         })
     }
 }
@@ -195,25 +220,27 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             });
 
-            let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, session_override).await;
+            let hub_ext =
+                build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
 
             msg.context_token = Some(vctx);
             msg.ilink_hub_ext = hub_ext;
 
-            state
-                .metrics
-                .messages_dispatched
-                .fetch_add(1, Ordering::Relaxed);
             match state.queue.push(&vtoken, msg).await {
+                Ok(false) => {
+                    state
+                        .metrics
+                        .messages_dispatched
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(true) => {
                     state
                         .metrics
                         .messages_dropped
                         .fetch_add(1, Ordering::Relaxed);
                 }
-                Ok(false) => {}
                 Err(e) => {
-                    error!(error = %e, vtoken = %vtoken, "failed to push message to queue");
+                    error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push message to queue");
                     state
                         .metrics
                         .messages_dropped
@@ -296,23 +323,24 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 });
 
                 let mut msg_clone = msg.clone();
-                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, None).await;
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, vtoken, None).await;
                 msg_clone.context_token = Some(vctx);
                 msg_clone.ilink_hub_ext = hub_ext;
-                state
-                    .metrics
-                    .messages_dispatched
-                    .fetch_add(1, Ordering::Relaxed);
                 match state.queue.push(vtoken, msg_clone).await {
+                    Ok(false) => {
+                        state
+                            .metrics
+                            .messages_dispatched
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(true) => {
                         state
                             .metrics
                             .messages_dropped
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    Ok(false) => {}
                     Err(e) => {
-                        error!(error = %e, vtoken = %vtoken, "failed to push broadcast message");
+                        error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push broadcast message");
                         state
                             .metrics
                             .messages_dropped
@@ -413,7 +441,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 )
                 .await;
                 let mut m = msg.clone();
-                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, None).await;
+                let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, vtoken, None).await;
                 m.context_token = Some(vctx.clone());
                 m.ilink_hub_ext = hub_ext;
                 // Replace text content in item_list
@@ -424,12 +452,26 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                         }
                     }
                 }
-                state
-                    .metrics
-                    .messages_dispatched
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Err(e) = state.queue.push(vtoken, m).await {
-                    error!(error = %e, vtoken = %vtoken, "failed to push hub broadcast message");
+                match state.queue.push(vtoken, m).await {
+                    Ok(false) => {
+                        state
+                            .metrics
+                            .messages_dispatched
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(true) => {
+                        state
+                            .metrics
+                            .messages_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push hub broadcast message");
+                        state
+                            .metrics
+                            .messages_dropped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             format!("📡 Broadcast to {} client(s)", online.len())
@@ -438,7 +480,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             let registry = state.registry.read().await;
             let online = registry.online_clients().len();
             let total = registry.all_clients().len();
-            format!("iLink Hub 状态：{}/{} 个客户端在线", online, total)
+            messages::hub_status(online, total)
         }
         HubCommand::Help => build_help_text(),
 
@@ -451,37 +493,60 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 None,
             )
             .await;
-            let active = state
-                .store
-                .get_active_session_name(&vctx)
+            // Session commands operate on the backend the user is currently routed to.
+            let vtoken = state
+                .router
+                .lock()
                 .await
-                .unwrap_or_else(|_| "default".to_string());
-            match state.store.list_backend_sessions(&vctx).await {
-                Ok(sessions) if sessions.is_empty() => {
-                    "当前对话尚无 session 记录。\n发送 `/session new <名称>` 创建一个 session。"
-                        .to_string()
-                }
-                Ok(sessions) => {
-                    let mut lines = vec!["**当前对话的 sessions：**".to_string()];
-                    for s in &sessions {
-                        let marker = if s.session_name == active { " ✅" } else { "" };
-                        let uuid_hint = if s.backend_session_id.is_empty() {
-                            "（尚无 UUID，下次对话时由后端写入）".to_string()
-                        } else {
-                            format!(
-                                "`{}`",
-                                &s.backend_session_id[..s.backend_session_id.len().min(12)]
-                            )
-                        };
-                        lines.push(format!("• `{}`{} — {}", s.session_name, marker, uuid_hint));
+                .get_route(&from_user_id)
+                .map(|s| s.to_string());
+            match vtoken {
+                None => messages::NO_BACKEND.to_string(),
+                Some(vtoken) => {
+                    // Resolve the backend display name for the reply header.
+                    let backend_name = {
+                        let registry = state.registry.read().await;
+                        registry
+                            .all_clients()
+                            .into_iter()
+                            .find(|c| c.vtoken == vtoken)
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| vtoken.clone())
+                    };
+                    let active = state
+                        .store
+                        .get_active_session_name(&vctx, &vtoken)
+                        .await
+                        .unwrap_or_else(|_| "default".to_string());
+                    match state.store.list_backend_sessions(&vctx, &vtoken).await {
+                        Ok(sessions) if sessions.is_empty() => {
+                            format!("当前后端 `{backend_name}` {}", messages::SESSION_LIST_NO_SESSIONS)
+                        }
+                        Ok(sessions) => {
+                            let mut lines = vec![format!("**后端 `{backend_name}` 的 sessions：**")];
+                            for s in &sessions {
+                                let marker = if s.session_name == active { " ✅" } else { "" };
+                                let uuid_hint = if s.backend_session_id.is_empty() {
+                                    messages::SESSION_SLOT_NO_UUID.to_string()
+                                } else {
+                                    format!(
+                                        "`{}`",
+                                        &s.backend_session_id
+                                            [..s.backend_session_id.len().min(12)]
+                                    )
+                                };
+                                lines.push(format!(
+                                    "• `{}`{} — {}",
+                                    s.session_name, marker, uuid_hint
+                                ));
+                            }
+                            lines.push(format!("\n当前活跃：`{}`", active));
+                            lines.push(messages::SESSION_LIST_SWITCH_HINT.to_string());
+                            lines.join("\n")
+                        }
+                        Err(e) => messages::session_list_failed(&e),
                     }
-                    lines.push(format!("\n当前活跃：`{}`", active));
-                    lines.push(
-                        "\n用 `/session use <名称>` 切换，`/session new <名称>` 新建。".to_string(),
-                    );
-                    lines.join("\n")
                 }
-                Err(e) => format!("❌ 查询 session 失败：{e}"),
             }
         }
 
@@ -494,33 +559,33 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 None,
             )
             .await;
-            match state
-                .store
-                .set_backend_session(&vctx, session_name, initial_uuid)
+            let vtoken = state
+                .router
+                .lock()
                 .await
-            {
-                Ok(()) => {
-                    let switch_result = state
+                .get_route(&from_user_id)
+                .map(|s| s.to_string());
+            match vtoken {
+                None => messages::NO_BACKEND.to_string(),
+                Some(vtoken) => {
+                    match state
                         .store
-                        .set_active_session_name(&vctx, session_name)
-                        .await;
-                    match switch_result {
+                        .set_backend_session(&vctx, &vtoken, session_name, initial_uuid)
+                        .await
+                    {
                         Ok(()) => {
-                            if initial_uuid.is_empty() {
-                                format!(
-                                    "✅ 已创建并切换到 session `{session_name}`。\n下次对话时后端会写入 UUID。"
-                                )
-                            } else {
-                                format!(
-                                    "✅ 已创建并切换到 session `{session_name}`，UUID: `{}`。",
-                                    &initial_uuid[..initial_uuid.len().min(12)]
-                                )
+                            let switch_result = state
+                                .store
+                                .set_active_session_name(&vctx, &vtoken, session_name)
+                                .await;
+                            match switch_result {
+                                Ok(()) => messages::session_new_ok(session_name),
+                                Err(e) => messages::session_new_created_switch_failed(session_name, &e),
                             }
                         }
-                        Err(e) => format!("✅ 已创建 session `{session_name}`，但切换失败：{e}"),
+                        Err(e) => messages::session_new_failed(&e),
                     }
                 }
-                Err(e) => format!("❌ 创建 session 失败：{e}"),
             }
         }
 
@@ -533,27 +598,41 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 None,
             )
             .await;
-            // Ensure the session exists (auto-create slot with empty UUID if not)
-            let ensure_result: Result<(), String> =
-                match state.store.get_backend_session(&vctx, session_name).await {
-                    Ok(None) => state
+            let vtoken = state
+                .router
+                .lock()
+                .await
+                .get_route(&from_user_id)
+                .map(|s| s.to_string());
+            match vtoken {
+                None => messages::NO_BACKEND.to_string(),
+                Some(vtoken) => {
+                    // Ensure the session exists (auto-create slot with empty UUID if not)
+                    let ensure_result: Result<(), String> = match state
                         .store
-                        .set_backend_session(&vctx, session_name, "")
-                        .await
-                        .map_err(|e| format!("❌ 创建 session slot 失败：{e}")),
-                    Err(e) => Err(format!("❌ 查询 session 失败：{e}")),
-                    Ok(Some(_)) => Ok(()),
-                };
-            match ensure_result {
-                Err(msg) => msg,
-                Ok(()) => {
-                    match state
-                        .store
-                        .set_active_session_name(&vctx, session_name)
+                        .get_backend_session(&vctx, &vtoken, session_name)
                         .await
                     {
-                        Ok(()) => format!("✅ 已切换到 session `{session_name}`"),
-                        Err(e) => format!("❌ 切换 session 失败：{e}"),
+                        Ok(None) => state
+                            .store
+                            .set_backend_session(&vctx, &vtoken, session_name, "")
+                            .await
+                            .map_err(|e| messages::session_use_slot_create_failed(&e)),
+                        Err(e) => Err(messages::session_use_query_failed(&e)),
+                        Ok(Some(_)) => Ok(()),
+                    };
+                    match ensure_result {
+                        Err(msg) => msg,
+                        Ok(()) => {
+                            match state
+                                .store
+                                .set_active_session_name(&vctx, &vtoken, session_name)
+                                .await
+                            {
+                                Ok(()) => messages::session_use_ok(session_name),
+                                Err(e) => messages::session_use_failed(&e),
+                            }
+                        }
                     }
                 }
             }
@@ -568,24 +647,33 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 None,
             )
             .await;
-            let active = state
-                .store
-                .get_active_session_name(&vctx)
+            let vtoken = state
+                .router
+                .lock()
                 .await
-                .unwrap_or_else(|_| "default".to_string());
-            if *session_name == active {
-                format!(
-                    "❌ 无法删除当前活跃的 session `{session_name}`。\n请先用 `/session use <其他名称>` 切换后再删除。"
-                )
-            } else {
-                match state
-                    .store
-                    .delete_backend_session(&vctx, session_name)
-                    .await
-                {
-                    Ok(true) => format!("✅ 已删除 session `{session_name}`"),
-                    Ok(false) => format!("❌ 未找到 session `{session_name}`"),
-                    Err(e) => format!("❌ 删除 session 失败：{e}"),
+                .get_route(&from_user_id)
+                .map(|s| s.to_string());
+            match vtoken {
+                None => messages::NO_BACKEND.to_string(),
+                Some(vtoken) => {
+                    let active = state
+                        .store
+                        .get_active_session_name(&vctx, &vtoken)
+                        .await
+                        .unwrap_or_else(|_| "default".to_string());
+                    if *session_name == active {
+                        messages::session_delete_active_error(session_name)
+                    } else {
+                        match state
+                            .store
+                            .delete_backend_session(&vctx, &vtoken, session_name)
+                            .await
+                        {
+                            Ok(true) => messages::session_delete_ok(session_name),
+                            Ok(false) => messages::session_delete_not_found(session_name),
+                            Err(e) => messages::session_delete_failed(&e),
+                        }
+                    }
                 }
             }
         }
@@ -651,7 +739,7 @@ async fn resolve_vctx_for_message(
     // atomically so no other task can race in between.
     let db_vctx = if client_scope.is_none() {
         let needs_seed = if let Some(ref key) = conv_key {
-            !state.ctx_map.lock().await.has_conversation(key)
+            !state.ctx_map.read().await.has_conversation(key)
         } else {
             false
         };
@@ -674,7 +762,7 @@ async fn resolve_vctx_for_message(
         None
     };
 
-    let mut ctx_map = state.ctx_map.lock().await;
+    let mut ctx_map = state.ctx_map.write().await;
     if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
         // Only seed if nothing else raced in while we held the lock released.
         if !ctx_map.has_conversation(key) {
@@ -696,24 +784,28 @@ async fn resolve_vctx_for_message(
 
 /// Build `HubExt` for an outbound message.
 ///
+/// Sessions are scoped to `(vctx, vtoken)` so that each backend has its own independent
+/// session namespace for the same WeChat conversation.
+///
 /// When `session_override` is provided (from a quote-reply), that session is used directly
 /// instead of the current active session, so the message is routed to the correct conversation.
 async fn build_hub_ext_for_vctx(
     store: &Store,
     vctx: &str,
+    vtoken: &str,
     session_override: Option<String>,
 ) -> Option<HubExt> {
     let session_name = match session_override {
         Some(name) if !name.is_empty() => name,
         _ => store
-            .get_active_session_name(vctx)
+            .get_active_session_name(vctx, vtoken)
             .await
             .ok()
             .unwrap_or_else(|| "default".to_string()),
     };
 
     let session_id = store
-        .get_backend_session(vctx, &session_name)
+        .get_backend_session(vctx, vtoken, &session_name)
         .await
         .ok()
         .flatten()
@@ -765,7 +857,7 @@ fn build_no_backend_reply(user_text: Option<&str>) -> String {
 
     if is_command {
         // User tried a command — give a hint that /help is available
-        return "未识别的指令。发送 /help 查看可用指令。".to_string();
+        return messages::UNRECOGNIZED_COMMAND.to_string();
     }
 
     "你好！我是 iLink Hub 消息路由服务。\n\
@@ -779,4 +871,61 @@ fn build_no_backend_reply(user_text: Option<&str>) -> String {
      \n\
      如需接入 AI 助手，请联系管理员配置后端服务。"
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::InMemoryQueue;
+    use crate::ilink::UpstreamClient;
+    use crate::store::Store;
+
+    /// Verify that concurrent calls to register_client_in_hub (registry → router lock order)
+    /// never deadlock against each other or against route-reading.
+    ///
+    /// A deadlock would cause this test to hang and be killed by the tokio timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_register_and_route_does_not_deadlock() {
+        let store = Store::connect("sqlite::memory:").await.expect("in-memory store");
+        let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+
+        let mut handles = vec![];
+
+        // Spawn tasks that repeatedly register clients (acquires registry write → router write).
+        for i in 0..8 {
+            let s = Arc::clone(&state);
+            handles.push(tokio::spawn(async move {
+                for j in 0..10 {
+                    crate::server::pairing::register_client_in_hub(
+                        &s,
+                        format!("client-{i}-{j}"),
+                        None,
+                    )
+                    .await;
+                }
+            }));
+        }
+
+        // Spawn tasks that repeatedly read the router (acquires router lock).
+        for _ in 0..4 {
+            let s = Arc::clone(&state);
+            handles.push(tokio::spawn(async move {
+                for _ in 0..20 {
+                    let _ = s.router.lock().await.get_route("any_user");
+                    tokio::task::yield_now().await;
+                }
+            }));
+        }
+
+        // All tasks must finish within 5 seconds — a deadlock would cause timeout.
+        let timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures_util::future::join_all(handles),
+        )
+        .await;
+        assert!(timeout.is_ok(), "concurrent register+route timed out (possible deadlock)");
+    }
 }

@@ -290,16 +290,70 @@ pub trait MessageQueue: Send + Sync {
 }
 
 // ─── InMemoryQueue ────────────────────────────────────────────────────────────
+//
+// Design: a two-level locking scheme so concurrent long-polls for different
+// clients never block each other.
+//
+//  Outer map lock (short-held):  only used to look up / insert a PerClientSlot.
+//  Per-client lock (independent): protects the message buffer for one client.
+//
+// `wait_notify` grabs the outer lock just long enough to clone the Arc<Notify>,
+// then releases it before awaiting — so N simultaneous long-polls hold zero
+// shared locks while waiting.
+
+struct PerClientSlot {
+    messages: std::sync::Mutex<VecDeque<WeixinMessage>>,
+    notify: Arc<Notify>,
+}
+
+impl PerClientSlot {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            messages: std::sync::Mutex::new(VecDeque::new()),
+            notify: Arc::new(Notify::new()),
+        })
+    }
+
+    fn push(&self, msg: WeixinMessage) -> bool {
+        let mut q = self.messages.lock().unwrap();
+        let dropped = if q.len() >= MAX_QUEUE_SIZE {
+            q.pop_front();
+            warn!(max = MAX_QUEUE_SIZE, "client queue full, dropping oldest message");
+            true
+        } else {
+            false
+        };
+        q.push_back(msg);
+        self.notify.notify_one();
+        dropped
+    }
+
+    fn drain(&self) -> Vec<WeixinMessage> {
+        self.messages.lock().unwrap().drain(..).collect()
+    }
+
+    fn len(&self) -> usize {
+        self.messages.lock().unwrap().len()
+    }
+}
 
 pub struct InMemoryQueue {
-    queues: tokio::sync::Mutex<HashMap<String, ClientQueue>>,
+    slots: tokio::sync::Mutex<HashMap<String, Arc<PerClientSlot>>>,
 }
 
 impl InMemoryQueue {
     pub fn new() -> Self {
         Self {
-            queues: tokio::sync::Mutex::new(HashMap::new()),
+            slots: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    async fn get_or_create(&self, vtoken: &str) -> Arc<PerClientSlot> {
+        let mut slots = self.slots.lock().await;
+        slots
+            .entry(vtoken.to_string())
+            .or_insert_with(PerClientSlot::new)
+            .clone()
     }
 }
 
@@ -312,41 +366,34 @@ impl Default for InMemoryQueue {
 #[async_trait]
 impl MessageQueue for InMemoryQueue {
     async fn push(&self, vtoken: &str, msg: WeixinMessage) -> Result<bool, HubError> {
-        let mut queues = self.queues.lock().await;
-        let queue = queues.entry(vtoken.to_string()).or_default();
-        let dropped = queue.push(msg);
-        Ok(dropped)
+        let slot = self.get_or_create(vtoken).await;
+        Ok(slot.push(msg))
     }
 
     async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
-        let mut queues = self.queues.lock().await;
-        Ok(queues
-            .get_mut(vtoken)
-            .map(|q| q.drain())
-            .unwrap_or_default())
+        let slot = {
+            let slots = self.slots.lock().await;
+            slots.get(vtoken).cloned()
+        };
+        Ok(slot.map(|s| s.drain()).unwrap_or_default())
     }
 
     async fn wait_notify(&self, vtoken: &str, timeout_secs: u64) -> Result<bool, HubError> {
-        let notify = {
-            let mut queues = self.queues.lock().await;
-            queues.entry(vtoken.to_string()).or_default().notify.clone()
-        };
+        // Grab notify handle and immediately release the outer lock so other clients
+        // can push/drain/wait concurrently without contention.
+        let notify = self.get_or_create(vtoken).await.notify.clone();
         let result =
             tokio::time::timeout(Duration::from_secs(timeout_secs), notify.notified()).await;
         Ok(result.is_ok())
     }
 
     async fn remove_client(&self, vtoken: &str) -> Result<(), HubError> {
-        let mut queues = self.queues.lock().await;
-        queues.remove(vtoken);
+        self.slots.lock().await.remove(vtoken);
         Ok(())
     }
 
     async fn queue_sizes(&self) -> Result<HashMap<String, usize>, HubError> {
-        let queues = self.queues.lock().await;
-        Ok(queues
-            .iter()
-            .map(|(k, q)| (k.clone(), q.pending.len()))
-            .collect())
+        let slots = self.slots.lock().await;
+        Ok(slots.iter().map(|(k, s)| (k.clone(), s.len())).collect())
     }
 }
