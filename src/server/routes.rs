@@ -5,8 +5,10 @@
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -22,6 +24,13 @@ pub const UNKNOWN_VTOKEN_MSG: &str = "Unknown or revoked virtual token; register
 
 // ─── Auth helper ─────────────────────────────────────────────────────────────
 
+/// Redact a virtual token for logging: show only the first 8 characters followed by `…`.
+/// This lets operators correlate log lines without exposing the full credential.
+fn redact_token(t: &str) -> String {
+    let prefix: String = t.chars().take(8).collect();
+    format!("{prefix}…")
+}
+
 fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("authorization")
@@ -31,36 +40,54 @@ fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
 }
 
 /// Returns the configured admin token, reading env once per process.
-/// Returns `None` if not set or empty (no auth required — suitable for private nets).
 fn admin_token() -> Option<&'static str> {
     use std::sync::OnceLock;
     static TOKEN: OnceLock<Option<String>> = OnceLock::new();
     TOKEN
         .get_or_init(|| {
-            let t = std::env::var("ILINK_ADMIN_TOKEN")
+            std::env::var("ILINK_ADMIN_TOKEN")
                 .ok()
-                .filter(|s| !s.is_empty());
-            if t.is_none() {
-                tracing::warn!(
-                    "ILINK_ADMIN_TOKEN is not set — admin endpoints are unprotected. \
-                     Set this variable in production."
-                );
-            }
-            t
+                .filter(|s| !s.is_empty())
         })
         .as_deref()
 }
 
+/// Returns `true` when the request should be allowed through to an admin endpoint.
+///
+/// Auth logic:
+/// - `ILINK_ADMIN_TOKEN` set → Bearer token must match exactly.
+/// - `ILINK_ADMIN_TOKEN` not set AND `ILINK_ADMIN_INSECURE_NO_AUTH=true` → allow (with a
+///   loud startup warning logged separately).
+/// - `ILINK_ADMIN_TOKEN` not set and insecure flag absent → deny with 403.
 fn check_admin_auth(headers: &HeaderMap) -> bool {
-    let Some(required) = admin_token() else {
-        return true;
-    };
-    let provided = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .unwrap_or("");
-    provided == required
+    if let Some(required) = admin_token() {
+        let provided = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .unwrap_or("");
+        return provided == required;
+    }
+    // No token configured — only allow if the operator explicitly opts in to insecure mode.
+    insecure_no_auth()
+}
+
+fn insecure_no_auth() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        let enabled = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if enabled {
+            tracing::warn!(
+                "ILINK_ADMIN_INSECURE_NO_AUTH is set — admin endpoints have NO authentication. \
+                 Never expose this server to the public internet."
+            );
+        }
+        enabled
+    })
 }
 
 // ─── Registration (Hub-specific, non-iLink) ───────────────────────────────────
@@ -132,7 +159,7 @@ pub async fn getupdates(
     {
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %vtoken, "getupdates rejected: unknown virtual token");
+            warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(GetUpdatesResponse {
@@ -157,15 +184,15 @@ pub async fn getupdates(
     let notified =
         wait_notify_or_shutdown(state.queue.as_ref(), &mut shutdown_rx, &vtoken, poll_secs).await;
     if !notified && *state.shutdown.borrow() {
-        debug!(vtoken = %vtoken, "getupdates returning early due to shutdown");
+        debug!(vtoken = %redact_token(&vtoken), "getupdates returning early due to shutdown");
     }
 
     let messages = state.queue.drain(&vtoken).await.unwrap_or_else(|e| {
-        error!(error = %e, vtoken = %vtoken, "queue drain failed");
+        error!(error = %e, vtoken = %redact_token(&vtoken), "queue drain failed");
         vec![]
     });
 
-    debug!(vtoken = %vtoken, count = messages.len(), "getupdates returning");
+    debug!(vtoken = %redact_token(&vtoken), count = messages.len(), "getupdates returning");
 
     (
         StatusCode::OK,
@@ -200,7 +227,7 @@ pub async fn sendmessage(
     {
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %vtoken, "sendmessage rejected: unknown virtual token");
+            warn!(vtoken = %redact_token(&vtoken), "sendmessage rejected: unknown virtual token");
             return Json(SendMessageResponse::err(401, UNKNOWN_VTOKEN_MSG));
         }
     }
@@ -215,7 +242,7 @@ pub async fn sendmessage(
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
-        let ctx_map = state.ctx_map.lock().await;
+        let ctx_map = state.ctx_map.read().await;
         ctx_map
             .resolve_full(&vctx)
             .map(|(r, p)| (r.to_string(), p.to_string()))
@@ -225,7 +252,7 @@ pub async fn sendmessage(
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
         match state.store.resolve_context_token_full(&vctx).await {
             Ok(Some((r, p))) => {
-                let mut ctx_map = state.ctx_map.lock().await;
+                let mut ctx_map = state.ctx_map.write().await;
                 ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
@@ -246,19 +273,35 @@ pub async fn sendmessage(
     };
 
     if let Some(msg) = &mut req.msg {
-        // Read cli_session_id from hub_ext and persist it to the active session.
+        // Extract the session name echoed back by the bridge (set since the race-condition fix).
+        // This tells us which session was active when the *original message was dispatched*,
+        // which may differ from the current active session if the user ran `/session new` or
+        // `/session use` while the AI was processing the reply.
+        let replied_session_name: Option<String> = msg
+            .ilink_hub_ext
+            .as_ref()
+            .and_then(|e| e.session_name.as_ref())
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_string());
+
+        // Read cli_session_id from hub_ext and persist it to the correct session.
         if let Some(ext) = msg.ilink_hub_ext.as_mut() {
             if let Some(cli_sid) = ext.cli_session_id.take() {
                 let t = cli_sid.trim().to_string();
                 if !t.is_empty() {
-                    let session_name = state
-                        .store
-                        .get_active_session_name(&vctx)
-                        .await
-                        .unwrap_or_else(|_| "default".to_string());
+                    // Prefer the session name echoed by the bridge; only fall back to the
+                    // current active session when the bridge didn't provide one (older clients).
+                    let session_name = match replied_session_name.clone() {
+                        Some(n) => n,
+                        None => state
+                            .store
+                            .get_active_session_name(&vctx, &vtoken)
+                            .await
+                            .unwrap_or_else(|_| "default".to_string()),
+                    };
                     if let Err(e) = state
                         .store
-                        .set_backend_session(&vctx, &session_name, &t)
+                        .set_backend_session(&vctx, &vtoken, &session_name, &t)
                         .await
                     {
                         warn!(error = %e, vctx = %vctx, "failed to persist backend session");
@@ -285,7 +328,12 @@ pub async fn sendmessage(
             )
         };
 
-        let active_session = state.store.get_active_session_name(&vctx).await.ok();
+        // Use the session name from the bridge reply when available; fall back to current
+        // active session only for older bridge clients that don't echo it back.
+        let active_session = match replied_session_name.clone() {
+            Some(n) => Some(n),
+            None => state.store.get_active_session_name(&vctx, &vtoken).await.ok(),
+        };
 
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
         if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {
@@ -332,7 +380,7 @@ pub async fn sendtyping(
     {
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %vtoken, "sendtyping rejected: unknown virtual token");
+            warn!(vtoken = %redact_token(&vtoken), "sendtyping rejected: unknown virtual token");
             return Json(serde_json::json!({"ret": 401, "errmsg": UNKNOWN_VTOKEN_MSG}));
         }
     }
@@ -358,7 +406,7 @@ pub async fn getconfig(
     {
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %vtoken, "getconfig rejected: unknown virtual token");
+            warn!(vtoken = %redact_token(&vtoken), "getconfig rejected: unknown virtual token");
             return Json(GetConfigResponse {
                 ret: Some(401),
                 typing_ticket: None,
@@ -370,7 +418,7 @@ pub async fn getconfig(
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
         let real_ctx = {
-            let ctx_map = state.ctx_map.lock().await;
+            let ctx_map = state.ctx_map.read().await;
             ctx_map.resolve(vctx).map(str::to_string)
         };
         if let Some(real) = real_ctx {
@@ -411,7 +459,7 @@ pub async fn getuploadurl(
     {
         let registry = state.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %vtoken, "getuploadurl rejected: unknown virtual token");
+            warn!(vtoken = %redact_token(&vtoken), "getuploadurl rejected: unknown virtual token");
             return Json(GetUploadUrlResponse {
                 ret: 401,
                 upload_url: None,
@@ -636,6 +684,83 @@ pub async fn admin_update_client(
     }
 }
 
+// ─── iLink status + QR re-login (Admin) ──────────────────────────────────────
+
+#[derive(Serialize)]
+pub struct IlinkStatusResponse {
+    pub status: &'static str,
+    pub code: u8,
+}
+
+pub async fn admin_ilink_status(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<IlinkStatusResponse>) {
+    if !check_admin_auth(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(IlinkStatusResponse { status: "unauthorized", code: 0 }),
+        );
+    }
+    let code = state.ilink_status.load(Ordering::Relaxed);
+    let status = match code {
+        crate::hub::ilink_status::CONNECTED => "connected",
+        crate::hub::ilink_status::NEEDS_LOGIN => "needs_login",
+        crate::hub::ilink_status::LOGGING_IN => "logging_in",
+        _ => "unknown",
+    };
+    (StatusCode::OK, Json(IlinkStatusResponse { status, code }))
+}
+
+pub async fn admin_ilink_relogin(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !check_admin_auth(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        );
+    }
+    let _ = state.relogin_tx.send(());
+    (StatusCode::OK, Json(serde_json::json!({"ok": true})))
+}
+
+pub async fn admin_ilink_qr_stream(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
+    // EventSource can't set headers — accept token via query param as fallback.
+    // When a token is configured, also accept it as `?token=` query param.
+    // When no token is configured, apply the same insecure-flag gate as other admin routes.
+    let authed = check_admin_auth(&headers) || admin_token().map_or(insecure_no_auth(), |required| {
+        params.get("token").map(String::as_str).unwrap_or("") == required
+    });
+    if !authed {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    // Grab the cached Ready event before subscribing, so we don't miss it.
+    let cached = state.qr_last_ready.lock().await.clone();
+    let rx = state.qr_tx.subscribe();
+
+    let s = stream::unfold((cached, rx), |(cached, mut rx)| async move {
+        // Replay cached Ready event on first poll if present.
+        if let Some(evt) = cached {
+            let data = serde_json::to_string(&evt).unwrap_or_default();
+            return Some((Ok(Event::default().data(data)), (None, rx)));
+        }
+        match rx.recv().await {
+            Ok(evt) => {
+                let data = serde_json::to_string(&evt).unwrap_or_default();
+                Some((Ok(Event::default().data(data)), (None, rx)))
+            }
+            Err(_) => None,
+        }
+    });
+    Ok(Sse::new(s).keep_alive(KeepAlive::default()))
+}
+
 // ─── Web Admin UI ─────────────────────────────────────────────────────────────
 
 static ADMIN_HTML: &str = include_str!("admin.html");
@@ -747,7 +872,7 @@ async fn wait_notify_or_shutdown(
         _ = wait_shutdown_signal(shutdown) => false,
         notified = async {
             queue.wait_notify(vtoken, poll_secs).await.unwrap_or_else(|e| {
-                error!(error = %e, vtoken = %vtoken, "wait_notify failed");
+                error!(error = %e, vtoken = %redact_token(&vtoken), "wait_notify failed");
                 false
             })
         } => notified,
