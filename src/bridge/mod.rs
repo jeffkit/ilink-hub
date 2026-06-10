@@ -308,6 +308,14 @@ fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
     }
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        from    = msg.from_user_id.as_deref().unwrap_or("?"),
+        ctx     = msg.context_token.as_deref().unwrap_or("(none)"),
+        profile = tracing::field::Empty,
+    )
+)]
 async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMessage) -> Result<()> {
     dump_inbound_weixin_message_for_debug(&msg);
 
@@ -347,6 +355,7 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
         .unwrap_or("default")
         .to_string();
 
+    tracing::Span::current().record("profile", profile_name);
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
     match run_cli(

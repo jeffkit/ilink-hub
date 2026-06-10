@@ -212,6 +212,13 @@ pub async fn getupdates(
 
 // ─── sendmessage ─────────────────────────────────────────────────────────────
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        vtoken = tracing::field::Empty,
+        vctx   = tracing::field::Empty,
+    )
+)]
 pub async fn sendmessage(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
@@ -223,6 +230,7 @@ pub async fn sendmessage(
             "Missing Authorization header",
         ));
     };
+    tracing::Span::current().record("vtoken", redact_token(&vtoken));
 
     {
         let registry = state.registry.read().await;
@@ -239,6 +247,8 @@ pub async fn sendmessage(
             return Json(SendMessageResponse::err(400, "Missing msg.context_token"));
         }
     };
+
+    tracing::Span::current().record("vctx", &vctx);
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {

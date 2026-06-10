@@ -157,6 +157,14 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
     });
 }
 
+#[tracing::instrument(
+    skip_all,
+    fields(
+        from = msg.from_user_id.as_deref().unwrap_or("?"),
+        ctx  = msg.context_token.as_deref().unwrap_or("(none)"),
+        msg_type = msg.message_type.unwrap_or(0),
+    )
+)]
 async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     // Bot-side copies from upstream (used to correlate outbound client_id → item msg_id).
     if msg.message_type == Some(2) {
