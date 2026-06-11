@@ -159,6 +159,25 @@ async fn main() -> Result<()> {
                      each profile gets an independent auto-registered child bridge"
                 );
             }
+            // Child bridges inherit this process's environment, so a manager-level
+            // ILINK_ADMIN_TOKEN propagates to every child's `/hub/register` call. If it is
+            // missing and the Hub enforces admin auth, auto-registration fails with 401 and
+            // operators are tempted to hand-craft credentials that reuse another backend's
+            // vtoken — which makes multiple bridges share one message queue (split-brain).
+            if std::env::var("ILINK_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .is_none()
+            {
+                tracing::warn!(
+                    "ILINK_ADMIN_TOKEN is not set for the bridge manager. If the Hub enforces \
+                     admin auth, child bridges will fail to auto-register (HTTP 401). Set \
+                     ILINK_ADMIN_TOKEN (matching the Hub) in the manager's environment so each \
+                     profile registers as an independent backend. Never reuse another backend's \
+                     credentials/token to work around this — sharing a vtoken makes bridges \
+                     compete for the same message queue."
+                );
+            }
             let mut opts = ilink_hub::bridge::manager::BridgeManagerOptions::new(
                 cli.hub_url.clone(),
                 profiles_dir.clone(),
