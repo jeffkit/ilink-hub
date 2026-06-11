@@ -178,6 +178,21 @@ pub async fn getupdates(
         registry.mark_seen(&vtoken);
     }
 
+    // Detect split-brain: more than one concurrent long-poll for the same vtoken means two
+    // bridge processes share one credential/token and will compete for this vtoken's queue
+    // (drain is a destructive read), so inbound messages get stolen non-deterministically.
+    // The guard is held for the whole handler so the count reflects truly-concurrent polls.
+    let (concurrent_polls, _poll_guard) = state.poll_tracker.enter(&vtoken);
+    if concurrent_polls > 1 {
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            concurrent = concurrent_polls,
+            "multiple bridges are long-polling the same vtoken — they share one credential/token \
+             and will steal each other's messages. Give each backend its own registration \
+             instead of reusing a token."
+        );
+    }
+
     // Use timeout from legacy field if provided, otherwise 30s
     let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
     let mut shutdown_rx = state.shutdown.clone();
@@ -335,6 +350,8 @@ pub async fn sendmessage(
         // Strip ilink_hub_ext before forwarding to upstream iLink.
         msg.ilink_hub_ext = None;
 
+        // Conversation scope for the quote index (captured before peer_user_id is moved).
+        let conv_scope = peer_user_id.clone();
         // Replace virtual context_token with real one and inject to_user_id if missing
         msg.context_token = Some(real_ctx);
         if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
@@ -370,11 +387,22 @@ pub async fn sendmessage(
             }
         }
 
-        if let Some(cid) = msg.client_id.as_deref().filter(|s| !s.is_empty()) {
-            if let Some((name, label)) = client_meta {
-                let mut q = state.quote_index.lock().await;
-                q.register_pending_client(cid, vtoken.clone(), name, label, active_session);
-            }
+        // Index this outbound reply so a later quote-reply in the same conversation routes
+        // back to this backend + session. Content-based by necessity: real iLink never echoes
+        // bot messages and strips `msg_id` from the quoted `ref_msg`, leaving only the text.
+        let outbound_text = msg.text().map(str::to_string);
+        if let (Some((name, label)), Some(text)) = (client_meta, outbound_text) {
+            let origin = crate::hub::quote_route::QuoteOrigin::Client {
+                vtoken: vtoken.clone(),
+                name,
+                label,
+                session_name: active_session,
+            };
+            state
+                .quote_index
+                .lock()
+                .await
+                .register_outbound_content(&conv_scope, &text, origin);
         }
     }
     if req.base_info.is_none() {

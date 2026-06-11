@@ -156,6 +156,20 @@ async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result
         return Ok(v.to_string());
     }
     let msg = resp["errmsg"].as_str().unwrap_or("unknown");
+    if resp["ret"] == 401 {
+        let admin_present = std::env::var("ILINK_ADMIN_TOKEN")
+            .ok()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let hint = if admin_present {
+            "已设置 ILINK_ADMIN_TOKEN，但 Hub 仍返回 401：请确认它与 Hub 端 ILINK_ADMIN_TOKEN 完全一致。"
+        } else {
+            "Hub 启用了 admin 鉴权，但本进程未设置 ILINK_ADMIN_TOKEN。请在环境中设置与 Hub 一致的 \
+             ILINK_ADMIN_TOKEN（manager 模式下设置在 manager 进程的环境里，会自动透传给子 bridge）。\
+             切勿复用其他后端的凭证/token 绕过——共享 vtoken 会导致多个 bridge 抢占同一消息队列。"
+        };
+        anyhow::bail!("POST /hub/register 被拒绝 (401 Unauthorized)。{hint}");
+    }
     anyhow::bail!(
         "POST /hub/register failed: ret={} errmsg={}",
         resp["ret"],

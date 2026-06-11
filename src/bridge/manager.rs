@@ -259,6 +259,26 @@ impl BridgeManager {
             if let Some(mut managed) = self.children.remove(&id) {
                 info!(profile = %id, "stopping bridge child for removed or changed profile");
                 stop_managed_child(&mut managed).await;
+                if desired.get(&id).is_none() {
+                    // Profile yaml was removed/renamed — clean up orphaned credentials so the
+                    // bridge does not re-register under the old name on next manager start.
+                    if let Err(e) = tokio::fs::remove_file(&managed.spec.cred_path).await {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            warn!(
+                                profile = %id,
+                                path = %managed.spec.cred_path.display(),
+                                error = %e,
+                                "failed to remove orphaned credentials"
+                            );
+                        }
+                    } else {
+                        info!(
+                            profile = %id,
+                            path = %managed.spec.cred_path.display(),
+                            "removed orphaned credentials for deleted profile"
+                        );
+                    }
+                }
             }
         }
     }
@@ -677,6 +697,15 @@ fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> 
     cmd.env_remove("WEIXIN_TOKEN");
     cmd.env_remove("ILINKHUB_BRIDGE_CREDS");
     cmd.env_remove("ILINKHUB_BRIDGE_REGISTER_NAME");
+    // Explicitly forward the admin token (also inherited by default) so each child can
+    // auto-register independently against an auth-protected Hub. Without it, registration
+    // returns 401 and tempts operators to reuse an existing backend's token, which causes
+    // multiple bridges to share one vtoken / message queue.
+    if let Ok(admin) = std::env::var("ILINK_ADMIN_TOKEN") {
+        if !admin.trim().is_empty() {
+            cmd.env("ILINK_ADMIN_TOKEN", admin);
+        }
+    }
     cmd.kill_on_drop(true);
 
     cmd.spawn().context("spawn bridge child")
@@ -736,6 +765,54 @@ stdin: none
         assert_eq!(specs[0].register_name, "claude-project");
         assert_eq!(specs[0].cred_path, creds.join("claude-project.json"));
         assert_eq!(specs[1].cred_path, creds.join("codex.json"));
+    }
+
+    #[tokio::test]
+    async fn stop_removed_profile_cleans_up_credentials() {
+        let profiles = temp_dir("cleanup-profiles");
+        let creds = temp_dir("cleanup-creds");
+
+        // Write a profile and a matching credentials file (simulating a registered bridge).
+        write_profile(&profiles.join("old-profile.yaml"));
+        let cred_file = creds.join("old-profile.json");
+        fs::write(&cred_file, r#"{"token":"fake"}"#).unwrap();
+
+        // Desired has no "old-profile" (simulates yaml being removed/renamed).
+        let desired: HashMap<String, BridgeProcessSpec> = HashMap::new();
+
+        let fingerprint = FileFingerprint {
+            len: 0,
+            modified: None,
+        };
+        let spec = BridgeProcessSpec {
+            id: "old-profile".into(),
+            config_path: profiles.join("old-profile.yaml"),
+            cred_path: cred_file.clone(),
+            register_name: "old-profile".into(),
+            fingerprint,
+        };
+        let mut manager = BridgeManager::new(
+            BridgeManagerOptions::new(
+                "http://127.0.0.1:8765".into(),
+                profiles.clone(),
+                creds.clone(),
+            ),
+            Arc::new(Mutex::new(BridgeManagerStatus::default())),
+        );
+        manager.children.insert(
+            "old-profile".into(),
+            ManagedBridge {
+                spec,
+                child: None,
+                last_start: Instant::now(),
+                restart_attempts: 0,
+                state: ManagedBridgeState::Running,
+            },
+        );
+
+        manager.stop_removed_or_changed(&desired).await;
+
+        assert!(!cred_file.exists(), "orphaned credentials should be removed");
     }
 
     #[tokio::test]

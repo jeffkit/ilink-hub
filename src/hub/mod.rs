@@ -7,8 +7,9 @@ pub mod quote_route;
 pub mod registry;
 pub mod router;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -72,6 +73,59 @@ impl Default for Metrics {
     }
 }
 
+// ─── Concurrent long-poll tracker ─────────────────────────────────────────────
+
+/// Tracks how many `getupdates` long-polls are concurrently active per vtoken.
+///
+/// A healthy backend has at most one process polling its vtoken at a time. Two or more
+/// concurrent polls for the same vtoken mean multiple bridge processes share one
+/// credential/token and are competing for the same per-vtoken message queue (`drain` is a
+/// destructive read), so inbound messages get stolen non-deterministically. This tracker
+/// lets the Hub surface that misconfiguration instead of failing silently.
+#[derive(Default)]
+pub struct PollTracker {
+    counts: StdMutex<HashMap<String, usize>>,
+}
+
+impl PollTracker {
+    /// Register a new active poll for `vtoken`. Returns the number of polls now concurrently
+    /// active for that vtoken (always >= 1) and a guard that decrements the count on drop.
+    pub fn enter(self: &Arc<Self>, vtoken: &str) -> (usize, PollGuard) {
+        let count = {
+            let mut counts = self.counts.lock().unwrap();
+            let c = counts.entry(vtoken.to_string()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        (
+            count,
+            PollGuard {
+                tracker: Arc::clone(self),
+                vtoken: vtoken.to_string(),
+            },
+        )
+    }
+}
+
+/// RAII guard returned by [`PollTracker::enter`]; decrements the per-vtoken poll count when
+/// the long-poll handler returns (success, timeout, shutdown, or client disconnect).
+pub struct PollGuard {
+    tracker: Arc<PollTracker>,
+    vtoken: String,
+}
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        let mut counts = self.tracker.counts.lock().unwrap();
+        if let Some(c) = counts.get_mut(&self.vtoken) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                counts.remove(&self.vtoken);
+            }
+        }
+    }
+}
+
 // ─── Shared Hub State ─────────────────────────────────────────────────────────
 
 pub struct HubState {
@@ -95,6 +149,9 @@ pub struct HubState {
     pub qr_last_ready: Arc<Mutex<Option<QrLoginUiEvent>>>,
     /// Signals the polling loop to initiate a fresh QR re-login.
     pub relogin_tx: broadcast::Sender<()>,
+    /// Tracks concurrent `getupdates` long-polls per vtoken to detect bridges that share one
+    /// credential/token (queue split-brain).
+    pub poll_tracker: Arc<PollTracker>,
 }
 
 impl HubState {
@@ -121,6 +178,7 @@ impl HubState {
             qr_tx,
             qr_last_ready: Arc::new(Mutex::new(None)),
             relogin_tx,
+            poll_tracker: Arc::new(PollTracker::default()),
         })
     }
 }
@@ -175,10 +233,10 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
     )
 )]
 async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
-    // Bot-side copies from upstream (used to correlate outbound client_id → item msg_id).
+    // iLink does not echo bot-authored messages back through getupdates in practice, but
+    // guard regardless: a bot copy (message_type == 2) must never be routed as a user message
+    // (that would forward the Hub's own reply back into the backends).
     if msg.message_type == Some(2) {
-        let mut q = state.quote_index.lock().await;
-        q.observe_upstream_bot_message(&msg);
         return;
     }
 
@@ -193,8 +251,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     };
 
     let quoted = {
+        let scope = msg.from_user_id.as_deref().unwrap_or_default();
         let mut q = state.quote_index.lock().await;
-        q.resolve_user_quote(&msg)
+        q.resolve_user_quote(scope, &msg)
     };
     let routing = merge_routing_with_quote(routing, quoted);
 
@@ -316,20 +375,22 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
             let group_id = msg.group_id.clone();
 
-            // Resolve vctx for every online vtoken first (requires ctx_map write lock
-            // per call — done sequentially to maintain lock ordering).
-            let mut vctx_by_vtoken: Vec<(String, String)> = Vec::with_capacity(online.len());
-            for vtoken in &online {
-                let vctx = resolve_vctx_for_message(
-                    &state,
-                    &real_ctx,
-                    &peer_user_id,
-                    group_id.as_deref(),
-                    Some(vtoken.as_str()),
-                )
-                .await;
-                vctx_by_vtoken.push((vtoken.clone(), vctx));
-            }
+            // Use the conversation-stable (unscoped) vctx for every backend, so a backend's
+            // session namespace is identical whether a message arrives via `/use` (directed)
+            // or broadcast. Sessions are keyed by (vctx, vtoken), so one shared vctx still
+            // isolates per-backend sessions while keeping continuity across routing modes.
+            let vctx = resolve_vctx_for_message(
+                &state,
+                &real_ctx,
+                &peer_user_id,
+                group_id.as_deref(),
+                None,
+            )
+            .await;
+            let vctx_by_vtoken: Vec<(String, String)> = online
+                .iter()
+                .map(|vtoken| (vtoken.clone(), vctx.clone()))
+                .collect();
 
             // Batch-persist all vctx→real_ctx mappings in one transaction (fire-and-forget).
             {
@@ -471,12 +532,14 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     .collect::<Vec<_>>()
             };
             for vtoken in &online {
+                // Unscoped vctx (see broadcast note in dispatch_message): keeps each backend's
+                // session namespace consistent between directed and broadcast routing.
                 let vctx = resolve_vctx_for_message(
                     &state,
                     &real_ctx,
                     &from_user_id,
                     msg.group_id.as_deref(),
-                    Some(vtoken.as_str()),
+                    None,
                 )
                 .await;
                 let mut m = msg.clone();
@@ -722,21 +785,25 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
     let mut send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
     if let Some(m) = &mut send_req.msg {
         m.ensure_outbound();
-        if let Some(cid) = m.client_id.as_deref().filter(|s| !s.is_empty()) {
-            let index_hub_quote = matches!(
-                &cmd,
-                HubCommand::List
-                    | HubCommand::Status
-                    | HubCommand::Help
-                    | HubCommand::UseClient(_)
-                    | HubCommand::SessionList
-                    | HubCommand::SessionNew(_, _)
-                    | HubCommand::SessionUse(_)
-                    | HubCommand::SessionDelete(_)
-            );
-            if index_hub_quote {
-                let mut q = state.quote_index.lock().await;
-                q.register_pending_hub(cid, cmd.clone());
+        let index_hub_quote = matches!(
+            &cmd,
+            HubCommand::List
+                | HubCommand::Status
+                | HubCommand::Help
+                | HubCommand::UseClient(_)
+                | HubCommand::SessionList
+                | HubCommand::SessionNew(_, _)
+                | HubCommand::SessionUse(_)
+                | HubCommand::SessionDelete(_)
+        );
+        if index_hub_quote {
+            // Content path: works even though iLink never echoes the bot copy back.
+            if let Some(text) = m.text().map(str::to_string) {
+                state.quote_index.lock().await.register_outbound_content(
+                    &from_user_id,
+                    &text,
+                    quote_route::QuoteOrigin::Hub { cmd: cmd.clone() },
+                );
             }
         }
     }
@@ -759,8 +826,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 /// Reusing one vctx per peer/group keeps backend session IDs (Claude `--resume`, etc.)
 /// attached across turns.
 ///
-/// `client_scope` is `Some(vtoken)` in broadcast, creating per-client vctx entries so
-/// each backend gets an independent context token instead of sharing one.
+/// `client_scope` can pin the vctx to a specific backend (`Some(vtoken)`), but all current
+/// callers pass `None`: directed (`/use`) and broadcast share one conversation-stable vctx,
+/// and per-backend session isolation comes from the `(vctx, vtoken)` session key instead.
+/// Keeping the parameter leaves the door open for per-backend context scoping if ever needed.
 async fn resolve_vctx_for_message(
     state: &HubState,
     real_ctx: &str,
@@ -918,6 +987,31 @@ mod tests {
     use crate::hub::InMemoryQueue;
     use crate::ilink::UpstreamClient;
     use crate::store::Store;
+
+    #[test]
+    fn poll_tracker_counts_concurrent_polls_and_releases_on_drop() {
+        let tracker = Arc::new(PollTracker::default());
+
+        let (c1, g1) = tracker.enter("vt-a");
+        assert_eq!(c1, 1, "first poll is alone");
+
+        let (c2, g2) = tracker.enter("vt-a");
+        assert_eq!(c2, 2, "second concurrent poll on same vtoken detected");
+
+        // A different vtoken is tracked independently.
+        let (c_other, _g_other) = tracker.enter("vt-b");
+        assert_eq!(c_other, 1);
+
+        drop(g2);
+        let (c3, _g3) = tracker.enter("vt-a");
+        assert_eq!(c3, 2, "count drops when a guard is released, then rises again");
+
+        drop(g1);
+        drop(_g3);
+        // All vt-a guards released → entry removed; a fresh poll starts back at 1.
+        let (c4, _g4) = tracker.enter("vt-a");
+        assert_eq!(c4, 1);
+    }
 
     /// Verify that concurrent calls to register_client_in_hub (registry → router lock order)
     /// never deadlock against each other or against route-reading.

@@ -226,6 +226,70 @@
       display: none;
     }
 
+    /* Login overlay */
+    #login-overlay {
+      position: fixed; inset: 0;
+      background: rgba(15, 17, 23, 0.92);
+      backdrop-filter: blur(6px);
+      display: flex; align-items: center; justify-content: center;
+      z-index: 1000;
+    }
+    #login-overlay.hidden { display: none; }
+
+    #login-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 36px 32px;
+      width: 100%;
+      max-width: 380px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.6);
+    }
+    #login-box .login-logo {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 24px;
+    }
+    #login-box .login-logo h2 { font-size: 18px; font-weight: 600; }
+    #login-box .login-logo .badge {
+      font-size: 11px; background: var(--blue); color: #fff;
+      padding: 2px 8px; border-radius: 20px;
+    }
+    #login-box p {
+      font-size: 13px; color: var(--muted); margin-bottom: 20px; line-height: 1.6;
+    }
+    #login-box .login-field { margin-bottom: 16px; }
+    #login-box .login-field label {
+      display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px;
+    }
+    #login-box .login-field input {
+      width: 100%; padding: 9px 12px; font-size: 14px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); font-family: var(--font);
+      outline: none; transition: border-color 0.15s;
+    }
+    #login-box .login-field input:focus { border-color: var(--blue); }
+    #login-box .login-btn {
+      width: 100%; padding: 10px; font-size: 14px; font-weight: 600;
+      background: var(--blue); color: #fff; border: none;
+      border-radius: 6px; cursor: pointer; transition: background 0.15s;
+    }
+    #login-box .login-btn:hover { background: var(--blue-hover); }
+    #login-box .login-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    #login-error {
+      font-size: 12px; color: var(--red); margin-top: 10px;
+      display: none;
+    }
+
+    /* Logout button in header */
+    #logout-btn {
+      font-size: 11px; padding: 4px 10px;
+      background: transparent; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 6px;
+      cursor: pointer; transition: all 0.15s;
+      display: none;
+    }
+    #logout-btn:hover { background: var(--border); color: var(--text); }
+
     /* iLink upstream status */
     #ilink-section .status-row {
       display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
@@ -256,6 +320,26 @@
 </head>
 <body>
 
+<!-- Login overlay -->
+<div id="login-overlay">
+  <div id="login-box">
+    <div class="login-logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+      </svg>
+      <h2>iLink Hub</h2>
+      <span class="badge">Admin</span>
+    </div>
+    <p>请输入管理台访问密码（即 <code style="font-family:monospace;color:#a3e635">ILINK_ADMIN_TOKEN</code> 的值）。</p>
+    <div class="login-field">
+      <label for="login-token-input">Admin Token</label>
+      <input type="password" id="login-token-input" placeholder="请输入 Admin Token" autocomplete="current-password" />
+    </div>
+    <button class="login-btn" id="login-btn" onclick="doLogin()">登录</button>
+    <div id="login-error">Token 错误，请重试</div>
+  </div>
+</div>
+
 <header>
   <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
@@ -263,6 +347,7 @@
   <h1>iLink Hub</h1>
   <span class="badge">Admin</span>
   <span id="status-bar">Connecting…</span>
+  <button id="logout-btn" onclick="doLogout()">退出登录</button>
 </header>
 
 <main>
@@ -389,11 +474,9 @@ function authHeaders() {
 async function loadClients() {
   try {
     const r = await fetch('/hub/clients', { headers: authHeaders() });
-    if (r.status === 401) {
-      document.getElementById('auth-warning').style.display = 'block';
-      document.getElementById('token-field').style.display = 'block';
-      document.getElementById('clients-grid').innerHTML = '<div class="empty">Auth required — enter admin token below to register clients.</div>';
-      document.getElementById('status-bar').textContent = '🔒 Auth required';
+    if (r.status === 401 || r.status === 403) {
+      document.getElementById('status-bar').textContent = '🔒 未认证';
+      showLoginOverlay();
       return;
     }
     const data = await r.json();
@@ -714,10 +797,103 @@ async function triggerRelogin() {
   }
 }
 
+// ─── Login / Logout ───────────────────────────────────────────────────────────
+
+function showLoginOverlay() {
+  document.getElementById('login-overlay').classList.remove('hidden');
+  document.getElementById('logout-btn').style.display = 'none';
+  document.getElementById('login-token-input').value = '';
+  document.getElementById('login-error').style.display = 'none';
+  setTimeout(() => document.getElementById('login-token-input').focus(), 50);
+}
+
+function hideLoginOverlay() {
+  document.getElementById('login-overlay').classList.add('hidden');
+  document.getElementById('logout-btn').style.display = '';
+}
+
+async function doLogin() {
+  const input = document.getElementById('login-token-input');
+  const token = input.value.trim();
+  if (!token) { input.focus(); return; }
+
+  const btn = document.getElementById('login-btn');
+  btn.disabled = true;
+  btn.textContent = '验证中…';
+
+  try {
+    const r = await fetch('/hub/clients', {
+      headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' }
+    });
+    if (r.status === 401 || r.status === 403) {
+      document.getElementById('login-error').style.display = 'block';
+      input.value = '';
+      input.focus();
+      return;
+    }
+    // Token works
+    adminToken = token;
+    localStorage.setItem('ilink_admin_token', adminToken);
+    document.getElementById('login-error').style.display = 'none';
+    hideLoginOverlay();
+    loadClients();
+    loadIlinkStatus();
+  } catch(e) {
+    document.getElementById('login-error').textContent = '连接失败，请检查网络';
+    document.getElementById('login-error').style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录';
+  }
+}
+
+function doLogout() {
+  adminToken = '';
+  localStorage.removeItem('ilink_admin_token');
+  showLoginOverlay();
+}
+
+// Enter key in login input
+document.getElementById('login-token-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') doLogin();
+});
+
 // ─── Init ─────────────────────────────────────────────────────────────────────
 
-loadClients();
-loadIlinkStatus();
+// Check if we need to show login overlay
+async function init() {
+  if (!adminToken) {
+    // Check if server requires auth at all
+    const r = await fetch('/hub/clients').catch(() => null);
+    if (r && r.status === 401) {
+      showLoginOverlay();
+      return;
+    } else if (r && r.ok) {
+      // No auth required, load normally
+      hideLoginOverlay();
+      loadClients();
+      loadIlinkStatus();
+      return;
+    }
+    showLoginOverlay();
+    return;
+  }
+
+  // We have a stored token — verify it
+  const r = await fetch('/hub/clients', { headers: authHeaders() }).catch(() => null);
+  if (r && (r.status === 401 || r.status === 403)) {
+    // Stored token is invalid, clear and show login
+    adminToken = '';
+    localStorage.removeItem('ilink_admin_token');
+    showLoginOverlay();
+    return;
+  }
+  hideLoginOverlay();
+  loadClients();
+  loadIlinkStatus();
+}
+
+init();
 setInterval(() => { if (!editingClient) loadClients(); }, 10000);
 setInterval(loadIlinkStatus, 5000);
 </script>
