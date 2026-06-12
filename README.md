@@ -201,6 +201,19 @@ let bot = WeChatBot::new(BotOptions {
 
 Run a **local** command (Claude Code, Cursor Agent, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Usage guide (Chinese):** [bridge/USAGE](https://jeffkit.github.io/ilink-hub/bridge/USAGE.html). **Quick echo path:** [5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
 
+```yaml
+# Example bridge config (ilink-hub-bridge.yaml)
+profiles:
+  echo:
+    command: echo
+    args: ["{{MESSAGE}}"] # Placeholder replaced with user message
+    stdin: none
+```
+
+> [!WARNING]
+> **安全警告 / Security Warning**:
+> 绝不要将 `{{MESSAGE}}` 用于 shell `-c` 参数（例如 `args: ["-c", "run {{MESSAGE}}"]`），因为这会带来 shell 命令注入的安全隐患。推荐使用 `stdin: message` 模式，将消息内容通过标准输入安全地传递给子进程。
+
 ```bash
 cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml
 # Default — no WEIXIN_TOKEN and no cred file yet: POST /hub/register, saves ~/.ilink-hub/bridge-credentials.json (ILINK_ADMIN_TOKEN if Hub requires it). If the file exists but is corrupt/empty, bridge errors instead of overwriting — use --force-register or delete the file.
