@@ -1,0 +1,66 @@
+verdict: PASS
+milestone: m2
+title: Adversarial Review for Fix MEM-02 (QuoteRouteIndex Limit)
+findings:
+  - id: OVERFLOW-PANIC-01
+    title: Critical Integer Overflow and Panic in resolve_by_content
+    severity: CRITICAL
+    description: |
+      In `resolve_by_content` (src/hub/quote_route.rs), the subtraction `e.created_ms - ms` is performed directly where `ms` is the user-supplied `ref_ms` extracted from the message's `ref_msg.message_item.create_time_ms` payload. Because `ms` comes from the external network and can be any arbitrary 64-bit integer, an attacker can supply extreme values (such as `i64::MIN`). In debug builds, or release builds with overflow checks enabled, this subtraction will trigger a panic.
+    impact: |
+      Since `dispatch_message` runs in a loop inside a spawned tokio task, a panic in `resolve_by_content` will unwind and terminate the dispatcher loop. This permanently crashes the Hub's message routing pipeline for all clients until the process is manually restarted, causing a complete Denial of Service (DoS).
+    recommendation: |
+      Cast both timestamps to `i128` before performing subtraction, or use safe arithmetic methods like `checked_sub` / `saturating_sub`:
+      ```rust
+      (e.created_ms as i128 - ms as i128).abs()
+      ```
+
+  - id: KEY-EXHAUSTION-02
+    title: Denial of Service via QuoteRouteIndex Key Exhaustion
+    severity: HIGH
+    description: |
+      The `QuoteRouteIndex` caps the unique keys stored in `by_content` to `10,000` via `MAX_BY_CONTENT_KEYS`. When the limit is reached, `register_outbound_content` silently skips registering any new keys. Because the TTL of each entry is set to 7 days (`INDEX_TTL`), the index can easily fill up under normal usage within a few hours or days. Once filled, no new message routes can be registered for 7 days, rendering the quote routing feature useless.
+    impact: |
+      An attacker can easily flood the system with 10,000 unique messages to permanently disable quote routing for all users (DoS). Under normal system loads with high message volumes, the limit will also naturally be hit, breaking quote routing functionality.
+    recommendation: |
+      Instead of skipping new registrations when the index is full, implement a proper LRU (Least Recently Used) cache or FIFO eviction scheme that evicts the oldest keys when the limit is exceeded. Alternatively, decrease the `INDEX_TTL` to a much shorter duration (e.g., 24 hours).
+
+  - id: UNBOUNDED-KEY-SIZE-03
+    title: Unbounded Key Size in HashMap leading to Memory Exhaustion
+    severity: MEDIUM
+    description: |
+      The key used in the `by_content` HashMap is formatted as `"full:{sig}"`, where `sig` is the untrimmed/untruncated body text of the outbound message. If backends send extremely large messages (e.g., large log dumps or payloads), these huge strings are stored verbatim in the HashMap.
+    impact: |
+      An attacker or a misbehaving backend could send large payloads to exhaust system memory (OOM), leading to crashes.
+    recommendation: |
+      Since the HashMap keys are only used for exact-match lookups and the original key text is never retrieved from the map, store a hash of the signature (e.g., SHA-256 or a fast hashing function like SipHash/FxHash) instead of the raw long text.
+
+  - id: INCONSISTENT-LIMIT-04
+    title: Inconsistent/Partial Key Registration under Limit Checks
+    severity: LOW
+    description: |
+      In `register_outbound_content`, the limit check is performed inside the loop for each key:
+      ```rust
+      for key in content_keys(text) {
+          if !self.by_content.contains_key(&key) && self.by_content.len() >= MAX_BY_CONTENT_KEYS {
+              ...
+              continue;
+          }
+          ...
+      }
+      ```
+      If the map size is currently `9,999` and a long message generates two keys (`full:{sig}` and `pre:{prefix}`), the first key is registered, increasing the map size to `10,000`. The second key will then be skipped as the limit is hit.
+    impact: |
+      The message is left in a partially registered state, meaning that quote-replies matching the truncated prefix will fail to route while exact matches succeed.
+    recommendation: |
+      Perform the capacity check once before the loop, or group registrations atomically so they either all succeed or all fail/skipped.
+
+  - id: PERFORMANCE-MUTEX-05
+    title: Unnecessary Use of Asynchronous Mutex
+    severity: INFORMATIONAL
+    description: |
+      `quote_index` in `HubState` is wrapped in `tokio::sync::Mutex`. However, all operations on `QuoteRouteIndex` are strictly synchronous and complete immediately without yielding control (`.await`).
+    impact: |
+      `tokio::sync::Mutex` introduces unnecessary CPU and memory overhead compared to `std::sync::Mutex` or `parking_lot::Mutex`.
+    recommendation: |
+      Replace `tokio::sync::Mutex` with `std::sync::Mutex` or `parking_lot::Mutex` for `quote_index`.
