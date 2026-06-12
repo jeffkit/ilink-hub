@@ -26,6 +26,13 @@ const MAX_CTX_MAP_ENTRIES: usize = 50_000;
 
 // ─── context_token mapping ────────────────────────────────────────────────────
 
+#[derive(Clone, Debug)]
+pub struct ContextRecord {
+    pub real_token: String,
+    pub peer_user_id: String,
+    pub conv_key: Option<String>,
+}
+
 /// Maps virtual context tokens (issued to clients) to real context tokens
 /// (from actual iLink upstream). Clients never see the real tokens.
 /// Also stores the peer_user_id (WeChat sender) so the hub can set `to_user_id` on replies.
@@ -34,14 +41,131 @@ const MAX_CTX_MAP_ENTRIES: usize = 50_000;
 /// `conv_to_v` keeps one stable virtual token per conversation so backend session IDs
 /// (e.g. Claude `--resume`) survive across messages.
 ///
-/// All four maps are capped at [`MAX_CTX_MAP_ENTRIES`] with LRU eviction to bound
+/// The underlying `LruCache` is capped at [`MAX_CTX_MAP_ENTRIES`] with LRU eviction to bound
 /// memory usage during long-running deployments.
 pub struct ContextTokenMap {
-    v_to_real: LruCache<String, String>,
-    real_to_v: LruCache<String, String>,
-    v_to_peer: LruCache<String, String>,
-    /// Stable vctx per conversation (`peer:<id>` or `group:<id>`).
-    conv_to_v: LruCache<String, String>,
+    inner: std::sync::Mutex<ContextTokenMapInner>,
+}
+
+struct ContextTokenMapInner {
+    v_to_record: LruCache<String, ContextRecord>,
+    real_to_v: HashMap<String, String>,
+    conv_to_v: HashMap<String, String>,
+}
+
+impl ContextTokenMapInner {
+    fn insert_record(&mut self, vtoken: String, record: ContextRecord) {
+        // If the key already exists, pop it to clean up the secondary maps.
+        if let Some(old_record) = self.v_to_record.pop(&vtoken) {
+            if let Some(mapped_vtoken) = self.real_to_v.get(&old_record.real_token) {
+                if mapped_vtoken == &vtoken {
+                    self.real_to_v.remove(&old_record.real_token);
+                }
+            }
+            if let Some(ref k) = old_record.conv_key {
+                if let Some(mapped_vtoken) = self.conv_to_v.get(k) {
+                    if mapped_vtoken == &vtoken {
+                        self.conv_to_v.remove(k);
+                    }
+                }
+            }
+        }
+
+        // Push the new record and handle LRU eviction if we exceed capacity.
+        if let Some((evicted_vtoken, evicted_record)) =
+            self.v_to_record.push(vtoken.clone(), record.clone())
+        {
+            if let Some(mapped_vtoken) = self.real_to_v.get(&evicted_record.real_token) {
+                if mapped_vtoken == &evicted_vtoken {
+                    self.real_to_v.remove(&evicted_record.real_token);
+                }
+            }
+            if let Some(ref k) = evicted_record.conv_key {
+                if let Some(mapped_vtoken) = self.conv_to_v.get(k) {
+                    if mapped_vtoken == &evicted_vtoken {
+                        self.conv_to_v.remove(k);
+                    }
+                }
+            }
+        }
+
+        // Insert new indices.
+        self.real_to_v
+            .insert(record.real_token.clone(), vtoken.clone());
+        if let Some(ref k) = record.conv_key {
+            self.conv_to_v.insert(k.clone(), vtoken);
+        }
+    }
+
+    fn seed_record(
+        &mut self,
+        vtoken: String,
+        real_token: String,
+        peer_user_id: String,
+        conv_key: Option<String>,
+    ) {
+        let old_record = self.v_to_record.peek(&vtoken).cloned();
+        if let Some(record) = old_record {
+            let mut real_changed = false;
+            let mut old_real = String::new();
+            if record.real_token != real_token {
+                real_changed = true;
+                old_real = record.real_token;
+            }
+
+            let mut conv_changed = false;
+            let mut old_conv = None;
+            if let Some(ref k) = conv_key {
+                if record.conv_key.as_ref() != Some(k) {
+                    conv_changed = true;
+                    old_conv = record.conv_key;
+                }
+            }
+
+            if real_changed {
+                if let Some(mapped_vtoken) = self.real_to_v.get(&old_real) {
+                    if mapped_vtoken == &vtoken {
+                        self.real_to_v.remove(&old_real);
+                    }
+                }
+                self.real_to_v.insert(real_token.clone(), vtoken.clone());
+            }
+
+            if conv_changed {
+                if let Some(ref old_k) = old_conv {
+                    if let Some(mapped_vtoken) = self.conv_to_v.get(old_k) {
+                        if mapped_vtoken == &vtoken {
+                            self.conv_to_v.remove(old_k);
+                        }
+                    }
+                }
+                if let Some(ref k) = conv_key {
+                    self.conv_to_v.insert(k.clone(), vtoken.clone());
+                }
+            }
+
+            // Finally, perform the update and promotion
+            if let Some(r) = self.v_to_record.get_mut(&vtoken) {
+                if real_changed {
+                    r.real_token = real_token;
+                }
+                if !peer_user_id.is_empty() && r.peer_user_id != peer_user_id {
+                    r.peer_user_id = peer_user_id;
+                }
+                if conv_changed {
+                    r.conv_key = conv_key;
+                }
+            }
+        } else {
+            // Insert fresh record.
+            let record = ContextRecord {
+                real_token,
+                peer_user_id,
+                conv_key,
+            };
+            self.insert_record(vtoken, record);
+        }
+    }
 }
 
 /// Conversation identity for session continuity (DM vs group).
@@ -65,58 +189,78 @@ impl ContextTokenMap {
     pub fn new() -> Self {
         let cap = NonZeroUsize::new(MAX_CTX_MAP_ENTRIES).unwrap();
         Self {
-            v_to_real: LruCache::new(cap),
-            real_to_v: LruCache::new(cap),
-            v_to_peer: LruCache::new(cap),
-            conv_to_v: LruCache::new(cap),
+            inner: std::sync::Mutex::new(ContextTokenMapInner {
+                v_to_record: LruCache::new(cap),
+                real_to_v: HashMap::new(),
+                conv_to_v: HashMap::new(),
+            }),
         }
     }
 
     pub fn has_conversation(&self, conv_key: &str) -> bool {
-        self.conv_to_v.contains(conv_key)
+        let inner = self.inner.lock().unwrap();
+        inner.conv_to_v.contains_key(conv_key)
     }
 
     /// Seed a known conversation → vctx mapping (e.g. after DB warm-up on hub restart).
     pub fn seed_conversation(
-        &mut self,
+        &self,
         conv_key: String,
         vctx: String,
         real_ctx: String,
         peer_user_id: String,
     ) {
-        self.conv_to_v.put(conv_key, vctx.clone());
-        self.seed_full(vctx, real_ctx, peer_user_id);
+        let mut inner = self.inner.lock().unwrap();
+        inner.seed_record(vctx, real_ctx, peer_user_id, Some(conv_key));
     }
 
-    pub fn map(
-        &mut self,
-        real_token: String,
-        peer_user_id: String,
-        group_id: Option<&str>,
-    ) -> String {
+    pub fn map(&self, real_token: String, peer_user_id: String, group_id: Option<&str>) -> String {
         self.map_scoped(real_token, peer_user_id, group_id, None)
     }
 
     /// Like `map`, but scopes the stable vctx to a specific client (`client_scope`).
     /// Used in broadcast so each backend gets its own independent vctx.
     pub fn map_scoped(
-        &mut self,
+        &self,
         real_token: String,
         peer_user_id: String,
         group_id: Option<&str>,
         client_scope: Option<&str>,
     ) -> String {
+        let mut inner = self.inner.lock().unwrap();
         let conv_key = conversation_key(&peer_user_id, group_id).map(|k| match client_scope {
             Some(scope) => format!("{k}@{scope}"),
             None => k,
         });
 
         if let Some(ref key) = conv_key {
-            if let Some(vtoken) = self.conv_to_v.get(key).cloned() {
-                self.v_to_real.put(vtoken.clone(), real_token.clone());
-                self.real_to_v.put(real_token, vtoken.clone());
-                if !peer_user_id.is_empty() {
-                    self.v_to_peer.put(vtoken.clone(), peer_user_id);
+            if let Some(vtoken) = inner.conv_to_v.get(key).cloned() {
+                let old_record = inner.v_to_record.peek(&vtoken).cloned();
+                if let Some(record) = old_record {
+                    let mut real_changed = false;
+                    let mut old_real = String::new();
+                    if record.real_token != real_token {
+                        real_changed = true;
+                        old_real = record.real_token;
+                    }
+
+                    if real_changed {
+                        if let Some(mapped_vtoken) = inner.real_to_v.get(&old_real) {
+                            if mapped_vtoken == &vtoken {
+                                inner.real_to_v.remove(&old_real);
+                            }
+                        }
+                        inner.real_to_v.insert(real_token.clone(), vtoken.clone());
+                    }
+
+                    if let Some(r) = inner.v_to_record.get_mut(&vtoken) {
+                        if real_changed {
+                            r.real_token = real_token;
+                        }
+                        if !peer_user_id.is_empty() {
+                            r.peer_user_id = peer_user_id;
+                        }
+                    }
                 }
                 return vtoken;
             }
@@ -124,63 +268,63 @@ impl ContextTokenMap {
 
         // For unscoped calls, also check the real_to_v index.
         if client_scope.is_none() {
-            if let Some(vtoken) = self.real_to_v.get(&real_token).cloned() {
-                if !peer_user_id.is_empty() {
-                    self.v_to_peer.put(vtoken.clone(), peer_user_id);
+            if let Some(vtoken) = inner.real_to_v.get(&real_token).cloned() {
+                if let Some(record) = inner.v_to_record.get_mut(&vtoken) {
+                    if !peer_user_id.is_empty() {
+                        record.peer_user_id = peer_user_id;
+                    }
                 }
                 return vtoken;
             }
         }
 
         let vtoken = format!("vctx_{}", Uuid::new_v4().simple());
-        self.v_to_real.put(vtoken.clone(), real_token.clone());
-        self.real_to_v.put(real_token, vtoken.clone());
-        if let Some(key) = conv_key {
-            self.conv_to_v.put(key, vtoken.clone());
-        }
-        if !peer_user_id.is_empty() {
-            self.v_to_peer.put(vtoken.clone(), peer_user_id);
-        }
+        let record = ContextRecord {
+            real_token,
+            peer_user_id,
+            conv_key,
+        };
+        inner.insert_record(vtoken.clone(), record);
         vtoken
     }
 
     /// Number of virtual context token entries currently held in memory.
     pub fn len(&self) -> usize {
-        self.v_to_real.len()
+        let inner = self.inner.lock().unwrap();
+        inner.v_to_record.len()
     }
 
     /// Whether the map currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        self.v_to_real.is_empty()
+        let inner = self.inner.lock().unwrap();
+        inner.v_to_record.is_empty()
     }
 
-    pub fn resolve(&mut self, vtoken: &str) -> Option<&str> {
-        self.v_to_real.get(vtoken).map(String::as_str)
+    pub fn resolve(&self, vtoken: &str) -> Option<String> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.v_to_record.get(vtoken).map(|r| r.real_token.clone())
     }
 
     /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
     /// Uses `get` (updates LRU promotion) to correctly update the LRU cache priority.
-    pub fn resolve_full(&mut self, vtoken: &str) -> Option<(&str, &str)> {
-        let real = self.v_to_real.get(vtoken)?.as_str();
-        let peer = self.v_to_peer.get(vtoken).map(String::as_str).unwrap_or("");
-        Some((real, peer))
+    pub fn resolve_full(&self, vtoken: &str) -> Option<(String, String)> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .v_to_record
+            .get(vtoken)
+            .map(|r| (r.real_token.clone(), r.peer_user_id.clone()))
     }
 
     /// Seed a known mapping into the in-memory cache (without peer_user_id).
-    pub fn seed(&mut self, vctx: String, real_ctx: String) {
-        self.v_to_real
-            .get_or_insert(vctx.clone(), || real_ctx.clone());
-        self.real_to_v.get_or_insert(real_ctx, || vctx);
+    pub fn seed(&self, vctx: String, real_ctx: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seed_record(vctx, real_ctx, "".to_string(), None);
     }
 
     /// Seed a known mapping including peer_user_id.
-    pub fn seed_full(&mut self, vctx: String, real_ctx: String, peer_user_id: String) {
-        self.v_to_real
-            .get_or_insert(vctx.clone(), || real_ctx.clone());
-        self.real_to_v.get_or_insert(real_ctx, || vctx.clone());
-        if !peer_user_id.is_empty() {
-            self.v_to_peer.get_or_insert(vctx, || peer_user_id);
-        }
+    pub fn seed_full(&self, vctx: String, real_ctx: String, peer_user_id: String) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.seed_record(vctx, real_ctx, peer_user_id, None);
     }
 }
 
@@ -190,27 +334,30 @@ mod context_map_tests {
 
     #[test]
     fn map_creates_stable_virtual_for_same_real() {
-        let mut m = ContextTokenMap::default();
+        let m = ContextTokenMap::default();
         let v1 = m.map("real-ctx".into(), "user1".into(), None);
         let v2 = m.map("real-ctx".into(), "user1".into(), None);
         assert_eq!(v1, v2);
-        assert_eq!(m.resolve(&v1), Some("real-ctx"));
-        assert_eq!(m.resolve_full(&v1), Some(("real-ctx", "user1")));
+        assert_eq!(m.resolve(&v1), Some("real-ctx".to_string()));
+        assert_eq!(
+            m.resolve_full(&v1),
+            Some(("real-ctx".to_string(), "user1".to_string()))
+        );
     }
 
     #[test]
     fn map_reuses_vctx_for_same_peer_even_when_real_ctx_changes() {
-        let mut m = ContextTokenMap::default();
+        let m = ContextTokenMap::default();
         let peer = "user@im.wechat";
         let v1 = m.map("ctx-msg-1".into(), peer.into(), None);
         let v2 = m.map("ctx-msg-2".into(), peer.into(), None);
         assert_eq!(v1, v2);
-        assert_eq!(m.resolve(&v2), Some("ctx-msg-2"));
+        assert_eq!(m.resolve(&v2), Some("ctx-msg-2".to_string()));
     }
 
     #[test]
     fn map_different_real_gets_different_virtual() {
-        let mut m = ContextTokenMap::default();
+        let m = ContextTokenMap::default();
         let va = m.map("ctx-a".into(), "u".into(), None);
         let vb = m.map("ctx-b".into(), "v".into(), None);
         assert_ne!(va, vb);
@@ -218,15 +365,18 @@ mod context_map_tests {
 
     #[test]
     fn seed_full_then_resolve() {
-        let mut m = ContextTokenMap::default();
+        let m = ContextTokenMap::default();
         m.seed_full("vctx_1".into(), "real".into(), "peer@x".into());
-        assert_eq!(m.resolve("vctx_1"), Some("real"));
-        assert_eq!(m.resolve_full("vctx_1"), Some(("real", "peer@x")));
+        assert_eq!(m.resolve("vctx_1"), Some("real".to_string()));
+        assert_eq!(
+            m.resolve_full("vctx_1"),
+            Some(("real".to_string(), "peer@x".to_string()))
+        );
     }
 
     #[test]
     fn test_resolve_full_updates_lru_hotness() {
-        let mut m = ContextTokenMap::default();
+        let m = ContextTokenMap::default();
 
         let v0 = m.map("real-0".into(), "user-0".into(), None);
         let v1 = m.map("real-1".into(), "user-1".into(), None);
@@ -248,6 +398,53 @@ mod context_map_tests {
             m.resolve_full(&v1).is_none(),
             "v1 should be evicted as the oldest unpromoted entry"
         );
+    }
+
+    #[test]
+    fn test_lru_coherency_adversarial() {
+        let m = ContextTokenMap::default();
+
+        let peer0 = "user-adversarial-0";
+        let peer1 = "user-adversarial-1";
+        let v0 = m.map("real-0".into(), peer0.into(), None);
+        let v1 = m.map("real-1".into(), peer1.into(), None);
+
+        // Keep v0 hot by resolving it (uses resolve which only returns real_token,
+        // but under the hood it must promote the entire ContextRecord).
+        assert!(m.resolve(&v0).is_some());
+
+        // Insert 49,999 other entries to trigger exactly 1 eviction
+        for i in 2..=50000 {
+            m.map(format!("real-{}", i), format!("user-{}", i), None);
+        }
+
+        // Verify that v0 is fully coherent and preserved:
+        // 1. resolve_full still returns both real_token and peer_user_id
+        let full = m.resolve_full(&v0);
+        assert!(
+            full.is_some(),
+            "v0 should be preserved due to resolve promotion"
+        );
+        let (_real, peer_id) = full.unwrap();
+        assert_eq!(peer_id, peer0, "peer_user_id must be preserved for v0");
+
+        // 2. mapping the same peer with a new real token still returns the same stable v0
+        let v_new = m.map("real-new-for-0".into(), peer0.into(), None);
+        assert_eq!(
+            v_new, v0,
+            "conv_to_v mapping must be preserved for stable vctx"
+        );
+
+        // Verify that v1 is evicted and not found in any maps
+        assert!(m.resolve(&v1).is_none(), "v1 should be evicted");
+        assert!(
+            m.resolve_full(&v1).is_none(),
+            "v1 should be evicted from full resolve"
+        );
+
+        // Mapping peer1 with new real token should generate a NEW vtoken since it was evicted
+        let v1_new = m.map("real-new-for-1".into(), peer1.into(), None);
+        assert_ne!(v1_new, v1, "v1's conversation key should have been evicted");
     }
 }
 

@@ -1,0 +1,51 @@
+milestone: m1
+verdict: PASS
+findings:
+  - id: LRU-COHERENCY-MISMATCH
+    title: LRU Cache Eviction and Coherency Mismatch
+    severity: CRITICAL
+    category: Logic Error / Potential Data Loss
+    status: RESOLVED
+    resolution: >
+      Combined the four independent LruCache maps into a single LruCache mapping vtoken to a unified ContextRecord.
+      Used secondary HashMap index tables (real_to_v and conv_to_v) that dynamically track and mirror entries in the LruCache
+      (updated and removed atomically during insert and LRU eviction events), ensuring all maps remain synchronized.
+    description: >
+      `ContextTokenMap` contains four independent `LruCache` structures (`v_to_real`, `real_to_v`, `v_to_peer`, `conv_to_v`)
+      of the same capacity but with different access and promotion patterns. For example, `resolve` only queries and promotes
+      `v_to_real`, leaving `v_to_peer` unpromoted. Over time, active/hot virtual tokens will have their peer mapping evicted from
+      `v_to_peer` while remaining in `v_to_real`. A subsequent call to `resolve_full` will return an empty string for the peer
+      user ID, leading to message routing failures in `sendmessage`. Similarly, `conv_to_v` eviction causes stable virtual context
+      tokens to be broken and recreated, violating session continuity guarantees.
+    recommendation: >
+      Combine the four maps into a single `LruCache` mapping virtual tokens (`vtoken`) to a unified record structure containing
+      `real_token`, `peer_user_id`, and `conv_key`. Use secondary index tables (like `HashMap`) that dynamically track and mirror
+      only the entries currently present in the main `LruCache` (cleared/inserted during LRU eviction events) to ensure all components
+      remain synchronized and atomic.
+
+  - id: WRITE-LOCK-CONTENTION
+    title: Extreme Concurrency Bottleneck / Write Lock Contention
+    severity: HIGH
+    category: Performance / Concurrency Trap
+    status: RESOLVED
+    resolution: >
+      Wrapped the internal LruCache and HashMap indices of ContextTokenMap inside a std::sync::Mutex to support thread-safe internal mutability.
+      Changed all read operations (resolve and resolve_full) to take &self, allowing callers (routes.rs) to acquire a read lock (read().await)
+      concurrently, eliminating the serialization bottleneck and write lock contention.
+    description: >
+      Because `resolve` and `resolve_full` now take `&mut self` to update LRU hotness, callers must acquire a write lock (`write().await`)
+      on `state.ctx_map` for every inbound/outbound message and `getconfig` request. In a high-concurrency tokio environment, this serializes
+      all message resolution operations and destroys concurrent read performance, making the system prone to lock starvation and latency spikes under load.
+    recommendation: >
+      Use a concurrent cache implementation (e.g., `dashmap` or a dedicated thread-safe cache like `moka`) that supports lock-free/concurrent reads
+      and internal mutability for LRU tracking, or use a Mutex/RwLock wrapped around internal cache cells rather than locking the entire map.
+
+  - id: NON-CONSTANT-TIME-AUTH
+    title: Non-Constant-Time Bearer Token Comparison
+    severity: LOW
+    category: OWASP Security Issue
+    description: >
+      In `src/server/routes.rs`, the bearer token comparison `provided == required` uses standard string equality, which is not constant-time.
+      This theoretically exposes the admin API to timing attacks.
+    recommendation: >
+      Use `subtle::ConstantTimeEq` or a cryptographically secure hash comparison to validate authentication tokens.

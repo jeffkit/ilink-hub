@@ -823,7 +823,7 @@ async fn resolve_vctx_for_message(
         None
     };
 
-    let mut ctx_map = state.ctx_map.write().await;
+    let ctx_map = state.ctx_map.write().await;
     if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
         // Only seed if nothing else raced in while we held the lock released.
         if !ctx_map.has_conversation(key) {

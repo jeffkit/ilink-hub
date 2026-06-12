@@ -280,17 +280,15 @@ pub async fn sendmessage(
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
-        let mut ctx_map = state.ctx_map.write().await;
-        ctx_map
-            .resolve_full(&vctx)
-            .map(|(r, p)| (r.to_string(), p.to_string()))
+        let ctx_map = state.ctx_map.read().await;
+        ctx_map.resolve_full(&vctx)
     }
     .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
         match state.store.resolve_context_token_full(&vctx).await {
             Ok(Some((r, p))) => {
-                let mut ctx_map = state.ctx_map.write().await;
+                let ctx_map = state.ctx_map.write().await;
                 ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
@@ -473,8 +471,8 @@ pub async fn getconfig(
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
         let real_ctx = {
-            let mut ctx_map = state.ctx_map.write().await;
-            ctx_map.resolve(vctx).map(str::to_string)
+            let ctx_map = state.ctx_map.read().await;
+            ctx_map.resolve(vctx)
         };
         if let Some(real) = real_ctx {
             req.context_token = Some(real);

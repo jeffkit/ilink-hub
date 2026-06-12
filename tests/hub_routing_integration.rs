@@ -243,8 +243,8 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
     let real_ctx = {
-        let mut ctx_map = state.ctx_map.write().await;
-        ctx_map.resolve(&vctx).map(str::to_string)
+        let ctx_map = state.ctx_map.read().await;
+        ctx_map.resolve(&vctx)
     };
     if let Some(real) = real_ctx {
         if let Some(msg) = send_req.msg.as_mut() {
