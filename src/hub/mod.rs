@@ -84,15 +84,33 @@ impl Default for Metrics {
 /// lets the Hub surface that misconfiguration instead of failing silently.
 #[derive(Default)]
 pub struct PollTracker {
-    counts: StdMutex<HashMap<String, usize>>,
+    /// Per-vtoken concurrent poll counter. Public for test-only access so
+    /// integration tests can poison the mutex to verify the let-Ok
+    /// panic-safety path (F-M2-2); production code should only call
+    /// `enter` / rely on `Drop`.
+    pub counts: StdMutex<HashMap<String, usize>>,
 }
 
 impl PollTracker {
     /// Register a new active poll for `vtoken`. Returns the number of polls now concurrently
     /// active for that vtoken (always >= 1) and a guard that decrements the count on drop.
+    ///
+    /// F-M2-2: never panic on mutex poisoning. If the counts mutex is poisoned, the
+    /// guard is still produced but the count is reported as 0 (which means the 429
+    /// gate won't trip on this vtoken) and the drop handler becomes a best-effort
+    /// no-op. A poisoned `counts` map is a process-wide bug, but it must not take
+    /// the Tokio worker down on every subsequent long-poll.
     pub fn enter(self: &Arc<Self>, vtoken: &str) -> (usize, PollGuard) {
         let count = {
-            let mut counts = self.counts.lock().unwrap();
+            let Ok(mut counts) = self.counts.lock() else {
+                return (
+                    0,
+                    PollGuard {
+                        tracker: Arc::clone(self),
+                        vtoken: vtoken.to_string(),
+                    },
+                );
+            };
             let c = counts.entry(vtoken.to_string()).or_insert(0);
             *c += 1;
             *c
@@ -116,7 +134,11 @@ pub struct PollGuard {
 
 impl Drop for PollGuard {
     fn drop(&mut self) {
-        let mut counts = self.tracker.counts.lock().unwrap();
+        // F-M2-2: best-effort decrement; a poisoned mutex here would otherwise
+        // propagate a panic into the Tokio worker that called the handler.
+        let Ok(mut counts) = self.tracker.counts.lock() else {
+            return;
+        };
         if let Some(c) = counts.get_mut(&self.vtoken) {
             *c = c.saturating_sub(1);
             if *c == 0 {

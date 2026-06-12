@@ -97,6 +97,7 @@
   </div>
   <script>
     const code = "__PAIR_CODE__";
+    const csrf = "__PAIR_CSRF__";
     const btn = document.getElementById("confirm-btn");
     const nameInput = document.getElementById("name");
     nameInput.value = "openclaw-" + Math.random().toString(36).slice(2, 8);
@@ -108,7 +109,10 @@
         const confirmUrl = window.location.pathname.replace(/\/?$/, "") + "/confirm";
         const res = await fetch(confirmUrl, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-Pair-CSRF": csrf,
+          },
           body: JSON.stringify({
             name: nameInput.value.trim(),
             label: document.getElementById("label").value.trim() || null,

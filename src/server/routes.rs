@@ -157,7 +157,12 @@ pub async fn getupdates(
     };
 
     {
-        let registry = state.registry.read().await;
+        // F-M2-1: collapse the read (existence) + write (mark_seen) into a
+        // single write guard. Holding two separate locks creates a stale-
+        // online window where evict_stale could flip `online=false` between
+        // the read and the mark_seen. With one guard, the vtoken existence
+        // check and the last-seen timestamp bump are atomic w.r.t. evict_stale.
+        let mut registry = state.registry.write().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
             return (
@@ -171,10 +176,6 @@ pub async fn getupdates(
                 }),
             );
         }
-    }
-
-    {
-        let mut registry = state.registry.write().await;
         registry.mark_seen(&vtoken);
     }
 
