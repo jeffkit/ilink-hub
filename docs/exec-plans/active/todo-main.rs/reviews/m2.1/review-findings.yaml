@@ -1,0 +1,51 @@
+milestone: M2.1
+title: "M2.1 — 统一以 WEIXIN_BASE_URL 作为「Hub 地址」主入口"
+date: 2026-06-12
+verdict: PASS
+summary: >
+  All findings have been resolved successfully:
+  - missing-deprecation-warnings: Added warning check for deprecated ILINK_HUB_ADDR / ILINK_HUB_URL.
+  - cli-admin-commands-auth-failure: Passed ILINK_ADMIN_TOKEN inside CLI client commands.
+  - public-url-bind-failure: Captured EADDRNOTAVAIL bind error and printed friendly suggestion.
+findings:
+  - id: missing-deprecation-warnings
+    title: "未实现弃用环境变量（ILINK_HUB_ADDR / ILINK_HUB_URL）的警告提示"
+    severity: Medium
+    file: "src/main.rs, src/bin/ilink-hub-bridge.rs"
+    description: >
+      在 M0 评审残留问题（carry_forward OBS-2）中明确指出，在保留 `ILINK_HUB_ADDR` 和 `ILINK_HUB_URL` 作为别名兼容时，
+      应当在解析或运行时通过 `tracing::warn!` 打印弃用警告，以引导用户迁移到新的 `WEIXIN_BASE_URL`。
+      目前的 M2.1 实现中，对这两个变量的读取（在 `get_addr_default` / `get_hub_url_default` 中）完全是静默的，
+      导致用户在不知情的情况下继续依赖已被弃用的变量。
+    recommendation: >
+      在程序初始化并且 `tracing` 日志系统就绪后，检测环境中是否设置了 `ILINK_HUB_ADDR` 或 `ILINK_HUB_URL`，
+      若设置了且 `WEIXIN_BASE_URL` 未设置，则使用 `tracing::warn!` 打印明确的废弃警告。
+
+  - id: cli-admin-commands-auth-failure
+    title: "ilink-hub 注册及客户端管理 CLI 命令在启用管理员鉴权时必定失败"
+    severity: High
+    file: "src/main.rs"
+    description: >
+      在 `src/main.rs` 的 `register_client`（对应 `ilink-hub register`）与 `list_clients`（对应 `ilink-hub clients`）函数中，
+      分别向 Hub 的 `/hub/register` 和 `/hub/clients` 发送了 HTTP 请求。
+      然而，当 Hub 启用了管理员令牌验证（`ILINK_ADMIN_TOKEN`，这是 M0/M1 引入的安全加固默认行为）时，
+      这两个 CLI 函数并没有像 bridge 的 `register_via_hub_http` 那样，从环境变量中读取 `ILINK_ADMIN_TOKEN` 并携带
+      `Authorization: Bearer <token>` 头部，导致这些操作将始终返回 401 Unauthorized，CLI 注册及客户端查询功能完全瘫痪。
+    recommendation: >
+      修改 `src/main.rs` 中的 `register_client` 和 `list_clients` 函数，读取 `ILINK_ADMIN_TOKEN` 环境变量，
+      并向外发 HTTP 请求追加 `Authorization: Bearer <token>` 头部。
+
+  - id: public-url-bind-failure
+    title: "WEIXIN_BASE_URL 配置为公网 URL 时导致 Hub 启动绑定失败 (EADDRNOTAVAIL)"
+    severity: Medium
+    file: "src/main.rs"
+    description: >
+      `ilink-hub serve` 的 `--addr` 参数使用 `WEIXIN_BASE_URL` 作为环境变量源，
+      且当 `--addr` 未指定时，其默认值也会回退到通过 `get_addr_default()` 从 `WEIXIN_BASE_URL` 提取主机和端口。
+      然而，如果 `WEIXIN_BASE_URL` 包含公网或外部域名（例如 `https://hub.example.com`），
+      程序会尝试将本地 Socket 绑定到该公网域名（例如 `hub.example.com:8765`）。
+      若该机器并不直接拥有该公网 IP，绑定操作将失败并抛出 `EADDRNOTAVAIL`（无法分配请求的地址）导致 Hub 崩溃退出。
+    recommendation: >
+      避免直接使用外部客户端访问的 URL 域名作为本机的监听地址（通常本机应当监听 `127.0.0.1` 或 `0.0.0.0`）。
+      建议在 CLI 或运行时捕获 `EADDRNOTAVAIL` 绑定错误，若发生此类错误且监听地址来自 `WEIXIN_BASE_URL`，
+      输出更明确友好的提示，指导用户手动传入 `--addr 127.0.0.1:8765` 或 `--addr 0.0.0.0:8765`。

@@ -134,6 +134,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let has_deprecated_addr = std::env::var("ILINK_HUB_ADDR").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let has_deprecated_url = std::env::var("ILINK_HUB_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let has_new_url = std::env::var("WEIXIN_BASE_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
+    if (has_deprecated_addr || has_deprecated_url) && !has_new_url {
+        tracing::warn!(
+            "The environment variables `ILINK_HUB_ADDR` and `ILINK_HUB_URL` are deprecated. \
+             Please migrate to `WEIXIN_BASE_URL`."
+        );
+    }
+
     let cli = Cli::parse();
 
     match &cli.command {

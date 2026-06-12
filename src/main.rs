@@ -85,6 +85,16 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let has_deprecated_addr = std::env::var("ILINK_HUB_ADDR").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let has_deprecated_url = std::env::var("ILINK_HUB_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let has_new_url = std::env::var("WEIXIN_BASE_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
+    if (has_deprecated_addr || has_deprecated_url) && !has_new_url {
+        tracing::warn!(
+            "The environment variables `ILINK_HUB_ADDR` and `ILINK_HUB_URL` are deprecated. \
+             Please migrate to `WEIXIN_BASE_URL`."
+        );
+    }
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -151,8 +161,13 @@ async fn run_login(database_url: String, ilink_base_url: Option<String>) -> Resu
 
 async fn register_client(hub_url: &str, name: String, label: Option<String>) -> Result<()> {
     let client = reqwest::Client::new();
-    let resp: serde_json::Value = client
-        .post(format!("{hub_url}/hub/register"))
+    let mut req = client.post(format!("{hub_url}/hub/register"));
+    if let Ok(token) = std::env::var("ILINK_ADMIN_TOKEN") {
+        if !token.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", token.trim()));
+        }
+    }
+    let resp: serde_json::Value = req
         .json(&serde_json::json!({ "name": name, "label": label }))
         .send()
         .await?
@@ -182,8 +197,13 @@ async fn register_client(hub_url: &str, name: String, label: Option<String>) -> 
 
 async fn list_clients(hub_url: &str) -> Result<()> {
     let client = reqwest::Client::new();
-    let resp: serde_json::Value = client
-        .get(format!("{hub_url}/hub/clients"))
+    let mut req = client.get(format!("{hub_url}/hub/clients"));
+    if let Ok(token) = std::env::var("ILINK_ADMIN_TOKEN") {
+        if !token.trim().is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", token.trim()));
+        }
+    }
+    let resp: serde_json::Value = req
         .send()
         .await?
         .json()
