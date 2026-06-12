@@ -85,9 +85,18 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let has_deprecated_addr = std::env::var("ILINK_HUB_ADDR").ok().filter(|s| !s.trim().is_empty()).is_some();
-    let has_deprecated_url = std::env::var("ILINK_HUB_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
-    let has_new_url = std::env::var("WEIXIN_BASE_URL").ok().filter(|s| !s.trim().is_empty()).is_some();
+    let has_deprecated_addr = std::env::var("ILINK_HUB_ADDR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    let has_deprecated_url = std::env::var("ILINK_HUB_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
+    let has_new_url = std::env::var("WEIXIN_BASE_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some();
     if (has_deprecated_addr || has_deprecated_url) && !has_new_url {
         tracing::warn!(
             "The environment variables `ILINK_HUB_ADDR` and `ILINK_HUB_URL` are deprecated. \
@@ -203,11 +212,7 @@ async fn list_clients(hub_url: &str) -> Result<()> {
             req = req.header("Authorization", format!("Bearer {}", token.trim()));
         }
     }
-    let resp: serde_json::Value = req
-        .send()
-        .await?
-        .json()
-        .await?;
+    let resp: serde_json::Value = req.send().await?.json().await?;
 
     let clients = resp["clients"].as_array().cloned().unwrap_or_default();
     if clients.is_empty() {

@@ -69,7 +69,7 @@ ilink-hub --version
 ## 第二步：启动 Hub（首次会出二维码扫码登录）
 
 ```bash
-ilink-hub serve --addr 0.0.0.0:8765
+ilink-hub serve --addr 127.0.0.1:8765
 ```
 
 **首次启动**，Hub 会自动在终端显示一个二维码：
@@ -102,13 +102,13 @@ Hub 启动成功。**保持这个终端窗口开着**，关掉就停止服务了
 ::: details 提示「Address already in use」？
 端口 8765 被占用了。换一个端口：
 ```bash
-ilink-hub serve --addr 0.0.0.0:8766
+ilink-hub serve --addr 127.0.0.1:8766
 ```
 :::
 
 ::: tip 想在后台运行？
 ```bash
-nohup ilink-hub serve --addr 0.0.0.0:8765 > ilink-hub.log 2>&1 &
+nohup ilink-hub serve --addr 127.0.0.1:8765 > ilink-hub.log 2>&1 &
 ```
 日志会写入 `ilink-hub.log`。生产环境推荐用 [Docker 部署](/deployment/docker)。
 :::
@@ -120,14 +120,14 @@ nohup ilink-hub serve --addr 0.0.0.0:8765 > ilink-hub.log 2>&1 &
 Hub 启动后，在浏览器访问：
 
 ```
-http://localhost:8765/hub/ui
+http://127.0.0.1:8765/hub/ui
 ```
 
 你会看到管理界面。这里可以查看运行状态、注册 AI 客户端、复制配置。
 
 ::: details 打不开页面？
 - 确认 Hub 还在运行（终端没有报错）
-- 如果 Hub 不在本机，把 `localhost` 换成实际 IP 地址
+- 如果 Hub 不在本机，把 `127.0.0.1` 换成实际 IP 地址
 - 检查防火墙是否放行了 8765 端口
 :::
 
@@ -145,7 +145,7 @@ http://localhost:8765/hub/ui
 
 ```bash
 ilink-hub register \
-  --hub-url http://localhost:8765 \
+  --hub-url http://127.0.0.1:8765 \
   --name my-claude \
   --label "我的 Claude"
 ```
@@ -159,7 +159,7 @@ ilink-hub register \
   虚拟 Token：vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 请将以下配置添加到你的 AI 客户端：
-  WEIXIN_BASE_URL=http://localhost:8765
+  WEIXIN_BASE_URL=http://127.0.0.1:8765
   WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -175,12 +175,12 @@ ilink-hub register \
 
 ```toml [Recursive（~/.recursive/config.toml）]
 [weixin]
-base_url = "http://localhost:8765"
+base_url = "http://127.0.0.1:8765"
 token = "vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 ```bash [环境变量（大多数工具通用）]
-export WEIXIN_BASE_URL=http://localhost:8765
+export WEIXIN_BASE_URL=http://127.0.0.1:8765
 export WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
@@ -188,7 +188,7 @@ export WEIXIN_TOKEN=vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 {
   "channels": {
     "weixin": {
-      "base_url": "http://localhost:8765",
+      "base_url": "http://127.0.0.1:8765",
       "token": "vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     }
   }

@@ -472,5 +472,3 @@ fn test_bind_failure_friendly_message() {
         stderr
     );
 }
-
-

@@ -119,6 +119,29 @@
 
 ---
 
-## M2.2 / M2.3 — CONS-02（待执行）
+## M2.2 — 文档示例统一为 127.0.0.1
 
-按 `plan.md` 顺序串行执行，每步独立可验证。
+### Decisions
+- 将 `docs/guide/getting-started.md` 里所有 CLI 示例以及对应的环境变量配置/各语言 SDK 配置中的 `0.0.0.0:8765` / `localhost:8765` 统一修改为本机环回地址 `127.0.0.1:8765`，保持风格一致性。
+- `docs/bridge/quick-try.md` 中不含有 `localhost` / `0.0.0.0` 示例，已全为 `127.0.0.1`，无需更改。
+- 在 `docs/deployment/security.md` 中的「## 3. 网络隔离」段落追加关于 Hub 默认仅监听本机环回地址以确保安全性，若需对外暴露（如在 Docker 容器、虚拟机或局域网中运行）则必须显式传 `--addr 0.0.0.0:8765` 参数的说明，引导用户安全配置。
+
+### Problems
+- 无。
+
+### Outcome
+- fmt: `cargo fmt --check` 成功通过。
+- clippy: `cargo clippy -- -D warnings` 通过，无任何 warnings。
+- test: `cargo test` 全绿通过（154 passed）。
+- build: `cargo build` 编译成功。
+- desktop-frontend: Vite 构建和 TypeScript 检查通过，成功输出 dist。
+- desktop-tauri: Tauri `src-tauri` 检查通过。
+- 验证命令结果：
+  - `grep -RIn -E 'localhost|0\.0\.0\.0' docs/guide/getting-started.md docs/bridge/quick-try.md` 返回 exit code 1（无匹配项），表明除了被修改的说明外，全部示例均已统一为 `127.0.0.1`。
+- 在 `reviews/m2.2/review-request.yaml` 记录了所有执行结果与说明。
+
+---
+
+## M2.3 — CONS-02（待执行）
+
+按 `plan.md` 顺序串行执行，最后一步独立可验证。

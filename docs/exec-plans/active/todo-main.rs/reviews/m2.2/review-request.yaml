@@ -1,0 +1,89 @@
+milestone: M2.2
+title: "M2.2 — 文档示例统一为 127.0.0.1"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-main.rs
+base_commit: 0639ea59c2a198fa206f090c9ddac4176b6daf35
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-main.rs/plan.md
+checkpoint: "M2.2 文档示例统一为 127.0.0.1"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2.2:
+# - 将 docs/guide/getting-started.md、docs/bridge/quick-try.md 中涉及的 0.0.0.0:8765 / localhost:8765 示例统一为 127.0.0.1:8765。
+# - 在「部署/安全」章节显式说明：需要对外暴露时显式传 0.0.0.0。
+
+source_changes:
+  - file: "docs/guide/getting-started.md"
+    description: "Replaced all occurrences of 0.0.0.0 and localhost with 127.0.0.1 in configuration and commands examples for consistency."
+  - file: "docs/deployment/security.md"
+    description: "Added explicit instruction under '网络隔离' section explaining that the Hub listens on 127.0.0.1 by default and needs explicit --addr 0.0.0.0:8765 for LAN/container exposure."
+
+# ─── Commands run ───────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      total: "154 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc + vite build clean, dist/ produced"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished, exit 0"
+    result: pass
+  - id: verify-docs-grep
+    cmd: "grep -RIn -E 'localhost|0\\.0\\.0\\.0' docs/guide/getting-started.md docs/bridge/quick-try.md"
+    expected: "no matches, exit code 1"
+    actual: "no matches, exit code 1"
+    result: pass
+
+pass_conditions:
+  - id: fmt-green
+    plan_clause: "fmt: cargo fmt --check 通过"
+    observation: "cargo fmt --check exited 0."
+    result: pass
+  - id: clippy-green
+    plan_clause: "clippy: cargo clippy -- -D warnings 通过"
+    observation: "0 warnings, exit 0."
+    result: pass
+  - id: test-green
+    plan_clause: "test: cargo test 全绿"
+    observation: "all tests passed."
+    result: pass
+  - id: build-green
+    plan_clause: "build: cargo build 通过"
+    observation: "Finished, exit 0."
+    result: pass
+  - id: desktop-frontend-green
+    plan_clause: "desktop-frontend: npm run build 通过"
+    observation: "tsc + vite build clean, dist/ produced."
+    result: pass
+  - id: desktop-tauri-green
+    plan_clause: "desktop-tauri: cargo check --manifest-path .../src-tauri/Cargo.toml 通过"
+    observation: "Finished, exit 0."
+    result: pass
