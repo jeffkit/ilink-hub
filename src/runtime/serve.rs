@@ -283,6 +283,11 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     }
 }
 
+/// Lower bound for `ILINK_MAX_QUEUE_SIZE`. Values below this clamp to [`MIN_MAX_QUEUE_SIZE`].
+const MIN_MAX_QUEUE_SIZE: usize = 10;
+/// Upper bound for `ILINK_MAX_QUEUE_SIZE`. Values above this clamp to [`MAX_MAX_QUEUE_SIZE`].
+const MAX_MAX_QUEUE_SIZE: usize = 10_000;
+
 /// Select and initialise the queue backend from the `ILINK_QUEUE_BACKEND` env var.
 ///
 /// Supported values:
@@ -291,36 +296,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
 /// Any other value (including `"redis"`, which is not yet implemented) returns `Err` so
 /// the process fails fast rather than silently using memory and losing messages on restart.
 fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
-    let mut max_queue_size = crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE;
-    if let Ok(val) = std::env::var("ILINK_MAX_QUEUE_SIZE") {
-        match val.parse::<usize>() {
-            Ok(parsed) => {
-                if parsed < 10 {
-                    warn!(
-                        "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [10, 10000]. Clamping to 10.",
-                        parsed
-                    );
-                    max_queue_size = 10;
-                } else if parsed > 10000 {
-                    warn!(
-                        "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [10, 10000]. Clamping to 10000.",
-                        parsed
-                    );
-                    max_queue_size = 10000;
-                } else {
-                    max_queue_size = parsed;
-                }
-            }
-            Err(_) => {
-                warn!(
-                    "Invalid ILINK_MAX_QUEUE_SIZE value {:?}. Using default: {}.",
-                    val,
-                    crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE
-                );
-            }
-        }
-    }
-
+    let max_queue_size = resolve_max_queue_size();
     match std::env::var("ILINK_QUEUE_BACKEND")
         .as_deref()
         .unwrap_or("")
@@ -348,23 +324,80 @@ fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
     }
 }
 
+/// Resolve `ILINK_MAX_QUEUE_SIZE` against the [`MIN_MAX_QUEUE_SIZE`, [`MAX_MAX_QUEUE_SIZE`]
+/// range, emitting a warning when the value is out of range or unparseable. Pure function
+/// over the env var, exposed for unit tests.
+fn resolve_max_queue_size() -> usize {
+    let default = crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE;
+    let Ok(val) = std::env::var("ILINK_MAX_QUEUE_SIZE") else {
+        return default;
+    };
+    if val.is_empty() {
+        warn!("ILINK_MAX_QUEUE_SIZE is empty. Using default: {}.", default);
+        return default;
+    }
+    match val.parse::<usize>() {
+        Ok(parsed) if parsed < MIN_MAX_QUEUE_SIZE => {
+            warn!(
+                "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [{}, {}]. Clamping to {}.",
+                parsed, MIN_MAX_QUEUE_SIZE, MAX_MAX_QUEUE_SIZE, MIN_MAX_QUEUE_SIZE
+            );
+            MIN_MAX_QUEUE_SIZE
+        }
+        Ok(parsed) if parsed > MAX_MAX_QUEUE_SIZE => {
+            warn!(
+                "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [{}, {}]. Clamping to {}.",
+                parsed, MIN_MAX_QUEUE_SIZE, MAX_MAX_QUEUE_SIZE, MAX_MAX_QUEUE_SIZE
+            );
+            MAX_MAX_QUEUE_SIZE
+        }
+        Ok(parsed) => parsed,
+        Err(_) => {
+            warn!(
+                "Invalid ILINK_MAX_QUEUE_SIZE value {:?}. Using default: {}.",
+                val, default
+            );
+            default
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ilink::types::WeixinMessage;
     use std::sync::Mutex;
 
+    /// Serialises env-mutating tests in this module. The guard must never be held
+    /// across an `.await` point — `build_queue_backend` / `resolve_max_queue_size`
+    /// are sync, so we drop the guard before touching the async queue.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Build a queue backend under `ENV_LOCK` and release the guard before returning,
+    /// so callers can freely `.await` on the queue.
+    fn make_queue_for(value: &str) -> Arc<dyn MessageQueue> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("ILINK_MAX_QUEUE_SIZE", value);
+        build_queue_backend().unwrap()
+    }
+
+    fn make_queue_unset() -> Arc<dyn MessageQueue> {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
+        build_queue_backend().unwrap()
+    }
+
+    /// Cleanup helper — `set_var` is process-global; release the var to keep the
+    /// rest of the test suite deterministic.
+    fn clear_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
+    }
 
     #[tokio::test]
     async fn test_build_queue_backend_max_size_clamp() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        // Test custom valid value: 15
-        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "15");
-        let q = build_queue_backend().unwrap();
-
-        // Push 15 messages, no drops
+        // Custom valid value: 15
+        let q = make_queue_for("15");
         for i in 0..15 {
             let msg = WeixinMessage {
                 message_id: Some(i),
@@ -373,43 +406,227 @@ mod tests {
             let dropped = q.push("vtoken", msg).await.unwrap();
             assert!(!dropped);
         }
-        // Push 16th message, should drop one
-        let msg = WeixinMessage {
-            message_id: Some(15),
-            ..Default::default()
-        };
-        let dropped = q.push("vtoken", msg).await.unwrap();
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(15),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(dropped);
-
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 15);
         assert_eq!(drained[0].message_id, Some(1));
 
-        // Test lower bound clamping: 5 -> clamped to 10
-        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "5");
-        let q = build_queue_backend().unwrap();
+        // Lower bound clamping: 5 -> clamped to 10
+        let q = make_queue_for("5");
         for i in 0..10 {
-            let msg = WeixinMessage {
-                message_id: Some(i),
-                ..Default::default()
-            };
-            let dropped = q.push("vtoken", msg).await.unwrap();
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(!dropped);
         }
-        let msg = WeixinMessage {
-            message_id: Some(10),
-            ..Default::default()
-        };
-        let dropped = q.push("vtoken", msg).await.unwrap();
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 10);
 
-        // Test upper bound clamping: 20000 -> clamped to 10000
-        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "20000");
-        let _q = build_queue_backend().unwrap();
+        // Upper bound clamping: 20000 -> clamped to 10000
+        let q = make_queue_for("20000");
+        for i in 0..10_000 {
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!dropped);
+        }
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(10_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(dropped);
 
-        // Clean up
-        std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn test_build_queue_backend_unparseable_falls_back_to_default() {
+        // Unparseable value: "abc" -> falls through to default (200)
+        let q = make_queue_for("abc");
+        // Push up to default and one over to confirm default sizing.
+        for i in 0..crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE {
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i as i64),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!dropped);
+        }
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE as i64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(dropped);
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn test_build_queue_backend_empty_value_falls_back_to_default() {
+        // Empty string: "" -> falls through to default (200)
+        let q = make_queue_for("");
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(0),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!dropped);
+        // Confirm we can fill the default-sized queue without dropping.
+        for i in 1..crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE {
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i as i64),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!dropped);
+        }
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE as i64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(dropped);
+
+        clear_env();
+    }
+
+    #[tokio::test]
+    async fn test_build_queue_backend_unset_uses_default() {
+        // No env var set -> default (200). This is the common production path.
+        let q = make_queue_unset();
+        for i in 0..crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE {
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i as i64),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(!dropped);
+        }
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE as i64),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(dropped);
+    }
+
+    #[test]
+    fn test_resolve_max_queue_size_unit() {
+        // Pure unit tests for the resolution function — no .await, no async runtime.
+        use std::env;
+
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        env::remove_var("ILINK_MAX_QUEUE_SIZE");
+        assert_eq!(
+            resolve_max_queue_size(),
+            crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE
+        );
+
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "100");
+        assert_eq!(resolve_max_queue_size(), 100);
+
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "5");
+        assert_eq!(resolve_max_queue_size(), MIN_MAX_QUEUE_SIZE);
+
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "999999");
+        assert_eq!(resolve_max_queue_size(), MAX_MAX_QUEUE_SIZE);
+
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "abc");
+        assert_eq!(
+            resolve_max_queue_size(),
+            crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE
+        );
+
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "");
+        assert_eq!(
+            resolve_max_queue_size(),
+            crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE
+        );
+
+        // Boundary values that should pass through unclamped.
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "10");
+        assert_eq!(resolve_max_queue_size(), 10);
+        env::set_var("ILINK_MAX_QUEUE_SIZE", "10000");
+        assert_eq!(resolve_max_queue_size(), 10_000);
+
+        env::remove_var("ILINK_MAX_QUEUE_SIZE");
     }
 }

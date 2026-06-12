@@ -217,3 +217,89 @@ async fn test_mock_implementation() {
     assert!(q.drain("x").await.unwrap().is_empty());
     assert!(!q.wait_notify("x", 0).await.unwrap());
 }
+
+// ─── US3 (A-02) Adversarial Tests ───────────────────────────────────────────
+
+/// Boundary: cap=1 — single message occupies the slot; second push drops oldest.
+#[tokio::test]
+async fn test_with_limit_boundary_one() {
+    let q = InMemoryQueue::with_limit(1);
+    let dropped = q.push("v1", make_msg("first")).await.unwrap();
+    assert!(!dropped);
+    let dropped = q.push("v1", make_msg("second")).await.unwrap();
+    assert!(dropped, "cap=1 must drop oldest on the 2nd push");
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(msg_text(&drained[0]), Some("second"));
+}
+
+/// Boundary: cap=MAX (10_000) — push exactly cap, no drop; cap+1 drops oldest.
+#[tokio::test]
+async fn test_with_limit_boundary_max() {
+    let q = InMemoryQueue::with_limit(10_000);
+    for i in 0..10_000 {
+        let dropped = q.push("v1", make_msg(&format!("m{i}"))).await.unwrap();
+        assert!(!dropped, "unexpected drop at i={i}");
+    }
+    let dropped = q.push("v1", make_msg("overflow")).await.unwrap();
+    assert!(dropped, "cap+1 must drop the oldest");
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 10_000);
+    assert_eq!(
+        msg_text(&drained[0]),
+        Some("m1"),
+        "oldest (m0) should be evicted; m1 should be the new head"
+    );
+    assert_eq!(msg_text(&drained[9_999]), Some("overflow"));
+}
+
+/// Overflow on different vtokens is independent: filling A must not affect B's cap.
+#[tokio::test]
+async fn test_with_limit_per_vtoken_isolation() {
+    let q = InMemoryQueue::with_limit(2);
+    q.push("a", make_msg("a0")).await.unwrap();
+    q.push("a", make_msg("a1")).await.unwrap();
+    let dropped = q.push("a", make_msg("a2")).await.unwrap();
+    assert!(dropped, "a must overflow after 2 pushes");
+    let dropped = q.push("b", make_msg("b0")).await.unwrap();
+    assert!(!dropped, "b must not be affected by a's overflow");
+    let sizes = q.queue_sizes().await.unwrap();
+    assert_eq!(sizes["a"], 2);
+    assert_eq!(sizes["b"], 1);
+}
+
+/// Interleaved drain+push within the cap must not lose messages or exceed the cap.
+#[tokio::test]
+async fn test_with_limit_drain_then_refill() {
+    let q = InMemoryQueue::with_limit(3);
+    q.push("v1", make_msg("a")).await.unwrap();
+    q.push("v1", make_msg("b")).await.unwrap();
+    q.push("v1", make_msg("c")).await.unwrap();
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 3);
+    // Refill: should accept 3 more without drops.
+    for i in 0..3 {
+        let dropped = q.push("v1", make_msg(&format!("d{i}"))).await.unwrap();
+        assert!(!dropped, "refill push {i} unexpectedly dropped");
+    }
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 3);
+    assert_eq!(msg_text(&drained[0]), Some("d0"));
+}
+
+/// remove_client on a vtoken that has overflowed history must fully clear the slot,
+/// so a subsequent push to a fresh slot starts at cap (not already-filled).
+#[tokio::test]
+async fn test_with_limit_remove_client_resets_capacity() {
+    let q = InMemoryQueue::with_limit(2);
+    q.push("v1", make_msg("a")).await.unwrap();
+    q.push("v1", make_msg("b")).await.unwrap();
+    q.push("v1", make_msg("c")).await.unwrap(); // overflows
+    q.remove_client("v1").await.unwrap();
+    // After remove, a fresh push should not drop.
+    let dropped = q.push("v1", make_msg("fresh")).await.unwrap();
+    assert!(!dropped, "after remove_client, slot must be empty");
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 1);
+    assert_eq!(msg_text(&drained[0]), Some("fresh"));
+}

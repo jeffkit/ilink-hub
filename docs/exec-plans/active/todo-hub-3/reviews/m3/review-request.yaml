@@ -7,7 +7,7 @@ description: |
   Refactored `InMemoryQueue` in `src/hub/queue.rs` to support customizable capacity via `InMemoryQueue::with_limit`.
   Added unit tests in `src/hub/queue.rs` (`test_in_memory_queue_with_limit`) and `src/runtime/serve.rs` (`test_build_queue_backend_max_size_clamp`) to verify limit enforcement, environment variable parsing, clamping, and warning logging.
 verification:
-  - cargo fmt --check passed
-  - cargo clippy -- -D warnings passed
-  - cargo test passed
-  - cargo build passed
+  - cargo fmt --all -- --check passed
+  - cargo clippy --all-targets --all-features -- -D warnings passed
+  - cargo test --all-features passed (DATABASE_URL=sqlite::memory:)
+  - cargo build --all-features passed
