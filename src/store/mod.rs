@@ -194,12 +194,19 @@ impl Store {
     pub async fn upsert_client(&self, vtoken: &str, name: &str, label: Option<&str>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        // Get the old vtoken if it exists
-        let old_row = sqlx::query("SELECT vtoken FROM clients WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let old_vtoken = old_row.map(|r| r.get::<String, _>("vtoken"));
+        // Update routing_state for any routes pointing to this client's old vtoken
+        // before inserting/updating the client's vtoken.
+        sqlx::query(
+            r#"
+            UPDATE routing_state
+            SET active_vtoken = $1
+            WHERE active_vtoken = (SELECT vtoken FROM clients WHERE name = $2)
+            "#,
+        )
+        .bind(vtoken)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
 
         // ON CONFLICT (name): update vtoken so a post-restart re-registration with a new
         // vtoken wins, keeping DB and in-memory registry consistent.
@@ -218,16 +225,6 @@ impl Store {
         .bind(label)
         .execute(&mut *tx)
         .await?;
-
-        if let Some(old_vt) = old_vtoken {
-            if old_vt != vtoken {
-                sqlx::query("UPDATE routing_state SET active_vtoken = $1 WHERE active_vtoken = $2")
-                    .bind(vtoken)
-                    .bind(&old_vt)
-                    .execute(&mut *tx)
-                    .await?;
-            }
-        }
 
         tx.commit().await?;
         Ok(())
@@ -876,5 +873,68 @@ mod store_tests {
         // Check if entries are saved
         let recent = store.list_recent_context_tokens(100).await.unwrap();
         assert_eq!(recent.len(), 55);
+    }
+
+    #[tokio::test]
+    async fn test_sync_02_upsert_client_concurrent_adversarial() {
+        // Create a temporary database in target/ directory of the workspace
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_concurrent_db")
+            .tempdir_in("target")
+            .unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_url = format!(
+            "sqlite:{}",
+            db_path.to_str().unwrap()
+        );
+
+        let store = Store::connect(&db_url).await.expect("connect");
+
+        // Initial setup: register client "bridge-concurrent" with "vtoken-initial"
+        store
+            .upsert_client("vtoken-initial", "bridge-concurrent", None)
+            .await
+            .unwrap();
+
+        // Set route for user "alice" to "vtoken-initial"
+        store.set_route("alice", "vtoken-initial").await.unwrap();
+
+        // Now run multiple concurrent upserts of client "bridge-concurrent"
+        let num_concurrency = 20;
+        let mut handles = vec![];
+
+        let store = std::sync::Arc::new(store);
+
+        for i in 0..num_concurrency {
+            let store_clone = store.clone();
+            let vtoken = format!("vtoken-{}", i);
+            let handle = tokio::spawn(async move {
+                store_clone
+                    .upsert_client(&vtoken, "bridge-concurrent", None)
+                    .await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Retrieve the final vtoken in the clients table
+        let clients = store.list_clients().await.unwrap();
+        let final_client_vtoken = clients
+            .iter()
+            .find(|c| c.name == "bridge-concurrent")
+            .map(|c| c.vtoken.clone())
+            .unwrap();
+
+        // Retrieve the route for "alice"
+        let final_route = store.get_route("alice").await.unwrap().unwrap();
+
+        // Under race conditions in the old implementation, final_route would be stale
+        // while final_client_vtoken would be the last committed vtoken.
+        // We assert that they must be identical.
+        assert_eq!(final_route, final_client_vtoken);
     }
 }
