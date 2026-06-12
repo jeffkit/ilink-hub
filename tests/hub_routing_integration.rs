@@ -137,9 +137,18 @@ async fn two_clients_both_receive_broadcast_message() {
     // Sessions are isolated by (vctx, vtoken), so each backend's session is still independent.
     let vctx_a = msgs_a[0].context_token.as_deref().unwrap_or("");
     let vctx_b = msgs_b[0].context_token.as_deref().unwrap_or("");
-    assert!(vctx_a.starts_with("vctx_"), "context_token should be a vctx");
-    assert!(vctx_b.starts_with("vctx_"), "context_token should be a vctx");
-    assert_eq!(vctx_a, vctx_b, "broadcast uses one shared vctx per conversation for session continuity");
+    assert!(
+        vctx_a.starts_with("vctx_"),
+        "context_token should be a vctx"
+    );
+    assert!(
+        vctx_b.starts_with("vctx_"),
+        "context_token should be a vctx"
+    );
+    assert_eq!(
+        vctx_a, vctx_b,
+        "broadcast uses one shared vctx per conversation for session continuity"
+    );
 }
 
 /// With a default client configured, a message is forwarded only to that
@@ -168,8 +177,16 @@ async fn single_default_client_receives_forward_to_message() {
     let msgs_default = state.queue.drain(&vtoken_default).await.unwrap();
     let msgs_other = state.queue.drain(&vtoken_other).await.unwrap();
 
-    assert_eq!(msgs_default.len(), 1, "default client should receive message");
-    assert_eq!(msgs_other.len(), 0, "non-default client should NOT receive message in ForwardTo");
+    assert_eq!(
+        msgs_default.len(),
+        1,
+        "default client should receive message"
+    );
+    assert_eq!(
+        msgs_other.len(),
+        0,
+        "non-default client should NOT receive message in ForwardTo"
+    );
 }
 
 /// Messages from the same user always receive the same virtual context token
@@ -183,19 +200,20 @@ async fn same_user_gets_stable_virtual_context_token() {
     spawn_dispatcher(Arc::clone(&state), rx);
 
     // Same real_ctx, same from_user → same vctx.
-    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 1")).unwrap();
+    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let msgs1 = state.queue.drain(&vtoken).await.unwrap();
 
-    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 2")).unwrap();
+    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let msgs2 = state.queue.drain(&vtoken).await.unwrap();
 
     assert_eq!(msgs1.len(), 1);
     assert_eq!(msgs2.len(), 1);
     assert_eq!(
-        msgs1[0].context_token,
-        msgs2[0].context_token,
+        msgs1[0].context_token, msgs2[0].context_token,
         "same user should always get the same virtual context token"
     );
 }
@@ -211,7 +229,8 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
     spawn_dispatcher(Arc::clone(&state), rx);
 
     // Dispatch a message so a vctx→real_ctx mapping is created.
-    tx.send(make_user_msg("user@wx", "real-ctx-send", "hello")).unwrap();
+    tx.send(make_user_msg("user@wx", "real-ctx-send", "hello"))
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     let msgs = state.queue.drain(&vtoken).await.unwrap();
@@ -219,7 +238,8 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
     let vctx = msgs[0].context_token.clone().unwrap();
 
     // Build a sendmessage request using the virtual context token.
-    let mut send_req = SendMessageRequest::reply_text(vctx.clone(), "reply".to_string(), "user@wx", None);
+    let mut send_req =
+        SendMessageRequest::reply_text(vctx.clone(), "reply".to_string(), "user@wx", None);
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
     let real_ctx = {
@@ -238,8 +258,10 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
         .as_ref()
         .and_then(|m| m.context_token.as_deref())
         .unwrap_or("");
-    assert_eq!(translated, "real-ctx-send",
-        "sendmessage should translate vctx back to the original real_ctx");
+    assert_eq!(
+        translated, "real-ctx-send",
+        "sendmessage should translate vctx back to the original real_ctx"
+    );
 }
 
 /// Bot echo messages (message_type == 2) are ignored by the dispatcher
@@ -259,7 +281,10 @@ async fn bot_echo_messages_are_not_dispatched() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let msgs = state.queue.drain(&vtoken).await.unwrap();
-    assert!(msgs.is_empty(), "bot echo messages should not be dispatched to clients");
+    assert!(
+        msgs.is_empty(),
+        "bot echo messages should not be dispatched to clients"
+    );
 }
 
 /// Multiple messages from the same user are queued in FIFO order.
@@ -272,7 +297,12 @@ async fn messages_queued_in_fifo_order() {
     spawn_dispatcher(Arc::clone(&state), rx);
 
     for i in 0..5u8 {
-        tx.send(make_user_msg("user@wx", "real-ctx-fifo", &format!("msg-{i}"))).unwrap();
+        tx.send(make_user_msg(
+            "user@wx",
+            "real-ctx-fifo",
+            &format!("msg-{i}"),
+        ))
+        .unwrap();
         // Small delay to ensure ordering through the async dispatch path.
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -295,5 +325,8 @@ async fn migration_is_idempotent() {
 
     // A second fresh in-memory DB also migrates cleanly.
     let store2 = Store::connect("sqlite::memory:").await;
-    assert!(store2.is_ok(), "second connect to fresh in-memory DB should succeed");
+    assert!(
+        store2.is_ok(),
+        "second connect to fresh in-memory DB should succeed"
+    );
 }

@@ -227,8 +227,7 @@ mod tests {
             }
         });
         if let Some(ms) = ref_ms {
-            ref_item["ref_msg"]["message_item"]["create_time_ms"] =
-                serde_json::Value::from(ms);
+            ref_item["ref_msg"]["message_item"]["create_time_ms"] = serde_json::Value::from(ms);
         }
         WeixinMessage {
             message_type: Some(1),
@@ -290,7 +289,10 @@ mod tests {
                 cmd: HubCommand::List,
             }),
         );
-        assert!(matches!(out, RoutingDecision::HubInternal(HubCommand::List)));
+        assert!(matches!(
+            out,
+            RoutingDecision::HubInternal(HubCommand::List)
+        ));
     }
 
     #[test]
@@ -305,7 +307,10 @@ mod tests {
                 session_name: None,
             }),
         );
-        assert!(matches!(out, RoutingDecision::HubInternal(HubCommand::Status)));
+        assert!(matches!(
+            out,
+            RoutingDecision::HubInternal(HubCommand::Status)
+        ));
     }
 
     #[test]
@@ -363,7 +368,10 @@ mod tests {
         );
 
         let user = quote_reply("你有什么工具", sent, Some(1781153810000));
-        match idx.resolve_user_quote(SCOPE, &user).expect("content resolve") {
+        match idx
+            .resolve_user_quote(SCOPE, &user)
+            .expect("content resolve")
+        {
             QuoteOrigin::Client {
                 vtoken,
                 session_name,
@@ -447,7 +455,13 @@ mod tests {
     fn resolve_hub_origin_from_content() {
         let mut idx = QuoteRouteIndex::default();
         let sent = "iLink Hub 帮助\n...";
-        idx.register_outbound_content(SCOPE, sent, QuoteOrigin::Hub { cmd: HubCommand::Help });
+        idx.register_outbound_content(
+            SCOPE,
+            sent,
+            QuoteOrigin::Hub {
+                cmd: HubCommand::Help,
+            },
+        );
         let user = quote_reply("再说一遍", sent, None);
         assert!(matches!(
             idx.resolve_user_quote(SCOPE, &user),

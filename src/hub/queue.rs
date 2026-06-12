@@ -149,6 +149,11 @@ impl ContextTokenMap {
         self.v_to_real.len()
     }
 
+    /// Whether the map currently holds no entries.
+    pub fn is_empty(&self) -> bool {
+        self.v_to_real.is_empty()
+    }
+
     pub fn resolve(&mut self, vtoken: &str) -> Option<&str> {
         self.v_to_real.get(vtoken).map(String::as_str)
     }
@@ -157,19 +162,25 @@ impl ContextTokenMap {
     /// Uses `peek` (no LRU promotion) to allow `&self` and read-lock access.
     pub fn resolve_full(&self, vtoken: &str) -> Option<(&str, &str)> {
         let real = self.v_to_real.peek(vtoken)?.as_str();
-        let peer = self.v_to_peer.peek(vtoken).map(String::as_str).unwrap_or("");
+        let peer = self
+            .v_to_peer
+            .peek(vtoken)
+            .map(String::as_str)
+            .unwrap_or("");
         Some((real, peer))
     }
 
     /// Seed a known mapping into the in-memory cache (without peer_user_id).
     pub fn seed(&mut self, vctx: String, real_ctx: String) {
-        self.v_to_real.get_or_insert(vctx.clone(), || real_ctx.clone());
+        self.v_to_real
+            .get_or_insert(vctx.clone(), || real_ctx.clone());
         self.real_to_v.get_or_insert(real_ctx, || vctx);
     }
 
     /// Seed a known mapping including peer_user_id.
     pub fn seed_full(&mut self, vctx: String, real_ctx: String, peer_user_id: String) {
-        self.v_to_real.get_or_insert(vctx.clone(), || real_ctx.clone());
+        self.v_to_real
+            .get_or_insert(vctx.clone(), || real_ctx.clone());
         self.real_to_v.get_or_insert(real_ctx, || vctx.clone());
         if !peer_user_id.is_empty() {
             self.v_to_peer.get_or_insert(vctx, || peer_user_id);
@@ -339,7 +350,10 @@ impl PerClientSlot {
         let mut q = self.messages.lock().unwrap();
         let dropped = if q.len() >= MAX_QUEUE_SIZE {
             q.pop_front();
-            warn!(max = MAX_QUEUE_SIZE, "client queue full, dropping oldest message");
+            warn!(
+                max = MAX_QUEUE_SIZE,
+                "client queue full, dropping oldest message"
+            );
             true
         } else {
             false
@@ -364,7 +378,9 @@ pub struct InMemoryQueue {
 
 impl InMemoryQueue {
     pub fn new() -> Self {
-        Self { slots: DashMap::new() }
+        Self {
+            slots: DashMap::new(),
+        }
     }
 
     fn get_or_create(&self, vtoken: &str) -> Arc<PerClientSlot> {
@@ -388,7 +404,11 @@ impl MessageQueue for InMemoryQueue {
     }
 
     async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
-        Ok(self.slots.get(vtoken).map(|s| s.drain()).unwrap_or_default())
+        Ok(self
+            .slots
+            .get(vtoken)
+            .map(|s| s.drain())
+            .unwrap_or_default())
     }
 
     async fn wait_notify(&self, vtoken: &str, timeout_secs: u64) -> Result<bool, HubError> {
@@ -405,6 +425,10 @@ impl MessageQueue for InMemoryQueue {
     }
 
     async fn queue_sizes(&self) -> Result<HashMap<String, usize>, HubError> {
-        Ok(self.slots.iter().map(|e| (e.key().clone(), e.value().len())).collect())
+        Ok(self
+            .slots
+            .iter()
+            .map(|e| (e.key().clone(), e.value().len()))
+            .collect())
     }
 }

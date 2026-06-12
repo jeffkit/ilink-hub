@@ -5,8 +5,7 @@
 
 // ─── Generic errors ───────────────────────────────────────────────────────────
 
-pub const NO_BACKEND: &str =
-    "❌ 当前未路由到任何后端，请先用 `/use <名称>` 切换到一个后端。";
+pub const NO_BACKEND: &str = "❌ 当前未路由到任何后端，请先用 `/use <名称>` 切换到一个后端。";
 
 pub const UNRECOGNIZED_COMMAND: &str = "未识别的指令。发送 /help 查看可用指令。";
 

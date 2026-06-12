@@ -5,12 +5,11 @@
 //!   mysql://user:pass@host/db         → MySQL
 
 use anyhow::Result;
-use sqlx::{AnyPool, Connection, Row};
+use sqlx::{AnyPool, Row};
 use uuid::Uuid;
 
 pub struct Store {
     pool: AnyPool,
-    url: String,
 }
 
 impl Store {
@@ -39,7 +38,7 @@ impl Store {
         } else {
             AnyPool::connect(url).await?
         };
-        let store = Self { pool, url: url.to_string() };
+        let store = Self { pool };
         store.run_migrations().await?;
         Ok(store)
     }
@@ -465,12 +464,7 @@ impl Store {
 
         let mut session_placeholders = Vec::with_capacity(resolved.len());
         for i in 0..resolved.len() {
-            session_placeholders.push(format!(
-                "(${}, ${}, ${})",
-                i * 3 + 1,
-                i * 3 + 2,
-                i * 3 + 3
-            ));
+            session_placeholders.push(format!("(${}, ${}, ${})", i * 3 + 1, i * 3 + 2, i * 3 + 3));
         }
         let session_sql = format!(
             "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \
@@ -506,13 +500,12 @@ impl Store {
 
     /// Get the active session name for a (vctx, vtoken) pair (defaults to "default").
     pub async fn get_active_session_name(&self, vctx: &str, vtoken: &str) -> Result<String> {
-        let row = sqlx::query(
-            "SELECT session_name FROM active_sessions WHERE vctx = $1 AND vtoken = $2",
-        )
-        .bind(vctx)
-        .bind(vtoken)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT session_name FROM active_sessions WHERE vctx = $1 AND vtoken = $2")
+                .bind(vctx)
+                .bind(vtoken)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row
             .map(|r| r.get::<String, _>("session_name"))
             .filter(|s| !s.is_empty())
@@ -752,6 +745,10 @@ mod store_tests {
         let r = store.list_clients().await;
         assert!(r.is_ok(), "list_clients failed: {:?}", r.err());
         let r = store.list_recent_context_tokens(5).await;
-        assert!(r.is_ok(), "list_recent_context_tokens failed: {:?}", r.err());
+        assert!(
+            r.is_ok(),
+            "list_recent_context_tokens failed: {:?}",
+            r.err()
+        );
     }
 }

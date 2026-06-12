@@ -349,7 +349,10 @@ impl UpstreamClient {
                                 self.relogin_attempts.fetch_add(1, Ordering::Relaxed);
                                 match renew_expired_session(self.clone(), renewal_ctx).await {
                                     Ok(()) => {
-                                        set_status(renewal_ctx, crate::hub::ilink_status::CONNECTED);
+                                        set_status(
+                                            renewal_ctx,
+                                            crate::hub::ilink_status::CONNECTED,
+                                        );
                                         backoff_secs = 1;
                                         get_updates_buf.clear();
                                         renewing.store(false, Ordering::SeqCst);
@@ -403,34 +406,33 @@ async fn renew_expired_session(
     }
 
     // Build a combined QR UI sender: prefer desktop channel, fall back to SSE broadcast.
-    let ui_tx: Option<UnboundedSender<QrLoginUiEvent>> = renewal.qr_login_ui.clone().or_else(|| {
-        renewal.qr_tx.as_ref().map(|tx| {
-            let (unbounded_tx, mut unbounded_rx) = tokio::sync::mpsc::unbounded_channel();
-            let broadcast_tx = tx.clone();
-            let last_ready = renewal.qr_last_ready.clone();
-            tokio::spawn(async move {
-                while let Some(evt) = unbounded_rx.recv().await {
-                    // Cache the Ready event so late SSE subscribers can catch up.
-                    if let QrLoginUiEvent::Ready { .. } = &evt {
-                        if let Some(ref cache) = last_ready {
-                            *cache.lock().await = Some(evt.clone());
+    let ui_tx: Option<UnboundedSender<QrLoginUiEvent>> =
+        renewal.qr_login_ui.clone().or_else(|| {
+            renewal.qr_tx.as_ref().map(|tx| {
+                let (unbounded_tx, mut unbounded_rx) = tokio::sync::mpsc::unbounded_channel();
+                let broadcast_tx = tx.clone();
+                let last_ready = renewal.qr_last_ready.clone();
+                tokio::spawn(async move {
+                    while let Some(evt) = unbounded_rx.recv().await {
+                        // Cache the Ready event so late SSE subscribers can catch up.
+                        if let QrLoginUiEvent::Ready { .. } = &evt {
+                            if let Some(ref cache) = last_ready {
+                                *cache.lock().await = Some(evt.clone());
+                            }
+                        } else if matches!(evt, QrLoginUiEvent::Done | QrLoginUiEvent::Expired) {
+                            if let Some(ref cache) = last_ready {
+                                *cache.lock().await = None;
+                            }
                         }
-                    } else if matches!(evt, QrLoginUiEvent::Done | QrLoginUiEvent::Expired) {
-                        if let Some(ref cache) = last_ready {
-                            *cache.lock().await = None;
-                        }
+                        let _ = broadcast_tx.send(evt);
                     }
-                    let _ = broadcast_tx.send(evt);
-                }
-            });
-            unbounded_tx
-        })
-    });
+                });
+                unbounded_tx
+            })
+        });
 
     let login_client = LoginClient::new(renewal.ilink_base_url.clone());
-    let token = login_client
-        .login_with_qr_ui(ui_tx)
-        .await?;
+    let token = login_client.login_with_qr_ui(ui_tx).await?;
     let base = renewal
         .ilink_base_url
         .clone()
