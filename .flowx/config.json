@@ -1,0 +1,46 @@
+{
+  "_comment": "flowx 项目配置 — ilink-hub (Rust)",
+
+  "qualityGates": [
+    {
+      "name": "fmt",
+      "cmd": "cargo fmt --check",
+      "onFail": "autofix",
+      "autofixCmd": "cargo fmt"
+    },
+    {
+      "name": "clippy",
+      "cmd": "cargo clippy -- -D warnings",
+      "onFail": "resume-fix"
+    },
+    {
+      "name": "test",
+      "cmd": "cargo test",
+      "onFail": "resume-fix"
+    },
+    {
+      "name": "build",
+      "cmd": "cargo build",
+      "onFail": "rollback"
+    }
+  ],
+
+  "reviewer": "claude",
+
+  "agents": {
+    "default": [
+      { "cli": "claude", "provider": "anthropic-minimax", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] },
+      { "cli": "agy", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] },
+      { "cli": "claude", "provider": "anthropic-deepseek", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] }
+    ],
+    "reviewer": [
+      { "cli": "claude", "provider": "anthropic-minimax", "timeout": 600000, "extraArgs": ["--dangerously-skip-permissions"], "extraPromptPrefix": "你是一名 Rust 安全与并发专家，重点审查：内存安全、data race、tokio 异步陷阱、OWASP 安全问题。" },
+      { "cli": "agy", "timeout": 600000, "extraArgs": ["--dangerously-skip-permissions"] },
+      { "cli": "claude", "provider": "anthropic-deepseek", "timeout": 600000, "extraArgs": ["--dangerously-skip-permissions"] }
+    ]
+  },
+
+  "execPlans": {
+    "dir": "docs/exec-plans"
+  }
+}
