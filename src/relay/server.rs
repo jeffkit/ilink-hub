@@ -380,7 +380,11 @@ mod tests {
 
         let device_id = "test-device".to_string();
         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
-        state.hubs.write().await.insert(device_id.clone(), HubHandle { tx: ws_tx });
+        state
+            .hubs
+            .write()
+            .await
+            .insert(device_id.clone(), HubHandle { tx: ws_tx });
 
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
@@ -409,7 +413,10 @@ mod tests {
         // Assert that the request is currently registered in the pending map
         {
             let pending = state.pending.lock().unwrap();
-            assert!(pending.contains_key(&request_id), "request must be in pending map");
+            assert!(
+                pending.contains_key(&request_id),
+                "request must be in pending map"
+            );
         }
 
         // Abort the spawned task (simulating client cancel/disconnect)
@@ -422,8 +429,10 @@ mod tests {
         // Assert that the request_id is cleaned up and no longer exists in the pending map
         {
             let pending = state.pending.lock().unwrap();
-            assert!(!pending.contains_key(&request_id), "pending request must be cleaned up on cancel!");
+            assert!(
+                !pending.contains_key(&request_id),
+                "pending request must be cleaned up on cancel!"
+            );
         }
     }
 }
-

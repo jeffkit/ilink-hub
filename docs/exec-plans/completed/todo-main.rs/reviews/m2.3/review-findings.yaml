@@ -1,0 +1,35 @@
+milestone: M2.3
+title: "M2.3 — 调整 serve 默认监听为 127.0.0.1:8765"
+date: 2026-06-12
+verdict: PASS
+summary: >
+  M2.3 的默认监听地址调整行为（127.0.0.1）已经实现，有效降低了默认情况下对局域网暴露未授权管理接口的安全风险。对内存安全、数据竞争、异步和网络安全的对抗性审查已完成。系统整体表现稳定，已通过所有集成和单元测试。然而，审查中发现了公共 Relay 凭证 TOFU 重置风险、配对一致性缺陷以及双端默认值不一致的问题，这些建议在后续开发中予以改进。
+findings:
+  - id: relay-tofu-reset-on-restart
+    title: "公共 Relay 的 TOFU 设备密钥存储仅保存在内存中，重启后存在被抢占劫持风险"
+    severity: Medium
+    file: "src/relay/server.rs"
+    description: >
+      在 `src/relay/server.rs` 中，`RelayState` 的 `device_keys` 采用内存 `HashMap` 记录 `device_id` 到 `public_key` 的绑定（TOFU 模式）。
+      由于该绑定未作持久化，Relay 服务器一旦重启，绑定关系即丢失。攻击者可通过嗅探或猜测合法 Hub 的 `device_id`，在 Relay 重启后抢先使用自己的公钥注册该 `device_id`，从而可能在配对阶段诱导并劫持手机端的请求。
+    recommendation: >
+      在 Relay 服务端引入持久化存储（如 SQLite 或 Redis）保存 `device_id` 到公钥的绑定关系，避免重启导致身份认证状态被清除。
+  - id: pair-confirm-inconsistency
+    title: "配对确认失败时，已注册落库的客户端 credentials 未回滚"
+    severity: Low
+    file: "src/server/pairing.rs"
+    description: >
+      在 `pair_confirm` 处理函数中，代码先执行 `register_client_in_hub` 创建客户端并将 `vtoken` 落库，随后再执行 `pairing.confirm` 进行校验。
+      如果 `pairing.confirm` 校验失败（如 `PairingError::Expired` 或 `PairingError::NotFound`），先前已经落库持久化并注册的 client 信息并没有被回滚清除。这会导致数据库中堆积无效的 vtoken 脏数据。
+    recommendation: >
+      优化 `pair_confirm` 的逻辑顺序，应先确认配对码的有效性并锁定配对会话，再执行注册与落库；或者在 `pairing.confirm` 失败时捕获异常并回滚清除已保存的 client。
+  - id: cli-bridge-default-url-inconsistency
+    title: "CLI 默认 Hub URL 与 Bridge 默认 Hub URL 不一致（localhost vs 127.0.0.1）"
+    severity: Low
+    file: "src/main.rs"
+    description: >
+      在 `src/main.rs` 的 `get_hub_url_default()` 中，默认 Hub URL 仍配置为 `"http://localhost:8765"`。
+      而在 `src/bin/ilink-hub-bridge.rs` 中，对应的默认 Hub URL 为 `"http://127.0.0.1:8765"`。
+      双端默认值不一致可能由于双栈解析等因素引发通信失败，也违背了统一为 `127.0.0.1` 的设计规范。
+    recommendation: >
+      建议将 `src/main.rs` 里的默认值调整为 `"http://127.0.0.1:8765"`，使其与 bridge 端对齐。

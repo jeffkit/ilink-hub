@@ -338,7 +338,7 @@ async fn test_pair_confirm_auth_bypass_lockout_adversarial() {
     let legitimate_vtoken = register(&state, "mac-home").await;
 
     // Now, call pair_confirm with an invalid code and the same name "mac-home".
-    use axum::extract::{Path, State, Json};
+    use axum::extract::{Json, Path, State};
     use ilink_hub::server::pairing::{pair_confirm, PairConfirmRequest};
 
     let invalid_code = "invalid_code_xyz".to_string();
@@ -347,18 +347,19 @@ async fn test_pair_confirm_auth_bypass_lockout_adversarial() {
         label: None,
     };
 
-    let (status, _response_json) = pair_confirm(
-        State(state.clone()),
-        Path(invalid_code),
-        Json(req),
-    ).await;
+    let (status, _response_json) =
+        pair_confirm(State(state.clone()), Path(invalid_code), Json(req)).await;
 
     // The response status should be NOT_FOUND (404) or similar (not 200).
     assert_ne!(status, axum::http::StatusCode::OK);
 
     // Critically, the registry/store entry for "mac-home" MUST NOT have been overwritten or modified.
     let registry = state.registry.read().await;
-    let client = registry.get_by_name("mac-home").expect("mac-home client must exist");
-    assert_eq!(client.vtoken, legitimate_vtoken, "Vtoken must not be overwritten!");
+    let client = registry
+        .get_by_name("mac-home")
+        .expect("mac-home client must exist");
+    assert_eq!(
+        client.vtoken, legitimate_vtoken,
+        "Vtoken must not be overwritten!"
+    );
 }
-

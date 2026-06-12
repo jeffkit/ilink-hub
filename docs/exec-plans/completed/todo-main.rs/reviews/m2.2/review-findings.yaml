@@ -1,0 +1,17 @@
+milestone: M2.2
+title: "M2.2 — 文档示例统一为 127.0.0.1"
+date: 2026-06-12
+verdict: PASS
+summary: >
+  All documentation example updates and security notifications have been verified successfully. No code logic regressions were introduced. One lingering inconsistency between CLI default hub URL (localhost) and bridge default hub URL (127.0.0.1) is identified and should be addressed in the next milestone.
+findings:
+  - id: CLI-default-hub-url-inconsistency
+    title: "CLI 默认 Hub URL 仍为 localhost，与文档及 Bridge 默认值不一致"
+    severity: Low
+    file: "src/main.rs"
+    description: >
+      在 `src/main.rs` 的 `get_hub_url_default()` 中，若未指定任何环境变量，默认值仍为 `"http://localhost:8765"`。
+      然而，`src/bin/ilink-hub-bridge.rs` 的 `get_hub_url_default()` 默认值为 `"http://127.0.0.1:8765"`。
+      在 M2.2 中，文档示例已全部统一为 `127.0.0.1`。因此，CLI 默认值使用 `localhost` 会导致与文档及 bridge 行为不一致，不符合 CONS-02 统一默认值的原则。
+    recommendation: >
+      在 M2.3 或后续清理中，将 `src/main.rs` 中的 `get_hub_url_default()` 默认值更新为 `"http://127.0.0.1:8765"`，以实现完全的默认值统一。

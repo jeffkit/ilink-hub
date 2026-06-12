@@ -1,0 +1,29 @@
+milestone: M1
+title: "M1 — CONS-01 — CLI 帮助中文化"
+date: 2026-06-12
+verdict: pass
+findings:
+  - id: network-fault-credential-deletion
+    title: "网络闪断可能导致本地合法凭证被静默且永久删除"
+    severity: High
+    file: "src/bridge/connection.rs"
+    description: "在 `resolve_hub_connection` 中，如果 `validate_hub_token` 遇到由于网络超时、闪断、本地DNS故障等非 401 鉴权失效导致的临时网络错误时，会直接进入错误处理分支删除本地的 `bridge-credentials.json` 文件，造成客户端 `vtoken` 彻底丢失，导致不必要的重新扫码配对。"
+    recommendation: "在 `validate_hub_token` 中应捕获并区分 HTTP 401 状态码与其他网络错误，只有在确认为 401 Unauthorized 时才删除本地凭证文件。"
+  - id: pair-confirm-unauthorized
+    title: "配对确认接口 `POST /hub/pair/{code}/confirm` 无任何身份鉴权"
+    severity: High
+    file: "src/server/pairing.rs"
+    description: "配对确认接口在收到请求后，会直接为对应配对码 `code` 生成新的 `vtoken` 并绑定客户端，但接口本身没有进行任何微信端身份校验或来源验证。若中继服务暴露在公网，攻击者若能获知配对码即可伪造确认请求劫持消息通道。"
+    recommendation: "在确认配对页面/接口中引入签名验证、状态令牌或微信端的 oauth 状态校验，以防非扫码者伪造确认。"
+  - id: missing-client-timeout
+    title: "部分 HTTP 客户端创建缺少超时限制"
+    severity: Medium
+    file: "src/main.rs"
+    description: "在 `src/main.rs` 的 `register_client` 与 `list_clients`，以及 `src/bridge/connection.rs` 的 `register_via_hub_http` 中，使用 `reqwest::Client::new()` 创建客户端且没有设置任何超时时间。在网络无响应或死锁时会导致 CLI 进程无限期挂起。"
+    recommendation: "建议统一使用 `reqwest::Client::builder().timeout(...)` 设置合理的超时时间（如 10 秒）。"
+  - id: sqlite-locks-deadlock
+    title: "SQLite 数据库未配置 busy_timeout 或 WAL 模式易导致锁定死锁"
+    severity: Medium
+    file: "src/store/mod.rs"
+    description: "在 `Store::connect` 中使用 `sqlx::AnyPool` 连接 SQLite，但未针对 SQLite 连接执行任何 `PRAGMA busy_timeout` 或 `journal_mode=WAL` 配置。高并发下频繁写入极易触发 `database is locked` 错误导致操作失败。"
+    recommendation: "在连接 SQLite 的 URL 中追加参数 `?_busy_timeout=5000&_journal_mode=WAL`，或连接后显式配置 PRAGMA。"

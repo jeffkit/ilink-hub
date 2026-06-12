@@ -383,7 +383,9 @@ pub async fn pair_confirm(
         if let Some(session) = pairing.get(&code) {
             match session.public_status() {
                 crate::hub::pairing::PairingStatus::Expired => Err(PairingError::Expired),
-                crate::hub::pairing::PairingStatus::Confirmed => Err(PairingError::AlreadyConfirmed),
+                crate::hub::pairing::PairingStatus::Confirmed => {
+                    Err(PairingError::AlreadyConfirmed)
+                }
                 _ => Ok(()),
             }
         } else {
