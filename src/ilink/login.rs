@@ -124,7 +124,10 @@ impl LoginClient {
                 if let Some(tx) = ui {
                     let _ = tx.send(QrLoginUiEvent::Expired);
                 }
-                return Err(anyhow!("QR login timed out after {} attempts", MAX_ATTEMPTS));
+                return Err(anyhow!(
+                    "QR login timed out after {} attempts",
+                    MAX_ATTEMPTS
+                ));
             }
             attempts += 1;
 

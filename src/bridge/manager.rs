@@ -812,7 +812,10 @@ stdin: none
 
         manager.stop_removed_or_changed(&desired).await;
 
-        assert!(!cred_file.exists(), "orphaned credentials should be removed");
+        assert!(
+            !cred_file.exists(),
+            "orphaned credentials should be removed"
+        );
     }
 
     #[tokio::test]

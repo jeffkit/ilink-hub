@@ -476,10 +476,6 @@ fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
     }
 }
 
-/// Expand `${VAR}` placeholders in `template` using values from `env`.
-///
-/// Rules:
-/// - `${IDENT}` → value of `IDENT` from `env`; error if not found (even empty string is ok)
 /// Warn when a profile has a dangerous shell-injection pattern:
 /// a shell interpreter (bash/sh/zsh) as the command with `-c` as an arg AND
 /// `{{MESSAGE}}` somewhere in the args — user input would be interpolated into
@@ -510,9 +506,17 @@ fn warn_shell_injection_risk(p: &BridgeProfile, name: &str) {
     }
 }
 
+/// Expand `${VAR}` placeholders in `template` using values from `env`.
+///
+/// Rules:
+/// - `${IDENT}` → value of `IDENT` from `env`; error if not found (even empty string is ok)
 /// - `$$` → literal `$`
 /// - No other `$...` forms are recognised; they pass through unchanged
 /// - Invalid tokens like `${}` or `${1FOO}` are errors
+///
+/// Only exercised by unit tests today; the production path calls
+/// [`expand_env_var_named`] directly.
+#[allow(dead_code)]
 pub fn expand_env_var(
     template: &str,
     env: &std::collections::HashMap<String, String>,
@@ -803,7 +807,10 @@ routing:
     // ── expand_env_var ────────────────────────────────────────────────────────
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
@@ -815,7 +822,10 @@ routing:
     #[test]
     fn expand_multiple_occurrences() {
         let e = env(&[("X", "hello")]);
-        assert_eq!(expand_env_var("${X} and ${X}", &e).unwrap(), "hello and hello");
+        assert_eq!(
+            expand_env_var("${X} and ${X}", &e).unwrap(),
+            "hello and hello"
+        );
     }
 
     #[test]
@@ -853,7 +863,10 @@ routing:
     #[test]
     fn expand_empty_value_is_ok() {
         let e = env(&[("EMPTY", "")]);
-        assert_eq!(expand_env_var("before${EMPTY}after", &e).unwrap(), "beforeafter");
+        assert_eq!(
+            expand_env_var("before${EMPTY}after", &e).unwrap(),
+            "beforeafter"
+        );
     }
 
     #[test]
@@ -866,8 +879,9 @@ routing:
     #[test]
     fn expand_missing_var_error_includes_profile_and_field() {
         let e = env(&[]);
-        let err = expand_env_var_named("${X}", &e, Some("myprofile"), Some("env.ANTHROPIC_API_KEY"))
-            .unwrap_err();
+        let err =
+            expand_env_var_named("${X}", &e, Some("myprofile"), Some("env.ANTHROPIC_API_KEY"))
+                .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("myprofile"));
         assert!(msg.contains("env.ANTHROPIC_API_KEY"));

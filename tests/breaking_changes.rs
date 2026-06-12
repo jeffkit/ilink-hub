@@ -10,11 +10,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ilink_hub::{
-    hub::HubState,
-    ilink::UpstreamClient,
-    server::build_router,
-    store::Store,
-    InMemoryQueue,
+    hub::HubState, ilink::UpstreamClient, server::build_router, store::Store, InMemoryQueue,
 };
 use tower::ServiceExt; // for .oneshot()
 

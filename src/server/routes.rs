@@ -372,7 +372,11 @@ pub async fn sendmessage(
         // active session only for older bridge clients that don't echo it back.
         let active_session = match replied_session_name.clone() {
             Some(n) => Some(n),
-            None => state.store.get_active_session_name(&vctx, &vtoken).await.ok(),
+            None => state
+                .store
+                .get_active_session_name(&vctx, &vtoken)
+                .await
+                .ok(),
         };
 
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
@@ -750,7 +754,10 @@ pub async fn admin_ilink_status(
     if !check_admin_auth(&headers) {
         return (
             StatusCode::UNAUTHORIZED,
-            Json(IlinkStatusResponse { status: "unauthorized", code: 0 }),
+            Json(IlinkStatusResponse {
+                status: "unauthorized",
+                code: 0,
+            }),
         );
     }
     let code = state.ilink_status.load(Ordering::Relaxed);
@@ -781,13 +788,17 @@ pub async fn admin_ilink_qr_stream(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>, StatusCode> {
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    StatusCode,
+> {
     // EventSource can't set headers — accept token via query param as fallback.
     // When a token is configured, also accept it as `?token=` query param.
     // When no token is configured, apply the same insecure-flag gate as other admin routes.
-    let authed = check_admin_auth(&headers) || admin_token().map_or(insecure_no_auth(), |required| {
-        params.get("token").map(String::as_str).unwrap_or("") == required
-    });
+    let authed = check_admin_auth(&headers)
+        || admin_token().map_or(insecure_no_auth(), |required| {
+            params.get("token").map(String::as_str).unwrap_or("") == required
+        });
     if !authed {
         return Err(StatusCode::UNAUTHORIZED);
     }
@@ -909,23 +920,36 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
         ));
     }
 
-    out.push_str("# HELP ilink_hub_sendmessage_total Total sendmessage calls from backend clients\n");
+    out.push_str(
+        "# HELP ilink_hub_sendmessage_total Total sendmessage calls from backend clients\n",
+    );
     out.push_str("# TYPE ilink_hub_sendmessage_total counter\n");
-    out.push_str(&format!("ilink_hub_sendmessage_total {}\n", sendmessage_total));
+    out.push_str(&format!(
+        "ilink_hub_sendmessage_total {}\n",
+        sendmessage_total
+    ));
 
     out.push_str("# HELP ilink_hub_sendmessage_errors_total sendmessage calls rejected (unknown token, missing context, etc.)\n");
     out.push_str("# TYPE ilink_hub_sendmessage_errors_total counter\n");
-    out.push_str(&format!("ilink_hub_sendmessage_errors_total {}\n", sendmessage_errors));
+    out.push_str(&format!(
+        "ilink_hub_sendmessage_errors_total {}\n",
+        sendmessage_errors
+    ));
 
     out.push_str("# HELP ilink_hub_relogin_attempts_total Number of QR re-login attempts (manual or automatic)\n");
     out.push_str("# TYPE ilink_hub_relogin_attempts_total counter\n");
-    out.push_str(&format!("ilink_hub_relogin_attempts_total {}\n", relogin_attempts));
+    out.push_str(&format!(
+        "ilink_hub_relogin_attempts_total {}\n",
+        relogin_attempts
+    ));
 
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
 
-    out.push_str("# HELP ilink_hub_ctx_map_size Number of virtual context token entries in memory cache\n");
+    out.push_str(
+        "# HELP ilink_hub_ctx_map_size Number of virtual context token entries in memory cache\n",
+    );
     out.push_str("# TYPE ilink_hub_ctx_map_size gauge\n");
     out.push_str(&format!("ilink_hub_ctx_map_size {}\n", ctx_map_size));
 
@@ -948,7 +972,7 @@ async fn wait_notify_or_shutdown(
         _ = wait_shutdown_signal(shutdown) => false,
         notified = async {
             queue.wait_notify(vtoken, poll_secs).await.unwrap_or_else(|e| {
-                error!(error = %e, vtoken = %redact_token(&vtoken), "wait_notify failed");
+                error!(error = %e, vtoken = %redact_token(vtoken), "wait_notify failed");
                 false
             })
         } => notified,
