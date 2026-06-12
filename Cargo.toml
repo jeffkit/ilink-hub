@@ -61,13 +61,14 @@ anyhow = "1"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-rand = "0.8"
+rand = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 base64 = "0.22"
 dashmap = "6"
 lru = "0.12"
 
 # Storage — sqlx supports SQLite, PostgreSQL, MySQL via DATABASE_URL
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "mysql", "chrono", "uuid", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "migrate"] }
 
 # Config
 config = "0.14"
@@ -87,3 +88,9 @@ url = "2"
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = ["sqlite"]
+sqlite = ["sqlx/sqlite"]
+postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]

@@ -128,6 +128,15 @@ docker compose logs -f ilink-hub
 DATABASE_URL=postgres://user:pass@localhost/ilink_hub ilink-hub serve
 ```
 
+> [!NOTE]
+> When compiling `ilink-hub` from source (e.g., `cargo install` or `cargo build`), only the `sqlite` driver is enabled by default to reduce binary size and compilation times. To enable PostgreSQL or MySQL support, you must compile with the corresponding feature flags:
+> ```bash
+> cargo build --release --features postgres
+> # or
+> cargo build --release --features mysql
+> ```
+> Pre-built binaries and official Docker images are compiled with all features enabled.
+
 ---
 
 ## WeChat Commands
@@ -200,6 +209,19 @@ let bot = WeChatBot::new(BotOptions {
 ### ilink-hub-bridge (local CLI)
 
 Run a **local** command (Claude Code, Cursor Agent, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Usage guide (Chinese):** [bridge/USAGE](https://jeffkit.github.io/ilink-hub/bridge/USAGE.html). **Quick echo path:** [5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
+
+```yaml
+# Example bridge config (ilink-hub-bridge.yaml)
+profiles:
+  echo:
+    command: echo
+    args: ["{{MESSAGE}}"] # Placeholder replaced with user message
+    stdin: none
+```
+
+> [!WARNING]
+> **安全警告 / Security Warning**:
+> 绝不要将 `{{MESSAGE}}` 用于 shell `-c` 参数（例如 `args: ["-c", "run {{MESSAGE}}"]`），因为这会带来 shell 命令注入的安全隐患。推荐使用 `stdin: message` 模式，将消息内容通过标准输入安全地传递给子进程。
 
 ```bash
 cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml

@@ -1,0 +1,16 @@
+milestone: "m1"
+title: "Fix [S-03] Documentation Security Warnings"
+description: >
+  Added security warning boxes next to `{{MESSAGE}}` config examples in README.md, docs/bridge/README.md, and docs/bridge-config.md.
+  Explicitly explained that `{{MESSAGE}}` should not be used as part of a shell `-c` parameter due to shell injection risks, and recommended using `stdin: message` mode.
+files_changed:
+  - README.md
+  - docs/bridge/README.md
+  - docs/bridge-config.md
+validation:
+  commands:
+    - cargo fmt --check
+    - cargo clippy -- -D warnings
+    - cargo test
+    - cargo build
+  status: "Passed"
