@@ -243,3 +243,91 @@ fn queue_backend_memory_is_unchanged() {
         "ILINK_QUEUE_BACKEND should not be set to 'redis' in test environment"
     );
 }
+
+// ─── E-01: Sendtyping error propagation ──────────────────────────────────────
+
+#[tokio::test]
+async fn sendtyping_error_propagation_test() {
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // 1. 启动一个 mock upstream 服务
+    let should_fail = Arc::new(AtomicBool::new(false));
+    let should_fail_clone = should_fail.clone();
+
+    let mock_app = Router::new().route(
+        "/ilink/bot/sendtyping",
+        post(move || {
+            let sf = should_fail_clone.clone();
+            async move {
+                if sf.load(Ordering::Relaxed) {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock error")
+                } else {
+                    (axum::http::StatusCode::OK, "")
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    // 2. 构造 HubState，把 upstream client 的 base_url 指向我们的 mock server
+    let store = Store::connect("sqlite::memory:")
+        .await
+        .expect("in-memory store");
+    let upstream = Arc::new(UpstreamClient::new(
+        "sk-test:key".to_string(),
+        Some(base_url),
+    ));
+    let queue = Arc::new(InMemoryQueue::new());
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+
+    // 3. 注册一个 vtoken 以便能通过鉴权
+    let vtoken =
+        ilink_hub::server::pairing::register_client_in_hub(&state, "test-client".to_string(), None)
+            .await;
+
+    // 4. 构造我们要测试的 Axum router
+    let app = build_router(state);
+
+    // 5. 情况 A：upstream 成功
+    should_fail.store(false, Ordering::Relaxed);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ilink/bot/sendtyping")
+        .header("Authorization", format!("Bearer {vtoken}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"vctx":"vctx-123","typing":true}"#))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json["ret"], 0);
+
+    // 6. 情况 B：upstream 失败
+    should_fail.store(true, Ordering::Relaxed);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ilink/bot/sendtyping")
+        .header("Authorization", format!("Bearer {vtoken}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"vctx":"vctx-123","typing":true}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json["ret"], 500);
+    assert!(json["errmsg"].as_str().unwrap().contains("upstream error"));
+}
