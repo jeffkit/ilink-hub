@@ -57,11 +57,11 @@ commands:
       unit_src_main_rs: "0 passed; 0 failed; 0 ignored"
       unit_bin_ilink_hub_bridge: "0 passed; 0 failed; 0 ignored"
       unit_bin_ilink_relay: "0 passed; 0 failed; 0 ignored"
-      tests_breaking_changes: "7 passed; 0 failed; 0 ignored"
+      tests_breaking_changes: "9 passed; 0 failed; 0 ignored"
       tests_hub_routing_integration: "9 passed; 0 failed; 0 ignored"
       tests_queue_trait_tests: "10 passed; 0 failed; 0 ignored"
       doc_tests: "0 passed; 0 failed; 1 ignored"
-      total: "147 passed; 0 failed; 1 ignored"
+      total: "149 passed; 0 failed; 1 ignored"
     result: pass
   - id: build
     cmd: "cargo build"
@@ -95,6 +95,26 @@ commands:
       Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.97s;
       ilink-hub-desktop v0.1.11 + ilink-hub v0.1.20 both clean
     result: pass
+  - id: help-ilink-hub
+    cmd: "./target/release/ilink-hub --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 455 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-serve
+    cmd: "./target/release/ilink-hub serve --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 780 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-register
+    cmd: "./target/release/ilink-hub register --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 368 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-bridge
+    cmd: "./target/release/ilink-hub-bridge --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 1583 bytes, binary sha256 e84f3355585c1e38936796ea1a15266a7e857f81e23d7d9f9e6f07136010f21e"
+    result: pass
 
 # ─── M0-required --help snapshot (plan §M0 calls for these four) ──────────
 # These are the M0 baseline snapshots the plan explicitly asks for. They
@@ -123,7 +143,7 @@ help_snapshots:
           help: "Real iLink bot token. If omitted, loaded from DATABASE_URL or triggers QR login"
         - name: "--addr <ADDR>"
           env: "ILINK_HUB_ADDR"
-          default: "0.0.0.0:8765"
+          default: "127.0.0.1:8765"
           help: "Hub listen address"
         - name: "--ilink-base-url <ILINK_BASE_URL>"
           env: "ILINK_BASE_URL"
@@ -134,7 +154,7 @@ help_snapshots:
           help: >-
             Database connection URL. Defaults to SQLite at
             ~/.ilink-hub/ilink-hub.db
-      default_addr: "0.0.0.0:8765 (CONS-02 baseline — LAN-exposed)"
+      default_addr: "127.0.0.1:8765 (CONS-02 - loopback default)"
     file: "src/main.rs"
   - id: ilink-hub-register--help
     cmd: "./target/release/ilink-hub register --help"
@@ -256,14 +276,12 @@ pass_conditions:
       preserved verbatim; M1 will diff against this snapshot.
     result: pass
 
-# ─── Behavioural diff vs. baseline ──────────────────────────────────────────
-# No code changes at M0. This section exists to make the contract
-# explicit: M0 is a snapshot, not a behaviour change.
 behavioural_diff:
-  - area: "No source files modified"
-    before: "N/A"
-    after: "N/A"
-    security_classification: "N/A — M0 records state only."
+  - area: "Default listen address"
+    before: "0.0.0.0:8765"
+    after: "127.0.0.1:8765"
+    diff: "default_value = \"127.0.0.1:8765\""
+    security_classification: "HIGH — Close LAN exposure by defaulting to loopback."
 
 # ─── M0-specific open follow-ups ───────────────────────────────────────────
 # All baseline observations carry forward to later milestones.

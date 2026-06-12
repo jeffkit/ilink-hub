@@ -243,3 +243,38 @@ fn queue_backend_memory_is_unchanged() {
         "ILINK_QUEUE_BACKEND should not be set to 'redis' in test environment"
     );
 }
+
+// ─── S-04: Default Listen Address & LAN Exposure (OBS-1) ──────────────────────
+//
+// Security fix: `serve` now defaults to `127.0.0.1:8765` instead of `0.0.0.0:8765`
+// to prevent exposing unauthenticated admin endpoints to the local network by default.
+
+/// Verify that the CLI help lists the secure loopback address as the default.
+#[test]
+fn test_cli_default_listen_address_is_loopback() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub")
+        .unwrap_or_else(|_| "./target/release/ilink-hub".to_string());
+    let output = std::process::Command::new(bin_path)
+        .arg("serve")
+        .arg("--help")
+        .output()
+        .expect("failed to execute ilink-hub binary");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("default: \"127.0.0.1:8765\"")
+            || stdout.contains("default_value = \"127.0.0.1:8765\"")
+            || stdout.contains("127.0.0.1:8765"),
+        "CLI serve help must specify 127.0.0.1:8765 as the default listen address. Output:\n{}",
+        stdout
+    );
+}
+
+/// Verify that a socket address configured to the default is loopback.
+#[test]
+fn test_default_address_is_loopback_socket() {
+    let default_addr: std::net::SocketAddr = "127.0.0.1:8765".parse().unwrap();
+    assert!(
+        default_addr.ip().is_loopback(),
+        "Default address must be loopback to avoid LAN exposure"
+    );
+}

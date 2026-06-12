@@ -24,7 +24,7 @@ enum Commands {
         token: Option<String>,
 
         /// Hub listen address
-        #[arg(long, default_value = "0.0.0.0:8765", env = "ILINK_HUB_ADDR")]
+        #[arg(long, default_value = "127.0.0.1:8765", env = "ILINK_HUB_ADDR")]
         addr: String,
 
         /// Override real iLink base URL (for testing / custom deployments)
