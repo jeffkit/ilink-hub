@@ -207,21 +207,29 @@ pass_conditions:
   - id: graceful-close
     plan_clause: "关闭 hub 时 relay 服务端不再看到异常断开 (日志检查 graceful close)"
     observation: >-
-      The structural fix is `tokio::select! { shutdown.changed() ... run_session ... }`
-      inside the reconnect loop, with `shutdown.changed()` biased. This
-      guarantees that when `run_serve` flips `shutdown_rx` to `true`
-      (which is the same signal axum's `with_graceful_shutdown` watches),
-      the relay loop returns cleanly. The `tokio::spawn`-ed task drops
-      out of `tokio::select!`, after which `run_session`'s still-open
-      WebSocket is dropped — which sends a normal close frame to the
-      relay server instead of a TCP RST. The pre-M2 failure was that the
-      spawned task was killed by the runtime drop on hub shutdown, which
-      closed the TCP connection without a WebSocket close frame.
-      E2E-2 (the manual log check on relay server side) is the
-      authoritative validation; the unit tests prove the structural
-      guard, and the matching pattern with
-      `spawn_health_checker` / `spawn_quote_index_evictor` / the upstream
-      polling loop demonstrates the in-tree convention is honoured.
+      The shutdown signal is honoured at *every* in-flight I/O point inside
+      `run_session`, not just between sessions. Concretely, `run_session`
+      now races each await (`connect_async`, the register write,
+      `read.next()`, the HTTP forwarding call, the per-request reply write, and
+      the Ping reply write) against `wait_for_shutdown(&mut shutdown)`, with
+      the shutdown arm biased. On shutdown each future is dropped, which causes
+      the WebSocket stream to be dropped, which tokio_tungstenite translates
+      into a normal close frame on the wire — the relay server then sees
+      a clean disconnect instead of a TCP RST. The outer select! still
+      wraps the reconnect-sleep arm so the between-sessions case is also
+      interruptible. The spawn-time guard (`*shutdown.borrow() == true`
+      before the loop is entered) is retained to cover the startup race.
+      The pre-M2 failure was that the spawned task was killed by the
+      runtime drop on hub shutdown, which closed the TCP connection
+      without a WebSocket close frame. E2E-2 (the manual log check on
+      relay server side) is the authoritative validation; the unit tests
+      `relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled`,
+      `relay_loop_exits_during_held_handshake_when_shutdown_signalled`,
+      and `relay_loop_exits_during_http_forward_when_shutdown_signalled`
+      pin the between-sessions, in-handshake, and HTTP-forwarding code paths.
+      The matching pattern with `spawn_health_checker` /
+      `spawn_quote_index_evictor` / the upstream polling loop
+      demonstrates the in-tree convention is honoured.
     result: pass
   - id: clippy-clean
     plan_clause: "clippy 无 warning (M3 will re-run --all-targets)"
@@ -261,15 +269,13 @@ behavioural_diff:
     security_classification: "No production behavioural change. The constructor is `#[doc(hidden)]` and only intended for `#[cfg(test)]` callers."
 
 # ─── M2-specific open follow-ups (none) ────────────────────────────────────
-# E-03 is fully closed at HEAD. The `connect_async` future inside
-# `run_session` is NOT internally wrapped in a select! with the shutdown
-# signal — so a hub SIGTERM that lands *while* `connect_async` is mid
-# TCP handshake will still wait until the handshake either completes or
-# fails before the loop notices. For the relay pairing use case the
-# handshake completes in well under a second, so the practical impact
-# is bounded. A future hardening step (not required by M2) would push
-# the select! inside `run_session` so the handshake itself is
-# interruptible.
+# E-03 is fully closed at HEAD. The `run_session` body now races every
+# in-flight I/O (`connect_async`, the register write, `read.next()`, the
+# HTTP forwarding call, the per-request reply write, and the Ping reply write)
+# against a shutdown arm via `tokio::select!` with `biased;`, so a SIGTERM
+# that lands while any of those awaits is in flight is honoured within one poll.
+# The outer reconnect loop still wraps the `RECONNECT_SECS` sleep in a
+# select! so the between-sessions case is also interruptible.
 open_follow_ups: []
 
 # ─── Next milestone ────────────────────────────────────────────────────────

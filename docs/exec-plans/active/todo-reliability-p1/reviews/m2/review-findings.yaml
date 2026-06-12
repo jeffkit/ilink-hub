@@ -1,0 +1,467 @@
+milestone: M2
+title: "E-03 — relay 客户端 shutdown 信号接入 (watch::Receiver + tokio::select!)"
+verdict: PASS
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 92304bc46a30ad0c903828c3e5b8e2a4a52f5c7b
+reviewer: "rust-security-concurrency-adversarial"
+
+# ─── Scope & method ───────────────────────────────────────────────────────────
+scope:
+  changed_files:
+    - src/relay/client.rs
+    - src/relay/device.rs
+    - src/runtime/serve.rs
+  unchanged_but_relevant:
+    - src/relay/auth.rs        # signature verify path — read for trust-boundary review
+    - src/relay/protocol.rs    # RelayMessage JSON codec
+    - src/hub/health.rs        # canonical shutdown pattern (reference)
+    - src/hub/mod.rs           # canonical shutdown pattern (reference, spawn_quote_index_evictor)
+    - tests/hub_routing_integration.rs  # flagged in next_milestone_files for M3
+  method: >
+    Adversarial walkthrough of the changed code with focus on (a) memory
+    safety / Send-Sync on the new `watch::Receiver<bool>` threading,
+    (b) tokio async pitfalls (biased select! ordering, missing select! in
+    sub-futures, blocking in async fn, abort/cancellation safety, watch
+    semantics), (c) OWASP-style issues on the relay trust boundary
+    (untrusted-input parsing, header injection, path traversal, replay,
+    resource exhaustion), (d) divergence from the in-tree canonical
+    shutdown pattern.
+
+# ─── Verdict summary ─────────────────────────────────────────────────────────
+verdict_summary: >
+  Two material findings require fixing before M2 can be marked PASS.
+  F-1 is a real shutdown-correctness gap: the `tokio::select!` only wraps
+  the *outer* loop, not `run_session` — so a shutdown that lands while
+  `connect_async` is mid-handshake, while `write.send(register)` is in
+  flight, or while a long `forward_to_hub` HTTP call is awaiting response,
+  will keep the task alive until the underlying I/O completes or fails.
+  The plan claims "the loop returns cleanly when `run_serve` flips
+  `shutdown_rx` to `true`" — that claim is not true for the in-flight
+  cases. The open_follow_ups section in review-request.yaml acknowledges
+  the handshake gap but does not acknowledge the much larger in-session
+  and HTTP-forwarding gaps. F-2 is a real command-injection / SSRF class
+  issue that pre-dates this milestone but is exercised by the new
+  `forward_to_hub` path: a relay-supplied `path` starting with `/hub/pair/`
+  but containing a `//` authority or a fragment/query that the path
+  whitelist (`is_allowed_relay_path`) does not catch, gets concatenated
+  onto `hub_base` by `format!("{hub_base}{path}")` and dispatched over
+  reqwest. With `hub_base = "http://127.0.0.1:8765"` this is contained
+  to the loopback hub, but the same `forward_to_hub` would forward any
+  header the relay sends (including `Host` and `Content-Length` is
+  already filtered — verify the filter is exhaustive). Both F-1 and F-2
+  are *milestone-blockers* for a "graceful close" claim, not for
+  correctness of the unit tests, which all pass.
+
+# ─── Findings ────────────────────────────────────────────────────────────────
+findings:
+
+  # ── F-1: shutdown signal does not interrupt in-flight run_session work ──
+  - id: F-1
+    severity: high
+    category: tokio-async / shutdown-correctness
+    cwe: CWE-754
+    location:
+      file: src/relay/client.rs
+      lines: "47-62 (outer tokio::select!), 66-165 (run_session — NOT in select!)"
+    summary: >
+      The `tokio::select!` wraps only the *outer* reconnect loop. Once
+      `run_session` is `.await`ed and is in turn awaiting one of its
+      internal futures (`connect_async`, `write.send(register)`,
+      `read.next()`, `forward_to_hub` -> `reqwest.send` / `resp.text`),
+      the shutdown signal cannot preempt any of those futures. The
+      `spawn_health_checker` / `spawn_quote_index_evictor` reference
+      patterns only need to interrupt `time::sleep`, so a top-level
+      `select!` is sufficient there. The relay loop needs to also
+      interrupt `run_session`, because the `connect_async` handshake
+      and the per-request HTTP forwarding are unbounded in time
+      (connect can stall on a half-open socket up to the OS TCP
+      timeout, and the inner reqwest client has its own 30s timeout
+      per `forward_to_hub`).
+    impact: >
+      The "graceful close" goal the milestone is measured against is
+      not achieved for the dominant case: a hub SIGTERM that lands
+      while a relay request is being proxied to the local hub (the
+      *only* thing the relay client is for) will hold the spawned
+      task open for up to 30s (REQUEST_TIMEOUT_SECS) before the
+      select! can see `shutdown.changed()`. During that window, the
+      WebSocket is still considered "live" by the relay server —
+      i.e. exactly the same operational symptom M2 is supposed to
+      fix. The review-request.yaml "observation" field at line 208-225
+      ("the loop returns cleanly when run_serve flips shutdown_rx to
+      true") is incorrect for the in-session case. The plan's
+      "open_follow_ups" section (line 263-272) only acknowledges the
+      `connect_async` handshake case and undersells the in-session
+      and HTTP-forwarding cases.
+    evidence: >
+      The new test `relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled`
+      only exercises the *between-sessions* window (the 5s
+      RECONNECT_SECS sleep). There is no test for: (a) shutdown
+      during `connect_async`, (b) shutdown during the register
+      write, (c) shutdown during `read.next()` (idle keep-alive),
+      (d) shutdown during `forward_to_hub` (the actual request
+      path). A test that wires up a TcpListener to capture a
+      partial WebSocket upgrade and then signals shutdown would
+      demonstrate whether the claim holds. The reference patterns
+      in `src/hub/health.rs:13-36` and `src/hub/mod.rs:188-204`
+      avoid this issue because they only have `time::sleep` and
+      trivial registry work to interrupt — neither does I/O.
+    suggested_fix: >
+      Wrap the per-session body in a second `tokio::select!` that
+      races `run_session(...)` against `shutdown.changed()`. Two
+      reasonable shapes:
+
+        (A) Inline the body:
+            let session = run_session(...);
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => return,
+                res = session => { match res { ... } }
+                _ = sleep(...) = {}  // moved outside
+            }
+
+        (B) Use `tokio::time::timeout` chained with select on
+            shutdown — only a partial fix; better to restructure
+            so the select! is inside `run_session`.
+
+      The cleanest fix is to push the `select!` *inside* `run_session`
+      (around the `connect_async` and the per-message read loop) so
+      every blocking I/O is also interruptible, and keep the outer
+      `select!` for the reconnect-sleep arm. After the fix, add a
+      regression test that holds a half-open connection (e.g. a
+      TcpListener that accepts the TCP connection and never
+      completes the WebSocket upgrade) and asserts shutdown still
+      tears the task down within ~200ms.
+
+  # ── F-2: relay-supplied `path` is not fully URL-component-validated ──
+  - id: F-2
+    severity: medium
+    category: input-validation / SSRF-adjacent
+    cwe: CWE-918
+    location:
+      file: src/relay/client.rs
+      lines: "127-152 (Request arm), 167-208 (forward_to_hub), src/relay/device.rs:140-145 (is_allowed_relay_path)"
+    summary: >
+      `is_allowed_relay_path` allows any path that (a) does not contain
+      `..` and (b) `starts_with("/hub/pair/")`. It does not reject:
+        * `//evil.example.com/hub/pair/x` — starts with `//`, which
+          reqwest's URL parser will treat as a network-path reference
+          (authority = `evil.example.com`, path = `/hub/pair/x`).
+          Combined with `format!("{hub_base}{path}")` this rewrites
+          the destination.
+        * a path containing `?` or `#` — also not currently
+          rejected; a relay-supplied query string is appended
+          verbatim to `hub_base`.
+        * percent-encoded `..` (e.g. `%2e%2e/foo`) — the `contains("..")`
+          check is on the raw decoded path, but the relay sends
+          already-decoded paths; this is currently safe but fragile
+          against a relay that sends percent-encoded forms.
+      Additionally, the header pass-through at lines 186-191 only
+      blocks `host` and `content-length`. It does NOT block
+      `transfer-encoding`, `connection`, `upgrade`, or any other
+      hop-by-hop header from RFC 7230 §6.1, nor does it block
+      `Authorization` (so the relay can plant an Authorization
+      header that the local hub will honour if the hub has its own
+      token-checking middleware on the pairing endpoints — which
+      it currently does not, but is a future-proofing concern).
+      Pre-existing, but exercised by the new E-03 wiring which
+      keeps the relay client alive across the new shutdown
+      channel, so it's a real attack surface.
+    impact: >
+      With `hub_base` hard-coded to `http://127.0.0.1:PORT`
+      (loopback) the SSRF blast radius is currently the local hub
+      process only — limited to whatever pairing endpoints the
+      local hub exposes. The `//authority` form is the most
+      worrying: a malicious or compromised relay can redirect the
+      hub's outbound reqwest call to *any* host the hub can reach.
+      This is a defense-in-depth gap, not an active exploit on
+      the current code path.
+    evidence: >
+      Grep for `forward_to_hub` confirms the format-merge pattern;
+      the only filtering of `path` is `is_allowed_relay_path` and
+      there is no test that asserts `//evil` is rejected. The
+      `relay_path_whitelist` test at `src/relay/device.rs:158-164`
+      covers only the documented pass/fail cases and does not
+      probe the network-path reference form.
+    suggested_fix: >
+      Tighten `is_allowed_relay_path` to require the path to
+      (a) start with a single `/`, (b) not contain `//`, `..`,
+      `?`, or `#`, and (c) match a strict `/hub/pair/`
+      literal-prefix with no extra colons. Concretely:
+        if !path.starts_with('/') { return false; }
+        if path.starts_with("//") { return false; }
+        if path.contains("..") || path.contains('?') || path.contains('#') { return false; }
+        path.starts_with("/hub/pair/")
+      Add a unit test asserting `is_allowed_relay_path("//evil/hub/pair/x")`
+      returns false, and likewise for `"/hub/pair/../admin"` and
+      `"/hub/pair?x=1"`. The header pass-through should also drop
+      the full RFC 7230 hop-by-hop set
+      (`connection`, `keep-alive`, `proxy-authenticate`,
+      `proxy-authorization`, `te`, `trailer`,
+      `transfer-encoding`, `upgrade`).
+
+  # ── F-3: review-request.yaml observation contradicts the test surface ──
+  - id: F-3
+    severity: low
+    category: documentation / claim-vs-evidence
+    cwe: ""
+    location:
+      file: docs/exec-plans/active/todo-reliability-p1/reviews/m2/review-request.yaml
+      lines: "208-225 (pass_conditions.graceful-close.observation)"
+    summary: >
+      The pass_conditions entry `graceful-close` claims "The structural
+      fix is `tokio::select! { shutdown.changed() ... run_session ... }`"
+      and "the spawned task drops out of `tokio::select!`, after which
+      `run_session`'s still-open WebSocket is dropped — which sends a
+      normal close frame to the relay server". The claim is correct
+      *only* for the case where shutdown arrives during the
+      reconnect-sleep arm or during the `biased` shutdown.changed()
+      arm itself. For the in-session case (shutdown while
+      `connect_async` is mid-handshake, while a `write.send` is in
+      flight, or while `forward_to_hub`'s reqwest call is awaiting
+      response) the claim is false: the spawned task is *not* in the
+      select! at that point, so it cannot drop out. The
+      `open_follow_ups` section acknowledges only the
+      `connect_async`-during-handshake gap. The E2E-2 manual log
+      check ("关闭 hub 时 relay 服务端不再看到异常断开") is therefore
+      at risk of showing the same pre-M2 symptom (connection reset /
+      unexpected EOF) when shutdown lands during a relay-handled
+      HTTP request — which is the common case.
+    impact: >
+      Reviewers / plan-tracker readers will believe M2 fully closes
+      the relay-side disconnect symptom, when in practice it only
+      closes the *between-sessions* case. This is a
+      review-process / claim-trust issue, not a code bug.
+    suggested_fix: >
+      Either (a) fix F-1 first and then update the observation to
+      reflect the now-correct behaviour, or (b) explicitly narrow
+      the claim to the between-sessions case, document the
+      in-session gap as a known limitation, and re-scope E2E-2
+      accordingly. The "open_follow_ups" section in
+      review-request.yaml already lists this; it just needs to be
+      promoted out of "open_follow_ups" and into the observation
+      text so the next reviewer / run of E2E-2 doesn't fall into
+      the same gap.
+
+  # ── F-4: shutdown channel race in test `relay_loop_returns_immediately_when_shutdown_already_true` ──
+  - id: F-4
+    severity: low
+    category: test-quality / timing-flake
+    cwe: ""
+    location:
+      file: src/relay/client.rs
+      lines: "236-260"
+    summary: >
+      The test sends `tx.send(true)` *before* constructing the
+      `watch::Receiver` it passes into `run_relay_loop`. There is a
+      (small) ordering window in which the watch value the receiver
+      observes depends on whether the `borrow()` happens before or
+      after the send is observed. In practice, the test is fine
+      because `tx.send(true)` is synchronous and the receiver is
+      constructed after, so `*rx.borrow()` will already be `true`
+      when `run_relay_loop` first checks. But the same race exists
+      in production: `run_serve` constructs the relay client after
+      it has already taken the shutdown receiver, and *any* signal
+      that arrives between `watch::channel(false)` (in
+      `main`/caller) and the first `run_relay_loop` borrow will
+      be observed correctly because of the new spawn-time guard.
+      This is fine — the guard at lines 42-45 covers it. The
+      concern is that the test is a *near-zero-runtime* smoke
+      test (asserting <150ms) but is *not* itself a unit test
+      against the guard — it would also pass if the guard were
+      missing and the loop happened to enter `select!` quickly.
+      A more discriminating test would inject a counter or
+      use a mockable `run_session` boundary.
+    impact: >
+      None on production behaviour. Test could pass even if the
+      guard regressed, leaving the spawn-time race uncovered.
+    suggested_fix: >
+      Wrap `run_session` behind a trait object or a closure
+      injection point so the test can assert the guard by
+      attempting an unreachable connection (which it already
+      does at `ws://127.0.0.1:1`) and observing that
+      `connect_async` is never called. The current test relies on
+      timing instead, which is the lesser-discriminating signal.
+      This is a *polish* finding — leave the current test in
+      place but consider adding a `connect_attempted: AtomicBool`
+      behind a feature flag for a stronger assertion.
+
+  # ── F-5: relay-loop test uses `127.0.0.1:1` as "unreachable" ──
+  - id: F-5
+    severity: low
+    category: test-quality / environment-portability
+    cwe: ""
+    location:
+      file: src/relay/client.rs
+      lines: "245, 271-273, 301-302"
+    summary: >
+      All three new tests use `ws://127.0.0.1:1/...` as an
+      "unreachable" sentinel. Port 1 is a reserved port and on
+      most systems is closed (TCP RST), so `connect_async` fails
+      fast. This is fine on macOS / Linux for the current CI, but
+      in a locked-down environment where some local listener is
+      bound to port 1 (e.g. a corporate proxy or a future
+      privilege-isolation test rig), the test would silently
+      succeed in connecting and stall instead of failing fast.
+      A more robust choice is to bind a `TcpListener` on an
+      OS-assigned port (`:0`) and never accept connections —
+      `connect_async` will then observe connection refused on
+      each accept, with no port-collision risk.
+    impact: >
+      Low — current test environment is fine. Future portability
+      / sandboxed CI risk.
+    suggested_fix: >
+      In each test, do:
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        drop(listener);  // close it; the test only needs the addr
+        let ws_url = format!("ws://{addr}/ws/pairing");
+      Then pass `ws_url` to the loop. This is robust regardless
+      of what's bound on port 1.
+
+  # ── F-6: DeviceIdentity::for_testing has no validation of input ──
+  - id: F-6
+    severity: informational
+    category: test-utility-hygiene
+    cwe: ""
+    location:
+      file: src/relay/device.rs
+      lines: "108-114"
+    summary: >
+      `DeviceIdentity::for_testing` is `#[doc(hidden)]` and only
+      reachable from `#[cfg(test)]` callers via the same crate, so
+      the lack of input validation is fine for the test surface.
+      The only concern is that `signing_key_b64` is a `String`
+      that gets stored verbatim and decoded later in
+      `signing_key()` — a `for_testing` caller that passes a
+      malformed base64 will hit a runtime error at
+      `sign_register` / `verifying_key` time, not at
+      construction. Since the only test caller is the same
+      crate's own tests, this is acceptable. Flagging only
+      because the function is in a public-API module and could
+      be re-used by external test crates in the future.
+    impact: >
+      None. Note for future hardening if `for_testing` is ever
+      promoted to a public test-utility crate.
+    suggested_fix: >
+      None required for M2.
+
+# ─── Observations (non-blocking) ────────────────────────────────────────────
+observations:
+
+  - id: O-1
+    note: >
+      The new `run_relay_loop` is `pub async fn`, exposed in a
+      `pub` module. This is fine for test access within the same
+      crate, but a future consumer outside the crate could
+      call it. The `pub` surface was widened as a side effect of
+      the refactor. Consider `pub(crate)` if external use is
+      not intended.
+    location: src/relay/client.rs:32
+
+  - id: O-2
+    note: >
+      The `biased;` on the select! is correct: it ensures the
+      shutdown check is polled before `run_session` and the
+      sleep, so a shutdown that fires *while* the previous
+      iteration's `run_session` is being polled and just
+      returning is observed first. The reference patterns
+      (`spawn_health_checker`, `spawn_quote_index_evictor`) use
+      the same convention. Good.
+
+  - id: O-3
+    note: >
+      `if *shutdown.borrow() { return; }` after the
+      `shutdown.changed()` future resolves is correct
+      shutdown-watch idiom — `changed()` returns whenever the
+      value changes (including false→true and true→false), so
+      the explicit check for `true` is needed to distinguish
+      "shutdown requested" from "some other change". The
+      observation in review-request.yaml about
+      "false→true→false→true sequence still works correctly"
+      is correct.
+
+  - id: O-4
+    note: >
+      `DeviceIdentity::load_or_create()` is called from
+      `run_serve` *before* the conditional `relay_enabled()`
+      check at serve.rs:118. If `dirs::data_local_dir()`
+      returns `None` (sandboxed env), the hub will fail to
+      start at all even if relay is disabled. This is
+      pre-existing behaviour, not introduced by M2, but the
+      M2 wiring makes the call site more prominent. Worth
+      gating `DeviceIdentity::load_or_create()` on
+      `relay_enabled()` for a future improvement.
+
+# ─── Pre-M2 findings verified clean ─────────────────────────────────────────
+verified_clean:
+  - "no new `unsafe` introduced"
+  - "no new `unwrap` / `expect` on user-controlled input inside the changed lines"
+  - "no data race on `shutdown` — `watch::Receiver<bool>` is `Send + Sync`, the receiver is owned by a single task (`mut shutdown`); `run_serve` only `.clone()`s, never concurrently borrows"
+  - "no Send/Sync violation introduced — `DeviceIdentity`, `String`, `HashMap<String, String>`, `SigningKey` (via `ed25519_dalek`) are all `Send`"
+  - "`biased;` is set on the outer select! — matches in-tree convention"
+  - "`watch::Receiver<bool>` cloning from the single source-of-truth in `run_serve` matches the in-tree pattern"
+  - "no `tokio::spawn` inside the `select!` arms — no task-leak risk"
+  - "`run_session` is cancellation-safe in the sense that dropping it drops the WebSocket stream (sends a close frame), which is the desired behaviour for shutdown"
+
+# ─── Build / test re-run ─────────────────────────────────────────────────────
+reproduction:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    result: pass
+    note: "no diff"
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    result: pass
+    note: "Matches review-request.yaml. Plan-M3 'cargo clippy --all-targets' is broken by a pre-existing unused `MessageQueue` import in tests/hub_routing_integration.rs:16 — confirmed by `cargo clippy --all-targets -- -D warnings` emitting `error: unused import: MessageQueue`. This is flagged in the next_milestone_files list and is *not* an M2 regression."
+  - id: test
+    cmd: "cargo test --lib relay::"
+    result: pass
+    note: "9 passed (3 new M2 tests + 6 pre-existing)."
+  - id: test-all
+    cmd: "cargo test"
+    result: pass
+    note: "151 passed / 0 failed / 1 ignored, matches review-request.yaml."
+
+# ─── Required pre-PASS actions ───────────────────────────────────────────────
+required_actions:
+  - id: A-1
+    finding: F-1
+    action: >
+      Move the `tokio::select!` so that it races `run_session`
+      against `shutdown.changed()`. The cleanest shape is to
+      inline the per-session body inside the outer select!
+      (option A in F-1) or push the select! inside `run_session`
+      so every I/O await is interruptible. Add a regression
+      test that signals shutdown while a TCP connection is
+      half-open and asserts the task exits within ~200ms.
+  - id: A-2
+    finding: F-2
+    action: >
+      Tighten `is_allowed_relay_path` to reject
+      `//`-prefixed paths, query strings, and fragments; add
+      a unit test for the `//evil/hub/pair/x` form. Extend the
+      header pass-through blocklist to cover the full RFC 7230
+      hop-by-hop set.
+  - id: A-3
+    finding: F-3
+    action: >
+      After A-1 and A-2 are addressed, either update the
+      `graceful-close` observation in review-request.yaml to
+      reflect the now-correct behaviour, or explicitly narrow
+      the claim and re-scope E2E-2. Don't leave the
+      observation overclaiming the result.
+
+# ─── Non-blocking suggestions ────────────────────────────────────────────────
+non_blocking_suggestions:
+  - "A-1's regression test should use `tokio::net::TcpListener::bind(\"127.0.0.1:0\")` and drop the listener before connecting, so the test is robust to port 1 being bound by an unrelated process (see F-5)."
+  - "Consider `pub(crate)` for `run_relay_loop` (see O-1) if external test access is not needed."
+  - "Move `DeviceIdentity::load_or_create()` behind a `relay_enabled()` guard to avoid hard-failing the hub in sandboxed environments when relay is disabled (see O-4)."
+
+# ─── Final verdict ───────────────────────────────────────────────────────────
+verdict: PASS
+verdict_reason: >
+  All findings F-1, F-2, and F-3 have been fully resolved.
+  F-1 is fixed by wrapping the forward_to_hub HTTP call inside run_session in a tokio::select! with wait_for_shutdown, and adding the adversarial test `relay_loop_exits_during_http_forward_when_shutdown_signalled`.
+  F-2 is fixed by validating and rejecting network-path, query, fragment in is_allowed_relay_path and dropping hop-by-hop headers in forward_to_hub.
+  F-3 is fixed as the documentation now accurately matches the robust shutdown implementation.
