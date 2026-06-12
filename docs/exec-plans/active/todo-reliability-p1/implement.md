@@ -122,3 +122,30 @@
     0 失败。
 - 写完 `docs/exec-plans/active/todo-reliability-p1/reviews/m2/review-request.yaml`，
   模板结构与 m1 一致。
+
+## M3 — 质量门禁收尾
+
+### Decisions
+
+- 修复 `tests/hub_routing_integration.rs` 中的未使用的 `MessageQueue` 导入，以确保 `cargo clippy --all-targets -- -D warnings` 能干净地通过。
+- 确认全量代码格式化（`cargo fmt --check`）、语法/代码风格检查（`cargo clippy`）、全量单元/集成测试（`cargo test`）以及应用构建（`cargo build`）均通过无误，确保质量门禁完全合规。
+
+### Problems
+
+- `cargo clippy --all-targets` 阶段发现了一个先前遗留的未使用导入错误（`tests/hub_routing_integration.rs:16` 中的 `unused import: MessageQueue`）。已通过移除该导入完成修复。
+
+### Outcome
+
+- 移除了 `tests/hub_routing_integration.rs` 的未使用导入。
+- 质量门禁验证命令全绿：
+  - `cargo fmt --check` 通过。
+  - `cargo clippy --all-targets -- -D warnings` 通过（0 warnings, 0 errors）。
+  - `cargo test` 通过：
+    - unit_lib: 129 passed
+    - breaking_changes: 7 passed
+    - hub_routing_integration: 9 passed
+    - queue_trait_tests: 10 passed
+    - total: 155 passed, 0 failed, 1 ignored.
+  - `cargo build` 通过。
+- 完成 `docs/exec-plans/active/todo-reliability-p1/reviews/m3/review-request.yaml` 文件的编写。
+
