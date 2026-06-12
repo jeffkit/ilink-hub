@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
-use crate::hub::{HubState, MessageQueue};
+use crate::hub::{HubState, MessageQueue, MAX_CONCURRENT_POLLS_PER_VTOKEN};
 use crate::ilink::types::*;
 use crate::server::pairing::register_client_in_hub;
 
@@ -157,6 +157,54 @@ pub async fn getupdates(
         );
     };
 
+    // SEC-003: gate concurrent long-polls per vtoken BEFORE doing any
+    // registry work. The tracker increments the count and returns a guard;
+    // dropping the guard decrements (via Drop) regardless of whether we
+    // ultimately serve the long-poll or bail with 429. A poisoned counts
+    // mutex returns count=0 (F-M2-2) — we then fall through to the
+    // 429-without-guard path which is always safe.
+    let (concurrent_polls, poll_guard) = state.poll_tracker.enter(&vtoken);
+    if concurrent_polls > MAX_CONCURRENT_POLLS_PER_VTOKEN {
+        // Over the per-vtoken cap — drop the guard so the count returns to
+        // MAX, then reject.  We do NOT proceed to mark_seen / wait_notify:
+        // the request is over-budget and may indicate an attacker (or a
+        // misconfigured bridge) trying to exhaust Hub resources.
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            concurrent = concurrent_polls,
+            cap = MAX_CONCURRENT_POLLS_PER_VTOKEN,
+            "getupdates rejected: too many concurrent long-polls for this vtoken"
+        );
+        drop(poll_guard);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetUpdatesResponse {
+                ret: Some(429),
+                errcode: None,
+                errmsg: Some("too many concurrent polls for this vtoken".to_string()),
+                msgs: None,
+                get_updates_buf: None,
+            }),
+        );
+    }
+
+    // Split-brain detection: more than one (but still under the cap)
+    // concurrent long-poll means two bridge processes share one
+    // credential/token and will compete for this vtoken's queue (drain is
+    // a destructive read), so inbound messages get stolen
+    // non-deterministically.  Anything strictly above MAX has already been
+    // rejected above; we only warn for the legal-but-suspicious 1 < n <= MAX
+    // range.
+    if concurrent_polls > 1 {
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            concurrent = concurrent_polls,
+            "multiple bridges are long-polling the same vtoken — they share one credential/token \
+             and will steal each other's messages. Give each backend its own registration \
+             instead of reusing a token."
+        );
+    }
+
     {
         // F-M2-1: collapse the read (existence) + write (mark_seen) into a
         // single write guard. Holding two separate locks creates a stale-
@@ -178,21 +226,6 @@ pub async fn getupdates(
             );
         }
         registry.mark_seen(&vtoken);
-    }
-
-    // Detect split-brain: more than one concurrent long-poll for the same vtoken means two
-    // bridge processes share one credential/token and will compete for this vtoken's queue
-    // (drain is a destructive read), so inbound messages get stolen non-deterministically.
-    // The guard is held for the whole handler so the count reflects truly-concurrent polls.
-    let (concurrent_polls, _poll_guard) = state.poll_tracker.enter(&vtoken);
-    if concurrent_polls > 1 {
-        warn!(
-            vtoken = %redact_token(&vtoken),
-            concurrent = concurrent_polls,
-            "multiple bridges are long-polling the same vtoken — they share one credential/token \
-             and will steal each other's messages. Give each backend its own registration \
-             instead of reusing a token."
-        );
     }
 
     // Use timeout from legacy field if provided, otherwise 30s

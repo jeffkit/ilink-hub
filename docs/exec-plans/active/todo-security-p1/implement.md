@@ -146,3 +146,69 @@ This M1 section therefore certifies the **SEC-001 portion** of that commit again
 ### Next
 
 Proceed to M2 (SEC-003: cap concurrent getupdates per vtoken; return 429 over the threshold).
+
+---
+
+## M2 — SEC-003：getupdates 并发上限 + 429 `[Checkpoint ✅]`
+
+**Date**: 2026-06-12
+**Worktree**: `/Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1`
+**Base commit**: `2d2370b96fe7ca15b04f38f60ba8556518599c63` (M1 fix-up at HEAD before M2)
+
+### Plan §M2 commands
+
+| # | Command | Plan-required | Result |
+|---|---------|---------------|--------|
+| 1 | `cargo fmt --check` | yes (per task prompt) | no output, exit 0 |
+| 2 | `cargo clippy -- -D warnings` | yes (per task prompt) | no warnings, exit 0 |
+| 3 | `cargo test` | yes (per task prompt) | 171 passed / 0 failed / 1 ignored, exit 0 |
+| 4 | `cargo build` | yes (per task prompt) | Finished `dev` profile, exit 0 |
+| 5 | `cargo clippy --workspace --all-targets -- -D warnings` | yes (plan §M2) | no warnings, exit 0 |
+| 6 | `cargo test --workspace` | yes (plan §M2) | 171 passed; 0 failed; 1 ignored |
+
+### M2-required tests (plan §M2)
+
+| Test | Location | What it pins | Result |
+|------|----------|---------------|--------|
+| `poll_tracker_caps_concurrent` | `src/hub/mod.rs::tests` | Holds MAX guards, then asserts the (MAX+1)th `enter` reports `count == MAX+1 > MAX_CONCURRENT_POLLS_PER_VTOKEN` — the exact boundary the handler gates on. After drop, the next enter recovers to MAX+1, proving the Drop-decrement works end-to-end. | pass |
+| `getupdates_returns_429_when_polls_exceed_cap` | `tests/hub_routing_integration.rs` | End-to-end through the real axum handler: spawns 3 long-polls (with the shutdown sender held alive so they actually block for the full 1s), waits for the tracker to observe 3 active entries, sends a 4th call wrapped in a 2s timeout, asserts status 429 + `ret=429` + the documented errmsg + elapsed < 2s. After the in-budget polls finish, a recovery call returns 200 with `ret=0` — proves the counter is correctly decremented when a guard drops. | pass |
+
+### M2 source deltas
+
+| File | Change |
+|------|--------|
+| `src/hub/mod.rs` | Adds `pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3;` with a doc-comment explaining the split-brain motivation. Adds the `poll_tracker_caps_concurrent` unit test. |
+| `src/server/routes.rs` | Re-orders `getupdates` so `state.poll_tracker.enter(&vtoken)` runs immediately after the Authorization extraction and BEFORE the registry write lock + `mark_seen`. On `count > MAX` the guard is dropped (decrement via `Drop`) and the handler returns `(StatusCode::TOO_MANY_REQUESTS, Json(GetUpdatesResponse { ret: Some(429), errmsg: Some("too many concurrent polls for this vtoken"), .. }))` with a `warn!` carrying the redacted vtoken, the count, and the cap. The split-brain warn is moved to run AFTER the over-cap return and remains gated on `> 1` — it now only fires in the `1 < n <= MAX` legal-but-suspicious window. |
+| `tests/hub_routing_integration.rs` | Adds the `getupdates_returns_429_when_polls_exceed_cap` integration test. The test constructs a HubState with the shutdown SENDER kept alive (the shared `make_state()` helper drops its sender, which would make `wait_shutdown_signal` return immediately and mask the long-poll behaviour). Imports `axum::Json`, `axum::http::StatusCode`. |
+
+### F-M2-* (M0 review) alignment
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| F-M2-1 (HIGH, CWE-662) — registry read/write window | HIGH | Resolved in 1961dc3 (registry read + mark_seen collapsed into one write guard). M2 inherits this invariant. |
+| F-M2-2 (MEDIUM, CWE-754) — poisoned PollTracker mutex | MEDIUM | Resolved in 1961dc3 (let-Ok on counts mutex; enter() reports count=0 on poison; Drop is best-effort). M2's 429 gate degrades gracefully on poison (no panic; falls through to the over-cap branch with count=0, but 0 <= MAX so the over-cap branch isn't taken — the handler proceeds normally, which is the desired "don't take the worker down" behaviour). |
+
+### Pass conditions
+
+- [x] `cargo fmt --check` exit 0
+- [x] `cargo clippy -- -D warnings` exit 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exit 0
+- [x] `cargo build` exit 0
+- [x] `cargo test --workspace` exit 0 (171 passed, 0 failed, 1 ignored)
+- [x] New unit test `poll_tracker_caps_concurrent` passes
+- [x] New integration test `getupdates_returns_429_when_polls_exceed_cap` passes
+- [x] 2-racer split-brain warn behaviour is preserved (`> 1` gate, MAX=3 strictly greater than 2)
+- [x] Review request written to `reviews/m2/review-request.yaml`
+
+### Artifacts
+
+- `docs/exec-plans/active/todo-security-p1/plan.md` — source of truth (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/prompt.md` — source prompt (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/reviews/m2/review-request.yaml` — this milestone's checkpoint record
+- `src/hub/mod.rs` — new constant + unit test
+- `src/server/routes.rs` — `getupdates` handler with 429 gate
+- `tests/hub_routing_integration.rs` — `getupdates_returns_429_when_polls_exceed_cap` integration test
+
+### Next
+
+Proceed to M3 (SEC-013: Scanned 状态门 + CSRF token + 日志降级 — already implemented in 1961dc3; this milestone's review record lives in `reviews/m3/review-request.yaml`).

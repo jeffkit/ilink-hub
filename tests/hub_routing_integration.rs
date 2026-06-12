@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::http::StatusCode;
+use axum::Json;
 use ilink_hub::{
     hub::{spawn_dispatcher, HubState},
     ilink::types::{MessageItem, SendMessageRequest, TextItem, WeixinMessage},
@@ -584,6 +586,168 @@ async fn poll_tracker_poisoned_mutex_does_not_panic() {
     assert_eq!(count, 0, "poisoned mutex reports count=0");
     // Dropping the guard must not panic either.
     drop(guard);
+}
+
+/// SEC-003 / M2: when a single vtoken is long-polled more than
+/// `MAX_CONCURRENT_POLLS_PER_VTOKEN` times concurrently, additional
+/// getupdates calls must be rejected with HTTP 429. The plan §M2
+/// requirement: tokio::join! 4 long-polls, the 4th returns 429 within
+/// < 2s; releasing one long-poll and re-trying must succeed.
+///
+/// We exercise the full handler path (not just the tracker) to pin the
+/// 429 wire-format and the recovery-from-cap behavior.  Each long-poll
+/// uses `timeout: 1` so the 3 in-budget polls return after ~1s and
+/// release their guards; the over-cap call must see 429 immediately
+/// without entering `wait_notify_or_shutdown` (asserted by the < 2s
+/// bound and the `ret == Some(429)` body).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn getupdates_returns_429_when_polls_exceed_cap() {
+    use axum::extract::State;
+    use axum::http::{HeaderMap, HeaderValue};
+    use ilink_hub::hub::MAX_CONCURRENT_POLLS_PER_VTOKEN;
+    use ilink_hub::ilink::types::{GetUpdatesRequest, GetUpdatesResponse};
+    use ilink_hub::server::routes::getupdates;
+
+    // Build a HubState with the shutdown SENDER kept alive.  The shared
+    // make_state() helper drops its sender; that makes
+    // `state.shutdown.changed()` return Err immediately, so
+    // `wait_shutdown_signal` returns early and the long-poll handler
+    // never blocks for the requested `timeout` window.  Keeping the
+    // sender alive forces the long-poll to actually wait the full
+    // timeout, which is what we need to overlap 3 polls.
+    let store = Store::connect("sqlite::memory:")
+        .await
+        .expect("in-memory store");
+    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let queue = Arc::new(InMemoryQueue::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+    let _shutdown_tx_keepalive = shutdown_tx; // pin for test lifetime
+
+    let vtoken = register(&state, "claude").await;
+
+    // Build a fresh `Authorization: Bearer <vtoken>` header for the handler.
+    let auth_header = |vt: &str| -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(
+            "authorization",
+            HeaderValue::from_str(&format!("Bearer {vt}")).unwrap(),
+        );
+        h
+    };
+    let req_short_poll = || GetUpdatesRequest {
+        get_updates_buf: String::new(),
+        base_info: None,
+        timeout: Some(1), // 1s wait → each long-poll returns within ~1s
+    };
+
+    // Spawn MAX long-polls that will block in wait_notify for ~1s and
+    // then return OK (no messages, no shutdown signaled). The guards are
+    // held for the whole handler so the tracker count is genuinely MAX
+    // while we send the over-cap request.
+    let mut in_budget_handles = Vec::with_capacity(MAX_CONCURRENT_POLLS_PER_VTOKEN);
+    for _ in 0..MAX_CONCURRENT_POLLS_PER_VTOKEN {
+        let s = Arc::clone(&state);
+        let h = auth_header(&vtoken);
+        let r = req_short_poll();
+        in_budget_handles.push(tokio::spawn(async move {
+            getupdates(State(s), h, Json(r)).await
+        }));
+    }
+
+    // Wait until the tracker reports MAX active polls for this vtoken.
+    // Polling the count is more robust than `yield_now` because each
+    // spawned task must (1) be scheduled, (2) reach the handler body,
+    // and (3) call `poll_tracker.enter` before the count increments.
+    // With 4 worker threads this happens within a few ms in practice,
+    // but we cap the wait at 1s so a regression that forgets to call
+    // `enter` is caught as a test timeout.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    loop {
+        let n = state
+            .poll_tracker
+            .counts
+            .lock()
+            .map(|c| *c.get(&vtoken).unwrap_or(&0))
+            .unwrap_or(0);
+        if n >= MAX_CONCURRENT_POLLS_PER_VTOKEN {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "in-budget polls never reached {} active entries (saw {n})",
+                MAX_CONCURRENT_POLLS_PER_VTOKEN
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Send the over-cap request: it must observe count > MAX and return
+    // 429 within < 2s.  Use a tokio timeout so a regression that
+    // re-introduces the blocking path is caught fast.
+    let over_cap_start = std::time::Instant::now();
+    let over_cap = tokio::time::timeout(
+        Duration::from_secs(2),
+        getupdates(
+            State(Arc::clone(&state)),
+            auth_header(&vtoken),
+            Json(req_short_poll()),
+        ),
+    )
+    .await
+    .expect("over-cap request must not block past 2s (it should not enter wait_notify)");
+    let over_cap_elapsed = over_cap_start.elapsed();
+    assert!(
+        over_cap_elapsed < Duration::from_secs(2),
+        "over-cap request took {over_cap_elapsed:?}, must be < 2s"
+    );
+
+    let (over_status, Json(over_body)) = over_cap;
+    assert_eq!(
+        over_status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "over-cap request must return 429 (got {over_status})"
+    );
+    let GetUpdatesResponse {
+        ret, errmsg, msgs, ..
+    } = over_body;
+    assert_eq!(ret, Some(429), "body must carry ret=429");
+    assert_eq!(
+        errmsg.as_deref(),
+        Some("too many concurrent polls for this vtoken"),
+        "body errmsg must explain the 429"
+    );
+    assert!(msgs.is_none(), "429 response must carry no msgs");
+
+    // Recovery path: the in-budget polls will finish in ≤ ~1s. Wait for
+    // them, then issue a fresh request — it must succeed (200) with
+    // ret=0, proving the tracker counter is correctly decremented when a
+    // guard drops.
+    for h in in_budget_handles {
+        let _ = h.await.expect("in-budget handler task did not panic");
+    }
+    let recovery = tokio::time::timeout(
+        Duration::from_secs(3),
+        getupdates(
+            State(Arc::clone(&state)),
+            auth_header(&vtoken),
+            Json(req_short_poll()),
+        ),
+    )
+    .await
+    .expect("recovery request must complete within 3s");
+    let (recovery_status, Json(recovery_body)) = recovery;
+    assert_eq!(
+        recovery_status,
+        StatusCode::OK,
+        "after in-budget polls finish, a new getupdates must succeed (got {recovery_status})"
+    );
+    assert_eq!(
+        recovery_body.ret,
+        Some(0),
+        "recovery response must carry ret=0 (got {:?})",
+        recovery_body.ret
+    );
 }
 
 // ─── Adversarial: SEC-013 / F-M3-1 / F-M3-3 ──────────────────────────────────
