@@ -291,13 +291,47 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
 /// Any other value (including `"redis"`, which is not yet implemented) returns `Err` so
 /// the process fails fast rather than silently using memory and losing messages on restart.
 fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
+    let mut max_queue_size = crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE;
+    if let Ok(val) = std::env::var("ILINK_MAX_QUEUE_SIZE") {
+        match val.parse::<usize>() {
+            Ok(parsed) => {
+                if parsed < 10 {
+                    warn!(
+                        "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [10, 10000]. Clamping to 10.",
+                        parsed
+                    );
+                    max_queue_size = 10;
+                } else if parsed > 10000 {
+                    warn!(
+                        "ILINK_MAX_QUEUE_SIZE value {} is out of bounds [10, 10000]. Clamping to 10000.",
+                        parsed
+                    );
+                    max_queue_size = 10000;
+                } else {
+                    max_queue_size = parsed;
+                }
+            }
+            Err(_) => {
+                warn!(
+                    "Invalid ILINK_MAX_QUEUE_SIZE value {:?}. Using default: {}.",
+                    val,
+                    crate::hub::queue::DEFAULT_MAX_QUEUE_SIZE
+                );
+            }
+        }
+    }
+
     match std::env::var("ILINK_QUEUE_BACKEND")
         .as_deref()
         .unwrap_or("")
     {
         "memory" | "" => {
-            info!(backend = "memory", "queue backend initialized");
-            Ok(Arc::new(InMemoryQueue::new()))
+            info!(
+                backend = "memory",
+                max_queue_size = max_queue_size,
+                "queue backend initialized"
+            );
+            Ok(Arc::new(InMemoryQueue::with_limit(max_queue_size)))
         }
         "redis" => {
             anyhow::bail!(
@@ -311,5 +345,71 @@ fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
                 other
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ilink::types::WeixinMessage;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[tokio::test]
+    async fn test_build_queue_backend_max_size_clamp() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Test custom valid value: 15
+        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "15");
+        let q = build_queue_backend().unwrap();
+
+        // Push 15 messages, no drops
+        for i in 0..15 {
+            let msg = WeixinMessage {
+                message_id: Some(i),
+                ..Default::default()
+            };
+            let dropped = q.push("vtoken", msg).await.unwrap();
+            assert!(!dropped);
+        }
+        // Push 16th message, should drop one
+        let msg = WeixinMessage {
+            message_id: Some(15),
+            ..Default::default()
+        };
+        let dropped = q.push("vtoken", msg).await.unwrap();
+        assert!(dropped);
+
+        let drained = q.drain("vtoken").await.unwrap();
+        assert_eq!(drained.len(), 15);
+        assert_eq!(drained[0].message_id, Some(1));
+
+        // Test lower bound clamping: 5 -> clamped to 10
+        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "5");
+        let q = build_queue_backend().unwrap();
+        for i in 0..10 {
+            let msg = WeixinMessage {
+                message_id: Some(i),
+                ..Default::default()
+            };
+            let dropped = q.push("vtoken", msg).await.unwrap();
+            assert!(!dropped);
+        }
+        let msg = WeixinMessage {
+            message_id: Some(10),
+            ..Default::default()
+        };
+        let dropped = q.push("vtoken", msg).await.unwrap();
+        assert!(dropped);
+        let drained = q.drain("vtoken").await.unwrap();
+        assert_eq!(drained.len(), 10);
+
+        // Test upper bound clamping: 20000 -> clamped to 10000
+        std::env::set_var("ILINK_MAX_QUEUE_SIZE", "20000");
+        let _q = build_queue_backend().unwrap();
+
+        // Clean up
+        std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
     }
 }

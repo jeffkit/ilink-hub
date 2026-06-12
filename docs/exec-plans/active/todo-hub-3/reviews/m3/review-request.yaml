@@ -1,0 +1,13 @@
+milestone: m3
+title: Fix A-02 (Configurable MAX_QUEUE_SIZE)
+status: completed
+description: |
+  Updated `build_queue_backend` in `src/runtime/serve.rs` to read the environment variable `ILINK_MAX_QUEUE_SIZE`.
+  Clamped the parsed value to the range `[10, 10_000]` and emitted warning logs if the value was out of bounds or invalid.
+  Refactored `InMemoryQueue` in `src/hub/queue.rs` to support customizable capacity via `InMemoryQueue::with_limit`.
+  Added unit tests in `src/hub/queue.rs` (`test_in_memory_queue_with_limit`) and `src/runtime/serve.rs` (`test_build_queue_backend_max_size_clamp`) to verify limit enforcement, environment variable parsing, clamping, and warning logging.
+verification:
+  - cargo fmt --check passed
+  - cargo clippy -- -D warnings passed
+  - cargo test passed
+  - cargo build passed

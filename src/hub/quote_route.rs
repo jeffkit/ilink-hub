@@ -13,8 +13,8 @@
 //! group id) so a quote-reply in one conversation can never resolve to a message the Hub
 //! sent into a *different* conversation.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,9 @@ impl QuoteRouteIndex {
                 let mut oldest_seq = u64::MAX;
                 for (k, bucket) in &self.by_content {
                     if let Some(entry) = bucket.iter().min_by_key(|e| (e.created_ms, e.seq)) {
-                        if entry.created_ms < oldest_ms || (entry.created_ms == oldest_ms && entry.seq < oldest_seq) {
+                        if entry.created_ms < oldest_ms
+                            || (entry.created_ms == oldest_ms && entry.seq < oldest_seq)
+                        {
                             oldest_ms = entry.created_ms;
                             oldest_seq = entry.seq;
                             oldest_key = Some(*k);
@@ -547,7 +549,9 @@ mod tests {
 
         // msg_overflow should be present and resolve successfully
         let user = quote_reply("reply", "msg_overflow", None);
-        let origin = idx.resolve_user_quote(SCOPE, &user).expect("resolve overflow");
+        let origin = idx
+            .resolve_user_quote(SCOPE, &user)
+            .expect("resolve overflow");
         match origin {
             QuoteOrigin::Client { vtoken, .. } => assert_eq!(vtoken, "vt_overflow"),
             _ => panic!("expected client"),
@@ -619,4 +623,3 @@ mod tests {
         assert!(origin.is_some());
     }
 }
-

@@ -17,8 +17,9 @@ use uuid::Uuid;
 use crate::error::HubError;
 use crate::ilink::types::WeixinMessage;
 
-/// Maximum number of messages buffered per client.
-const MAX_QUEUE_SIZE: usize = 200;
+/// Default maximum number of messages buffered per client.
+pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
+const MAX_QUEUE_SIZE: usize = DEFAULT_MAX_QUEUE_SIZE;
 
 /// Maximum number of virtual context token mappings held in memory.
 /// Oldest entries are evicted when the limit is reached (LRU policy).
@@ -555,22 +556,24 @@ pub trait MessageQueue: Send + Sync {
 struct PerClientSlot {
     messages: std::sync::Mutex<VecDeque<WeixinMessage>>,
     notify: Arc<Notify>,
+    max_queue_size: usize,
 }
 
 impl PerClientSlot {
-    fn new() -> Arc<Self> {
+    fn new(max_queue_size: usize) -> Arc<Self> {
         Arc::new(Self {
             messages: std::sync::Mutex::new(VecDeque::new()),
             notify: Arc::new(Notify::new()),
+            max_queue_size,
         })
     }
 
     fn push(&self, msg: WeixinMessage) -> bool {
         let mut q = self.messages.lock().unwrap();
-        let dropped = if q.len() >= MAX_QUEUE_SIZE {
+        let dropped = if q.len() >= self.max_queue_size {
             q.pop_front();
             warn!(
-                max = MAX_QUEUE_SIZE,
+                max = self.max_queue_size,
                 "client queue full, dropping oldest message"
             );
             true
@@ -593,19 +596,25 @@ impl PerClientSlot {
 
 pub struct InMemoryQueue {
     slots: DashMap<String, Arc<PerClientSlot>>,
+    max_queue_size: usize,
 }
 
 impl InMemoryQueue {
     pub fn new() -> Self {
+        Self::with_limit(DEFAULT_MAX_QUEUE_SIZE)
+    }
+
+    pub fn with_limit(max_queue_size: usize) -> Self {
         Self {
             slots: DashMap::new(),
+            max_queue_size,
         }
     }
 
     fn get_or_create(&self, vtoken: &str) -> Arc<PerClientSlot> {
         self.slots
             .entry(vtoken.to_string())
-            .or_insert_with(PerClientSlot::new)
+            .or_insert_with(|| PerClientSlot::new(self.max_queue_size))
             .clone()
     }
 }
@@ -649,5 +658,39 @@ impl MessageQueue for InMemoryQueue {
             .iter()
             .map(|e| (e.key().clone(), e.value().len()))
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod queue_config_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_in_memory_queue_with_limit() {
+        let q = InMemoryQueue::with_limit(10);
+        let vtoken = "v1";
+
+        // Push 10 messages, no drops
+        for i in 0..10 {
+            let msg = WeixinMessage {
+                message_id: Some(i),
+                ..Default::default()
+            };
+            let dropped = q.push(vtoken, msg).await.unwrap();
+            assert!(!dropped);
+        }
+
+        // Push 11th message, should drop the first one
+        let msg = WeixinMessage {
+            message_id: Some(10),
+            ..Default::default()
+        };
+        let dropped = q.push(vtoken, msg).await.unwrap();
+        assert!(dropped);
+
+        let drained = q.drain(vtoken).await.unwrap();
+        assert_eq!(drained.len(), 10);
+        assert_eq!(drained[0].message_id, Some(1));
+        assert_eq!(drained[9].message_id, Some(10));
     }
 }

@@ -23,3 +23,16 @@
   - Run `cargo clippy -- -D warnings` -> Passed
   - Run `cargo test` -> Passed
   - Run `cargo build` -> Passed
+
+## Milestone 3: Fix A-02 (Configurable MAX_QUEUE_SIZE)
+- **Status**: Completed
+- **Changes**:
+  - Updated `build_queue_backend` in `src/runtime/serve.rs` to read the environment variable `ILINK_MAX_QUEUE_SIZE`.
+  - Clamped `ILINK_MAX_QUEUE_SIZE` to range `[10, 10_000]` and emitted warning logs if the value was out of bounds or invalid.
+  - Refactored `InMemoryQueue` in `src/hub/queue.rs` to support customizable capacity via `InMemoryQueue::with_limit`.
+  - Added unit tests `test_in_memory_queue_with_limit` in `src/hub/queue.rs` and `test_build_queue_backend_max_size_clamp` in `src/runtime/serve.rs` to verify clamping, parsing, warning logging, and limit enforcement.
+- **Verification**:
+  - Run `cargo fmt --check` -> Passed
+  - Run `cargo clippy -- -D warnings` -> Passed
+  - Run `cargo test` -> Passed
+  - Run `cargo build` -> Passed
