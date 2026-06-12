@@ -6,12 +6,12 @@ WORKDIR /app
 # Cache dependency layers
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release --locked || true
+RUN cargo build --release --locked --all-features || true
 RUN rm -rf src
 
 # Build actual code
 COPY src ./src
-RUN touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs && cargo build --release --locked --all-features
 
 FROM debian:bookworm-slim
 

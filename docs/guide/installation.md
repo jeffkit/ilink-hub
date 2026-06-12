@@ -123,8 +123,17 @@ docker run -it --rm \
 
 ## 方式五：Cargo（需要 Rust 工具链）
 
+默认仅启用 SQLite 支持以减少编译耗时。若需要启用 PostgreSQL 或 MySQL 驱动支持，需要显式指定 `--features` 参数：
+
 ```bash
+# 仅 SQLite 支持（默认）
 cargo install ilink-hub
+
+# 启用 PostgreSQL 支持
+cargo install ilink-hub --features postgres
+
+# 启用 MySQL 支持
+cargo install ilink-hub --features mysql
 ```
 
 安装后两个命令（`ilink-hub` 与 `ilink-hub-bridge`）都在 `~/.cargo/bin/`，确保该目录在 PATH 中。
@@ -136,7 +145,16 @@ cargo install ilink-hub
 ```bash
 git clone https://github.com/jeffkit/ilink-hub.git
 cd ilink-hub
+
+# 默认仅编译 SQLite 驱动
 cargo build --release
+
+# 启用特定数据库驱动支持
+cargo build --release --features postgres
+cargo build --release --features mysql
+# 或启用所有驱动支持
+cargo build --release --all-features
+
 # 二进制在 target/release/ilink-hub 和 target/release/ilink-hub-bridge
 ```
 

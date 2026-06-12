@@ -128,6 +128,15 @@ docker compose logs -f ilink-hub
 DATABASE_URL=postgres://user:pass@localhost/ilink_hub ilink-hub serve
 ```
 
+> [!NOTE]
+> When compiling `ilink-hub` from source (e.g., `cargo install` or `cargo build`), only the `sqlite` driver is enabled by default to reduce binary size and compilation times. To enable PostgreSQL or MySQL support, you must compile with the corresponding feature flags:
+> ```bash
+> cargo build --release --features postgres
+> # or
+> cargo build --release --features mysql
+> ```
+> Pre-built binaries and official Docker images are compiled with all features enabled.
+
 ---
 
 ## WeChat Commands
