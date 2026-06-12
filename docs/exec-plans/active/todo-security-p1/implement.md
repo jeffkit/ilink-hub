@@ -68,3 +68,81 @@ This is recorded here so M4 reviewers can see exactly what was already fixed in 
 ### Next
 
 Proceed to M1 (SEC-001: atomically register+confirm inside `state.pairing.write()`).
+
+---
+
+## M1 — SEC-001：pair_confirm 原子化 `[Checkpoint ✅]`
+
+**Date**: 2026-06-12
+**Worktree**: `/Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1`
+**Verifying commit**: `048a723` (combined M0 review fix `1961dc3` already in tree)
+
+### Deviation note — single combined fix commit
+
+The plan suggests three separate fix commits (one per milestone). In practice the M0 review (see `reviews/m0/review-findings.yaml`) flagged F-M1-1 (HIGH, CWE-662) and F-M1-2 (MEDIUM, CWE-754) as findings against the planned M1 changes, and the M0/M1/M2/M3 source files overlap heavily (all of `src/server/pairing.rs`, `src/hub/pairing.rs`, `src/hub/mod.rs`, `src/server/routes.rs`, and the `tests/hub_routing_integration.rs` integration helper are touched). To keep the security fix atomic and to exercise the full integration surface in one CI run, the three milestones were resolved in the single commit `1961dc3` (`fix(sec): resolve M0 review CRITICAL/HIGH findings (SEC-001/003/013)`).
+
+This M1 section therefore certifies the **SEC-001 portion** of that commit against plan §M1, M2 and M3 will be certified in their own milestones' review requests.
+
+### Plan §M1 commands
+
+| # | Command | Plan-required | Result |
+|---|---------|---------------|--------|
+| 1 | `cargo fmt --check` | yes (per task prompt) | no output, exit 0 |
+| 2 | `cargo clippy -- -D warnings` | yes (per task prompt) | no warnings, exit 0 |
+| 3 | `cargo test` | yes (per task prompt) | 160 passed / 0 failed / 1 ignored, exit 0 |
+| 4 | `cargo build` | yes (per task prompt) | Finished `dev` profile, exit 0 |
+| 5 | `cargo test --lib hub::pairing` | yes (plan §M1 specific) | 7 passed; 0 failed — includes `confirm_after_concurrent_attempt_returns_only_one_winner` |
+| 6 | `cargo test --workspace` | yes (plan §M1) | 160 passed; 0 failed; 1 ignored |
+
+### M1-required tests (plan §M1)
+
+| Test | Location | What it pins | Result |
+|------|----------|---------------|--------|
+| `confirm_after_concurrent_attempt_returns_only_one_winner` | `src/hub/pairing.rs:251` | First racer → `Ok`; second → `PairingError::AlreadyConfirmed` (not a leaked 412 or stale 200). | pass |
+| `create_and_confirm_pairing` | `src/hub/pairing.rs:198` | Happy path; `vtoken` written; `csrf` consumed. | pass |
+| `confirm_rejected_when_status_is_wait` | `src/hub/pairing.rs:233` | Confirm without `mark_scanned` → `CsrfMismatch` first (no csrf minted until Scanned); plan §M1 unit requirement satisfied indirectly through the `NotScanned` path. | pass |
+| `csrf_token_consumed_after_confirm` | `src/hub/pairing.rs:272` | Replay after Ok returns `AlreadyConfirmed` (F-M3-4 ordering keeps state invisible to attackers). | pass |
+| `pair_confirm_race_yields_single_winner_and_no_orphan_vtoken` | `tests/hub_routing_integration.rs:433` | 5-racer end-to-end: exactly 1 winner, 4 `AlreadyConfirmed`, registry holds 1 name (no orphan vtoken / queue / store row). | pass |
+| `concurrent_register_and_pair_confirm_does_not_deadlock` | `tests/hub_routing_integration.rs:354` | 6 register workers × 4 pair_confirm workers; 5s timeout; pins the F-M1-1 lock-order invariant. | pass |
+
+### M1 source deltas (SEC-001 portion of commit 1961dc3)
+
+| File | Change |
+|------|--------|
+| `src/server/pairing.rs` | `pair_confirm` now (1) reads the `X-Pair-CSRF` header, (2) calls `register_client_in_hub` OUTSIDE the pairing write lock, (3) takes `state.pairing.write()` and delegates to `PairingRegistry::confirm`, (4) on any non-Ok calls `rollback_speculative_register`. Doc comment at the handler records the `registry → router` lock-order invariant. |
+| `src/hub/pairing.rs` | `confirm` now takes `(code, client_name, client_label, vtoken, csrf_header)`, performs `purge_expired` + `NotFound` + `Expired` + `AlreadyConfirmed` + CSRF + `NotScanned` checks, and only on success writes vtoken / name / label and flips status to `Confirmed`. CSRF is consumed on success (F-M3-1). F-M3-4 ordering: `AlreadyConfirmed` precedes `NotScanned` so racers never learn the Scanned state. |
+| `src/hub/pairing.rs` (tests) | Added `confirm_after_concurrent_attempt_returns_only_one_winner` (plan §M1 unit requirement), plus companion tests for CSRF single-use and the `Wait` path. |
+| `tests/hub_routing_integration.rs` | Added the 5-racer single-winner test and the lock-order deadlock stress test. |
+
+### F-M1-* (M0 review) resolution
+
+| Finding | Severity | Resolution |
+|---------|----------|------------|
+| F-M1-1 (lock-order) | HIGH (CWE-662) | Option A: register runs outside the pairing write lock, preserving the canonical `registry → router` order. Doc comment in `src/server/pairing.rs` warns future maintainers. |
+| F-M1-2 (orphan rollback) | MEDIUM (CWE-754) | New `rollback_speculative_register` helper undoes the speculative register (registry.remove + queue.remove + store.clear_routes + store.delete) on every non-Ok from confirm. |
+| F-M1-3 (unbounded sessions) | MEDIUM (CWE-400) | `MAX_PAIRING_SESSIONS=1024` cap on `PairingRegistry::create` with new `PairingError::TooManySessions` variant. Not strictly SEC-001 but bundled in the same commit since the registry was being touched anyway. |
+
+### Pass conditions
+
+- [x] `cargo fmt --check` exit 0
+- [x] `cargo clippy -- -D warnings` exit 0
+- [x] `cargo build` exit 0
+- [x] `cargo test --workspace` exit 0 (160 passed, 0 failed, 1 ignored)
+- [x] `cargo test --lib hub::pairing` exit 0 (7 passed, including the plan-required `confirm_after_concurrent_attempt_returns_only_one_winner`)
+- [x] Concurrent `pair_confirm` integration test (`pair_confirm_race_yields_single_winner_and_no_orphan_vtoken`) passes — 1 winner, 4 `AlreadyConfirmed`, no orphan vtoken
+- [x] Lock-order deadlock stress test (`concurrent_register_and_pair_confirm_does_not_deadlock`) passes within 5s timeout
+- [x] Review request written to `reviews/m1/review-request.yaml`
+
+### Artifacts
+
+- `docs/exec-plans/active/todo-security-p1/plan.md` — source of truth (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/prompt.md` — source prompt (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/reviews/m0/review-findings.yaml` — M0 review that produced the F-M1-1/2/3 findings
+- `docs/exec-plans/active/todo-security-p1/reviews/m1/review-request.yaml` — this milestone's checkpoint record
+- `src/server/pairing.rs` — `pair_confirm` handler + `rollback_speculative_register` helper
+- `src/hub/pairing.rs` — `PairingRegistry::confirm` (atomic) + `PairingError` variants
+- `tests/hub_routing_integration.rs` — 5-racer + lock-order integration tests
+
+### Next
+
+Proceed to M2 (SEC-003: cap concurrent getupdates per vtoken; return 429 over the threshold).
