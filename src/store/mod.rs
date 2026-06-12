@@ -43,6 +43,11 @@ impl Store {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub fn pool(&self) -> &sqlx::AnyPool {
+        &self.pool
+    }
+
     /// Extract the file path from a SQLite URL and create the file + parent
     /// directories if they do not already exist.
     fn ensure_sqlite_file(url: &str) -> Result<()> {

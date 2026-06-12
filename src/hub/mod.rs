@@ -859,22 +859,44 @@ async fn build_hub_ext_for_vctx(
 ) -> Option<HubExt> {
     let session_name = match session_override {
         Some(name) if !name.is_empty() => name,
-        _ => store
-            .get_active_session_name(vctx, vtoken)
-            .await
-            .ok()
-            .unwrap_or_else(|| "default".to_string()),
+        _ => match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            store.get_active_session_name(vctx, vtoken),
+        )
+        .await
+        {
+            Ok(Ok(name)) => name,
+            Ok(Err(e)) => {
+                warn!("Failed to get active session name from DB for {vctx}: {e}");
+                "default".to_string()
+            }
+            Err(_) => {
+                warn!("Timeout getting active session name from DB for {vctx}");
+                "default".to_string()
+            }
+        },
     };
 
-    let session_id = store
-        .get_backend_session(vctx, vtoken, &session_name)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|s| {
+    let session_id = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        store.get_backend_session(vctx, vtoken, &session_name),
+    )
+    .await
+    {
+        Ok(Ok(Some(s))) => {
             let t = s.trim().to_string();
             (!t.is_empty()).then_some(t)
-        });
+        }
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            warn!("Failed to get backend session from DB for {vctx}/{session_name}: {e}");
+            None
+        }
+        Err(_) => {
+            warn!("Timeout getting backend session from DB for {vctx}/{session_name}");
+            None
+        }
+    };
 
     Some(HubExt {
         session_id,
@@ -1022,5 +1044,58 @@ mod tests {
             timeout.is_ok(),
             "concurrent register+route timed out (possible deadlock)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_hub_ext_for_vctx_timeout() {
+        let store = Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+
+        tokio::time::pause();
+
+        // sqlx uses connection pool with max_connections = 1 for sqlite::memory:
+        // Begin a transaction to acquire and hold the only connection.
+        let _tx = store.pool().begin().await.unwrap();
+
+        // Call build_hub_ext_for_vctx. It will attempt to get connection to call
+        // get_active_session_name. This will block.
+        // Since time is paused, tokio will automatically skip time forward when the future is blocked.
+        // The timeout should trigger after 5 virtual seconds.
+        let hub_ext = build_hub_ext_for_vctx(&store, "vctx-test", "vtoken-test", None).await;
+
+        // It should fallback to default values:
+        assert!(hub_ext.is_some());
+        let ext = hub_ext.unwrap();
+        assert_eq!(ext.session_name, Some("default".to_string()));
+        assert_eq!(ext.session_id, None);
+    }
+
+    #[tokio::test]
+    async fn test_build_hub_ext_for_vctx_timeout_with_session_override() {
+        let store = Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+
+        tokio::time::pause();
+
+        // Begin a transaction to acquire and hold the only connection.
+        let _tx = store.pool().begin().await.unwrap();
+
+        // Call build_hub_ext_for_vctx with session_override.
+        // It will skip get_active_session_name, but will block on get_backend_session.
+        // It should hit the 5-second timeout and fallback gracefully.
+        let hub_ext = build_hub_ext_for_vctx(
+            &store,
+            "vctx-test",
+            "vtoken-test",
+            Some("override".to_string()),
+        )
+        .await;
+
+        assert!(hub_ext.is_some());
+        let ext = hub_ext.unwrap();
+        assert_eq!(ext.session_name, Some("override".to_string()));
+        assert_eq!(ext.session_id, None);
     }
 }

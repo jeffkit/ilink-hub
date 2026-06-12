@@ -31,3 +31,28 @@
   - `cargo test` (147 passed, 0 failed, 1 ignored)
   - `cargo build` (exit 0)
 - Created `docs/exec-plans/active/todo-hub-2/reviews/m1/review-request.yaml`.
+
+## Milestone 2: Fix [TO-02] DB queries timeout in `build_hub_ext_for_vctx`
+
+### Decisions
+
+- Wrapped the two asynchronous database queries inside `build_hub_ext_for_vctx` (`store.get_active_session_name` and `store.get_backend_session`) with `tokio::time::timeout(std::time::Duration::from_secs(5), ...)` to prevent indefinite blocking in case of database locks or connection exhaustion.
+- Handled the timeout and connection errors gracefully by logging warnings using `tracing::warn` and falling back to robust default values:
+  - If `get_active_session_name` fails or times out, it falls back to `"default"`.
+  - If `get_backend_session` fails or times out, it falls back to `None`.
+- Added a `#[cfg(test)] pub fn pool(&self) -> &sqlx::AnyPool` accessor to `Store` in `src/store/mod.rs` to allow unit tests to obtain the database pool.
+- Added two unit tests (`test_build_hub_ext_for_vctx_timeout` and `test_build_hub_ext_for_vctx_timeout_with_session_override`) in `src/hub/mod.rs` that temporarily hold/lock the single connection of an in-memory SQLite database, verifying that both queries trigger the 5-second timeout and fallback gracefully (tokio's virtual time is advanced instantly during tests using `tokio::time::pause()`).
+
+### Problems
+
+- Initially, running `#[tokio::test(start_paused = true)]` caused `Store::connect` to fail immediately with pool timeout errors. This happens because SQLx's connection pool initialization depends on timer-based acquires, which fail when virtual time jumps instantly during test setup. Resolved by running normal `#[tokio::test]` and calling `tokio::time::pause()` only *after* the `Store::connect` operation completes.
+
+### Outcome
+
+- Verified that database query timeouts are handled gracefully without blocking the message routing thread.
+- All verification commands passed completely:
+  - `cargo fmt --check` (exit 0)
+  - `cargo clippy -- -D warnings` (exit 0)
+  - `cargo test` (123 passed, 0 failed, 0 ignored)
+  - `cargo build` (exit 0)
+- Created `docs/exec-plans/active/todo-hub-2/reviews/m2/review-request.yaml`.
