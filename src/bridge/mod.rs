@@ -736,15 +736,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_stdin_write_timeout() {
-        let app = BridgeApp::parse_yaml(
-            r#"
-command: /bin/sleep
-args: ["5"]
-stdin: message
-timeout_secs: 1
-"#,
-        )
-        .unwrap();
+        // Use `sleep` without absolute path for cross-platform compatibility.
+        // On macOS /bin/sleep exists; ubuntu-24.04+ GitHub Actions runners expose
+        // sleep only via PATH (/usr/bin/sleep), not necessarily at /bin/sleep.
+        let sleep_cmd = if cfg!(target_os = "macos") {
+            "/bin/sleep"
+        } else {
+            "sleep"
+        };
+        let yaml = format!(
+            "command: {sleep_cmd}\nargs: [\"10\"]\nstdin: message\ntimeout_secs: 1\n"
+        );
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
 
         // Create a large message that will fill the OS pipe buffer and block if not read
