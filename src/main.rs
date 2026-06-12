@@ -9,7 +9,10 @@ use ilink_hub::{
 
 #[derive(Parser)]
 #[command(name = "ilink-hub")]
-#[command(version, about = "iLink-compatible multiplexer hub for WeChat ClawBot")]
+#[command(
+    version,
+    about = "微信 ClawBot 的 iLink 兼容多路复用 Hub / iLink-compatible multiplexer hub for WeChat ClawBot"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -17,7 +20,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the hub server
+    /// 启动 Hub 服务器 / Start the hub server
     Serve {
         /// Real iLink bot token. If omitted, loaded from DATABASE_URL or triggers QR login.
         #[arg(long, env = "ILINK_TOKEN")]
@@ -50,7 +53,7 @@ enum Commands {
         ilink_base_url: Option<String>,
     },
 
-    /// Register a backend client with the hub (outputs vtoken to use)
+    /// 向 Hub 注册客户端（输出可用的 vtoken） / Register a backend client with the hub (outputs vtoken to use)
     Register {
         /// Hub URL
         #[arg(long, default_value = "http://localhost:8765", env = "ILINK_HUB_URL")]

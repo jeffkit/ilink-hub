@@ -35,7 +35,7 @@ use ilink_hub::paths::{
 #[command(name = "ilink-hub-bridge")]
 #[command(
     version,
-    about = "Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)"
+    about = "将微信（通过 iLink Hub）桥接到本地编码 CLI (Claude Code, Codex, …) / Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)"
 )]
 struct Cli {
     /// Hub base URL (same as WEIXIN_BASE_URL for other backends).

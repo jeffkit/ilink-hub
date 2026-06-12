@@ -1,0 +1,138 @@
+milestone: M1
+title: "M1 — CONS-01 — CLI 帮助中文化"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-main.rs
+base_commit: 63eaa6ac35ef918e81fb58d8b79f87934a1e7ab1
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-main.rs/plan.md
+checkpoint: "M1. CONS-01 — CLI 帮助中文化"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M1: "为 serve / register / bridge 三个顶层子命令的 about/help 文案补中文（或中英双语）。"
+#
+# Source changes are performed in:
+#   - src/main.rs (Cli struct + Commands enum variant about/help text)
+#   - src/bin/ilink-hub-bridge.rs (Cli struct about/help text)
+
+source_changes:
+  - file: "src/main.rs"
+    description: "Translated the Cli about, and Serve and Register command descriptions to bilingual (Chinese / English)"
+  - file: "src/bin/ilink-hub-bridge.rs"
+    description: "Translated the Cli about to bilingual (Chinese / English)"
+
+# ─── Commands run ───────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      total: "149 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc + vite build clean, dist/ produced"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished, exit 0"
+    result: pass
+  - id: help-ilink-hub
+    cmd: "./target/release/ilink-hub --help"
+    expected: "displays translated main Cli help"
+    actual: "displays translated main Cli help (bilingual about and serve/register commands)"
+    result: pass
+  - id: help-serve
+    cmd: "./target/release/ilink-hub serve --help"
+    expected: "displays translated serve subcommand help"
+    actual: "displays translated serve subcommand help"
+    result: pass
+  - id: help-register
+    cmd: "./target/release/ilink-hub register --help"
+    expected: "displays translated register subcommand help"
+    actual: "displays translated register subcommand help"
+    result: pass
+  - id: help-bridge
+    cmd: "./target/release/ilink-hub-bridge --help"
+    expected: "displays translated bridge Cli help"
+    actual: "displays translated bridge Cli help"
+    result: pass
+
+# ─── Help snapshots after translation ───────────────────────────────────────
+help_snapshots:
+  - id: ilink-hub--help
+    cmd: "./target/release/ilink-hub --help"
+    captures:
+      about: "微信 ClawBot 的 iLink 兼容多路复用 Hub / iLink-compatible multiplexer hub for WeChat ClawBot"
+      subcommands:
+        - "serve — 启动 Hub 服务器 / Start the hub server"
+        - "login — Interactive QR-code login — scans WeChat and saves bot_token to DB"
+        - "register — 向 Hub 注册客户端（输出可用的 vtoken） / Register a backend client with the hub (outputs vtoken to use)"
+        - "clients — List registered clients"
+      language: "bilingual (CONS-01 fixed)"
+    file: "src/main.rs"
+  - id: ilink-hub-serve--help
+    cmd: "./target/release/ilink-hub serve --help"
+    captures:
+      about: "启动 Hub 服务器 / Start the hub server"
+      args:
+        - name: "--addr <ADDR>"
+          default: "127.0.0.1:8765"
+    file: "src/main.rs"
+  - id: ilink-hub-register--help
+    cmd: "./target/release/ilink-hub register --help"
+    captures:
+      about: "向 Hub 注册客户端（输出可用的 vtoken） / Register a backend client with the hub (outputs vtoken to use)"
+    file: "src/main.rs"
+  - id: ilink-hub-bridge--help
+    cmd: "./target/release/ilink-hub-bridge --help"
+    captures:
+      about: "将微信（通过 iLink Hub）桥接到本地编码 CLI (Claude Code, Codex, …) / Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)"
+    file: "src/bin/ilink-hub-bridge.rs"
+
+pass_conditions:
+  - id: fmt-green
+    plan_clause: "fmt: cargo fmt --check 通过"
+    observation: "cargo fmt --check exited 0."
+    result: pass
+  - id: clippy-green
+    plan_clause: "clippy: cargo clippy -- -D warnings 通过"
+    observation: "0 warnings, exit 0."
+    result: pass
+  - id: test-green
+    plan_clause: "test: cargo test 全绿"
+    observation: "all tests passed."
+    result: pass
+  - id: build-green
+    plan_clause: "build: cargo build 通过"
+    observation: "Finished, exit 0."
+    result: pass
+  - id: desktop-frontend-green
+    plan_clause: "desktop-frontend: npm run build 通过"
+    observation: "tsc + vite build clean, dist/ produced."
+    result: pass
+  - id: desktop-tauri-green
+    plan_clause: "desktop-tauri: cargo check --manifest-path .../src-tauri/Cargo.toml 通过"
+    observation: "Finished, exit 0."
+    result: pass

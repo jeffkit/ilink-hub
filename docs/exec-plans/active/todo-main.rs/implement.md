@@ -68,14 +68,32 @@
 
 ---
 
-## M1 — CONS-01（待执行）
+## M1 — CONS-01 — CLI 帮助中文化
 
-由 `reviews/m0/review-request.yaml` 的 `next_milestone` 字段驱动。
-预计改动文件：
-- `src/main.rs`（Cli struct + Commands enum variant 的 about/help 文案）
-- `src/bin/ilink-hub-bridge.rs`（Cli struct 的 about/help 文案）
+### Decisions
+- 将 `ilink-hub` 主命令、`serve` 子命令、`register` 子命令以及 `ilink-hub-bridge` 主命令的 `about`/`help` 文案更新为中英双语。
+- 采用双语格式以最大程度保持和原有系统的一致性，防止第三方系统强依赖原英文部分。
+- 调整后通过 `cargo fmt` 自动格式化对超长属性进行换行折叠。
+
+### Problems
+- 初始提交时 `cargo fmt --check` 因属性超长未格式化报错，已通过 `cargo fmt` 自动排版解决。
+
+### Outcome
+- fmt: `cargo fmt --check` 成功通过。
+- clippy: `cargo clippy -- -D warnings` 通过，无任何 warnings。
+- test: `cargo test` 全绿通过（149 passed）。
+- build: `cargo build` 及 `cargo build --release` 编译成功。
+- desktop-frontend: Vite 构建和 TypeScript 检查通过，成功输出 dist。
+- desktop-tauri: Tauri `src-tauri` 检查通过。
+- 命令验证：
+  - `ilink-hub --help` 显示：`微信 ClawBot 的 iLink 兼容多路复用 Hub / iLink-compatible multiplexer hub for WeChat ClawBot`
+  - `serve --help` 显示：`启动 Hub 服务器 / Start the hub server`
+  - `register --help` 显示：`向 Hub 注册客户端（输出可用的 vtoken） / Register a backend client with the hub (outputs vtoken to use)`
+  - `ilink-hub-bridge --help` 显示：`将微信（通过 iLink Hub）桥接到本地编码 CLI (Claude Code, Codex, …) / Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)`
+- 在 `reviews/m1/review-request.yaml` 记录了所有执行结果与快照。
+
+---
 
 ## M2.1 / M2.2 / M2.3 — CONS-02（待执行）
 
 按 `plan.md` 顺序串行执行，每步独立可验证。
-
