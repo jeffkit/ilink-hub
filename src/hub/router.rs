@@ -199,14 +199,14 @@ mod tests {
         let r = Router::new(Some("default_vt".into()));
         let msg = WeixinMessage {
             from_user_id: Some("user@wechat".into()),
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
                 voice_item: None,
-            }]),
+            }])),
             ..Default::default()
         };
         assert!(matches!(
@@ -284,14 +284,14 @@ mod tests {
         let r = Router::new(None);
         let msg = WeixinMessage {
             from_user_id: Some("user@wechat".into()),
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
                 voice_item: None,
-            }]),
+            }])),
             ..Default::default()
         };
         assert!(matches!(r.route(&msg), RoutingDecision::Broadcast));

@@ -541,7 +541,8 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 m.ilink_hub_ext = hub_ext;
                 // Replace text content in item_list
                 if let Some(items) = &mut m.item_list {
-                    if let Some(first) = items.first_mut() {
+                    let items_mut = std::sync::Arc::make_mut(items);
+                    if let Some(first) = items_mut.first_mut() {
                         if let Some(ti) = &mut first.text_item {
                             ti.text = Some(text.clone());
                         }

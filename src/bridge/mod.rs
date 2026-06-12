@@ -750,14 +750,14 @@ mod dispatcher_tests {
                 session_name: Some(session_name.into()),
                 cli_session_id: None,
             }),
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some("hello".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
                 voice_item: None,
-            }]),
+            }])),
             from_user_id: Some("user1".into()),
             ..Default::default()
         }

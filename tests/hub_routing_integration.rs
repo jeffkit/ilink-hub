@@ -34,14 +34,14 @@ fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
         message_type: Some(1),
         from_user_id: Some(from_user.to_string()),
         context_token: Some(real_ctx.to_string()),
-        item_list: Some(vec![MessageItem {
+        item_list: Some(std::sync::Arc::new(vec![MessageItem {
             item_type: Some(1),
             text_item: Some(TextItem {
                 text: Some(text.to_string()),
             }),
             extra: serde_json::Value::Object(Default::default()),
             voice_item: None,
-        }]),
+        }])),
         ..Default::default()
     }
 }

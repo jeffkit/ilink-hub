@@ -56,7 +56,8 @@ pub fn append_outbound_origin_footer_to_first_text_item(
     let Some(items) = msg.item_list.as_mut() else {
         return;
     };
-    let Some(first) = items.first_mut() else {
+    let items_mut = std::sync::Arc::make_mut(items);
+    let Some(first) = items_mut.first_mut() else {
         return;
     };
     let Some(ti) = first.text_item.as_mut() else {
@@ -125,14 +126,14 @@ mod tests {
     #[test]
     fn append_footer_mutates_first_text() {
         let mut msg = WeixinMessage {
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some("body".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
                 voice_item: None,
-            }]),
+            }])),
             ..Default::default()
         };
         append_outbound_origin_footer_to_first_text_item(&mut msg, "w", Some("lbl"), None);
