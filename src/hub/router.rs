@@ -156,7 +156,11 @@ impl Router {
 
         let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
         if let Some(vtoken) = self.get_route(from_user_id) {
-            debug!(from_user_id, vtoken, "routing message");
+            debug!(
+                from_user_id,
+                vtoken = %&vtoken[..vtoken.len().min(8)],
+                "routing message"
+            );
             RoutingDecision::ForwardTo {
                 vtoken: vtoken.to_string(),
                 session_override: None,
@@ -295,5 +299,84 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(r.route(&msg), RoutingDecision::Broadcast));
+    }
+
+    #[test]
+    fn route_redacts_vtoken_in_logs() {
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct MockSubscriber {
+            last_vtoken: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+        }
+
+        impl Subscriber for MockSubscriber {
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {
+            }
+            fn event(&self, event: &Event<'_>) {
+                struct VTokenVisitor {
+                    vtoken: Option<String>,
+                }
+                impl Visit for VTokenVisitor {
+                    fn record_str(&mut self, field: &Field, value: &str) {
+                        if field.name() == "vtoken" {
+                            self.vtoken = Some(value.to_string());
+                        }
+                    }
+                    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                        if field.name() == "vtoken" {
+                            self.vtoken = Some(format!("{:?}", value));
+                        }
+                    }
+                }
+                let mut visitor = VTokenVisitor { vtoken: None };
+                event.record(&mut visitor);
+                if let Some(vt) = visitor.vtoken {
+                    if let Ok(mut guard) = self.last_vtoken.lock() {
+                        *guard = Some(vt);
+                    }
+                }
+            }
+            fn enter(&self, _span: &tracing::span::Id) {}
+            fn exit(&self, _span: &tracing::span::Id) {}
+        }
+
+        let logged_vtoken = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sub = MockSubscriber {
+            last_vtoken: logged_vtoken.clone(),
+        };
+
+        let dispatcher = tracing::Dispatch::new(sub);
+        tracing::dispatcher::with_default(&dispatcher, || {
+            let r = Router::new(Some("very_long_vtoken_that_should_be_redacted".into()));
+            let msg = WeixinMessage {
+                from_user_id: Some("user@wechat".into()),
+                item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                    item_type: Some(1),
+                    text_item: Some(TextItem {
+                        text: Some("hello".into()),
+                    }),
+                    extra: serde_json::Value::Object(Default::default()),
+                    voice_item: None,
+                }])),
+                ..Default::default()
+            };
+            let decision = r.route(&msg);
+            assert!(matches!(
+                decision,
+                RoutingDecision::ForwardTo { ref vtoken, .. } if vtoken == "very_long_vtoken_that_should_be_redacted"
+            ));
+        });
+
+        let guard = logged_vtoken.lock().unwrap();
+        let redacted = guard.as_ref().expect("expected vtoken to be logged");
+        assert_eq!(redacted, "very_lon");
     }
 }

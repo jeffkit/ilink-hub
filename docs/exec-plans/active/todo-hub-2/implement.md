@@ -56,3 +56,24 @@
   - `cargo test` (123 passed, 0 failed, 0 ignored)
   - `cargo build` (exit 0)
 - Created `docs/exec-plans/active/todo-hub-2/reviews/m2/review-request.yaml`.
+
+## Milestone 3: Fix [S-01] vtoken exposure in debug logs
+
+### Decisions
+
+- Modified the debug logging call in the routing path of `Router::route` within `src/hub/router.rs` to only log the first 8 characters of `vtoken` (`&vtoken[..vtoken.len().min(8)]`).
+- Added a robust unit test (`route_redacts_vtoken_in_logs`) in `src/hub/router.rs` that registers a mock subscriber to capture and verify that the logged `vtoken` field matches the redacted 8-character prefix.
+
+### Problems
+
+- Writing the unit test with `tracing::Dispatcher` caused compilation errors since the correct struct name in the `tracing` crate is `tracing::Dispatch`. Resolved by changing it to `tracing::Dispatch::new(sub)`.
+
+### Outcome
+
+- Verified that virtual tokens are successfully redacted in routing debug logs to prevent credential leakage.
+- All verification commands passed completely:
+  - `cargo fmt --check` (exit 0)
+  - `cargo clippy -- -D warnings` (exit 0)
+  - `cargo test` (124 passed, 0 failed, 0 ignored/filtered)
+  - `cargo build` (exit 0)
+- Created `docs/exec-plans/active/todo-hub-2/reviews/m3/review-request.yaml`.
