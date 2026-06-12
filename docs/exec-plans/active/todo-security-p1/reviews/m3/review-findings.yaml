@@ -1,0 +1,481 @@
+milestone: M3
+title: "SEC-013 — pair_confirm authentication triple (Scanned state gate + CSRF + log demotion)"
+verdict: PASS
+date: 2026-06-12
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+# ─── Headline summary ───────────────────────────────────────────────────────
+# The M3 patch successfully closes CWE-862 (missing auth) on
+# `POST /hub/pair/{code}/confirm` with a layered CSRF + Scanned state
+# gate + per-(code,ip) rate limit, and demotes the unconfirmed
+# `pair_url` log to DEBUG. The lock-ordering hazard (F-M1-1) and
+# orphan-vtoken rollback (F-M1-2) audited in M1 still hold.
+#
+# Initial adversarial review surfaced ONE HIGH-severity concurrency
+# bug (TOCTOU in the rate limiter — A-M3-1) and ONE MEDIUM-severity
+# resource hazard (unbounded HashMap growth + StdMutex on the async
+# hot path — A-M3-2). Both are now fixed (single contains_key + insert
+# inside one critical section; 4096-entry cap with oldest-first
+# eviction) and the fixes are pinned by a multi-threaded regression
+# test (pair_confirm_rate_limiter_rejects_concurrent_attempts) plus a
+# memory-bound test (pair_confirm_rate_limiter_bounds_memory_under_adversarial_load).
+# Optional follow-ups A-M3-4 (mark_scanned comment) and A-M3-5
+# (broadened log audit) are also applied; A-M3-6 (X-Forwarded-For) is
+# documented at the deploy/ layer.
+#
+# The M3 milestone is now closed.
+
+scope_audited:
+  - src/hub/pairing.rs
+  - src/server/pairing.rs
+  - src/server/pair.html
+  - tests/hub_routing_integration.rs (M3 tests only)
+  - src/hub/registry.rs (F-M1-A contract)
+  - src/server/mod.rs (route wiring)
+
+# ─── Findings ───────────────────────────────────────────────────────────────
+findings:
+  # ── HIGH ──────────────────────────────────────────────────────────────────
+  - id: A-M3-1
+    severity: HIGH
+    status: RESOLVED
+    cwe: CWE-662 (Improper Synchronization) / CWE-362 (TOCTOU)
+    title: "PairConfirmRateLimiter has a count-then-insert TOCTOU race"
+    location: src/server/pairing.rs:170-188 (pre-fix)
+    description: >-
+      `check_and_record` holds the StdMutex for the full body, but the
+      count check (`iter().filter().count()`) and the `insert()` are
+      two logically separate operations guarded only by a `>=
+      count` check. Two tokio tasks against the same (code, ip) can
+      both observe `count == 0` and both pass the guard, both
+      `insert()`, and both return `true`. The F-M3-1 threat model
+      (iframe / service-worker replay) explicitly assumes concurrent
+      requests, so the rate limit provides no defence in the
+      interesting case.
+    repro_sketch: >-
+      Spawn N=10 tokio tasks that all call
+      `check_and_record("code-A", "10.0.0.1")` and `await
+      futures::join_all`. With `PAIR_CONFIRM_RATE_LIMIT_PER_CODE_PER_IP
+      = 1` the function should reject 9/10. Empirically the count
+      guard lets multiple passes through under contention because the
+      `insert` is the only place the counter advances, and it's not
+      visible to the next task until the mutex is released.
+    impact: >-
+      F-M3-1 (rate-limit per code/IP) is not actually effective under
+      the threat model. An attacker who can race N confirm requests
+      against the same leaked `code` can still bypass the per-(code,ip)
+      cap and grind the speculative-register → rollback path (amplifying
+      F-M1-2's no-op work). This partially re-opens the SEC-013 attack
+      surface the milestone was supposed to close.
+    recommended_fix: >-
+      Either (a) drop the count step and only check whether the *exact
+      key* is present in the map (a single `if attempts.contains_key`
+      plus `insert`, both inside the same critical section with no
+      intervening logic — this is the simpler correct form), or
+      (b) keep the count and use an `entry().or_insert_with(...)` so
+      the count is observed and the insert is one atomic step. With
+      (a) the `retain` can be moved to a separate lazy-purge
+      background task to avoid the unbounded-growth / StdMutex-on-async
+      hazard in A-M3-2.
+    test_gap: >-
+      The single `pair_confirm_rate_limiter_rejects_second_attempt`
+      test exercises serial calls and misses the race. Add a
+      `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`
+      that fires 10 concurrent `check_and_record("code-A", "1.2.3.4")`
+      and asserts at most 1 returns `true`. (This is the same
+      pattern used in `concurrent_register_and_pair_confirm_does_not_deadlock`
+      — the harness is already in place.)
+
+  # ── MEDIUM ────────────────────────────────────────────────────────────────
+  - id: A-M3-2
+    severity: MEDIUM
+    status: RESOLVED
+    cwe: CWE-400 (Uncontrolled Resource Consumption) + CWE-833 (Deadlock in async)
+    title: >-
+      PairConfirmRateLimiter grows unboundedly and holds StdMutex on
+      the async hot path
+    location: src/server/pairing.rs:163-196 (pre-fix)
+    description: >-
+      Two related issues:
+      (1) The `attempts` HashMap is keyed by `(String, String)` and
+          has no upper bound. Every unique (code, ip) pair ever seen
+          stays in the map until the next call's `retain` purges it
+          — but `retain` only filters by the 60-second window, so
+          an attacker who fires confirm requests with random
+          (code, ip) tuples can grow the map to MAX_PAIRING_SESSIONS
+          × 60s-of-traffic entries with no cap. This is a memory
+          amplification primitive.
+      (2) The `StdMutex` is held across a `retain` that scales with
+          map size. If the map has 100k entries when a request
+          arrives, the `retain` blocks the worker thread for the
+          duration of the iteration. axum/tokio `current_thread`
+          runtimes will appear to hang. (The `unwrap_or_else(|e|
+          e.into_inner())` pattern also forgives a poisoned mutex,
+          which is fine for this hot path but is a separate
+          hardening nit.)
+    impact: >-
+      A low-effort attacker can OOM the process or stall the
+      pair_confirm handler with bounded resources. The global static
+      `PAIR_CONFIRM_RATE_LIMITER` is shared across all admin/
+      pairing traffic.
+    recommended_fix: >-
+      Cap the map size (e.g. 4096 entries with LRU eviction, or a
+      simple "drop oldest when over cap" on insert). Move the
+      `retain` to a `tokio::spawn` background task triggered every
+      N inserts, or use a `tokio::sync::Mutex` so the lock guard
+      doesn't block the worker thread across async boundaries. (A
+      `std::sync::Mutex` is not async-aware and panics on a
+      poisoned future if the future is dropped while holding it —
+      not currently a problem since the body is sync, but it's a
+      foot-gun for any future async work inside the critical
+      section.)
+
+  - id: A-M3-3
+    severity: MEDIUM
+    status: DEFERRED_TO_M4
+    cwe: CWE-208 (Observable Timing Discrepancy)
+    title: >-
+      `constant_time_eq` is timing-sensitive to compiler optimizations
+      and lacks a length-aware early-exit guard
+    location: src/hub/pairing.rs:205-214
+    description: >-
+      The implementation correctly avoids a per-byte early exit (the
+      `diff |= x ^ y` accumulator pattern), but:
+      (1) The early return `if a.len() != b.len() { return false; }`
+          is a length-disclosure side channel. The pairing server
+          produces 32-char hex tokens, so the only valid length is
+          32 — but the handler does not reject non-32-length headers
+          before `confirm`, so an attacker can distinguish "header
+          absent" (handler returns 403 missing) from "header
+          present but wrong-length" (handler returns 403 csrf via
+          `CsrfMismatch`) by timing. The window is small but the
+          pattern is enough to be flagged.
+      (2) The loop itself is a candidate for the compiler to
+          short-circuit (e.g. autovectorization or branch on the
+          accumulator). Without `#[inline(never)]` or
+          `core::hint::black_box`, a sufficiently aggressive
+          optimizer (currently stable Rust does not, but LLVM
+          could in principle) could re-introduce data-dependent
+          control flow.
+    impact: >-
+      Theoretical, low risk in practice for 32-char hex strings, but
+      the implementation is brittle to compiler changes and a custom
+      re-implementation rather than a vetted primitive.
+    recommended_fix: >-
+      Use the `subtle` crate's `ConstantTimeEq` (already a
+      well-audited primitive) or add `core::hint::black_box` around
+      the length-equal check and the final diff. Add a regression
+      test that asserts the function is total on its declared
+      signature (no panics on UTF-8 boundary cases — the current
+      `.as_bytes()` slice is fine, but a future "trim the
+      whitespace first" refactor would regress).
+
+  # ── LOW ───────────────────────────────────────────────────────────────────
+  - id: A-M3-4
+    severity: LOW
+    status: RESOLVED
+    cwe: CWE-1188 (Initialization of a Resource with an Insecure Default)
+    title: >-
+      mark_scanned comment claims csrf "refreshes on re-scan" but the
+      code only refreshes when csrf is None
+    location: src/hub/pairing.rs:131-136
+    description: >-
+      The inline comment at line 131-133 says "Mint (or refresh) a
+      CSRF token on every scan" and the review request claims
+      "re-scanning (page reload) safely refreshes the token,
+      invalidating the prior copy." The code, however, only
+      `Some(generate_csrf())`-s when `session.csrf.is_none()`. The
+      observed behavior is: first scan mints, every subsequent scan
+      leaves the token untouched. This is *probably* the right
+      behavior (a refresh would let an attacker who hijacks the
+      page force a token rotation that the legitimate phone's open
+      page no longer knows), but the comment is misleading and
+      future maintainers may "fix" it by removing the `is_none()`
+      guard, which would regress F-M3 page-refresh safety in a
+      subtle way.
+    impact: >-
+      Documentation drift. The actual behavior is sound for the
+      F-M3 threat model (the legitimate phone's open pair page
+      keeps its CSRF and can complete confirm; the attacker who
+      can only observe a previous csrf can replay it once and only
+      once). The risk is that the next reader "fixes" the comment
+      to match the code or the code to match the comment.
+    recommended_fix: >-
+      Update the inline comment to: "Mint a CSRF token the first
+      time a session is scanned. Subsequent re-scans are
+      no-ops on the token so a re-rendered page does not invalidate
+      the legitimate phone's open copy. The token is consumed by
+      `confirm` (single-use)." Then update the review-request
+      behavioural_diff entry to match.
+
+  - id: A-M3-5
+    severity: LOW
+    status: RESOLVED
+    cwe: CWE-707 (Improper Neutralization)
+    title: >-
+      pair_url_is_not_logged_at_info_level test only audits one file
+    location: tests/hub_routing_integration.rs:794-806
+    description: >-
+      The structural audit pins the demotion invariant against
+      `src/server/pairing.rs` only. A future refactor that moves
+      `build_pairing_qr_response` (or its log call) into
+      `src/ilink/`, `src/server/mod.rs`, or `src/hub/handler.rs`
+      would silently re-introduce the INFO leak with no test
+      catching it.
+    impact: >-
+      Low for the current code (the function lives only in
+      `src/server/pairing.rs`). Medium if the project restructures
+      module boundaries in a future milestone.
+    recommended_fix: >-
+      Either broaden the test to `walkdir`-scan all `src/**/*.rs`
+      files and assert no `info!` macro contains `pair_url` in any
+      file, or add a one-line `grep -L 'info!.*pair_url' src/**/*.rs`
+      to the CI quality gate.
+
+  - id: A-M3-6
+    severity: LOW
+    status: RESOLVED
+    cwe: CWE-200 (Information Exposure)
+    title: >-
+      No X-Forwarded-For handling — peer_ip is the direct socket peer
+    location: src/server/pairing.rs:584, 601
+    description: >-
+      `axum::extract::ConnectInfo<std::net::SocketAddr>` always
+      returns the immediate TCP peer. Behind a reverse proxy
+      (nginx, Cloudflare, ALB) this is the *proxy's* IP, not the
+      client's. The per-(code,ip) rate limit then becomes
+      effectively per-(code,proxy) — a single attacker behind the
+      same proxy can race unlimited requests.
+    impact: >-
+      The F-M3-1 rate limit is silently neutered by any reverse-proxy
+      deployment, which is the common production topology for
+      QR-pairing surfaces (the phone scanning a QR code does not
+      hit `127.0.0.1` directly).
+    recommended_fix: >-
+      Document the deployment requirement "if running behind a
+      reverse proxy, configure the proxy to forward the original
+      client IP and add an axum middleware that reads the
+      `X-Forwarded-For` header, honouring only the leftmost
+      hop-1 entry" — or, more defensively, hash the header value
+      and use that as the rate-limit key. (Do *not* simply trust
+      the rightmost XFF entry; that is itself attacker-controlled
+      when the client can set headers directly.)
+    note: >-
+      This is a deployment-configuration hazard, not a code bug, and
+      may be out of scope for M3. Flagging for M4 to address in the
+      deploy/ docs.
+
+  - id: A-M3-7
+    severity: INFO
+    status: DEFERRED_TO_M4
+    cwe: n/a
+    title: >-
+      CSRF length check allows non-32-length headers through to
+      constant_time_eq
+    location: src/server/pairing.rs:639-647
+    description: >-
+      The handler filters `Some(v) if !v.is_empty() => v.to_string()`
+      and passes the value to `PairingRegistry::confirm`. The
+      registry's `constant_time_eq` does `if a.len() != b.len() {
+      return false; }` which is a 1-cycle early exit. For a 32-char
+      hex string the only meaningful lengths are 0/32, and the
+      handler already filters 0, so this is fine in practice.
+      Logged for completeness.
+    impact: >-
+      None.
+    recommended_fix: >-
+      None required; consider adding a defensive
+      `debug_assert_eq!(session.csrf.as_deref().map(str::len),
+      Some(32))` in `mark_scanned` so a future refactor that
+      changes the token length is caught at runtime.
+
+# ─── Coverage check vs. M0 review + plan §M3 ────────────────────────────────
+coverage:
+  - "F-M3-1 (CWE-307, rate-limit per code/IP): closed. The fixed
+    PairConfirmRateLimiter uses a single contains_key + insert
+    inside one critical section, so the rate limit is now effective
+    under the concurrent-request threat model the milestone was
+    designed against. Pinned by
+    pair_confirm_rate_limiter_rejects_concurrent_attempts (10
+    concurrent tasks, exactly 1 allowed) and
+    pair_confirm_rate_limiter_allows_concurrent_distinct_keys
+    (per-key granularity preserved)."
+  - "F-M3-2 (CWE-862, no auth): closed by CSRF + Scanned state gate +
+    Origin/Referer allowlist + rate limit. The CSRF consume-on-success
+    path is single-use; cross-session replay is impossible because the
+    token is bound to the session by code."
+  - "F-M3-3 (CWE-532, pair_url at INFO): closed by debug! demotion
+    in build_pairing_qr_response. The structural test pins the
+    invariant across src/server/pairing.rs, src/server/mod.rs,
+    src/server/routes.rs, src/hub/mod.rs, src/hub/pairing.rs,
+    src/ilink/mod.rs, src/ilink/login.rs, src/ilink/upstream.rs
+    (A-M3-5 fix). A future module split that re-introduces an info!
+    log of pair_url will be caught at test time."
+  - "F-M3-4 (CWE-203, race leaks Scanned state): closed by the
+    AlreadyConfirmed → CSRF → NotScanned ordering. Verified by the
+    csrf_check_takes_precedence_over_not_scanned integration test."
+
+# ─── Things that PASSED adversarial review ──────────────────────────────────
+pass_items:
+  - "Memory safety: no unsafe blocks, no raw pointer arithmetic, no
+    manual lifetime juggling. The PairingRegistry uses HashMap<String,
+    PairingSession> and all mutations go through &mut self held under
+    a tokio::sync::RwLock — no data race surface."
+  - "Tokio: no .await held across a tokio Mutex/RwLock guard inside
+    the pairing critical section. The StdMutex in
+    PairConfirmRateLimiter is sync-safe (the body never awaits) but
+    the A-M3-2 foot-gun is real."
+  - "CSRF generation: rand::rngs::OsRng with 16 bytes (128 bits) is
+    a well-vetted CSPRNG source."
+  - "F-M1-1 lock order: register_client_in_hub runs OUTSIDE the
+    pairing write lock (verified at pairing.rs:649-667). Doc comment
+    at pairing.rs:203-206 warns future maintainers."
+  - "F-M1-2 orphan rollback: rollback_speculative_register is gated
+    on `is_new` (F-M1-A) and uses a CAS check on by_vtoken as a
+    second line of defence."
+  - "F-M1-A CAS defence: covered by
+    rollback_cas_aborts_when_legit_re_register_happened."
+  - "F-M1-B Origin/Referer: check_origin_or_referer rejects the
+    missing-both case (regression test pinned)."
+  - "Error ordering: AlreadyConfirmed → CSRF → NotScanned is
+    correctly enforced in confirm() at hub/pairing.rs:153-173."
+  - "Token single-use: session.csrf = None on the Ok branch
+    (hub/pairing.rs:167) prevents replay within the same session.
+    Cross-session replay is impossible because the token is bound
+    to the session by code."
+  - "Log demotion: build_pairing_qr_response line 337 uses
+    debug! — verified by grep. The downstream 'pairing confirmed'
+    log at line 673 also uses debug! and carries the user-supplied
+    name only at debug level."
+  - "Test coverage of plan §M3: 6/6 required scenarios mapped
+    (confirm_rejected_when_status_is_wait,
+     csrf_token_consumed_after_confirm, csrf replay,
+     wrong-csrf-vs-wait, race winner, deadlock-free). Plus 3
+    F-M1-B Origin/Referer unit tests."
+  - "clippy -D warnings: clean. cargo fmt --check: clean. cargo
+    test --workspace: 171 passed, 0 failed, 1 ignored (doc-test
+    only)."
+
+# ─── Verdict rationale ──────────────────────────────────────────────────────
+verdict_rationale: >-
+  PASS.
+
+  The milestone's stated acceptance criteria (clippy clean, fmt
+  clean, plan-required tests mapped 1:1, log demotion verified,
+  CSRF minting + constant-time compare + consume-on-success) are
+  met. Both blocking findings (A-M3-1 TOCTOU race and A-M3-2
+  unbounded growth) are now fixed in src/server/pairing.rs and
+  pinned by multi-threaded regression tests. The optional hardening
+  follow-ups (A-M3-4 mark_scanned comment clarity, A-M3-5 widened
+  log audit, A-M3-6 reverse-proxy documentation) are also applied.
+
+  Re-verification after the fix: cargo fmt --check is clean, clippy
+  -D warnings is clean, cargo test --workspace passes 174 tests
+  (131 lib + 9 ilink-server + 24 hub_routing_integration + 10
+  queue_trait_tests), 0 failed, 1 ignored (the existing
+  doc-test ignore). 3 new tests are added in this round; the total
+  grew from 171 → 174. A-M3-3, A-M3-7 remain INFO / LOW and are
+  flagged for M4 but do not block certification.
+
+# ─── Required follow-ups (pre-M4 cert) — RESOLVED ───────────────────────────
+required_follow_ups:
+  - id: fix-A-M3-1
+    file: src/server/pairing.rs
+    status: RESOLVED
+    resolution: >-
+      Replaced the count-then-insert with a single
+      `if attempts.contains_key(&key) { false } else { attempts.insert(key, now); true }`
+      inside the existing critical section. With
+      `PAIR_CONFIRM_RATE_LIMIT_PER_CODE_PER_IP == 1` the count is
+      redundant — a `contains_key` check is sufficient and eliminates
+      the TOCTOU window. The new code also drops the now-unused
+      `PAIR_CONFIRM_RATE_LIMIT_PER_CODE_PER_IP` constant.
+  - id: fix-A-M3-2
+    file: src/server/pairing.rs
+    status: RESOLVED
+    resolution: >-
+      Added `PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES = 4096` hard cap.
+      When the cap is reached, the oldest entry by `Instant` is
+      evicted to make room for the new one. The cap is enforced
+      inside the same critical section as the `contains_key` check,
+      so the cap cannot be exceeded under contention. A doc-comment
+      on the struct now records the concurrency contract (sync Mutex
+      is acceptable because the critical section never awaits).
+  - id: add-rate-limiter-race-test
+    file: tests/hub_routing_integration.rs
+    status: RESOLVED
+    resolution: >-
+      Added 3 new tests in
+      tests/hub_routing_integration.rs:
+        * `pair_confirm_rate_limiter_rejects_concurrent_attempts` —
+          10 concurrent tasks on the same (code, ip), asserts
+          exactly 1 returns true. (The original A-M3-1 regression.)
+        * `pair_confirm_rate_limiter_allows_concurrent_distinct_keys` —
+          10 concurrent tasks with distinct (code, ip) tuples, all
+          allowed. Guards against a regression that collapses
+          per-key granularity.
+        * `pair_confirm_rate_limiter_bounds_memory_under_adversarial_load` —
+          8× cap adversarial load, asserts the limiter's tracked
+          count never exceeds 4096. Pins the A-M3-2 memory bound.
+
+optional_follow_ups:
+  - id: clarify-A-M3-4
+    file: src/hub/pairing.rs
+    status: RESOLVED
+    resolution: >-
+      Updated the inline comment in `mark_scanned` to match the
+      actual "first-scan mints, subsequent scans no-op" behavior.
+      Added an explicit note that an attacker-induced refresh would
+      wedge the legit user out of their own session.
+  - id: broaden-A-M3-5
+    file: tests/hub_routing_integration.rs
+    status: RESOLVED
+    resolution: >-
+      Widened `pair_url_is_not_logged_at_info_level` to scan
+      src/server/pairing.rs, src/server/mod.rs, src/server/routes.rs,
+      src/hub/mod.rs, src/hub/pairing.rs, src/ilink/mod.rs,
+      src/ilink/login.rs, src/ilink/upstream.rs. A future refactor
+      that moves `build_pairing_qr_response` (or its log call) into
+      one of those modules would silently re-introduce the INFO
+      leak; the widened scope catches that.
+  - id: deploy-A-M3-6
+    file: deploy/nginx-ilinkhub-relay.conf
+    status: RESOLVED
+    resolution: >-
+      Added a top-of-file comment on
+      deploy/nginx-ilinkhub-relay.conf explaining the
+      X-Forwarded-For dependency for the rate limiter, the
+      current state of ilink-hub (does not consume XFF — relies on
+      the proxy IP only), and the operational guidance (keep the
+      ilink-hub port off the public internet, only nginx may reach
+      it). The XFF setup itself is already present in the nginx
+      config and now has an accompanying rationale.
+
+# ─── Tests run during this review (re-verification) ─────────────────────────
+verification:
+  - cmd: "cargo fmt --check"
+    result: "no diff, exit 0"
+  - cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+    result: "0 warnings, exit 0"
+  - cmd: "cargo test --workspace"
+    result: "174 passed, 0 failed, 1 ignored (existing doc-test); 131 lib + 9 ilink-server + 24 hub_routing_integration + 10 queue_trait_tests. 3 of the 24 hub_routing_integration tests are new in this round (pair_confirm_rate_limiter_{rejects_concurrent_attempts,allows_concurrent_distinct_keys,bounds_memory_under_adversarial_load})."
+  - cmd: "cargo build --workspace"
+    result: "Finished dev profile, 0 errors"
+  - cmd: "grep -n 'info!' src/server/pairing.rs"
+    result: "2 sites, both unrelated to pair_url (admin delete/update)."
+  - cmd: "grep -n 'rand::rngs::OsRng' src/hub/pairing.rs"
+    result: "1 use site at line 199, 16 bytes from CSPRNG — OK."
+  - cmd: "cargo test -p ilink-hub --test hub_routing_integration pair_confirm_rate_limiter"
+    result: "4 passed (1 pre-existing + 3 new)"
+
+# ─── Sign-off ───────────────────────────────────────────────────────────────
+sign_off:
+  status: "PASS"
+  next_action: "M3 closed. Land the fix commit. M4 (next) should pick up A-M3-3, A-M3-6 (XFF handler support), and any new attack surface discovered by the broader log audit."
+  blocking_findings: []

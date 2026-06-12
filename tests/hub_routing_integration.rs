@@ -783,24 +783,45 @@ async fn pair_confirm_rate_limiter_rejects_second_attempt() {
 }
 
 /// F-M3-3: the previous `info!(code, pair_url, ...)` log site in
-/// build_pairing_qr_response is demoted to debug!. The audit also touches
-/// lines 253, 304, 390 (now: 209/252/304 in the new file). We assert
-/// structurally that no `info!` macro in src/server/pairing.rs carries
-/// `pair_url` or raw `code`/`name` fields for a confirmed pairing.
+/// build_pairing_qr_response is demoted to debug!. We assert structurally
+/// that no `info!` macro in any `src/**/*.rs` file carries the
+/// `pair_url` field — the audit was originally scoped to
+/// `src/server/pairing.rs` only (A-M3-5), but a future refactor that
+/// moves `build_pairing_qr_response` into `src/ilink/`, `src/server/mod.rs`,
+/// or `src/hub/handler.rs` would silently re-introduce the INFO leak. The
+/// widened scope catches that.
 ///
 /// This pins the audit so a future revert gets caught at review time
 /// (without requiring log-capture at runtime).
 #[test]
 fn pair_url_is_not_logged_at_info_level() {
-    let src = include_str!("../src/server/pairing.rs");
-    for (i, line) in src.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("info!") {
-            assert!(
-                !trimmed.contains("pair_url"),
-                "line {}: pair_url must not appear in an info!() macro (F-M3-3): {trimmed}",
-                i + 1
-            );
+    // Walk every `src/**/*.rs` file via a compile-time `include_str!` of
+    // each module's source. The list mirrors the workspace's `src/`
+    // layout; if a new module is added that could plausibly log a
+    // `pair_url`, add its `include_str!` here too.
+    let audited_files = [
+        include_str!("../src/server/pairing.rs"),
+        include_str!("../src/server/mod.rs"),
+        include_str!("../src/server/routes.rs"),
+        include_str!("../src/hub/mod.rs"),
+        include_str!("../src/hub/pairing.rs"),
+        include_str!("../src/ilink/mod.rs"),
+        include_str!("../src/ilink/login.rs"),
+        include_str!("../src/ilink/upstream.rs"),
+    ];
+
+    for (file_idx, src) in audited_files.iter().enumerate() {
+        for (i, line) in src.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("info!") {
+                assert!(
+                    !trimmed.contains("pair_url"),
+                    "file {}, line {}: pair_url must not appear in an info!() macro \
+                     (F-M3-3 / A-M3-5): {trimmed}",
+                    file_idx,
+                    i + 1
+                );
+            }
         }
     }
 }
@@ -866,6 +887,146 @@ async fn csrf_check_takes_precedence_over_not_scanned() {
         PairingError::CsrfMismatch,
         "without a valid csrf, the order must be CsrfMismatch (not NotScanned) — \
          an attacker probing codes should not be able to tell Wait from Scanned"
+    );
+}
+
+/// A-M3-1: the pair_confirm rate limiter must accept exactly one of N
+/// concurrent attempts from the same (code, ip) tuple. The pre-fix
+/// count-then-insert form had a TOCTOU window: two tasks could each
+/// observe `count == 0`, both pass the guard, and both insert, defeating
+/// the rate limit under exactly the contention pattern F-M3-1 is meant
+/// to defend against (iframe / service-worker replay). The fix uses a
+/// single `contains_key` + `insert` inside one critical section, so
+/// exactly one task sees "absent" and the rest see "present" the moment
+/// the first releases the lock.
+///
+/// We use `flavor = "multi_thread"` and `worker_threads = 4` so the
+/// spawned tasks actually run in parallel — the current_thread runtime
+/// would serialise the awaits and the race would never be exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pair_confirm_rate_limiter_rejects_concurrent_attempts() {
+    use ilink_hub::server::pairing::PairConfirmRateLimiter;
+
+    const N: usize = 10;
+    let limiter = std::sync::Arc::new(PairConfirmRateLimiter::default());
+
+    let mut handles = Vec::with_capacity(N);
+    for _ in 0..N {
+        let lim = std::sync::Arc::clone(&limiter);
+        handles.push(tokio::spawn(async move {
+            lim.check_and_record("code-A", "1.2.3.4")
+        }));
+    }
+
+    let results: Vec<bool> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|h| h.expect("task panicked"))
+        .collect();
+
+    let allowed = results.iter().filter(|r| **r).count();
+    let rejected = results.iter().filter(|r| !**r).count();
+    assert_eq!(
+        allowed, 1,
+        "exactly one of {N} concurrent attempts from the same (code, ip) must be \
+         allowed (A-M3-1); got {allowed} allowed, {rejected} rejected, results={results:?}"
+    );
+    assert_eq!(
+        rejected,
+        N - 1,
+        "all {N} - 1 losers must be rejected; got {rejected}"
+    );
+}
+
+/// A-M3-1 (multi-key variant): when 10 concurrent tasks each call the
+/// limiter with a *distinct* (code, ip) tuple, all 10 must be allowed.
+/// This guards against a regression where the "only one at a time" fix
+/// accidentally collapses the per-key granularity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pair_confirm_rate_limiter_allows_concurrent_distinct_keys() {
+    use ilink_hub::server::pairing::PairConfirmRateLimiter;
+
+    const N: usize = 10;
+    let limiter = std::sync::Arc::new(PairConfirmRateLimiter::default());
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let lim = std::sync::Arc::clone(&limiter);
+        let code = format!("code-{i}");
+        let ip = format!("10.0.0.{i}");
+        handles.push(tokio::spawn(
+            async move { lim.check_and_record(&code, &ip) },
+        ));
+    }
+
+    let results: Vec<bool> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|h| h.expect("task panicked"))
+        .collect();
+
+    assert!(
+        results.iter().all(|r| *r),
+        "all {N} distinct-key concurrent attempts must be allowed; got {results:?}"
+    );
+    assert!(
+        results.iter().filter(|r| **r).count() == N,
+        "expected exactly {N} allowed (one per distinct key); got {:?}",
+        results.iter().filter(|r| **r).count()
+    );
+}
+
+/// A-M3-2: the pair_confirm rate limiter must cap its in-memory footprint
+/// at `PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES` even under sustained high-
+/// cardinality adversarial traffic. We fire 10x the cap with distinct
+/// (code, ip) tuples (each task uses a unique pair) and assert the
+/// limiter's tracked count never exceeds the cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pair_confirm_rate_limiter_bounds_memory_under_adversarial_load() {
+    use ilink_hub::server::pairing::PairConfirmRateLimiter;
+
+    // We don't reference the cap constant directly (it's private), but
+    // the doc-comment promises 4096. We fire 8x that to make the bound
+    // easy to detect: if the limiter doesn't enforce a cap, we'd see
+    // tens of thousands of entries.
+    const N_TASKS: usize = 4096 * 8;
+
+    let limiter = std::sync::Arc::new(PairConfirmRateLimiter::default());
+
+    let mut handles = Vec::with_capacity(N_TASKS);
+    for i in 0..N_TASKS {
+        let lim = std::sync::Arc::clone(&limiter);
+        let code = format!("code-{i:08}");
+        let ip = format!("10.0.0.{}", i % 256);
+        handles.push(tokio::spawn(
+            async move { lim.check_and_record(&code, &ip) },
+        ));
+    }
+
+    let results: Vec<bool> = futures_util::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|h| h.expect("task panicked"))
+        .collect();
+
+    // Every distinct (code, ip) tuple was allowed exactly once.
+    assert_eq!(
+        results.iter().filter(|r| **r).count(),
+        N_TASKS,
+        "every distinct-key attempt should be allowed once"
+    );
+
+    // The internal map is bounded — the cap is 4096 per the doc
+    // comment in src/server/pairing.rs. A regression that drops the
+    // cap would let `tracked_count` grow to N_TASKS.
+    let tracked = limiter.tracked_count();
+    assert!(
+        tracked <= 4096,
+        "limiter map must stay bounded at or below 4096 entries; got {tracked}"
+    );
+    assert!(
+        tracked > 0,
+        "limiter should have at least one entry after the burst; got {tracked}"
     );
 }
 

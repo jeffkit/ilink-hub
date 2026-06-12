@@ -128,9 +128,13 @@ impl PairingRegistry {
             if session.status == PairingStatus::Wait {
                 session.status = PairingStatus::Scanned;
             }
-            // Mint (or refresh) a CSRF token on every scan. Safe to refresh on re-scan:
-            // the token is only valid for a single confirm; if the page is reloaded
-            // (re-scan) the previous token is invalidated and a fresh one is issued.
+            // Mint a CSRF token the first time a session is scanned. Subsequent
+            // re-scans (page reloads, re-renders) are no-ops on the token so a
+            // re-rendered page does not invalidate the legitimate phone's open
+            // copy — an attacker who could force a rotation would otherwise be
+            // able to wedge the legit user out of their own session. The token
+            // is consumed by `confirm` (single-use) and bound to this `code`,
+            // so cross-session replay is impossible regardless.
             if session.csrf.is_none() {
                 session.csrf = Some(generate_csrf());
             }

@@ -42,12 +42,23 @@ pub struct BotQrcodeBody {
 const QR_STATUS_LONG_POLL: Duration = Duration::from_secs(25);
 const QR_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Max number of distinct (peer_ip, code) confirm attempts per window. F-M3-1
-/// hardening against iframe/service-worker replay; one attempt per IP per code
-/// within the window is enough for a real phone scan, but blocks an attacker
-/// from racing many requests through the same leaked `code`.
-const PAIR_CONFIRM_RATE_LIMIT_PER_CODE_PER_IP: usize = 1;
+/// How long a (code, ip) entry remains "occupied" once recorded. F-M3-1
+/// hardening against iframe/service-worker replay; one attempt per IP per
+/// code within the window is enough for a real phone scan, but blocks an
+/// attacker from racing many requests through the same leaked `code`.
 const PAIR_CONFIRM_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Hard cap on the number of (code, ip) entries the limiter retains. The
+/// cap is per-process, not per-window, and is reached only when an attacker
+/// fires confirm requests with a high-cardinality set of (code, ip) tuples
+/// to grow the map. A bounded LRU-like overflow policy keeps the limiter's
+/// memory footprint independent of adversarial traffic.
+///
+/// Sized generously: 4096 unique (code, ip) tuples is more than the
+/// MAX_PAIRING_SESSIONS * IPs-per-code observed in any realistic pairing
+/// flow, and bounds the worst-case work per critical-section entry to a
+/// small, bounded retain.
+const PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES: usize = 4096;
 
 #[derive(Debug, Deserialize)]
 pub struct PairConfirmRequest {
@@ -161,6 +172,32 @@ pub fn check_origin_or_referer(
 }
 
 /// Per-(code, ip) sliding-window counter. Trimmed lazily on insert.
+///
+/// F-M3-1: a single (code, ip) tuple may be recorded at most once within
+/// `PAIR_CONFIRM_RATE_LIMIT_WINDOW`. A real phone scan produces exactly one
+/// request from a given IP, so 1/window is enough for legitimate traffic
+/// while denying iframe/service-worker replays.
+///
+/// Concurrency: the map is guarded by a `std::sync::Mutex`. We use the sync
+/// primitive (not `tokio::sync::Mutex`) because the critical section is
+/// strictly synchronous — no `.await` happens while the lock is held, and
+/// the body does not park the worker. Using `tokio::sync::Mutex` here would
+/// just add the cost of an async-aware acquire with no benefit, and using
+/// either flavour requires the same care about not awaiting inside the
+/// guard.
+///
+/// Correctness (A-M3-1): the prior count-then-insert was a TOCTOU race —
+/// two concurrent tasks could each observe `count == 0` and both pass the
+/// guard, both `insert()`, and both return `true`. The fixed form uses a
+/// single `contains_key` + `insert` inside the same critical section,
+/// making the "first attempt wins, all subsequent attempts lose" outcome
+/// observable to every other task as soon as the mutex is released.
+///
+/// Memory bound (A-M3-2): the map is capped at
+/// `PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES`. When the cap is reached we evict
+/// the oldest entry by `Instant` to make room for the new one. This
+/// guarantees the map size is bounded regardless of attacker-supplied
+/// (code, ip) cardinality.
 #[derive(Default)]
 pub struct PairConfirmRateLimiter {
     /// (code, ip) → first-seen instant
@@ -172,19 +209,47 @@ impl PairConfirmRateLimiter {
         let now = Instant::now();
         let key = (code.to_string(), ip.to_string());
         let mut attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
-        // Purge stale entries.
+
+        // Purge stale entries so the bound stays tight under sustained
+        // legit traffic. The retain is O(n) but bounded by
+        // PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES.
         attempts.retain(|_, t| now.duration_since(*t) < PAIR_CONFIRM_RATE_LIMIT_WINDOW);
-        let count = attempts
-            .iter()
-            .filter(|((c, i), t)| {
-                c == code && i == ip && now.duration_since(**t) < PAIR_CONFIRM_RATE_LIMIT_WINDOW
-            })
-            .count();
-        if count >= PAIR_CONFIRM_RATE_LIMIT_PER_CODE_PER_IP {
+
+        // A-M3-1: single contains_key check + insert in one critical
+        // section. With the previous count-then-insert form, two tasks
+        // could both observe "no entries for (code, ip)" and both pass the
+        // guard under contention. The single contains_key is sufficient
+        // because the policy is "first attempt wins, all others lose"
+        // (one attempt per (code, ip) per window) — we never need a
+        // counter.
+        if attempts.contains_key(&key) {
             return false;
         }
+
+        // A-M3-2: bound the map size. If we are at the cap, drop the
+        // oldest entry to make room. (Any policy that drops SOMETHING is
+        // acceptable here; the attacker can still fill the cap, but
+        // cannot grow it past the cap.)
+        if attempts.len() >= PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES {
+            if let Some(oldest) = attempts
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(k, _)| k.clone())
+            {
+                attempts.remove(&oldest);
+            }
+        }
+
         attempts.insert(key, now);
         true
+    }
+
+    /// Test-only: number of tracked (code, ip) entries. Used by the
+    /// concurrency regression test to assert the cap holds.
+    #[doc(hidden)]
+    pub fn tracked_count(&self) -> usize {
+        let attempts = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        attempts.len()
     }
 }
 
