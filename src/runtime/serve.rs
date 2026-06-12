@@ -87,7 +87,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(256);
+    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(1024);
 
     spawn_dispatcher(state.clone(), rx);
 
@@ -261,8 +261,14 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
         Ok(routes) => {
             let count = routes.len();
             let mut router = state.routing.router.lock().await;
+            let mut router = state.routing.router.lock().await;
+            let registry = state.clients.registry.read().await;
             for (from_user, vtoken) in routes {
-                router.set_route(&from_user, vtoken);
+                if registry.get_by_vtoken(&vtoken).is_some() {
+                    router.set_route(&from_user, vtoken);
+                } else {
+                    tracing::warn!(vtoken = %vtoken, from_user = %from_user, "skipping route loading for non-existent vtoken");
+                }
             }
             info!(count, "loaded routing state from database");
         }

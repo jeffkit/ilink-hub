@@ -60,7 +60,7 @@
 
 ### CONS-01 · CLI 帮助全英文，文档与 GUI 全中文
 
-- **状态**：open
+- **状态**：done
 - **文件**：`src/main.rs`（`ilink-hub` clap 定义），`src/bin/ilink-hub-bridge.rs`（`ilink-hub-bridge` clap 定义）
 - **现象**：`ilink-hub --help` / `ilink-hub serve --help` / `ilink-hub-bridge --help` 输出**全英文**（"Start the hub server"、"Register a backend client" 等），而文档站、桌面 GUI 全部中文。面向中文小白时，一旦从 GUI 掉到终端就出现语言割裂。
 - **修复方向**：
@@ -69,7 +69,7 @@
 
 ### CONS-02 · 「Hub 地址」三套环境变量与默认值不一致，默认监听 `0.0.0.0`
 
-- **状态**：open
+- **状态**：done
 - **文件**：`src/main.rs`（`serve --addr` env `ILINK_HUB_ADDR` 默认 `0.0.0.0:8765`；`register --hub-url` env `ILINK_HUB_URL` 默认 `http://localhost:8765`），`src/bin/ilink-hub-bridge.rs`（`--hub-url` env `WEIXIN_BASE_URL` 默认 `http://127.0.0.1:8765`），`docs/guide/getting-started.md:72`（示例用 `0.0.0.0:8765`）对比 `docs/bridge/quick-try.md:37`（示例用 `127.0.0.1:8765`）
 - **问题**：同一个「Hub 在哪」的概念散落成三套环境变量名（`ILINK_HUB_ADDR` / `ILINK_HUB_URL` / `WEIXIN_BASE_URL`），并混用 `localhost` / `127.0.0.1` / `0.0.0.0`；文档内部示例也不统一。其中 `serve` 默认监听 `0.0.0.0:8765` 意味着**默认对整个局域网开放**，对不懂网络的小白是潜在安全隐患（桌面端用的是 `127.0.0.1` 更稳妥）。
 - **修复方向**：

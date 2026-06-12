@@ -80,6 +80,8 @@ pub struct Metrics {
     /// for semantics. Split from the per-message counter so operators can distinguish
     /// single-row failures from per-broadcast batch failures.
     pub persist_fire_and_forget_failures_broadcast: AtomicU64,
+    /// Number of messages missed because the dispatcher lagged behind the broadcast channel.
+    pub dispatcher_lagged: AtomicU64,
 }
 
 impl Metrics {
@@ -93,6 +95,7 @@ impl Metrics {
             relogin_attempts: AtomicU64::new(0),
             persist_fire_and_forget_failures_forward: AtomicU64::new(0),
             persist_fire_and_forget_failures_broadcast: AtomicU64::new(0),
+            dispatcher_lagged: AtomicU64::new(0),
         }
     }
 }
@@ -327,6 +330,10 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(skipped = n, "dispatcher lagged behind upstream");
+                    state
+                        .metrics
+                        .dispatcher_lagged
+                        .fetch_add(n, Ordering::Relaxed);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("upstream broadcast channel closed, dispatcher exiting");
