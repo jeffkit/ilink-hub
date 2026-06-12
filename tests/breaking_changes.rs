@@ -243,3 +243,76 @@ fn queue_backend_memory_is_unchanged() {
         "ILINK_QUEUE_BACKEND should not be set to 'redis' in test environment"
     );
 }
+
+// ─── F-M1-B: end-to-end test that the production pair_confirm handler ────────
+//     rejects requests with neither Origin nor Referer.
+//
+// The handler requires `ConnectInfo<SocketAddr>`. We rebuild a router
+// with `into_make_service_with_connect_info` semantics so the
+// extractor resolves in the test. (axum's `Router::oneshot_with_connect_info`
+// is the unit-test equivalent.)
+
+/// F-M1-B (handler-level): a bare-curl POST with no Origin and no
+/// Referer hits the production pair_confirm handler and is rejected
+/// with 403. Pre-fix the request would have passed through to the
+/// CSRF / state check (the if/else-if chain had no terminating
+/// `else`).
+#[tokio::test]
+async fn pair_confirm_handler_rejects_no_origin_no_referer() {
+    use std::net::SocketAddr;
+    let state = make_state().await;
+    let app = ilink_hub::server::build_router(state);
+    let mut req = Request::builder()
+        .method("POST")
+        // Unique code per test so the (code, ip) rate limiter does
+        // not collide across tests in the same process.
+        .uri("/hub/pair/pair_fm1b_no_origin/confirm")
+        .header("Content-Type", "application/json")
+        .header("X-Pair-CSRF", "deadbeef".repeat(4))
+        // No Origin, no Referer, on purpose.
+        .body(Body::from(serde_json::json!({"name": "alice"}).to_string()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo::<SocketAddr>(
+            "127.0.0.1:55555".parse().unwrap(),
+        ));
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "F-M1-B: pair_confirm with no Origin/Referer must be rejected (got {})",
+        resp.status()
+    );
+}
+
+/// F-M1-B (handler-level): a POST with a foreign Origin (not the
+/// device's pair-public-url) is rejected with 403.
+#[tokio::test]
+async fn pair_confirm_handler_rejects_foreign_origin() {
+    use std::net::SocketAddr;
+    let state = make_state().await;
+    let app = ilink_hub::server::build_router(state);
+    let mut req = Request::builder()
+        .method("POST")
+        // Unique code per test so the (code, ip) rate limiter does
+        // not collide across tests in the same process.
+        .uri("/hub/pair/pair_fm1b_foreign_origin/confirm")
+        .header("Content-Type", "application/json")
+        .header("X-Pair-CSRF", "deadbeef".repeat(4))
+        .header("Origin", "https://attacker.example.com")
+        .body(Body::from(serde_json::json!({"name": "alice"}).to_string()))
+        .unwrap();
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo::<SocketAddr>(
+            "127.0.0.1:55555".parse().unwrap(),
+        ));
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::FORBIDDEN,
+        "F-M1-B: pair_confirm with foreign Origin must be rejected (got {})",
+        resp.status()
+    );
+}

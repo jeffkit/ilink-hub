@@ -123,7 +123,8 @@ pub async fn register(
         );
     }
 
-    let vtoken = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let (vtoken, _is_new) =
+        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
     (
         StatusCode::OK,

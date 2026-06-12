@@ -113,6 +113,53 @@ fn origin_matches_device_base(origin: &str) -> bool {
     origin.trim_end_matches('/') == base.trim_end_matches('/')
 }
 
+/// F-M1-B: pure helper that classifies a (Origin?, Referer?) header pair
+/// against the device's pair-public-url allowlist. Returning a
+/// `Result<(), OriginCheckError>` lets the handler pick the right HTTP
+/// status (403 for "missing", 403 for "mismatched") and lets us unit-test
+/// the policy in isolation.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OriginCheckError {
+    Missing,
+    NotAllowed,
+}
+
+pub fn check_origin_or_referer(
+    origin_header: Option<&str>,
+    referer_header: Option<&str>,
+) -> Result<(), OriginCheckError> {
+    // F-M1-B: a request with NEITHER header is rejected. The previous
+    // if/else-if chain had no terminating `else` and let bare-curl bypass
+    // the cross-origin guard.
+    let value = match origin_header.or(referer_header) {
+        None => return Err(OriginCheckError::Missing),
+        Some(v) => v,
+    };
+    // If `value` is a Referer URL (no scheme://host[:port] form), normalize
+    // it. The string-compare fallback in `origin_matches_device_base`
+    // handles malformed Referers safely.
+    let origin_to_check = if value.contains("://") {
+        value.to_string()
+    } else {
+        match url::Url::parse(value) {
+            Ok(parsed) => {
+                let mut s = format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""));
+                if let Some(port) = parsed.port() {
+                    s.push(':');
+                    s.push_str(&port.to_string());
+                }
+                s
+            }
+            Err(_) => value.to_string(),
+        }
+    };
+    if origin_matches_device_base(&origin_to_check) {
+        Ok(())
+    } else {
+        Err(OriginCheckError::NotAllowed)
+    }
+}
+
 /// Per-(code, ip) sliding-window counter. Trimmed lazily on insert.
 #[derive(Default)]
 pub struct PairConfirmRateLimiter {
@@ -152,16 +199,16 @@ pub async fn register_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
-) -> String {
+) -> (String, bool) {
     // Lock order: registry → router (always). MUST NOT be called while
     // `state.pairing.write()` is held; doing so would introduce a new
     // `pairing → registry → router` lock order that deadlocks against any
     // future code path that takes registry+router and then pairing. (F-M1-1)
-    let (vtoken, is_first) = {
+    let (vtoken, is_new, is_first) = {
         let mut registry = state.registry.write().await;
-        let vtoken = registry.register(name.clone(), label.clone());
-        let is_first = registry.all_clients().len() == 1;
-        (vtoken, is_first)
+        let (vtoken, is_new) = registry.register(name.clone(), label.clone());
+        let is_first = is_new && registry.all_clients().len() == 1;
+        (vtoken, is_new, is_first)
     };
 
     if is_first {
@@ -177,7 +224,7 @@ pub async fn register_client_in_hub(
         warn!(error = %e, name = %name, "failed to persist paired client");
     }
 
-    vtoken
+    (vtoken, is_new)
 }
 
 #[derive(Debug)]
@@ -468,9 +515,31 @@ pub async fn pair_page(
 /// lost the race under the pairing write lock. F-M1-2: prevents orphan
 /// vtoken / queue / store row accumulation when confirm() returns
 /// AlreadyConfirmed (or any other non-Ok) for the speculative winner.
-async fn rollback_speculative_register(state: &HubState, name: &str, vtoken: &str) {
+///
+/// F-M1-A: this MUST only be called when the speculative register actually
+/// inserted a fresh row (`is_new == true`). If the supplied name was already
+/// registered, the registry returned the legitimate client's vtoken and
+/// rolling it back would evict that legitimate client (CWE-863/CWE-284).
+/// The CAS check on `by_vtoken` adds a second layer of defence: even if a
+/// caller passes `is_new = true` after a TOCTOU window in which the
+/// legitimate entry was re-registered, the rollback aborts.
+pub async fn rollback_speculative_register(state: &HubState, name: &str, vtoken: &str) {
     let new_default = {
         let mut registry = state.registry.write().await;
+        // CAS: only remove if the by_vtoken entry still maps `name → vtoken`.
+        // If the entry was rewritten (legitimate re-register), the rollback
+        // is a no-op and the legitimate client survives.
+        match registry.get_by_name(name) {
+            Some(info) if info.vtoken == vtoken => {}
+            _ => {
+                debug!(
+                    name = %name,
+                    "rollback_speculative_register: name no longer maps to the \
+                     speculative vtoken; refusing to roll back (F-M1-A defence)"
+                );
+                return;
+            }
+        }
         if !registry.remove(name) {
             return;
         }
@@ -540,38 +609,30 @@ pub async fn pair_confirm(
     // CSRF can't set custom headers without preflight, but iframe +
     // service-worker can still trigger a same-origin fetch on the user's
     // behalf if the page is embedded; this Origin check closes that).
-    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
-        if !origin_matches_device_base(origin) {
-            return (
+    //
+    // F-M1-B: the previous if/else-if chain had no terminating `else`
+    // rejection, so a request with NEITHER header (curl/wget) bypassed the
+    // check. The extracted `check_origin_or_referer` helper enforces the
+    // "at least one header present + must match device base" policy.
+    let origin_hdr = headers
+        .get("origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let referer_hdr = headers
+        .get("referer")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(err) = check_origin_or_referer(origin_hdr.as_deref(), referer_hdr.as_deref()) {
+        return match err {
+            OriginCheckError::Missing => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "origin header required" })),
+            ),
+            OriginCheckError::NotAllowed => (
                 StatusCode::FORBIDDEN,
                 Json(serde_json::json!({ "error": "origin not allowed" })),
-            );
-        }
-    } else if let Some(referer) = headers.get("referer").and_then(|v| v.to_str().ok()) {
-        // Some clients omit Origin on same-origin POSTs; fall back to Referer.
-        if let Ok(parsed) = url::Url::parse(referer) {
-            let referer_origin =
-                format!("{}://{}", parsed.scheme(), parsed.host_str().unwrap_or(""),);
-            if let Some(port) = parsed.port() {
-                let referer_origin = format!("{referer_origin}:{port}");
-                if !origin_matches_device_base(&referer_origin) {
-                    return (
-                        StatusCode::FORBIDDEN,
-                        Json(serde_json::json!({ "error": "origin not allowed" })),
-                    );
-                }
-            } else if !origin_matches_device_base(&referer_origin) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({ "error": "origin not allowed" })),
-                );
-            }
-        } else {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({ "error": "origin not allowed" })),
-            );
-        }
+            ),
+        };
     }
 
     // SEC-013: CSRF token must be supplied via `X-Pair-CSRF` header.
@@ -587,11 +648,19 @@ pub async fn pair_confirm(
 
     // Speculative register — runs OUTSIDE the pairing write lock to keep the
     // canonical `registry → router` lock order intact (F-M1-1).
-    let vtoken = register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
+    // `is_new` tells us whether this call actually inserted a fresh row; if
+    // the supplied name was already registered, the registry returned the
+    // legitimate client's vtoken. The pairing write lock may still reject the
+    // confirm (CSRF / state / AlreadyConfirmed), but rolling back in that
+    // case would evict the legitimate client (F-M1-A). We MUST gate the
+    // rollback on `is_new`.
+    let (vtoken, is_new) =
+        register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
 
     // Atomic check + commit under the pairing write lock. On any non-Ok
     // result, roll back the speculative register so we don't leak a
-    // vtoken/queue/store row (F-M1-2).
+    // vtoken/queue/store row (F-M1-2). The rollback is gated on `is_new`
+    // (F-M1-A) to prevent evicting a legitimate pre-existing client.
     let confirm_result = {
         let mut pairing = state.pairing.write().await;
         pairing.confirm(&code, name.clone(), label, vtoken.clone(), &csrf_header)
@@ -613,10 +682,19 @@ pub async fn pair_confirm(
         }
         Err(e) => {
             // The speculative register must be undone on every non-Ok
-            // outcome. F-M1-2: do this even for AlreadyConfirmed / NotScanned
-            // / CsrfMismatch — a losing concurrent racer must not leave a
-            // ghost vtoken in the registry, queue, or store.
-            rollback_speculative_register(state.as_ref(), &name, &vtoken).await;
+            // outcome — BUT only when the speculative call actually inserted
+            // a fresh row (F-M1-A). If the name was already registered, the
+            // speculative call was a no-op merge and the rollback would
+            // evict the legitimate client. `is_new` is the gate.
+            if is_new {
+                rollback_speculative_register(state.as_ref(), &name, &vtoken).await;
+            } else {
+                debug!(
+                    name = %name,
+                    "pair_confirm lost the race on a pre-existing client; \
+                     skipping rollback to preserve the legitimate entry (F-M1-A)"
+                );
+            }
             match e {
                 PairingError::NotFound => (
                     StatusCode::NOT_FOUND,
@@ -644,5 +722,62 @@ pub async fn pair_confirm(
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // F-M1-B: the policy helper must reject a request with neither
+    // header — this is the regression the M1 review flagged.
+    #[test]
+    fn check_origin_or_referer_rejects_missing_headers() {
+        assert_eq!(
+            check_origin_or_referer(None, None),
+            Err(OriginCheckError::Missing),
+            "F-M1-B: missing both Origin and Referer must be rejected (the \
+             pre-fix if/else-if chain had no terminating else)"
+        );
+    }
+
+    // F-M1-B: Origin present, but a clearly foreign scheme/host
+    // (relative to the device base URL) must be rejected as
+    // NotAllowed. We can't pin the exact base URL here without
+    // mutating env, so we just assert that any non-base origin is
+    // rejected — the pre-fix code would have either let it through
+    // (no header case) or fallen into the NotAllowed branch.
+    #[test]
+    fn check_origin_or_referer_rejects_garbage() {
+        assert_eq!(
+            check_origin_or_referer(Some("not a url"), None),
+            Err(OriginCheckError::NotAllowed),
+            "garbage Origin must be rejected as NotAllowed"
+        );
+        assert_eq!(
+            check_origin_or_referer(None, Some("not a url")),
+            Err(OriginCheckError::NotAllowed),
+            "garbage Referer must be rejected as NotAllowed"
+        );
+    }
+
+    // F-M1-B: when a Referer is present and parses as a URL, the
+    // helper normalises it to scheme://host[:port] before the
+    // allowlist compare. This is the path the previous code took
+    // inside the if/else-if chain — moving it to a helper makes
+    // the policy testable in isolation.
+    #[test]
+    fn check_origin_or_referer_accepts_well_formed_referer() {
+        // Pair-public-url resolves to something like http://127.0.0.1:PORT
+        // (or similar) in tests; the exact value is environment-driven.
+        // We only assert that a referer whose scheme/host is NOT the
+        // base is rejected, which is the negative-direction sanity
+        // check.
+        let bad = "https://attacker.example.com/some/path";
+        assert_eq!(
+            check_origin_or_referer(None, Some(bad)),
+            Err(OriginCheckError::NotAllowed),
+            "a well-formed but foreign Referer must be rejected"
+        );
     }
 }

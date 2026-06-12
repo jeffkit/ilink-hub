@@ -5,6 +5,13 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const PAIRING_TTL: Duration = Duration::from_secs(600);
+/// How long a `Confirmed` pairing session is retained before being purged.
+/// The session is no longer needed once confirmed: the vtoken, name, and
+/// label are persisted in the registry and store, so the in-memory entry
+/// can be safely dropped. F-M1-C: without a TTL here, Confirmed sessions
+/// are immortal and `MAX_PAIRING_SESSIONS` is effectively neutered once
+/// the live set has cycled through `create` + `confirm`.
+const CONFIRMED_TTL: Duration = Duration::from_secs(86_400);
 /// Hard cap on simultaneously-live pairing sessions. Prevents a `GET /ilink/bot/get_bot_qrcode`
 /// flood from growing `state.pairing.sessions` unboundedly. Each entry is a `PairingSession` plus
 /// optional CSRF string; 1024 is generous and the cap is checked at `create()`.
@@ -33,7 +40,21 @@ pub struct PairingSession {
 
 impl PairingSession {
     fn is_expired(&self) -> bool {
-        self.created_at.elapsed() > PAIRING_TTL && self.status != PairingStatus::Confirmed
+        // Live (Wait / Scanned) sessions expire after PAIRING_TTL; the
+        // pre-existing semantics for get()/public_status() are preserved.
+        self.status != PairingStatus::Confirmed && self.created_at.elapsed() > PAIRING_TTL
+    }
+
+    /// F-M1-C: Confirmed sessions are dropped by `purge_expired` after
+    /// CONFIRMED_TTL. We keep the public "is this session still meaningful
+    /// to a client" semantics in `is_expired` separate from "should this
+    /// row be evicted from the registry" so a long-confirmed session
+    /// doesn't suddenly show as `expired` to a `get()` caller.
+    fn should_evict(&self) -> bool {
+        match self.status {
+            PairingStatus::Confirmed => self.created_at.elapsed() > CONFIRMED_TTL,
+            _ => self.created_at.elapsed() > PAIRING_TTL,
+        }
     }
 
     pub fn public_status(&self) -> PairingStatus {
@@ -66,8 +87,10 @@ impl PairingRegistry {
     }
 
     fn purge_expired(&mut self) {
-        self.sessions
-            .retain(|_, s| !s.is_expired() || s.status == PairingStatus::Confirmed);
+        // F-M1-C: evict using should_evict (covers Confirmed TTL), not
+        // is_expired (which preserves the live-set status semantics for
+        // get()/public_status()).
+        self.sessions.retain(|_, s| !s.should_evict());
     }
 
     pub fn create(&mut self) -> Result<String, PairingError> {
@@ -306,5 +329,44 @@ mod tests {
         }
         let err = reg.create().unwrap_err();
         assert_eq!(err, PairingError::TooManySessions);
+    }
+
+    /// F-M1-C: Confirmed sessions must be evicted by `purge_expired` after
+    /// CONFIRMED_TTL elapses, otherwise the live-set cap is neutered. We
+    /// backdate `created_at` past the TTL to exercise the eviction path
+    /// without sleeping in the test.
+    #[test]
+    fn confirmed_sessions_are_evicted_after_confirmed_ttl() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.confirm(&code, "client".into(), None, "vhub_x".into(), &csrf)
+            .unwrap();
+        // Session is now Confirmed and visible.
+        assert_eq!(reg.sessions.len(), 1);
+        assert_eq!(
+            reg.get(&code).unwrap().status_str(),
+            "confirmed",
+            "freshly confirmed session must be visible"
+        );
+
+        // Backdate created_at past CONFIRMED_TTL and force a purge.
+        reg.sessions.get_mut(&code).unwrap().created_at =
+            Instant::now() - Duration::from_secs(86_400 + 60);
+        reg.purge_expired();
+
+        // The session must be evicted, and the live set is empty so a new
+        // create() succeeds (this is the whole point — the cap is no
+        // longer shadowed by immortal Confirmed sessions).
+        assert!(
+            reg.get(&code).is_none(),
+            "Confirmed session must be evicted after CONFIRMED_TTL"
+        );
+        let code2 = reg.create().unwrap();
+        assert!(
+            reg.get(&code2).is_some(),
+            "create must succeed once the immortal Confirmed entry is evicted"
+        );
     }
 }

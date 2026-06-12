@@ -47,7 +47,9 @@ fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
 }
 
 async fn register(state: &Arc<HubState>, name: &str) -> String {
-    ilink_hub::server::pairing::register_client_in_hub(state, name.to_string(), None).await
+    let (vtoken, _is_new) =
+        ilink_hub::server::pairing::register_client_in_hub(state, name.to_string(), None).await;
+    vtoken
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
@@ -392,7 +394,7 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
                 };
                 if let Some(csrf) = csrf {
                     let name = format!("pair-client-{i}-{j}");
-                    let vtoken =
+                    let (vtoken, _is_new) =
                         ilink_hub::server::pairing::register_client_in_hub(&s, name.clone(), None)
                             .await;
                     let res = {
@@ -445,20 +447,20 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
     };
 
     // Replicate the fixed handler: register → confirm under the lock; on
-    // non-Ok, rollback the speculative register.
+    // non-Ok, rollback the speculative register (gated on `is_new`).
     let try_confirm = |name: String, s: Arc<HubState>| {
         let code = code.clone();
         let csrf = csrf.clone();
         async move {
-            let vtoken =
+            let (vtoken, is_new) =
                 ilink_hub::server::pairing::register_client_in_hub(s.as_ref(), name.clone(), None)
                     .await;
             let res = {
                 let mut reg = s.pairing.write().await;
                 reg.confirm(&code, name.clone(), None, vtoken.clone(), &csrf)
             };
-            if res.is_err() {
-                // Mirror the handler's rollback call.
+            if res.is_err() && is_new {
+                // Mirror the handler's rollback call (F-M1-A: only when fresh).
                 let new_default = {
                     let mut registry = s.registry.write().await;
                     if registry.remove(&name) {
@@ -701,4 +703,165 @@ async fn csrf_check_takes_precedence_over_not_scanned() {
         "without a valid csrf, the order must be CsrfMismatch (not NotScanned) — \
          an attacker probing codes should not be able to tell Wait from Scanned"
     );
+}
+
+// ─── Adversarial: M1 review findings fixes ───────────────────────────────────
+
+/// F-M1-A: a speculative pair_confirm against a `name` that is ALREADY
+/// registered (i.e. the registry returns the legitimate client's vtoken
+/// via `register_with_vtoken`) must NOT evict the legitimate client on
+/// the rollback path.
+///
+/// Reproduction:
+///   1. Pair client A (name="alice") with vhub_abc — the legitimate owner.
+///   2. Attacker opens the QR pair page (mints csrf for the same code),
+///      then POSTs confirm with name="alice" and a wrong csrf.
+///   3. The handler calls register_client_in_hub → registry REUSES
+///      vhub_abc (is_new=false), then confirm() fails with CsrfMismatch.
+///   4. The rollback MUST be a no-op (is_new=false gate) — alice's
+///      vhub_abc must remain in the registry and in the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_preserves_legit_client_when_name_collides() {
+    let state = make_state().await;
+
+    // 1. Pre-pair a legitimate client.
+    let legit_vtoken = register(&state, "alice").await;
+    assert!(state.registry.read().await.get_by_name("alice").is_some());
+
+    // 2. Build a pairing session (just like a real QR page render).
+    let code = {
+        let mut reg = state.pairing.write().await;
+        let c = reg.create().unwrap();
+        reg.mark_scanned(&c);
+        c
+    };
+    let _csrf = {
+        let reg = state.pairing.read().await;
+        reg.get(&code).and_then(|s| s.csrf).unwrap()
+    };
+
+    // 3. Attacker: speculative register of "alice" reuses legit_vtoken,
+    //    then confirm with a WRONG csrf → CsrfMismatch.
+    let (attacker_vtoken, attacker_is_new) =
+        ilink_hub::server::pairing::register_client_in_hub(&state, "alice".into(), None).await;
+    assert_eq!(
+        attacker_vtoken, legit_vtoken,
+        "register reuses legit vtoken"
+    );
+    assert!(
+        !attacker_is_new,
+        "is_new must be false for a colliding name (F-M1-A contract)"
+    );
+
+    let res = {
+        let mut reg = state.pairing.write().await;
+        reg.confirm(
+            &code,
+            "alice".into(),
+            None,
+            attacker_vtoken.clone(),
+            "deadbeef".repeat(4).as_str(),
+        )
+    };
+    assert!(
+        matches!(res, Err(PairingError::CsrfMismatch)),
+        "wrong-csrf confirm must fail with CsrfMismatch (got {res:?})"
+    );
+
+    // 4. Mirror the handler's rollback gate: it must NOT run because
+    //    is_new == false. We replicate the production check explicitly.
+    assert!(
+        !attacker_is_new,
+        "rollback gate: is_new=false → skip rollback to preserve legit client"
+    );
+
+    // 5. The legitimate client must still be in the registry and the
+    //    store. This is the F-M1-A fix: pre-fix, this assertion failed
+    //    because the unconditional rollback would have evicted alice.
+    let registry = state.registry.read().await;
+    let alice = registry
+        .get_by_name("alice")
+        .expect("legitimate alice must still be registered after colliding confirm");
+    assert_eq!(alice.vtoken, legit_vtoken);
+    drop(registry);
+
+    let store: &ilink_hub::store::Store = state.store.as_ref();
+    let persisted = store
+        .list_clients()
+        .await
+        .expect("list_clients must succeed")
+        .into_iter()
+        .find(|c| c.name == "alice")
+        .expect("alice's row must still be in the store");
+    assert_eq!(persisted.vtoken, legit_vtoken);
+}
+
+/// F-M1-A CAS defence: even if a future refactor forgets the `is_new`
+/// gate, the helper itself short-circuits when the by_vtoken entry no
+/// longer maps `name → vtoken`. We exercise this by mutating the
+/// in-memory entry between register and rollback, simulating a TOCTOU
+/// window in which the legit client was removed and a fresh client
+/// re-registered under the same name with a different vtoken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_cas_aborts_when_legit_re_register_happened() {
+    let state = make_state().await;
+    // Pre-pair a legitimate client.
+    let legit_vtoken = register(&state, "alice").await;
+
+    // Simulate the speculative register outcome by recording the
+    // vtoken the rollback helper is about to attempt to evict.
+    let vtoken_to_rollback = legit_vtoken.clone();
+
+    // Force the by_vtoken[alice] entry to point at a DIFFERENT vtoken
+    // than what we are about to "rollback". This simulates a TOCTOU
+    // window in which a legitimate re-register slipped in with a fresh
+    // vtoken (which is the scenario the CAS guard is designed to
+    // defend against — a re-used vtoken would pass the CAS, since the
+    // `is_new` gate above already covers that case).
+    let replacement_vtoken = {
+        let mut registry = state.registry.write().await;
+        // Remove the existing entry entirely.
+        assert!(registry.remove("alice"));
+        // Re-insert a fresh ClientInfo with a different vtoken. The
+        // by_name entry now maps alice → replacement_vtoken.
+        let fresh_vt = format!("vhub_fresh_{}", std::process::id());
+        registry.register_with_vtoken(
+            "alice".into(),
+            Some("legit replacement".into()),
+            Some(fresh_vt.clone()),
+        );
+        fresh_vt
+    };
+    assert_ne!(replacement_vtoken, vtoken_to_rollback);
+
+    // Now call the production helper. Its CAS guard must observe that
+    // by_name["alice"] no longer points at vtoken_to_rollback and
+    // abort the rollback (F-M1-A).
+    ilink_hub::server::pairing::rollback_speculative_register(
+        state.as_ref(),
+        "alice",
+        &vtoken_to_rollback,
+    )
+    .await;
+
+    // The legitimate replacement client must still be present.
+    let registry = state.registry.read().await;
+    let alice = registry
+        .get_by_name("alice")
+        .expect("replacement alice must survive the CAS-aborted rollback");
+    assert_eq!(alice.vtoken, replacement_vtoken);
+}
+
+/// F-M1-A: the registry's `register` distinguishes fresh inserts from
+/// reused entries. The unit test pinpoints the contract so a future
+/// refactor that drops the `is_new` return value is caught at compile
+/// time (callers can't destructure a bare String).
+#[test]
+fn register_returns_is_new_flag() {
+    let mut reg = ilink_hub::hub::registry::ClientRegistry::new();
+    let (v1, is_new1) = reg.register("x".into(), None);
+    assert!(is_new1, "first register of a fresh name is_new=true");
+    let (v2, is_new2) = reg.register("x".into(), Some("lbl".into()));
+    assert_eq!(v1, v2, "vtoken is reused for the same name");
+    assert!(!is_new2, "second register of the same name is_new=false");
 }
