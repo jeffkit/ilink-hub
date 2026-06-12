@@ -228,11 +228,22 @@ fn build_pairing_qr_response(code: String) -> GetQrcodeResponse {
 }
 
 async fn create_pairing_qr(state: &HubState) -> GetQrcodeResponse {
-    let code = {
+    let result = {
         let mut pairing = state.pairing.write().await;
         pairing.create()
     };
-    build_pairing_qr_response(code)
+    match result {
+        Ok(code) => build_pairing_qr_response(code),
+        Err(e) => {
+            warn!(error = ?e, "failed to create pairing QR code");
+            GetQrcodeResponse {
+                ret: -1,
+                qrcode: None,
+                qrcode_img_content: None,
+                errmsg: Some(format!("failed to create pairing session: {:?}", e)),
+            }
+        }
+    }
 }
 
 /// `GET /ilink/bot/get_bot_qrcode` — start a Hub pairing session (not WeChat login).
@@ -408,6 +419,10 @@ pub async fn pair_confirm(
         Err(PairingError::AlreadyConfirmed) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": "pairing already confirmed" })),
+        ),
+        Err(PairingError::LimitExceeded) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "limit exceeded" })),
         ),
     }
 }
