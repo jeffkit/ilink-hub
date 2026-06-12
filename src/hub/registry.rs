@@ -54,19 +54,25 @@ impl ClientRegistry {
 
     /// Register a new client, returning its virtual token.
     /// If a client with the same name already exists, its vtoken is reused.
-    pub fn register(&mut self, name: String, label: Option<String>) -> String {
+    /// Returns `(vtoken, is_new)`. `is_new = true` only when this call inserted
+    /// a fresh row; if the name was already registered, the existing entry is
+    /// preserved and `is_new = false`. Callers that need to roll back a
+    /// speculative register MUST honour `is_new`: rolling back a reused
+    /// entry evicts the legitimate client (F-M1-A).
+    pub fn register(&mut self, name: String, label: Option<String>) -> (String, bool) {
         self.register_with_vtoken(name, label, None)
     }
 
     /// Register a client with a specific vtoken (used when loading from DB on startup).
     /// If name already exists, the existing entry is updated; vtoken argument is ignored.
     /// If name is new and vtoken is provided, that vtoken is used; otherwise a fresh one is generated.
+    /// Returns `(vtoken, is_new)` — see `register` for the `is_new` contract.
     pub fn register_with_vtoken(
         &mut self,
         name: String,
         label: Option<String>,
         vtoken: Option<String>,
-    ) -> String {
+    ) -> (String, bool) {
         if let Some(existing_vtoken) = self.by_name.get(&name) {
             let existing_vtoken = existing_vtoken.clone();
             if let Some(info) = self.by_vtoken.get_mut(&existing_vtoken) {
@@ -76,7 +82,7 @@ impl ClientRegistry {
                 info.online = true;
                 info.last_seen = Some(Instant::now());
             }
-            return existing_vtoken;
+            return (existing_vtoken, false);
         }
 
         let mut info = ClientInfo::new(name.clone(), label);
@@ -86,7 +92,7 @@ impl ClientRegistry {
         let vtoken = info.vtoken.clone();
         self.by_name.insert(name, vtoken.clone());
         self.by_vtoken.insert(vtoken.clone(), info);
-        vtoken
+        (vtoken, true)
     }
 
     pub fn get_by_vtoken(&self, vtoken: &str) -> Option<&ClientInfo> {
@@ -194,17 +200,23 @@ mod tests {
     fn registered_count_single_vs_multi() {
         let mut reg = ClientRegistry::new();
         assert_eq!(reg.all_clients().len(), 0);
-        reg.register("a".into(), None);
+        let (v1, is_new1) = reg.register("a".into(), None);
+        assert!(is_new1);
+        assert!(!v1.is_empty());
         assert_eq!(reg.all_clients().len(), 1);
-        reg.register("b".into(), Some("B".into()));
+        let (v2, is_new2) = reg.register("b".into(), Some("B".into()));
+        assert!(is_new2);
+        assert!(!v2.is_empty());
         assert_eq!(reg.all_clients().len(), 2);
     }
 
     #[test]
     fn register_same_name_reuses_vtoken() {
         let mut reg = ClientRegistry::new();
-        let v1 = reg.register("w".into(), None);
-        let v2 = reg.register("w".into(), Some("lbl".into()));
+        let (v1, is_new1) = reg.register("w".into(), None);
+        assert!(is_new1);
+        let (v2, is_new2) = reg.register("w".into(), Some("lbl".into()));
+        assert!(!is_new2, "second register of same name is NOT new");
         assert_eq!(v1, v2);
         assert_eq!(reg.all_clients().len(), 1);
     }
@@ -222,7 +234,7 @@ mod tests {
     #[test]
     fn update_client_renames_and_updates_label() {
         let mut reg = ClientRegistry::new();
-        let vtoken = reg.register("old".into(), Some("old label".into()));
+        let (vtoken, _is_new) = reg.register("old".into(), Some("old label".into()));
         reg.update_client("old", "new", Some("new label".into()))
             .unwrap();
         assert!(reg.get_by_name("old").is_none());

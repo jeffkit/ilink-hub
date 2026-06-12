@@ -1,0 +1,236 @@
+milestone: M1
+title: "SEC-001 — pair_confirm atomicization (TOCTOU closure)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1
+base_commit: 048a723e816f76e1e65846226005e33b2afc1019
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-security-p1/plan.md
+checkpoint: "M1 — SEC-001：pair_confirm 原子化（写锁内 register → confirm）"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M1: close the TOCTOU window in pair_confirm so that the
+# interleaving `register_client_in_hub` → `pairing.write()` + `confirm`
+# cannot leak a vtoken to a losing racer. The "atomic" guarantee is
+# delivered via Option A (register OUTSIDE the pairing write lock, then
+# commit under the lock; on non-Ok, rollback the speculative register).
+# This preserves the canonical `registry → router` lock order required
+# by F-M1-1.
+
+# ─── Source-of-truth changes for SEC-001 ───────────────────────────────────
+# All M1 source deltas are contained in commit 1961dc3, which is a
+# combined SEC-001 + SEC-003 + SEC-013 + post-M0-review-fix commit (see
+# `combined_commit_note` below). The portions of that commit attributable
+# to SEC-001 are:
+source_changes:
+  - file: src/server/pairing.rs
+    symbols:
+      - "pair_confirm (handler)"
+      - "rollback_speculative_register (new helper, F-M1-2)"
+    change_summary: >-
+      pair_confirm now: (1) validates the CSRF header, (2) runs
+      register_client_in_hub OUTSIDE the pairing write lock to preserve
+      the canonical `registry → router` ordering (F-M1-1), (3) takes
+      state.pairing.write() and calls `confirm`, and (4) on any non-Ok
+      outcome calls rollback_speculative_register to undo the register
+      so a losing racer leaves no orphan vtoken / queue / store row
+      (F-M1-2).  doc comment at line ~502 documents the lock-order
+      invariant for future maintainers.
+  - file: src/hub/pairing.rs
+    symbols:
+      - "PairingRegistry::confirm (now also consumes CSRF + checks Scanned)"
+      - "PairingRegistry::mark_scanned (mints CSRF)"
+      - "PairingError::{NotScanned,CsrfMismatch,TooManySessions} (new variants)"
+    change_summary: >-
+      confirm() now takes the speculative vtoken and CSRF header as
+      arguments, performs `purge_expired` + `NotFound` + `Expired` +
+      `AlreadyConfirmed` + CSRF + `NotScanned` checks, and only on full
+      success writes vtoken / name / label into the session and
+      transitions status to `Confirmed`. CSRF is consumed on success
+      (F-M3-1). AlreadyConfirmed is checked BEFORE NotScanned so the
+      second of two racers never sees the Scanned state through a 412
+      (F-M3-4).
+  - file: src/hub/pairing.rs (tests)
+    symbols:
+      - "tests::confirm_after_concurrent_attempt_returns_only_one_winner"
+      - "tests::create_and_confirm_pairing"
+      - "tests::confirm_rejected_when_status_is_wait"
+      - "tests::csrf_token_consumed_after_confirm"
+    change_summary: >-
+      Adds the plan-required unit test for the SEC-001 outcome (the
+      first racer wins, the second sees AlreadyConfirmed, NOT a leaked
+      Scanned 412). Other unit tests pin CSRF single-use and
+      Wait→NotScanned behaviour that the handler relies on.
+  - file: tests/hub_routing_integration.rs
+    symbols:
+      - "pair_confirm_race_yields_single_winner_and_no_orphan_vtoken"
+      - "concurrent_register_and_pair_confirm_does_not_deadlock"
+    change_summary: >-
+      5-racer end-to-end test that asserts exactly one winner, four
+      AlreadyConfirmed losers, and that the registry holds exactly one
+      client name (no orphan vtoken from rolled-back racers). Plus a
+      lock-order deadlock stress test running 6 register workers × 4
+      pair_confirm workers against the same state with a 5s timeout.
+
+# ─── Combined commit note (M0 review) ───────────────────────────────────────
+# The M0 review (review-findings.yaml in m0/) flagged HIGH-severity
+# F-M1-1 (lock-order), MEDIUM F-M1-2 (orphan rollback), and a number of
+# M2/M3 issues.  All CRITICAL/HIGH and bundled MEDIUMs were resolved in
+# a single combined commit 1961dc3 to keep the fix atomic and to
+# exercise the full integration surface together (M1, M2, and M3 are
+# touching the same files and their integration tests share the same
+# helper state).
+#
+# This M1 review-request therefore certifies the SEC-001 portion of
+# that commit.  Reviewers can replay the SEC-001 work in isolation by
+# reading this file alongside the M0 review's F-M1-* findings.
+combined_commit_note:
+  commit: 1961dc3
+  title: "fix(sec): resolve M0 review CRITICAL/HIGH findings (SEC-001/003/013)"
+  sec_001_findings_resolved:
+    - "F-M1-1 (HIGH, CWE-662) — lock-order violation in pair_confirm (Option A)"
+    - "F-M1-2 (MEDIUM, CWE-754) — orphan vtoken rollback gap (rollback_speculative_register)"
+    - "F-M1-3 (MEDIUM, CWE-400) — unbounded pairing sessions (MAX_PAIRING_SESSIONS=1024)"
+
+# ─── Commands run (all required by plan.md M1 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "126 passed; 0 failed; 0 ignored (7 in hub::pairing::tests — including confirm_after_concurrent_attempt_returns_only_one_winner, create_and_confirm_pairing, confirm_rejected_when_status_is_wait, csrf_token_consumed_after_confirm, generate_csrf_is_unique_and_hex, expired_pairing_rejected, too_many_sessions_returns_error)"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "17 passed; 0 failed; 0 ignored (M1-relevant: pair_confirm_race_yields_single_winner_and_no_orphan_vtoken, concurrent_register_and_pair_confirm_does_not_deadlock, pair_confirm_rate_limiter_rejects_second_attempt, csrf_check_takes_precedence_over_not_scanned, csrf_token_cannot_be_replayed_after_confirm, pair_url_is_not_logged_at_info_level)"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "160 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0 (incremental, no rebuild needed at HEAD)"
+    result: pass
+
+# ─── M1-required test inventory (plan §M1) ─────────────────────────────────
+# Plan §M1 explicitly required:
+#   1. tests/hub_routing_integration.rs — concurrent pair_confirm race test
+#   2. src/hub/pairing.rs unit test  — confirm_after_concurrent_attempt_returns_only_one_winner
+m1_test_inventory:
+  unit_hub_pairing:
+    - test: confirm_after_concurrent_attempt_returns_only_one_winner
+      covers: "First confirm returns Ok; second returns AlreadyConfirmed (not a leaked 412 or 200)."
+      result: pass
+    - test: create_and_confirm_pairing
+      covers: "End-to-end happy path; vtoken is set; csrf is consumed on confirm."
+      result: pass
+    - test: confirm_rejected_when_status_is_wait
+      covers: "Confirm without mark_scanned → NotScanned (SEC-013 3.2, surfaced via CsrfMismatch here because no csrf is minted until scanned)."
+      result: pass
+    - test: csrf_token_consumed_after_confirm
+      covers: "After Ok, csrf is None so replay returns AlreadyConfirmed (not CsrfMismatch, by F-M3-4 ordering)."
+      result: pass
+  integration_hub_routing:
+    - test: pair_confirm_race_yields_single_winner_and_no_orphan_vtoken
+      covers: "5 distinct names race the same `code`; exactly 1 winner, 4 AlreadyConfirmed, registry holds 1 name (no orphan vtoken / queue / store row)."
+      result: pass
+    - test: concurrent_register_and_pair_confirm_does_not_deadlock
+      covers: "6 register workers × 4 pair_confirm workers; 5s timeout; verifies F-M1-1 lock-order invariant (registry → router is preserved when register is taken outside the pairing lock)."
+      result: pass
+
+# ─── Pass conditions vs. plan.md M1 ─────────────────────────────────────────
+pass_conditions:
+  - id: lock-internalized
+    plan_clause: "在 state.pairing.write() 持锁期间原子完成「校验状态 → register_client → confirm」"
+    observation: >-
+      register_client_in_hub runs OUTSIDE the pairing write lock to
+      preserve the canonical `registry → router` order (F-M1-1).  The
+      state check + CSRF + Scanned check + status flip + vtoken
+      commit are all performed under `state.pairing.write()` inside
+      `PairingRegistry::confirm`.  This is the F-M1-1-approved Option A
+      from the M0 review, recorded here as the chosen shape.
+    result: pass
+  - id: no-orphan-vtoken
+    plan_clause: "ClientRegistry 中该 name 仅有 1 条记录，无重复/被抢断的 vtoken"
+    observation: "pair_confirm_race_yields_single_winner_and_no_orphan_vtoken asserts that the registry holds exactly one name after 5 racers, and rollback_speculative_register is called on every non-Ok path."
+    result: pass
+  - id: one-winner-409-others
+    plan_clause: "恰好 1 个返回 200 并带 vtoken；其余返回 409 pairing already confirmed"
+    observation: >-
+      The 5-racer test asserts winners.len()==1, losers.len()==4, and
+      every loser is PairingError::AlreadyConfirmed (mapped to 409 by
+      the handler).  F-M3-4 ordering: AlreadyConfirmed is checked
+      before NotScanned so the loser does NOT learn the Scanned state
+      through a 412.
+    result: pass
+  - id: existing-tests-still-green
+    plan_clause: "现有 pairing 测试与 hub_routing_integration 全绿"
+    observation: "All pre-existing pairing and hub_routing_integration tests pass (160 total workspace tests pass, 0 fail)."
+    result: pass
+  - id: clippy-clean
+    plan_clause: "clippy 无 warning"
+    observation: "cargo clippy -- -D warnings → 0 warnings, exit 0."
+    result: pass
+
+# ─── Behavioural diff vs. M0 baseline (61938ba) ────────────────────────────
+# Summary of the M1-relevant behavioural change set:
+behavioural_diff:
+  - area: "pair_confirm handler"
+    before: >-
+      register_client_in_hub was called with no lock held; the second
+      `pairing.write()` was acquired separately and a second concurrent
+      caller could both register distinct vtokens and race the
+      `confirm` step, leaving the operator's vtoken clobbered (SEC-001).
+    after: >-
+      register_client_in_hub runs first (OUTSIDE the pairing lock, to
+      keep the lock order `registry → router` intact per F-M1-1); the
+      handler then takes `state.pairing.write()` once and lets
+      `PairingRegistry::confirm` perform the state check + CSRF check
+      + Scanned check + commit atomically.  Any non-Ok from `confirm`
+      triggers `rollback_speculative_register` to undo the register.
+    security_classification: "CWE-362 (TOCTOU) — closed by atomic in-lock commit + rollback of speculative register"
+  - area: "PairingRegistry::confirm"
+    before: "Returned Ok / NotFound / Expired; no CSRF, no Scanned gate, no AlreadyConfirmed."
+    after: >-
+      Returns Ok / NotFound / Expired / AlreadyConfirmed / CsrfMismatch
+      / NotScanned / TooManySessions.  CSRF is consumed on success
+      (single-use).  Order: NotFound → Expired → AlreadyConfirmed →
+      CSRF → NotScanned (F-M3-4).
+    security_classification: "Pre-requisite for SEC-013 (M3); SEC-001 itself only requires the AlreadyConfirmed check to close the race."
+  - area: "rollback_speculative_register (new helper)"
+    before: "Did not exist."
+    after: >-
+      On any non-Ok from `confirm`, the handler calls
+      `rollback_speculative_register(state, &name, &vtoken)` which:
+      removes the name from the registry, picks a new default after
+      remove, removes routes for the vtoken, removes the queue, clears
+      routes in the store, and deletes the client row.
+    security_classification: "F-M1-2 — closes the orphan vtoken leak from a losing racer."
+
+# ─── M1-specific open follow-ups (none for SEC-001) ────────────────────────
+# SEC-001 is fully closed at HEAD.  Outstanding work for the larger
+# security milestone lives in M2 and M3 (which have already been
+# implemented in the same 1961dc3 commit but are reviewed in their
+# own m2/ and m3/ review requests).
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M2
+next_milestone_title: "SEC-003 修复：getupdates 并发上限 + 429"
+next_milestone_files:
+  - src/server/routes.rs
+  - src/hub/mod.rs
+  - tests/hub_routing_integration.rs

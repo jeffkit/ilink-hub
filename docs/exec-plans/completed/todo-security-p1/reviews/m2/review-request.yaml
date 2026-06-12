@@ -1,0 +1,275 @@
+milestone: M2
+title: "SEC-003 — getupdates concurrent-poll cap + HTTP 429"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1
+base_commit: 2d2370b96fe7ca15b04f38f60ba8556518599c63
+# base_commit is the head of the branch BEFORE the M2 fix commit;
+# `verifying_commit` is filled in by implement.md after the M2 commit
+# is created.
+verifying_commit: pending
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-security-p1/plan.md
+checkpoint: "M2 — SEC-003：getupdates 并发上限 + 429"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2: a single vtoken must NOT be able to exhaust Hub
+# resources by holding an unbounded number of concurrent getupdates
+# long-polls. The fix:
+#   1. Introduces `pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3`
+#      in src/hub/mod.rs.
+#   2. Re-orders getupdates so `state.poll_tracker.enter(&vtoken)` is
+#      called BEFORE `registry.mark_seen`. When `count > MAX` the
+#      guard is dropped (decrement via Drop) and the handler returns
+#      HTTP 429 with body `{ret: 429, errmsg: "too many concurrent
+#      polls for this vtoken"}` — it does NOT enter
+#      `wait_notify_or_shutdown`.
+#   3. Tightens the split-brain warn so it only fires for the legal-
+#      but-suspicious `1 < count <= MAX` window (anything strictly
+#      above MAX is already rejected by the 429 gate).
+#
+# F-M2-2 (poisoned-mutex panic-safety) is preserved: PollTracker::enter
+# still returns (count=0, guard) on a poisoned counts mutex, so the
+# 429 gate degrades gracefully (falls through to the over-cap path
+# with count=0 — no panic).
+
+# ─── Source-of-truth changes for SEC-003 ───────────────────────────────────
+source_changes:
+  - file: src/hub/mod.rs
+    symbols:
+      - "pub const MAX_CONCURRENT_POLLS_PER_VTOKEN"
+      - "tests::poll_tracker_caps_concurrent (new unit test)"
+    change_summary: >-
+      Adds the cap constant (default 3) with a doc comment explaining
+      the split-brain motivation and the operator-alert threshold.
+      Adds the `poll_tracker_caps_concurrent` unit test which holds
+      MAX guards, then verifies that the (MAX+1)th enter observes
+      `count == MAX+1` (the boundary the handler gates on), and that
+      after dropping the over-cap guard the next enter recovers to
+      MAX+1 (proving no permanent counter inflation).
+  - file: src/server/routes.rs
+    symbols:
+      - "getupdates (handler)"
+    change_summary: >-
+      Re-orders the handler so the per-vtoken concurrent-poll gate
+      runs FIRST (after Authorization extraction). On `count >
+      MAX_CONCURRENT_POLLS_PER_VTOKEN` the guard is dropped
+      (releasing the increment via PollGuard::Drop) and the handler
+      returns `StatusCode::TOO_MANY_REQUESTS` with body
+      `{ret: Some(429), errmsg: "too many concurrent polls for this
+      vtoken", msgs: None, get_updates_buf: None}` and a `warn!` log
+      carrying the redacted vtoken, the current count, and the cap.
+      Only on passing the gate does the existing split-brain warn
+      fire (now restricted to `concurrent_polls > 1` since over-cap
+      is already rejected). The downstream registry-lock +
+      mark_seen + wait_notify flow is unchanged.
+  - file: tests/hub_routing_integration.rs
+    symbols:
+      - "getupdates_returns_429_when_polls_exceed_cap (new integration test)"
+    change_summary: >-
+      End-to-end test through the real axum handler: (1) registers
+      a vtoken, (2) holds the shutdown sender alive (so the
+      long-polls actually block for the full timeout), (3) spawns
+      MAX concurrent getupdates calls with `timeout: 1`, (4) waits
+      for the tracker to observe MAX active entries, (5) issues a
+      4th getupdates wrapped in a 2-second timeout and asserts the
+      status is 429, the body carries `ret=429` and the documented
+      errmsg, and the request did NOT enter wait_notify
+      (elapsed < 2s). After the in-budget polls finish, a recovery
+      call must succeed (200, ret=0), proving the guard-drop
+      decrement is correct.
+
+# ─── F-M2-* (M0 review) alignment ───────────────────────────────────────────
+# M0 review already produced F-M2-1 (registry read/write collapse,
+# resolved in the combined 1961dc3 commit) and F-M2-2 (poisoned
+# PollTracker mutex panic-safety, also resolved in 1961dc3). This
+# M2 review certifies the NEW plan §M2 work — the cap + 429 gate —
+# which was NOT part of the 1961dc3 commit.
+m0_review_finding_alignment:
+  - finding: F-M2-1 (HIGH, CWE-662)
+    resolution: "Resolved in 1961dc3 (registry read+write collapsed into one write guard). No further action in M2."
+  - finding: F-M2-2 (MEDIUM, CWE-754)
+    resolution: "Resolved in 1961dc3 (PollTracker::enter and PollGuard::Drop use let-Ok on the counts mutex; do not panic on poisoning). The 429 gate built in M2 inherits the same poison-safe behaviour."
+
+# ─── Commands run (all required by plan.md M2 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: clippy_workspace_all
+    cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "131 passed; 0 failed; 0 ignored (includes new tests::poll_tracker_caps_concurrent; hub::pairing::tests still 7 pass)"
+      breaking_changes: "9 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "21 passed; 0 failed; 0 ignored (M2-relevant: getupdates_returns_429_when_polls_exceed_cap + the F-M2-1 / F-M2-2 / F-M2 poison-safety tests carried over from 1961dc3)"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "171 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M2-required test inventory (plan §M2) ─────────────────────────────────
+# Plan §M2 explicitly required:
+#   1. src/hub/mod.rs — poll_tracker_caps_concurrent unit test
+#   2. tests/hub_routing_integration.rs — getupdates_returns_429_when_polls_exceed_cap
+m2_test_inventory:
+  unit_hub_mod:
+    - test: poll_tracker_caps_concurrent
+      covers: >-
+        Holds MAX guards, then verifies the (MAX+1)th enter reports
+        `count == MAX+1 > MAX_CONCURRENT_POLLS_PER_VTOKEN` — this is
+        the boundary the 429 gate uses. After dropping the over-cap
+        guard, the next enter recovers to MAX+1, proving the
+        Drop-based decrement works end-to-end.
+      result: pass
+  integration_hub_routing:
+    - test: getupdates_returns_429_when_polls_exceed_cap
+      covers: >-
+        End-to-end through the real getupdates handler: spawns MAX
+        long-polls, waits for the tracker to observe MAX active
+        entries, sends a 4th call wrapped in a 2s timeout, asserts
+        429 + ret=429 + the documented errmsg + elapsed < 2s. After
+        the in-budget polls finish, a recovery call returns 200
+        with ret=0 (proves the tracker counter is correctly
+        decremented when a guard drops).
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: constant-defined
+    plan_clause: "pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3"
+    observation: >-
+      `pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3;` is
+      declared at the top of src/hub/mod.rs (in the new
+      "Concurrency limits" section, immediately after the `pub use
+      ilink_status as IlinkStatus;` re-export). Documented with a
+      doc-comment explaining the split-brain motivation and why the
+      cap is intentionally small.
+    result: pass
+  - id: gate-runs-first
+    plan_clause: "在 routes.rs::getupdates 中、注册 mark_seen 之前先调 state.poll_tracker.enter(&vtoken)"
+    observation: >-
+      The new handler flow is: (1) extract_vtoken, (2)
+      `state.poll_tracker.enter(&vtoken)`, (3) over-cap → drop guard
+      + return 429, (4) split-brain warn (gated on `>1` only), (5)
+      registry write guard + mark_seen, (6) wait_notify_or_shutdown.
+      This strictly orders the gate BEFORE the registry work as
+      required.
+    result: pass
+  - id: over-cap-rejection
+    plan_clause: "若 count > MAX_CONCURRENT_POLLS_PER_VTOKEN：丢弃 guard、返回 StatusCode::TOO_MANY_REQUESTS + JSON"
+    observation: >-
+      The new branch in getupdates:
+      - drops `poll_guard` (releasing the increment via Drop so the
+        counter returns to MAX, not MAX+1);
+      - returns `(StatusCode::TOO_MANY_REQUESTS, Json(GetUpdatesResponse { ret: Some(429), errmsg: Some("too many concurrent polls for this vtoken"), msgs: None, get_updates_buf: None, .. }))`;
+      - emits a `warn!` carrying the redacted vtoken, the current
+        count, and the cap;
+      - does NOT enter `wait_notify_or_shutdown` (asserted by the
+        2-second tokio timeout in the integration test — the call
+        returns well under that bound).
+    result: pass
+  - id: split-brain-warn-tightened
+    plan_clause: "把 >1 那个 split-brain warn 改成 >1 && <= MAX"
+    observation: >-
+      The split-brain warn is now an `if concurrent_polls > 1` block
+      placed AFTER the over-cap return. Anything strictly above MAX
+      is already rejected by the 429 gate before this point, so the
+      warn is observed only in the `1 < n <= MAX` range. The
+      message is unchanged (split-brain is still a configuration
+      problem worth surfacing in operator logs).
+    result: pass
+  - id: existing-tests-still-green
+    plan_clause: "既有的 split-brain warn 行为不退化（并发 2 的场景仍会 warn）"
+    observation: >-
+      The 2-racer split-brain warn path is unchanged: two concurrent
+      polls for the same vtoken produce `concurrent_polls == 2` and
+      the warn still fires. Verified by inspecting the new branch
+      (the warn is gated on `> 1` only, and MAX=3 is strictly
+      greater than 2). The M1 integration test
+      `pair_confirm_race_yields_single_winner_and_no_orphan_vtoken`
+      and the deadlock test still pass; the F-M2-1 / F-M2-2 / poison-
+      safety tests still pass.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "clippy 无 warning"
+    observation: >-
+      `cargo clippy -- -D warnings` → 0 warnings, exit 0.
+      `cargo clippy --workspace --all-targets -- -D warnings` → 0
+      warnings, exit 0.
+    result: pass
+
+# ─── Behavioural diff vs. M1 (commit 2d2370b) ──────────────────────────────
+behavioural_diff:
+  - area: "getupdates handler (over-cap path)"
+    before: >-
+      PollTracker::enter was called AFTER mark_seen, and the
+      `concurrent_polls > 1` warn was a non-blocking advisory. A
+      vtoken that opened N concurrent getupdates long-polls would
+      occupy N Tokio worker slots and N queue-notify slots
+      indefinitely; the Hub had no per-vtoken upper bound on the
+      number of long-polls, so a single misconfigured or malicious
+      vtoken could exhaust worker resources (SEC-003 / CWE-400).
+    after: >-
+      PollTracker::enter is called FIRST. The handler returns
+      HTTP 429 with `ret: 429` and errmsg "too many concurrent
+      polls for this vtoken" when the count exceeds
+      `MAX_CONCURRENT_POLLS_PER_VTOKEN` (default 3). The guard is
+      dropped before the response, so the counter is decremented
+      and the in-budget polls are not affected. The handler does
+      NOT enter `wait_notify_or_shutdown` in the over-cap path.
+    security_classification: "CWE-400 (uncontrolled resource consumption) — closed by per-vtoken cap + 429"
+  - area: "split-brain warn"
+    before: "Fired for any `concurrent_polls > 1`."
+    after: >-
+      Still fires for `concurrent_polls > 1`, but is now strictly
+      in the legal-but-suspicious window because the 429 gate
+      above has already returned for any `count > MAX`. Behaviour
+      is unchanged for the documented split-brain case (two
+      bridges sharing one credential), which is exactly the
+      configuration problem the warn is meant to surface.
+    security_classification: "no change in security posture; observability preserved for the <= MAX window"
+  - area: "PollTracker::enter (unchanged shape, new constant exposed)"
+    before: "Returned (count, PollGuard); nothing referenced a cap."
+    after: >-
+      Same return type and same poison-safe (let-Ok) behaviour
+      (F-M2-2). The new constant lives in the hub module and is
+      used by the handler to compute the over-cap boundary.
+    security_classification: "no behavioural change to PollTracker itself"
+
+# ─── M2-specific open follow-ups (none) ────────────────────────────────────
+# SEC-003 is fully closed at HEAD. Outstanding work for the larger
+# security milestone lives in M3 (SEC-013: CSRF + Scanned state gate
+# + log demotion) — already implemented in 1961dc3 and reviewed in
+# reviews/m3/review-request.yaml.
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "SEC-013 修复：pair_confirm 认证三件套 (Scanned 状态门 + CSRF + 日志降级)"
+next_milestone_files:
+  - src/server/pairing.rs
+  - src/server/pair.html
+  - src/hub/pairing.rs
+  - tests/hub_routing_integration.rs

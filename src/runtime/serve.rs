@@ -141,15 +141,18 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     }
     info!(%addr, "iLink Hub listening");
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            while !*shutdown_rx.borrow() {
-                if shutdown_rx.changed().await.is_err() {
-                    break;
-                }
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        while !*shutdown_rx.borrow() {
+            if shutdown_rx.changed().await.is_err() {
+                break;
             }
-        })
-        .await?;
+        }
+    })
+    .await?;
 
     info!("iLink Hub stopped");
     Ok(())

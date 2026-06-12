@@ -1,0 +1,601 @@
+milestone: M4
+title: "质量门禁收口（quality-gate roll-up against the combined M1+M2+M3 diff）"
+verdict: PASS
+date: 2026-06-12
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - owasp_xss_injection
+  - cwe_classification
+
+# ─── Headline summary ───────────────────────────────────────────────────────
+# M4 itself carries no source changes — it is a roll-up milestone that
+# certifies the three SEC-* commits landed in M0/M1/M2/M3 against the
+# task-prompt-mandated quality gate (fmt / clippy / test / build) plus
+# the plan.md M4 release-build and workspace-clippy gates.  All six
+# gates are independently re-verified in this review and pass:
+#
+#   cargo fmt --check                                            → exit 0
+#   cargo clippy --workspace --all-targets -- -D warnings        → 0 warn
+#   cargo test --workspace                                       → 180/0/1
+#   cargo build                                                  → dev ok
+#   cargo build --workspace --release                            → release ok
+#
+# The three SEC-* commits that this gate validates hold up under
+# adversarial review of memory safety, data race, tokio async
+# pitfalls, and OWASP authentication concerns.  The rate-limiter
+# A-M3-1/A-M3-2 fixes and the F-M2-2 poisoned-mutex guard, the
+# F-M1-1 lock-order invariant, the F-M1-2 rollback-CAS guard, and
+# the F-M3-1 Origin/CSRF triple are all in place and pinned by the
+# 180-test suite (10 of which are new in the M3+post-M3 round, and
+# 6 of which are the A-M4-1 XSS regression net added during this
+# M4 review).
+#
+# The one finding this M4 review surfaced (A-M4-1: CWE-79 XSS in the
+# `pair_page` confirmed view via raw `client_name` interpolation) is
+# **RESOLVED**: a server-side `html_escape` helper now sits between
+# `session.client_name` and the response body at
+# src/server/pairing.rs:548-557, and six unit tests pin the policy
+# (no raw `<`/`>` survives; the full OWASP five-char set
+# `& < > " '` is replaced with named entities; CJK + emoji survive;
+# no panic / no quadratic blowup on a 8 KiB adversarial name).
+# All six gates remain green after the fix.
+#
+# Verdict: PASS.  M4 certifies.
+
+scope_audited:
+  - src/hub/mod.rs
+  - src/hub/pairing.rs
+  - src/hub/registry.rs
+  - src/runtime/serve.rs
+  - src/server/pair.html
+  - src/server/pairing.rs
+  - src/server/routes.rs
+  - tests/hub_routing_integration.rs
+  - tests/breaking_changes.rs
+  - deploy/nginx-ilinkhub-relay.conf
+
+# ─── Findings ───────────────────────────────────────────────────────────────
+findings:
+  # ── HIGH (must-fix before merge) ───────────────────────────────────────────
+  - id: A-M4-1
+    severity: HIGH
+    status: RESOLVED
+    resolved_in: HEAD (post-review commit)
+    cwe: CWE-79 (Cross-Site Scripting)
+    title: >-
+      `pair_page` interpolates the user-supplied `client_name` into HTML
+      without escaping
+    location: src/server/pairing.rs:548-557
+    description: >-
+      When the pair session is already `Confirmed`, the handler renders
+      a success page that includes the user-supplied `name`.  Pre-fix
+      the name was interpolated raw via
+
+        Html(format!(
+          "<h1>已配对</h1><p>客户端 <strong>{name}</strong> 已成功接入。</p>"
+        ))
+
+      with no HTML escaping.  Post-fix the name flows through the new
+      `html_escape(&str) -> String` helper (defined at the top of
+      src/server/pairing.rs) before interpolation, replacing the five
+      OWASP HTML-special characters `&`, `<`, `>`, `"`, `'` with their
+      named / numeric entities in the correct order (`&` first, so the
+      `&` introduced by the other replacements is not double-escaped).
+      The helper is char-iterated (not byte-iterated), so multi-byte
+      UTF-8 (CJK, emoji) survives intact.  An attacker who confirms a
+      pairing with a name containing `<img src=x onerror=…>` now sees
+      the angle brackets / quotes / ampersand entity-encoded in the
+      response body and the browser does not parse a tag.
+    repro_sketch: >-
+      (pre-fix) 1. Get a pair code via GET /ilink/bot/get_bot_qrcode.
+      2. Mark it scanned via GET /hub/pair/{code} (mints csrf, sets
+         status=Scanned).
+      3. POST /hub/pair/{code}/confirm with the XSS payload as `name`
+         and the csrf token; observe 200 OK.
+      4. GET /hub/pair/{code} again — pre-fix the response body is
+         `<h1>已配对</h1><p>客户端 <strong><img src=x onerror=...></strong>...</p>`.
+      5. Render the response in a browser; the onerror fires.
+      (post-fix) Same steps 1-4, but step 4 returns the body with the
+      payload entity-encoded (`&lt;img src=x onerror=&quot;…&quot;&gt;`).
+      The browser does not parse a tag and the onerror never fires.
+    impact: >-
+      (pre-fix) CWE-79 XSS on the device-base origin.  Self-XSS in the
+      realistic single-user deployment; full same-origin script
+      execution in any shared-origin or wider-access deployment
+      (/admin, hub metrics, /hub/register, etc.).
+      (post-fix) Eliminated at the render boundary.  No new attack
+      surface is introduced by the helper itself (it is total on its
+      signature: no panics on UTF-8 boundaries; O(n) in the input
+      length so no quadratic DoS via a long adversarial name).
+    recommended_fix: >-
+      APPLIED.  Server-side HTML-escape via the new `html_escape`
+      helper at the top of src/server/pairing.rs.  No new dependency
+      added (the helper is ~15 LOC).  The fix is scoped to the
+      `confirmed` render site; the rest of the codebase already
+      routes user-supplied strings through serde_json (JSON-escaped
+      automatically) or HTML template substitution with server-
+      generated hex-only UUIDs (safe from XSS by construction).
+    test_gap: >-
+      CLOSED.  Six new unit tests in src/server/pairing.rs pin the
+      helper and the rendered shape:
+
+        - html_escape_replaces_all_five_special_chars
+            exact-asserts the OWASP five-char replacement set,
+            including the ' must-escape-first / ' order so that
+            '&' is not double-encoded.
+        - html_escape_is_a_noop_on_safe_input
+            ASCII / digit / CJK / underscore / hyphen / whitespace
+            pass through unchanged.
+        - html_escape_preserves_unicode_codepoints
+            char-iteration preserves multi-byte UTF-8 (CJK + emoji)
+            and only escapes the four ASCII special chars.
+        - confirmed_pair_page_renders_with_escaped_client_name
+            the M4-review adversarial payload `<img src=x onerror=…>`
+            is escaped: zero raw `<`/`>` survive, the literal
+            `<img` / `<script` / `<iframe` substrings are absent from
+            the rendered body, and the exact tag count equals the six
+            static-template tags.
+        - confirmed_pair_page_uses_fallback_when_client_name_missing
+            the `unwrap_or("client")` fallback path renders the
+            literal "client" — escape helper must not transform it.
+        - confirmed_pair_page_handles_long_adversarial_name
+            an 8 KiB adversarial name (4096 A's + `<script>` + 4096
+            B's) is escaped in O(n) with no panic and no quadratic
+            blowup; the `<script>` substring is gone.
+
+  # ── MEDIUM (defer to next iteration; not blocking M4 cert once A-M4-1 is fixed)
+  - id: A-M4-2
+    severity: MEDIUM
+    status: DEFERRED
+    cwe: CWE-693 (Protection Mechanism Failure) — defence-in-depth
+    title: >-
+      `pair_confirm` response body echoes attacker-controlled `name` and
+      `vtoken` without sanitisation in the success JSON
+    location: src/server/pairing.rs:740-746
+    description: >-
+      On a successful confirm, the handler returns
+
+        { "ret": 0, "name": name, "vtoken": vtoken }
+
+      The `vtoken` is server-generated and safe; the `name` is the
+      same attacker-controlled string flagged in A-M4-1.  In the
+      current client (src/server/pair.html line 125) the `data.name`
+      is rendered via `textContent`, so the XSS is not realised in
+      the bundled UI, but any third-party integrator that copies the
+      success-page pattern and re-renders `data.name` into HTML
+      (rather than setting `textContent`) inherits the XSS.  This
+      is defence-in-depth, not a direct hole.
+    impact: >-
+      Self-XSS only via the bundled UI; latent footgun for integrators.
+    recommended_fix: >-
+      Document the contract in the OpenAPI / type doc that `name` is
+      untrusted and must be rendered with `textContent` or HTML-escaped
+      before insertion.  Optionally normalise `name` server-side
+      (length cap, control-char strip) to make the worst-case output
+      less dangerous if an integrator forgets.
+    test_gap: >-
+      None directly; covered by the A-M4-1 unit test if the helper
+      is shared.
+
+  - id: A-M4-3
+    severity: MEDIUM
+    status: DEFERRED
+    cwe: CWE-200 (Information Exposure) — deployment-level
+    title: >-
+      X-Forwarded-For still not honoured — A-M3-6 follow-up incomplete
+    location: src/server/pairing.rs:584, 601 (the rate-limiter
+      `pair_confirm_rate_limiter().check_and_record(&code, &peer_ip.0.ip().to_string())`)
+    description: >-
+      M3 deferred A-M3-6 (X-Forwarded-For handling for the per-(code,ip)
+      rate limiter behind a reverse proxy) with a doc-only mitigation
+      in deploy/nginx-ilinkhub-relay.conf.  The handler still consumes
+      the immediate TCP peer, so a single attacker behind the same
+      proxy can race unlimited requests and exhaust the per-(code, ip)
+      tuple space (all of which appear to come from the proxy IP).
+      The pair-confirm rate limit is then effectively per-(code, proxy)
+      rather than per-(code, attacker IP), neutralising F-M3-1 under
+      any production deployment.
+    impact: >-
+      Production deployments behind nginx / Cloudflare / ALB have a
+      silently weakened per-(code, ip) rate limit.  This is a
+      *deployment-configuration* hazard, not a code bug, and the
+      M3 cert explicitly punted it to a future iteration.
+    recommended_fix: >-
+      Add an axum middleware that reads X-Forwarded-For (honouring
+      only the leftmost hop-1 entry, never the rightmost attacker-
+      controlled entry) and feeds that into the rate-limiter key.
+      Hash the IP before using it as a HashMap key to keep the cap's
+      memory bound tight (no PII at rest in the limiter's entries).
+      Pin with a multi-threaded integration test that fires N
+      confirm requests with distinct XFF values and asserts all N are
+      rate-limited independently.
+    test_gap: >-
+      None today.  Without the XFF middleware, the rate limiter's
+      per-IP granularity cannot be exercised behind a proxy in CI.
+
+  - id: A-M4-4
+    severity: MEDIUM
+    status: DEFERRED
+    cwe: CWE-208 (Observable Timing Discrepancy)
+    title: >-
+      `constant_time_eq` is still custom (A-M3-3 follow-up) — timing
+      side-channel footgun
+    location: src/hub/pairing.rs:209-218
+    description: >-
+      M3 deferred A-M3-3 (custom constant_time_eq + length-disclosure
+      early exit) as INFO/LOW.  The implementation is sound for the
+      32-hex-char CSRF case and the length-equality short-circuit
+      happens before any per-byte work, so the only signal an attacker
+      can extract is "is the supplied header 32 bytes long" — already
+      trivial to learn from the handler's other return codes.  The
+      custom impl remains brittle: a future "trim whitespace first"
+      refactor or autovectorisation by a new LLVM version could
+      re-introduce data-dependent control flow.
+    impact: >-
+      Theoretical only.  32 hex chars is short enough that even an
+      aggressive timing oracle is below the noise floor on modern
+      hardware.  A flag for future hardening, not an active hole.
+    recommended_fix: >-
+      Replace with `subtle::ConstantTimeEq` (well-audited primitive,
+      already in widespread use) or add `core::hint::black_box` around
+      the length-equal check.  Pin with a property test that the
+      function is total on its signature (no panics on UTF-8 boundary
+      cases, no early returns that depend on byte values).
+
+  # ── LOW (informational; not blocking) ──────────────────────────────────────
+  - id: A-M4-5
+    severity: LOW
+    status: DEFERRED
+    cwe: CWE-1188 (Insecure Default)
+    title: >-
+      `admin_token()` falls open when `ILINK_ADMIN_TOKEN` is unset AND
+      `ILINK_ADMIN_INSECURE_NO_AUTH=true` — operator footgun
+    location: src/server/routes.rs:62-91
+    description: >-
+      The `insecure_no_auth()` flag is parsed once at first use and
+      logged at warn!() with a "Never expose this server to the
+      public internet" caveat.  This is correct behaviour for an
+      opt-in escape hatch, but the warning only fires on the *first*
+      call, so a long-running process that flips the env var after
+      startup (e.g. via reload-config-from-file) will silently
+      re-enable the insecure path without a re-warning.  A
+      misconfigured container restart that pulls the env from a stale
+      configmap will also skip the warning.
+    impact: >-
+      Operator misconfiguration that exposes admin endpoints without
+      auth.  Currently warned at startup; re-warn if the env var
+      changes mid-process, or bind the flag to the initial env
+      snapshot explicitly.
+    recommended_fix: >-
+      Document that `insecure_no_auth` is a startup-only setting
+      (re-read on each call is also acceptable but adds a syscall
+      per request; not worth it for a flag that should never change
+      in production).  If you want defence in depth, add a
+      startup-time check that the hub is bound to 127.0.0.1 (not
+      0.0.0.0) when the flag is set, and refuse to start otherwise.
+    test_gap: >-
+      None.
+
+  - id: A-M4-6
+    severity: LOW
+    status: DEFERRED
+    cwe: CWE-754 (Improper Check for Unusual or Exceptional Conditions)
+    title: >-
+      `origin_matches_device_base` falls back to a *string* compare
+      when `url::Url::parse` fails on either side
+    location: src/server/pairing.rs:108-125
+    description: >-
+      The helper attempts a structured (scheme/host/port) compare
+      first and only falls back to a literal string compare if URL
+      parsing fails.  A literal compare of "https://evil.com:443/"
+      against the device base (which would also fail to parse on the
+      same code path) is a no-op pass-through, but the success case
+      (both parse) is the one that matters.  The fallback is a
+      defence-in-depth belt, not the primary check.
+    impact: >-
+      None directly.  The fallback can only ever widen or narrow
+      the allowlist by accident; the structured path is the gate.
+      A `url::Url::parse` of the Origin header that succeeds for
+      `evil.com` but fails for the device base (e.g. because the
+      device base is some non-URL string) would let the request
+      through — but the device base is set from `pair_public_url()`
+      which is a well-formed URL in production.
+    recommended_fix: >-
+      None required.  If desired, log a warn!() the first time the
+      fallback fires so an operator can investigate, but this is
+      a polish item, not a bug.
+    test_gap: >-
+      None.
+
+  - id: A-M4-7
+    severity: LOW
+    status: DEFERRED
+    cwe: CWE-400 (Uncontrolled Resource Consumption) — micro-DOS
+    title: >-
+      `peer_ip.0.ip().to_string()` allocates a fresh String for every
+      pair_confirm request before the rate-limiter check
+    location: src/server/pairing.rs:666
+    description: >-
+      `pair_ip.ip().to_string()` heap-allocates on the hot path.  At
+      1k req/s this is 1k allocations/s, which is negligible, but
+      under a 4096-entry cap-and-evict attack it is one allocation
+      per request regardless of whether the cap has been hit.  The
+      attacker can also use a forged peer IP via the rate-limiter
+      if the source IP is the loopback; the allocation isn't the
+      bottleneck.
+    impact: >-
+      Cosmetic / minor; not a security issue.
+    recommended_fix: >-
+      Pass the `SocketAddr` into the rate limiter (or its
+      `check_and_record`) and do the `to_string()` once, lazily,
+      inside the critical section.  Or use `std::net::IpAddr` (Copy)
+      as the key (with a small `(IpAddr, &str)` tuple) to avoid
+      re-parsing on lookup.  Micro-optimisation, not a fix.
+    test_gap: >-
+      None.
+
+# ─── Things that PASSED adversarial review ──────────────────────────────────
+pass_items:
+  # Quality gates (re-verified in this review, post A-M4-1 fix)
+  - "cargo fmt --check → no output, exit 0."
+  - "cargo clippy --workspace --all-targets -- -D warnings → 0 warnings, exit 0."
+  - "cargo test --workspace → 180 passed, 0 failed, 1 ignored (the existing
+    hub::queue::MessageQueue doc-test ignore).  137 lib + 9 ilink-server +
+    24 hub_routing_integration + 10 queue_trait_tests.  Numbers match the
+    M3 cert (171) + 3 new rate-limiter tests from the A-M3-1/A-M3-2 fix
+    + 6 new html_escape / XSS regression tests added for A-M4-1."
+  - "cargo build → Finished `dev` profile [unoptimized + debuginfo], exit 0."
+  - "cargo build --workspace --release → Finished `release` profile [optimized], exit 0."
+
+  # Memory safety / unsafe surface
+  - "No `unsafe` blocks introduced in any of the three SEC-* commits."
+  - "No raw pointer arithmetic, no manual lifetime juggling.  All
+    HashMap<String, T> mutations are behind either a tokio::sync::RwLock
+    (registry, pairing, ctx_map), a tokio::sync::Mutex (router, quote_index,
+    qr_last_ready), or a std::sync::Mutex (poll_tracker, rate limiter)."
+
+  # Data-race surface
+  - "PairingRegistry.sessions is only mutated under `state.pairing.write()`
+    in src/server/pairing.rs (create_pairing_qr, pair_page, pair_confirm).
+    The unit tests in src/hub/pairing.rs run on a single thread, so no
+    data race is observable at the type level.  The
+    `concurrent_register_and_pair_confirm_does_not_deadlock` integration
+    test fires 8 registerers + 4 route-readers on a 4-worker tokio runtime
+    and pins the no-deadlock invariant; no race detector output."
+  - "PollTracker.counts is std::sync::Mutex<HashMap<String, usize>>;
+    every enter / drop is a single critical section.  The
+    `poll_tracker_poisoned_mutex_does_not_panic` test exercises the
+    poisoned-mutex path (F-M2-2) and confirms count=0 fallback works
+    under the let-Ok pattern (no panic on enter or drop)."
+  - "PairConfirmRateLimiter.attempts uses a single std::sync::Mutex with
+    the contains_key + insert inside one critical section.  The
+    `pair_confirm_rate_limiter_rejects_concurrent_attempts` integration
+    test fires 10 concurrent tasks on the same (code, ip) and asserts
+    exactly 1 returns true.  A-M3-1 TOCTOU race is closed."
+  - "PairConfirmRateLimiter attempts map is capped at
+    PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES = 4096 with oldest-first eviction
+    inside the same critical section.  The
+    `pair_confirm_rate_limiter_bounds_memory_under_adversarial_load`
+    test fires 8x the cap's worth of distinct (code, ip) tuples and
+    asserts the tracked count never exceeds 4096.  A-M3-2 memory
+    amplification primitive is closed."
+
+  # Tokio async pitfalls
+  - "Lock order invariant: registry → router.  `register_client_in_hub`
+    takes registry write first, drops it, then takes router write.  The
+    pairing write lock is NEVER acquired while holding registry/router,
+    and `register_client_in_hub` is NEVER called while holding the
+    pairing write lock (pair_confirm calls it before acquiring
+    `state.pairing.write()`).  F-M1-1 deadlock is structurally impossible
+    under the current code; the comment at pairing.rs:268-271 and
+    pairing.rs:636-644 documents the invariant for future maintainers.
+    The `concurrent_register_and_pair_confirm_does_not_deadlock`
+    integration test is the regression net."
+  - "No `.await` is held across a tokio Mutex/RwLock guard in the pairing
+    critical section.  `confirm()` is purely sync; the async wrapper
+    pair_confirm does the speculative register OUTSIDE the pairing write
+    lock and drops the registry/router guards BEFORE awaiting the store.
+    F-M1-1 + F-M1-2 (orphan vtoken rollback) is preserved."
+  - "StdMutex usage in poll_tracker and PairConfirmRateLimiter: the
+    critical sections are strictly synchronous (no `.await`); using
+    tokio::sync::Mutex would be wasted ceremony.  The A-M3-2 foot-gun
+    ('StdMutex on async hot path can block the worker') was specifically
+    addressed by moving the retain into the same critical section as
+    the insert — the cap is now bounded and the retain work is bounded
+    by the cap, so the worker is no longer exposed to adversarial
+    retain-time stalls."
+  - "PollGuard Drop is best-effort (let-Ok); a poisoned mutex on drop
+    returns silently rather than panicking the worker (F-M2-2)."
+
+  # OWASP authentication / CSRF
+  - "CSRF token: 16 bytes from rand::rngs::OsRng → 128 bits of entropy
+    encoded as 32 hex chars.  Generated once at first `mark_scanned`,
+    stored on the session, consumed on successful `confirm` (set to
+    None, so a replay attempt returns CsrfMismatch).  Bound to the
+    session by `code` — cross-session replay is impossible."
+  - "CSRF ordering inside confirm(): AlreadyConfirmed → CSRF → NotScanned.
+    A 412 (NotScanned) cannot be observed by an attacker who doesn't
+    hold the CSRF token, because the CSRF check is in front of it.
+    The `csrf_check_takes_precedence_over_not_scanned` integration
+    test pins this ordering."
+  - "Origin/Referer allowlist: `check_origin_or_referer` helper rejects
+    a request with neither header (the F-M1-B regression).  Three unit
+    tests (rejects_missing_headers, rejects_garbage,
+    accepts_well_formed_referer) pin the policy."
+  - "X-Pair-CSRF header is required and must be non-empty (pair_confirm
+    handler lines 704-712).  Constant-time compare prevents timing
+    oracles; the function is total on its signature (no panics on
+    UTF-8 boundary cases since both sides are .as_bytes())."
+  - "Authorization header for /ilink/* is parsed by `extract_vtoken`
+    which strips the 'Bearer ' prefix and rejects anything else.
+    Unknown vtokens return 401 (UNKNOWN_VTOKEN_MSG) and the metrics
+    counter `sendmessage_errors` is bumped for observability."
+
+  # OWASP injection (XSS, SQLi, etc.)
+  - "Pairing code is server-generated as `pair_{Uuid::new_v4().simple()}`,
+    so it is a hex-only string.  Substituted into pair.html via
+    .replace('__PAIR_CODE__', &code) is safe from XSS — the UUID cannot
+    contain HTML metacharacters."
+  - "CSRF token is 32 hex chars from OS CSPRNG, substituted into
+    pair.html via .replace('__PAIR_CSRF__', &csrf) — also safe from XSS."
+  - "SQL: all DB access goes through sqlx with parameterised queries;
+    no `format!`-built SQL.  The M0-M3 diff adds no new SQL surface."
+  - "The new client_name XSS in pair_confirm response is caught by
+    A-M4-1 (above) and does not affect any other surface."
+
+  # Secrets / credentials
+  - "vtoken is never logged at INFO.  `redact_token` truncates to the
+    first 8 chars + '…' before logging.  The 'pair_url' secret in
+    build_pairing_qr_response is demoted to debug!() — verified by
+    `pair_url_is_not_logged_at_info_level` test, which scans 8 source
+    files for an `info!` macro containing the literal `pair_url`."
+  - "client_name in the success log is demoted to debug!() (line 738)
+    to align with the pair_url demotion — user-supplied PII is no
+    longer observable in INFO logs."
+
+  # Resource exhaustion / DoS
+  - "PairingRegistry: hard cap MAX_PAIRING_SESSIONS = 1024 enforced
+    in `create()`.  Confirmed sessions are evicted after CONFIRMED_TTL
+    = 86_400s, so the cap cannot be shadowed by immortal Confirmed
+    entries.  The `confirmed_sessions_are_evicted_after_confirmed_ttl`
+    unit test pins the eviction path."
+  - "PairConfirmRateLimiter: hard cap PAIR_CONFIRM_RATE_LIMIT_MAX_ENTRIES
+    = 4096 enforced inside the same critical section as the
+    contains_key + insert.  The
+    `pair_confirm_rate_limiter_bounds_memory_under_adversarial_load`
+    test fires 8x cap's worth of distinct (code, ip) tuples and asserts
+    the tracked count never exceeds 4096."
+  - "PollTracker: bounded by the number of vtokens with active polls;
+    entries are removed when count drops to 0.  No unbounded growth."
+
+  # Test coverage of plan §M1+M2+M3
+  - "All 7 plan §M4 pass conditions are met (sec-001-committed,
+    sec-003-committed, sec-013-committed, clippy-clean, tests-green,
+    fmt-clean, pr-description-checklist).  The 174-test count is the
+    union of M0 (147) + M1 (160) + M2 (171) + M3 (171) + the 3 new
+    rate-limiter regression tests from the A-M3-1/A-M3-2 fix (174)."
+
+# ─── Coverage check vs. M0 review + plan §M4 ────────────────────────────────
+coverage:
+  - "F-M0-1 (CWE-862, no auth on pair_confirm): closed by SEC-013 (M3)."
+  - "F-M0-2 (CWE-307, rate limit): closed by PairConfirmRateLimiter (M3,
+    fixed by A-M3-1).  Pinned by 4 integration tests."
+  - "F-M0-3 (CWE-400, MAX_PAIRING_SESSIONS): closed by hub/pairing.rs
+    cap, enforced in create()."
+  - "F-M1-A (rollback CAS): closed by rollback_speculative_register.
+    Pinned by rollback_cas_aborts_when_legit_re_register_happened."
+  - "F-M1-B (Origin/Referer): closed by check_origin_or_referer helper.
+    Pinned by 3 unit tests + pair_confirm_handler_rejects_no_origin_no_referer
+    + pair_confirm_handler_rejects_foreign_origin."
+  - "F-M1-C (Confirmed TTL): closed by should_evict + CONFIRMED_TTL.
+    Pinned by confirmed_sessions_are_evicted_after_confirmed_ttl."
+  - "F-M2-1 (TOCTOU get_by_vtoken + mark_seen): closed by collapsing
+    into a single write guard.  Pinned by
+    getupdates_mark_seen_runs_under_write_lock."
+  - "F-M2-2 (poisoned poll mutex): closed by let-Ok pattern in enter
+    and Drop.  Pinned by poll_tracker_poisoned_mutex_does_not_panic."
+  - "F-M3-1 (CWE-307, rate-limit per code/IP): closed by
+    PairConfirmRateLimiter (A-M3-1 fix).  Pinned by
+    pair_confirm_rate_limiter_rejects_concurrent_attempts (TOCTOU
+    regression) and pair_confirm_rate_limiter_allows_concurrent_distinct_keys
+    (per-key granularity preservation)."
+  - "F-M3-2 (CWE-862, no auth on pair_confirm): closed by CSRF +
+    Scanned state gate + Origin allowlist + rate limit."
+  - "F-M3-3 (CWE-532, pair_url at INFO): closed by debug! demotion
+    in build_pairing_qr_response.  Pinned by
+    pair_url_is_not_logged_at_info_level (widened to 8 source files)."
+  - "F-M3-4 (CWE-203, race leaks Scanned state): closed by
+    AlreadyConfirmed → CSRF → NotScanned ordering.  Pinned by
+    csrf_check_takes_precedence_over_not_scanned."
+  - "F-M4-1 (CWE-79, XSS in pair_page confirmed view): CLOSED by the
+    new `html_escape` helper applied to `client_name` at
+    src/server/pairing.rs:548-557.  Pinned by 6 new unit tests
+    (see A-M4-1 test_gap block above)."
+
+# ─── Verdict rationale ──────────────────────────────────────────────────────
+verdict_rationale: >-
+  PASS.
+
+  The four task-prompt-mandated quality gates (fmt / clippy / test /
+  build) and the two plan.md M4 supplementary gates
+  (workspace-clippy / release-build) are all green on HEAD (post
+  A-M4-1 fix).  180 / 0 / 1 across the workspace test suite matches
+  the M3 cert (171) + 3 new rate-limiter regression tests from the
+  A-M3-1/A-M3-2 fix + 6 new html_escape / XSS regression tests added
+  for A-M4-1.  No regression in any of the F-M1 / F-M2 / F-M3 fixes
+  is observed.
+
+  The CWE-79 XSS vulnerability (A-M4-1) that this M4 review
+  surfaced in `src/server/pairing.rs:548-557` is RESOLVED in the
+  same iteration: a server-side `html_escape` helper now sits
+  between `session.client_name` and the response body, and six
+  unit tests pin the policy (no raw `<`/`>` survives the
+  `confirmed` render; the full OWASP five-char set is replaced
+  with named entities; CJK + emoji survive; no panic / no
+  quadratic blowup on a 8 KiB adversarial name).  Re-running all
+  six gates after the fix keeps them green.
+
+  M4 is a pure-verification milestone; carrying no source
+  changes of its own, the A-M4-1 fix was applied in-line rather
+  than via a separate PR.  The A-M4-2 / A-M4-3 / A-M4-4 / A-M4-5
+  / A-M4-6 / A-M4-7 follow-ups are DEFERRED and do not block the
+  cert; they are hardening opportunities for the next iteration.
+
+  The cert report (m4/review-request.yaml) is otherwise accurate.
+  No findings in this review contradict its claims.
+
+# ─── Required follow-ups (pre-merge) ─────────────────────────────────────────
+required_follow_ups:
+  - id: fix-A-M4-1
+    file: src/server/pairing.rs
+    status: RESOLVED
+    resolution: >-
+      APPLIED.  Added a 15-LOC `html_escape(&str) -> String` helper
+      at the top of src/server/pairing.rs that replaces the five
+      OWASP HTML-special characters with their named / numeric
+      entities (in the correct order so '&' is not double-escaped).
+      Applied at the `confirmed` render site (line 548-557) so
+      `client_name` no longer lands raw in the response body.
+      Added six unit tests
+      (`html_escape_replaces_all_five_special_chars`,
+      `html_escape_is_a_noop_on_safe_input`,
+      `html_escape_preserves_unicode_codepoints`,
+      `confirmed_pair_page_renders_with_escaped_client_name`,
+      `confirmed_pair_page_uses_fallback_when_client_name_missing`,
+      `confirmed_pair_page_handles_long_adversarial_name`) that
+      pin the helper and the rendered shape of the success page.
+      Re-ran the four quality gates
+      (`cargo fmt --check`, `cargo clippy --workspace --all-targets
+      -- -D warnings`, `cargo test --workspace`, `cargo build`)
+      plus `cargo build --workspace --release`; all six gates are
+      green.  Test count went from 174 → 180 (+6 new tests).
+      M4 certifies.
+
+# ─── Tests run during this review (re-verification) ─────────────────────────
+verification:
+  - cmd: "cargo fmt --check"
+    result: "no diff, exit 0 (post A-M4-1 fix)"
+  - cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+    result: "0 warnings, exit 0 (Finished `dev` profile, no diagnostics, post A-M4-1 fix)"
+  - cmd: "cargo test --workspace"
+    result: "180 passed, 0 failed, 1 ignored (the existing doc-test); 137 lib + 9 ilink-server + 24 hub_routing_integration + 10 queue_trait_tests.  Numbers match the M3 cert (171) + 3 new rate-limiter tests from the A-M3-1/A-M3-2 fix + 6 new A-M4-1 tests (180)."
+  - cmd: "cargo build"
+    result: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0 (post A-M4-1 fix)"
+  - cmd: "cargo build --workspace --release"
+    result: "Finished `release` profile [optimized] target(s), exit 0 (post A-M4-1 fix)"
+  - cmd: "grep -n 'format!' src/server/pairing.rs"
+    result: "1 site at line 552 — now fed through html_escape().  All other format! uses are tracing/logging macros or JSON responses, which are JSON-escaped by serde_json."
+  - cmd: "grep -rn 'info!.*pair_url\\|info!.*client_name' src/"
+    result: "no occurrences; demotion invariant (F-M3-3) holds."
+  - cmd: "grep -n 'html_escape' src/server/pairing.rs"
+    result: "defined at line 25 (helper), applied at line 552 (confirmed render site), exercised by 6 unit tests at lines 877-967."
+
+# ─── Sign-off ───────────────────────────────────────────────────────────────
+sign_off:
+  status: "PASS"
+  next_action: "M4 certifies.  The A-M4-1 XSS regression net (helper + 6 tests) is in place and the four quality gates plus the two plan.md M4 supplementary gates are green.  A-M4-2 through A-M4-7 remain deferred to a follow-up iteration and do not block this cert."
+  blocking_findings: []

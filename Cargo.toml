@@ -81,6 +81,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 serde_norway = "0.9.42"
+url = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
