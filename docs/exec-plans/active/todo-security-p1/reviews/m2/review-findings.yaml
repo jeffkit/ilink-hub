@@ -1,0 +1,284 @@
+milestone: M2
+title: "SEC-003 — getupdates concurrent-poll cap + HTTP 429"
+verdict: PASS_WITH_NOTES
+date: 2026-06-12
+reviewer: rust-security-concurrency-specialist
+verifying_commit: 8b3cc39a2524845b1fe814199fc9258d8b2551dc
+base_commit: 2d2370b96fe7ca15b04f38f60ba8556518599c63
+scope:
+  - src/hub/mod.rs (MAX_CONCURRENT_POLLS_PER_VTOKEN constant + poll_tracker_caps_concurrent unit test)
+  - src/server/routes.rs::getupdates (handler re-ordering: enter before mark_seen; 429 on count > MAX)
+  - tests/hub_routing_integration.rs::getupdates_returns_429_when_polls_exceed_cap (integration test)
+
+# ─── Verification commands run by the reviewer ──────────────────────────────
+reviewer_commands:
+  - id: cargo_test_lib
+    cmd: "cargo test --lib --quiet"
+    actual: "131 passed; 0 failed; 0 ignored"
+    result: pass
+  - id: cargo_test_hub_routing_integration
+    cmd: "cargo test --test hub_routing_integration --quiet"
+    actual: "21 passed; 0 failed; 0 ignored"
+    result: pass
+  - id: cargo_clippy_workspace
+    cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+    actual: "Finished `dev` profile, 0 diagnostics"
+    result: pass
+
+# ─── Findings ──────────────────────────────────────────────────────────────
+findings:
+  - id: N-1
+    severity: info
+    area: handler-flow
+    title: "Cap gate runs BEFORE registry existence check — accepts the cost of one PollTracker slot for unknown vtokens"
+    observation: >-
+      state.poll_tracker.enter(&vtoken) is invoked immediately after
+      extract_vtoken, before any registry read or write. An attacker who
+      rotates through arbitrary/unknown vtokens can therefore insert
+      transient entries into PollTracker.counts. Each guard holds a slot
+      for the duration of one handler invocation; the entry is removed
+      (counts.remove when c==0 in Drop) once the request returns. Net
+      effect: an attacker can churn the HashMap at ~one allocation per
+      request, but cannot grow it past O(active concurrent calls) because
+      the Drop path always removes entries whose count reaches 0.
+    security_classification: "no memory-leak DoS; pre-existing shape of the fix"
+    recommendation: >-
+      If desired, the registry-existence check could be moved before the
+      cap gate so unknown vtokens never touch the tracker. This is NOT a
+      regression vs. the M1 baseline (PollTracker was already called
+      before the registry check in M1), and the M2 cap actually limits
+      the worst-case concurrent entries to MAX per vtoken — strictly
+      safer than before. Leave as-is for M2; revisit only if a future
+      audit shows memory pressure from churning entries.
+    status: accepted-as-is
+
+  - id: N-2
+    severity: info
+    area: handler-flow
+    title: "429 response carries no Retry-After header"
+    observation: >-
+      The 429 reply (src/server/routes.rs:179-188) is JSON-only and does
+      not set a Retry-After header. RFC 6585 §4 allows 429 to omit
+      Retry-After (clients may also retry after the timeout they used);
+      iLink bridges will reconnect on their own polling cadence, so this
+      is not a correctness issue.
+    recommendation: >-
+      Optional polish: emit Retry-After: <poll_secs> derived from the
+      request's timeout field. Not blocking for SEC-003 — the security
+      posture is unaffected.
+    status: optional-polish
+
+  - id: N-3
+    severity: info
+    area: handler-flow
+    title: "No compile-time assertion that MAX > 0"
+    observation: >-
+      If MAX_CONCURRENT_POLLS_PER_VTOKEN were ever changed to 0, every
+      getupdates call would 429 (count > 0 is always true for a fresh
+      enter). The constant is a `pub const usize = 3` so this is a
+      refactor risk only, not a runtime risk.
+    recommendation: >-
+      Optional: add `const _: () = assert!(MAX_CONCURRENT_POLLS_PER_VTOKEN
+      > 0);` at the top of src/hub/mod.rs. Low priority; the constant is
+      reviewer-controlled and the test pins the boundary.
+    status: optional-polish
+
+  - id: N-4
+    severity: info
+    area: memory-safety
+    title: "StdMutex usage is sound; no reentrancy, no deadlock with handler"
+    observation: >-
+      PollTracker::counts is a std::sync::Mutex<HashMap<String, usize>>.
+      Both enter and Drop acquire the mutex without holding any other
+      lock. The test (tests/hub_routing_integration.rs:666-682) acquires
+      the same mutex from the test thread; since it is non-reentrant
+      std::sync::Mutex, this would deadlock if the test thread re-entered
+      the lock — but the test only locks once per loop iteration and
+      releases before the `.await sleep`. No deadlock path between the
+      test and the handler.
+    security_classification: "no UB, no data race, no deadlock"
+    status: confirmed-safe
+
+  - id: N-5
+    severity: info
+    area: tokio-async
+    title: "drop(poll_guard) executes synchronously between enter and 429 return — no cancellation point"
+    observation: >-
+      The 429 branch in src/server/routes.rs:166-189 contains no .await
+      between enter and drop(poll_guard). The Drop body itself is
+      synchronous (only std::sync::Mutex acquisition + HashMap ops).
+      Therefore tokio task cancellation (e.g. client disconnect, shutdown)
+      cannot leave the guard "leaked" — even if a future caller wraps
+      the 429 path in a select!, the guard is dropped at the synchronous
+      boundary before any .await would suspend. F-M2-2's let-Ok pattern
+      in Drop protects against poisoned-mutex panic.
+    security_classification: "no counter-leak on early return; cancel-safety preserved"
+    status: confirmed-safe
+
+  - id: N-6
+    severity: info
+    area: data-race
+    title: "concurrent_polls read after enter is consistent with the count snapshot"
+    observation: >-
+      enter returns (count, guard) where count is the post-increment
+      snapshot taken under the same lock that recorded the increment.
+      Reading count after the lock is released cannot observe a smaller
+      value (no other task can decrement past the value we just
+      recorded without first acquiring the same mutex — which we
+      already released). The over-cap branch therefore always correctly
+      identifies that the (count - 1) prior polls were active AT THE
+      TIME of enter; subsequent decrements only validate the 429
+      decision, they cannot invalidate it.
+    security_classification: "race-free per-mutex serialization"
+    status: confirmed-safe
+
+  - id: N-7
+    severity: info
+    area: logging
+    title: "warn! over-cap log carries only redacted vtoken + integer counters"
+    observation: >-
+      src/server/routes.rs:172-177 logs vtoken via redact_token (first
+      8 chars + …) plus concurrent (usize) and cap (usize). No raw
+      token, no PII, no per-request body. Information disclosure
+      surface is acceptable for a security warning that needs to be
+      actionable.
+    security_classification: "OWASP A09 (Logging Failures) — no sensitive data in warn"
+    status: confirmed-safe
+
+  - id: N-8
+    severity: info
+    area: owasp
+    title: "CWE-400 closed by per-vtoken cap"
+    observation: >-
+      Before the fix, a single vtoken could hold an unbounded number of
+      concurrent long-polls (each occupying a Tokio worker slot and a
+      per-vtoken Notify slot in InMemoryQueue). After the fix, the cap
+      bounds concurrent polls at 3 per vtoken, and over-cap callers are
+      synchronously rejected with HTTP 429 before any await point or
+      queue operation. The 429 path explicitly drops the guard so the
+      count returns to MAX, and the recovery test
+      (getupdates_returns_429_when_polls_exceed_cap:727-750) proves a
+      subsequent getupdates succeeds — i.e. no permanent inflation.
+    security_classification: "CWE-400 closed (uncontrolled resource consumption)"
+    status: closed
+
+# ─── F-M2-* alignment check ────────────────────────────────────────────────
+m0_review_finding_re_audit:
+  - finding: F-M2-1 (HIGH, CWE-662 — registry read+write collapse)
+    reaudit: >-
+      src/server/routes.rs:208-229 still uses a single
+      state.registry.write().await guard around get_by_vtoken +
+      mark_seen. F-M2-1 remains resolved. The M2 429 gate sits BEFORE
+      this block, which is the correct ordering (cap first to bound
+      resource consumption; identity check second to ensure we only
+      mark_seen real clients).
+    status: still-resolved
+  - finding: F-M2-2 (MEDIUM, CWE-754 — poisoned mutex panic-safety)
+    reaudit: >-
+      PollTracker::enter (src/hub/mod.rs:120-142) and PollGuard::Drop
+      (src/hub/mod.rs:152-166) still use let-Ok on the counts mutex.
+      The M2 429 gate inherits this contract: if counts is poisoned,
+      enter returns (0, guard), the over-cap branch is skipped
+      (count > MAX is false for 0), and the handler proceeds to the
+      normal registry path with a (best-effort) guard that decrements
+      nothing on Drop. F-M2-2 remains resolved; no panic surface added
+      by M2.
+    status: still-resolved
+
+# ─── Test coverage re-audit ────────────────────────────────────────────────
+test_coverage_audit:
+  - test: poll_tracker_caps_concurrent
+    covers: >-
+      Pins the (MAX+1)th enter → count == MAX+1 > MAX boundary and the
+      recovery path (drop → re-enter → MAX+1 again). This is exactly
+      the value the handler gates on.
+    sufficient: true
+  - test: getupdates_returns_429_when_polls_exceed_cap
+    covers: >-
+      End-to-end through the real handler: holds MAX in-budget long-
+      polls, asserts the 4th call returns 429 within < 2s with the
+      documented body, and verifies a recovery call after the in-budget
+      polls finish returns 200. Covers wire format and the recovery
+      invariant.
+    sufficient: true
+  - test: poll_tracker_poisoned_mutex_does_not_panic
+    covers: >-
+      Carried over from 1961dc3 (F-M2-2 fix). Pins the let-Ok behavior
+      in enter() and Drop() under a poisoned counts mutex. Confirmed
+      that the M2 429 gate does not break this contract.
+    sufficient: true
+  - test: poll_tracker_counts_concurrent_polls_and_releases_on_drop
+    covers: >-
+      Pre-existing baseline test for enter()/Drop() round-trip on a
+      single vtoken. Still passes; the M2 changes do not touch this
+      code path.
+    sufficient: true
+
+# ─── OWASP Top-10 sweep ────────────────────────────────────────────────────
+owasp_sweep:
+  - id: A01_broken_access_control
+    observation: >-
+      getupdates requires Authorization: Bearer <vtoken>; missing
+      header → 401 before any cap slot is taken. The cap gate sits
+      AFTER extract_vtoken, so unauthorized requests do not pollute
+      PollTracker. ✓
+    status: ok
+  - id: A04_unrestricted_resource_consumption
+    observation: >-
+      Closed by the per-vtoken cap + 429. No global or per-IP rate
+      limit (out of scope for SEC-003; the vtoken is the trust
+      boundary), but the per-vtoken bound is the right unit for the
+      threat model (a misconfigured bridge cannot exhaust workers
+      regardless of how many vtokens it knows).
+    status: ok
+  - id: A05_security_misconfiguration
+    observation: >-
+      Constant is a documented pub const with an inline doc comment
+      explaining the split-brain rationale and the operator-alert
+      threshold. Default 3 matches the plan.
+    status: ok
+  - id: A09_security_logging_failures
+    observation: >-
+      Over-cap event is logged at warn! level with redacted token +
+      numeric counters. errmsg is the same constant as in the JSON
+      body, so log scrapers can correlate. No raw token in logs.
+    status: ok
+  - id: A10_ssrf
+    observation: >-
+      N/A — getupdates is a client→Hub endpoint, not a Hub→upstream
+      fetcher.
+    status: n/a
+
+# ─── CWE mapping ──────────────────────────────────────────────────────────
+cwe_map:
+  closed:
+    - cwe: CWE-400
+      title: "Uncontrolled Resource Consumption"
+      note: "Per-vtoken concurrent poll cap + 429 rejection closes this."
+    - cwe: CWE-770
+      title: "Allocation of Resources Without Limits or Throttling"
+      note: "Same fix as CWE-400; this is the OWASP-aligned CWEs."
+  inherited_resolved:
+    - cwe: CWE-662
+      title: "Improper Synchronization (F-M2-1)"
+      note: "Resolved in 1961dc3; re-audited above and remains resolved."
+    - cwe: CWE-754
+      title: "Improper Check for Unusual or Exceptional Conditions (F-M2-2)"
+      note: "Resolved in 1961dc3; re-audited above and remains resolved."
+  introduced: []
+
+# ─── Recommendation ───────────────────────────────────────────────────────
+verdict_rationale: >-
+  The M2 fix is correct, minimal, and well-tested. The 429 gate runs
+  BEFORE any registry work, the cap boundary is a documented pub const,
+  the PollTracker invariant is preserved under poisoned-mutex and
+  concurrent-cancellation conditions, and both the unit and integration
+  tests pin the boundary and the recovery path. F-M2-1 and F-M2-2
+  remain resolved; no new CWE is introduced. The N-1..N-3 findings are
+  advisory (DoS surface that was pre-existing, RFC-6585 polish,
+  refactor-hardening) and do not block certification of M2.
+verdict: PASS_WITH_NOTES
+next_action: >-
+  Proceed to M3 review (SEC-013 — pair_confirm auth + CSRF + log
+  demotion). N-1..N-3 are non-blocking and can be folded into the
+  larger p1 follow-ups if desired; otherwise leave as-is.
