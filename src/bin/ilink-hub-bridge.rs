@@ -199,6 +199,16 @@ async fn main() -> Result<()> {
             let app = BridgeApp::load(&config_path)?;
             info!(config_path = %config_path.display(), "loaded bridge config");
 
+            // Startup probe to verify that the CLI command(s) exist and are usable.
+            for name in app.profile_names() {
+                if let Some(profile) = app.profile(name) {
+                    if let Err(e) = ilink_hub::bridge::probe_profile_light(profile) {
+                        eprintln!("Startup probe failed for profile `{}`: {}", name, e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             let cred_path = cli
                 .cred_file
                 .as_deref()

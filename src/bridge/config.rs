@@ -106,6 +106,25 @@ pub struct BridgeProfile {
     pub cli_session_first_line_prefix: Option<String>,
 }
 
+impl Default for BridgeProfile {
+    fn default() -> Self {
+        Self {
+            profile_type: None,
+            script: None,
+            command: String::new(),
+            args: Vec::new(),
+            stdin: StdinMode::default(),
+            cwd: None,
+            env: HashMap::new(),
+            timeout_secs: default_timeout_secs(),
+            max_reply_chars: default_max_reply_chars(),
+            truncation_suffix: default_truncation_suffix(),
+            include_stderr_in_reply: false,
+            cli_session_first_line_prefix: None,
+        }
+    }
+}
+
 fn default_timeout_secs() -> u64 {
     1800
 }

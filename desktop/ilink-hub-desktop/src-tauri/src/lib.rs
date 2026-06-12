@@ -422,7 +422,9 @@ fn delete_client_err(auth_required: bool, error: impl Into<String>) -> DeleteCli
     }
 }
 
-fn hub_state_from_app(app: &tauri::AppHandle) -> Result<Arc<ilink_hub::HubState>, DeleteClientResult> {
+fn hub_state_from_app(
+    app: &tauri::AppHandle,
+) -> Result<Arc<ilink_hub::HubState>, DeleteClientResult> {
     let Some(ctrl) = app.try_state::<HubController>() else {
         return Err(delete_client_err(false, "Hub 未初始化"));
     };
@@ -459,9 +461,7 @@ async fn hub_delete_client(app: tauri::AppHandle, name: String) -> DeleteClientR
             false,
             format!("后端「{name}」仍在线，请先停止对应进程后再删除"),
         ),
-        Err(UnregisterClientError::Store(e)) => {
-            delete_client_err(false, format!("删除失败: {e}"))
-        }
+        Err(UnregisterClientError::Store(e)) => delete_client_err(false, format!("删除失败: {e}")),
     }
 }
 
@@ -529,9 +529,7 @@ async fn hub_update_client(
         Err(UpdateClientError::NameTaken) => {
             update_client_err(false, format!("名称「{name}」已被占用"))
         }
-        Err(UpdateClientError::InvalidName) => {
-            update_client_err(false, "后端名称不能为空")
-        }
+        Err(UpdateClientError::InvalidName) => update_client_err(false, "后端名称不能为空"),
         Err(UpdateClientError::Store(e)) => update_client_err(false, format!("更新失败: {e}")),
     }
 }
@@ -622,6 +620,7 @@ pub struct DesktopBridgeProfileFile {
     pub args: Vec<String>,
     /// All user-defined environment variables from the primary profile.
     pub env_vars: Vec<EnvVar>,
+    pub probe_error: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -839,6 +838,9 @@ fn summarize_bridge_profile_file(
                     vars
                 })
                 .unwrap_or_default();
+            let probe_error = profile
+                .and_then(|p| ilink_hub::bridge::probe_profile_light(p).err())
+                .map(|e| e.to_string());
             DesktopBridgeProfileFile {
                 id,
                 path: path.display().to_string(),
@@ -860,6 +862,7 @@ fn summarize_bridge_profile_file(
                 command: profile.map(|p| p.command.clone()),
                 args: profile.map(|p| p.args.clone()).unwrap_or_default(),
                 env_vars,
+                probe_error,
             }
         }
         Err(e) => DesktopBridgeProfileFile {
@@ -879,6 +882,7 @@ fn summarize_bridge_profile_file(
             command: None,
             args: vec![],
             env_vars: vec![],
+            probe_error: None,
         },
     }
 }
@@ -1095,6 +1099,7 @@ async fn bridge_profiles(app: tauri::AppHandle) -> BridgeProfilesPayload {
                 command: None,
                 args: vec![],
                 env_vars: vec![],
+                probe_error: None,
             }),
         }
     }
@@ -1158,6 +1163,66 @@ async fn bridge_delete_profile(app: tauri::AppHandle, id: String) -> Result<(), 
             .await
             .map_err(|e| format!("删除 profile 失败: {e}")),
         None => Ok(()),
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeResult {
+    pub success: bool,
+    pub error_type: Option<String>,
+    pub error_message: Option<String>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+}
+
+#[tauri::command]
+async fn bridge_test_profile(
+    app: tauri::AppHandle,
+    id: String,
+    _message: String,
+) -> Result<ProbeResult, String> {
+    let Some(ctrl) = app.try_state::<BridgeController>() else {
+        return Err("Bridge 未初始化".into());
+    };
+    let config_path =
+        existing_profile_path(&ctrl, &id)?.ok_or_else(|| format!("未找到 profile `{id}`"))?;
+    let app_cfg = ilink_hub::bridge::BridgeApp::load(&config_path)
+        .map_err(|e| format!("加载配置失败: {e}"))?;
+    let profile_name = app_cfg.default_profile_name();
+    let profile = app_cfg
+        .profile(profile_name)
+        .ok_or_else(|| format!("配置中未找到默认 profile `{profile_name}`"))?;
+
+    // For safety, hardcode the probe message to "ping" to prevent command injection/RCE.
+    let msg = "ping";
+    match ilink_hub::bridge::dry_run_profile(profile, msg).await {
+        Ok(stdout) => Ok(ProbeResult {
+            success: true,
+            error_type: None,
+            error_message: None,
+            stdout: Some(stdout),
+            stderr: None,
+        }),
+        Err(e) => {
+            let error_type = e.error_type().to_string();
+            let error_message = e.to_string();
+            let (stdout, stderr) = match &e {
+                ilink_hub::bridge::ProbeError::Unauthenticated(detail)
+                | ilink_hub::bridge::ProbeError::ExecutionError(detail) => {
+                    (None, Some(detail.clone()))
+                }
+                _ => (None, None),
+            };
+
+            Ok(ProbeResult {
+                success: false,
+                error_type: Some(error_type),
+                error_message: Some(error_message),
+                stdout,
+                stderr,
+            })
+        }
     }
 }
 
@@ -1598,6 +1663,7 @@ pub fn run() {
             bridge_profiles,
             bridge_save_profile,
             bridge_delete_profile,
+            bridge_test_profile,
             bridge_status,
             bridge_start,
             bridge_stop,
