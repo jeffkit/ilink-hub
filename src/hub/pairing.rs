@@ -166,4 +166,33 @@ mod tests {
             .confirm(&code, "x".into(), None, "vhub_x".into())
             .is_err());
     }
+
+    #[test]
+    fn double_confirm_returns_already_confirmed() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create();
+        reg.mark_scanned(&code);
+
+        let first = reg.confirm(
+            &code,
+            "openclaw-test".to_string(),
+            Some("Test".to_string()),
+            "vhub_abc".to_string(),
+        );
+        assert!(first.is_ok(), "first confirm should succeed");
+        assert_eq!(reg.get(&code).unwrap().status_str(), "confirmed");
+
+        let second = reg.confirm(
+            &code,
+            "openclaw-test".to_string(),
+            Some("Test".to_string()),
+            "vhub_abc".to_string(),
+        );
+        assert_eq!(second, Err(PairingError::AlreadyConfirmed));
+
+        // Session remains Confirmed and original vtoken is preserved.
+        let session = reg.get(&code).unwrap();
+        assert_eq!(session.status_str(), "confirmed");
+        assert_eq!(session.vtoken.as_deref(), Some("vhub_abc"));
+    }
 }

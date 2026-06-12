@@ -36,3 +36,19 @@
   - Run `cargo clippy -- -D warnings` -> Passed
   - Run `cargo test` -> Passed
   - Run `cargo build` -> Passed
+
+## Milestone 4: Fix T-02 (Pairing AlreadyConfirmed Test Coverage)
+- **Status**: Completed
+- **Changes**:
+  - Added unit test `double_confirm_returns_already_confirmed` in `src/hub/pairing.rs` that:
+    1. Creates a pairing session via `PairingRegistry::create`, marks it scanned via `mark_scanned`.
+    2. Calls `confirm` once and asserts success (status `Confirmed`, vtoken set to the supplied value).
+    3. Calls `confirm` a second time with the same arguments and asserts the result is `Err(PairingError::AlreadyConfirmed)`.
+    4. Verifies the session state remains `Confirmed` and the original vtoken is preserved (so a second confirm does not clobber the first binding).
+  - This pins the existing `confirm` contract in `src/hub/pairing.rs:102-125`, which already short-circuits on a second confirm before mutating `vtoken`, `client_name`, or `client_label`. No production code change was required; the T-02 finding was a coverage gap, not a behavior bug.
+- **Verification**:
+  - Run `cargo fmt --check` -> Passed
+  - Run `cargo clippy -- -D warnings` -> Passed
+  - Run `cargo test` -> Passed (4 pairing tests including the new `double_confirm_returns_already_confirmed`; 133 lib + 7 breaking_changes + 9 hub_routing_integration + 15 queue_trait_tests all green; 1 doc-test ignored)
+  - Run `cargo build` -> Passed
+  - Targeted: `cargo test pairing` shows `hub::pairing::tests::double_confirm_returns_already_confirmed ... ok`
