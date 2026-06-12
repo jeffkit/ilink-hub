@@ -92,8 +92,33 @@
   - `ilink-hub-bridge --help` 显示：`将微信（通过 iLink Hub）桥接到本地编码 CLI (Claude Code, Codex, …) / Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)`
 - 在 `reviews/m1/review-request.yaml` 记录了所有执行结果与快照。
 
+## M2.1 — 统一以 WEIXIN_BASE_URL 作为「Hub 地址」主入口
+
+### Decisions
+- 将 `main.rs` 的 `--addr`、`--hub-url` 参数以及 `ilink-hub-bridge.rs` 的 `hub_url` 参数的主环境变量统一为 `WEIXIN_BASE_URL`。
+- 在 `main.rs` 和 `ilink-hub-bridge.rs` 中实现 `get_hub_url_default()` 和 `get_addr_default()` 辅助函数，使 CLI 在 `WEIXIN_BASE_URL` 未设置时能依次降级回退读取别名环境变量 `ILINK_HUB_URL` 和 `ILINK_HUB_ADDR`，保证前向兼容性。
+- 对 `serve` 命令的 `addr` 参数进行运行时拦截，若读取到的值是 URL 形式（例如 `http://127.0.0.1:9000`），则提取其主机名与端口部分（`127.0.0.1:9000`），从而避免由于传递了 URL 协议头而导致 `TcpListener::bind` 报错。
+- 在 `tests/breaking_changes.rs` 增加 `test_cli_hub_url_env_fallback` 和 `test_bridge_hub_url_env_fallback` 两个集成测试，以全面覆盖不同环境变量优先级和回退逻辑。
+
+### Problems
+- 无。逻辑与单元/集成测试运行顺利，未遇到阻碍。
+
+### Outcome
+- fmt: `cargo fmt --check` 成功通过。
+- clippy: `cargo clippy -- -D warnings` 通过，无任何 warnings。
+- test: `cargo test` 全绿通过（151 passed）。
+- build: `cargo build` 及 `cargo build --release` 编译成功。
+- desktop-frontend: Vite 构建和 TypeScript 检查通过，成功输出 dist。
+- desktop-tauri: Tauri `src-tauri` 检查通过。
+- 验证命令结果：
+  - `WEIXIN_BASE_URL=http://127.0.0.1:9000 ./target/release/ilink-hub register --help` 成功显示 `[env: WEIXIN_BASE_URL=http://127.0.0.1:9000] [default: http://127.0.0.1:9000]`。
+  - `ILINK_HUB_ADDR=http://127.0.0.1:9000 ./target/release/ilink-hub register --help` 成功兼容回退显示 `[default: http://127.0.0.1:9000]`。
+  - `ILINK_HUB_URL=http://127.0.0.1:9000 ./target/release/ilink-hub register --help` 成功兼容回退显示 `[default: http://127.0.0.1:9000]`。
+  - `WEIXIN_BASE_URL=http://127.0.0.1:9000 ./target/release/ilink-hub serve --help` 成功提取出 `[default: 127.0.0.1:9000]`。
+- 在 `reviews/m2.1/review-request.yaml` 记录了所有执行结果与快照。
+
 ---
 
-## M2.1 / M2.2 / M2.3 — CONS-02（待执行）
+## M2.2 / M2.3 — CONS-02（待执行）
 
 按 `plan.md` 顺序串行执行，每步独立可验证。

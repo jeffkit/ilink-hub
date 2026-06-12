@@ -42,7 +42,7 @@ struct Cli {
     #[arg(
         long,
         env = "WEIXIN_BASE_URL",
-        default_value = "http://127.0.0.1:8765",
+        default_value_t = get_hub_url_default(),
         global = true
     )]
     hub_url: String,
@@ -254,4 +254,28 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+fn get_hub_url_default() -> String {
+    if let Ok(val) = std::env::var("WEIXIN_BASE_URL") {
+        if !val.trim().is_empty() {
+            return val.trim().to_string();
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_URL") {
+        if !val.trim().is_empty() {
+            return val.trim().to_string();
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_ADDR") {
+        if !val.trim().is_empty() {
+            let val_trimmed = val.trim();
+            if val_trimmed.starts_with("http://") || val_trimmed.starts_with("https://") {
+                return val_trimmed.to_string();
+            } else {
+                return format!("http://{}", val_trimmed);
+            }
+        }
+    }
+    "http://127.0.0.1:8765".to_string()
 }

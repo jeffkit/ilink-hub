@@ -278,3 +278,108 @@ fn test_default_address_is_loopback_socket() {
         "Default address must be loopback to avoid LAN exposure"
     );
 }
+
+#[test]
+fn test_cli_hub_url_env_fallback() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub")
+        .unwrap_or_else(|_| "./target/release/ilink-hub".to_string());
+
+    // Case 1: WEIXIN_BASE_URL is set
+    let output = std::process::Command::new(&bin_path)
+        .arg("register")
+        .arg("--help")
+        .env("WEIXIN_BASE_URL", "http://127.0.0.1:9001")
+        .env_remove("ILINK_HUB_URL")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9001"),
+        "Should use WEIXIN_BASE_URL: {}",
+        stdout
+    );
+
+    // Case 2: ILINK_HUB_URL is set and WEIXIN_BASE_URL is not
+    let output = std::process::Command::new(&bin_path)
+        .arg("register")
+        .arg("--help")
+        .env_remove("WEIXIN_BASE_URL")
+        .env("ILINK_HUB_URL", "http://127.0.0.1:9002")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9002"),
+        "Should use ILINK_HUB_URL: {}",
+        stdout
+    );
+
+    // Case 3: ILINK_HUB_ADDR is set and WEIXIN_BASE_URL/ILINK_HUB_URL are not
+    let output = std::process::Command::new(&bin_path)
+        .arg("register")
+        .arg("--help")
+        .env_remove("WEIXIN_BASE_URL")
+        .env_remove("ILINK_HUB_URL")
+        .env("ILINK_HUB_ADDR", "http://127.0.0.1:9003")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9003"),
+        "Should use ILINK_HUB_ADDR: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_bridge_hub_url_env_fallback() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub-bridge")
+        .unwrap_or_else(|_| "./target/release/ilink-hub-bridge".to_string());
+
+    // Case 1: WEIXIN_BASE_URL is set
+    let output = std::process::Command::new(&bin_path)
+        .arg("--help")
+        .env("WEIXIN_BASE_URL", "http://127.0.0.1:9001")
+        .env_remove("ILINK_HUB_URL")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9001"),
+        "Should use WEIXIN_BASE_URL: {}",
+        stdout
+    );
+
+    // Case 2: ILINK_HUB_URL is set
+    let output = std::process::Command::new(&bin_path)
+        .arg("--help")
+        .env_remove("WEIXIN_BASE_URL")
+        .env("ILINK_HUB_URL", "http://127.0.0.1:9002")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9002"),
+        "Should use ILINK_HUB_URL: {}",
+        stdout
+    );
+
+    // Case 3: ILINK_HUB_ADDR is set
+    let output = std::process::Command::new(&bin_path)
+        .arg("--help")
+        .env_remove("WEIXIN_BASE_URL")
+        .env_remove("ILINK_HUB_URL")
+        .env("ILINK_HUB_ADDR", "http://127.0.0.1:9003")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("http://127.0.0.1:9003"),
+        "Should use ILINK_HUB_ADDR: {}",
+        stdout
+    );
+}
