@@ -52,12 +52,17 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
-    /// Failures of the fire-and-forget `persist_context_token(s)_batch` calls on the
-    /// broadcast / fan-out dispatch path. Counts every background task that returned
-    /// an error, so a non-zero value means context-token mappings were dropped on the
-    /// floor (we keep delivering messages but lose durability of the real_ctx↔vctx
-    /// mapping for those rows). See `docs/exec-plans/active/todo-hub-2/plan.md` C-01.
-    pub persist_fire_and_forget_failures: AtomicU64,
+    /// Failures of the fire-and-forget `persist_context_token` call on the per-message
+    /// (ForwardTo) dispatch path. Counts every background task that returned an error,
+    /// so a non-zero value means context-token mappings were dropped on the floor (we
+    /// keep delivering messages but lose durability of the real_ctx↔vctx mapping for
+    /// those rows). See `docs/exec-plans/active/todo-hub-2/plan.md` C-01.
+    pub persist_fire_and_forget_failures_forward: AtomicU64,
+    /// Failures of the fire-and-forget `persist_context_tokens_batch` call on the
+    /// broadcast / fan-out dispatch path. See `persist_fire_and_forget_failures_forward`
+    /// for semantics. Split from the per-message counter so operators can distinguish
+    /// single-row failures from per-broadcast batch failures.
+    pub persist_fire_and_forget_failures_broadcast: AtomicU64,
 }
 
 impl Metrics {
@@ -69,7 +74,8 @@ impl Metrics {
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
-            persist_fire_and_forget_failures: AtomicU64::new(0),
+            persist_fire_and_forget_failures_forward: AtomicU64::new(0),
+            persist_fire_and_forget_failures_broadcast: AtomicU64::new(0),
         }
     }
 }
@@ -298,7 +304,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
                     warn!(error = %e, "failed to persist context_token mapping");
                     metrics
-                        .persist_fire_and_forget_failures
+                        .persist_fire_and_forget_failures_forward
                         .fetch_add(1, Ordering::Relaxed);
                 }
             });
@@ -383,7 +389,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     if let Err(e) = store.persist_context_tokens_batch(&entries).await {
                         warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
                         metrics
-                            .persist_fire_and_forget_failures
+                            .persist_fire_and_forget_failures_broadcast
                             .fetch_add(1, Ordering::Relaxed);
                     }
                 });
@@ -1114,7 +1120,7 @@ mod tests {
         assert_eq!(ext.session_id, None);
     }
 
-    /// `persist_fire_and_forget_failures` increments on broadcast-path persist errors.
+    /// `persist_fire_and_forget_failures_broadcast` increments on broadcast-path persist errors.
     ///
     /// Spawns a tokio task using the exact fire-and-forget shape from the broadcast
     /// dispatch path (see `dispatch_message` `RoutingDecision::Broadcast`). We use a
@@ -1134,10 +1140,17 @@ mod tests {
         let metrics = Arc::new(Metrics::new());
         assert_eq!(
             metrics
-                .persist_fire_and_forget_failures
+                .persist_fire_and_forget_failures_broadcast
                 .load(Ordering::Relaxed),
             0,
-            "counter starts at zero"
+            "broadcast counter starts at zero"
+        );
+        assert_eq!(
+            metrics
+                .persist_fire_and_forget_failures_forward
+                .load(Ordering::Relaxed),
+            0,
+            "forward counter starts at zero"
         );
 
         // Hold the only pool connection so the background persist call cannot acquire
@@ -1157,7 +1170,7 @@ mod tests {
             if let Err(e) = store_clone.persist_context_tokens_batch(&entries).await {
                 warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
                 metrics_clone
-                    .persist_fire_and_forget_failures
+                    .persist_fire_and_forget_failures_broadcast
                     .fetch_add(1, Ordering::Relaxed);
             }
         });
@@ -1169,10 +1182,17 @@ mod tests {
 
         assert!(
             metrics
-                .persist_fire_and_forget_failures
+                .persist_fire_and_forget_failures_broadcast
                 .load(Ordering::Relaxed)
                 >= 1,
-            "counter must have been incremented after persist failure"
+            "broadcast counter must have been incremented after persist failure"
+        );
+        assert_eq!(
+            metrics
+                .persist_fire_and_forget_failures_forward
+                .load(Ordering::Relaxed),
+            0,
+            "forward counter must NOT be touched by broadcast failure"
         );
     }
 }

@@ -854,6 +854,14 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     let upstream_polls_ok = state.upstream.polls_ok.load(Ordering::Relaxed);
     let upstream_polls_err = state.upstream.polls_err.load(Ordering::Relaxed);
     let relogin_attempts = state.upstream.relogin_attempts.load(Ordering::Relaxed);
+    let persist_faf_failures_forward = state
+        .metrics
+        .persist_fire_and_forget_failures_forward
+        .load(Ordering::Relaxed);
+    let persist_faf_failures_broadcast = state
+        .metrics
+        .persist_fire_and_forget_failures_broadcast
+        .load(Ordering::Relaxed);
     let ilink_status = state.ilink_status.load(Ordering::Relaxed);
     let ctx_map_size = state.ctx_map.read().await.len();
 
@@ -936,6 +944,17 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     out.push_str(&format!(
         "ilink_hub_relogin_attempts_total {}\n",
         relogin_attempts
+    ));
+
+    out.push_str("# HELP ilink_hub_persist_fire_and_forget_failures_total Fire-and-forget persist_context_token(s)_batch failures on the dispatch path; non-zero rate means context-token mappings were dropped on the floor\n");
+    out.push_str("# TYPE ilink_hub_persist_fire_and_forget_failures_total counter\n");
+    out.push_str(&format!(
+        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"forward_to\"}} {}\n",
+        persist_faf_failures_forward
+    ));
+    out.push_str(&format!(
+        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"broadcast\"}} {}\n",
+        persist_faf_failures_broadcast
     ));
 
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
@@ -1025,5 +1044,110 @@ mod shutdown_poll_tests {
         wait_shutdown_signal(&mut shutdown_rx).await;
 
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod metrics_endpoint_tests {
+    use super::metrics;
+    use axum::extract::State;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use crate::hub::queue::InMemoryQueue;
+    use crate::hub::HubState;
+    use crate::ilink::UpstreamClient;
+    use crate::store::Store;
+    use tokio::sync::watch;
+
+    async fn build_test_state() -> Arc<HubState> {
+        let upstream = Arc::new(UpstreamClient::new("botid@im.bot:secret".into(), None));
+        let store = Arc::new(
+            Store::connect("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, rx) = watch::channel(false);
+        HubState::new(upstream, store, queue, rx)
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_emits_persist_fire_and_forget_failures_lines() {
+        let state = build_test_state().await;
+
+        // Sanity: counters start at zero so the labelled-zero case is exercised.
+        assert_eq!(
+            state
+                .metrics
+                .persist_fire_and_forget_failures_forward
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            state
+                .metrics
+                .persist_fire_and_forget_failures_broadcast
+                .load(Ordering::Relaxed),
+            0
+        );
+
+        // Increment broadcast counter only; forward counter must remain zero so
+        // the label split is provably independent.
+        state
+            .metrics
+            .persist_fire_and_forget_failures_broadcast
+            .fetch_add(7, Ordering::Relaxed);
+
+        let (_status, body) = metrics(State(state.clone())).await;
+
+        // HELP/TYPE/label lines must all be present, with the exact counter names.
+        assert!(
+            body.contains("# HELP ilink_hub_persist_fire_and_forget_failures_total "),
+            "missing HELP line; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains("# TYPE ilink_hub_persist_fire_and_forget_failures_total counter"),
+            "missing TYPE line; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains(
+                "ilink_hub_persist_fire_and_forget_failures_total{path=\"forward_to\"} 0\n",
+            ),
+            "forward_to label missing or non-zero; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains(
+                "ilink_hub_persist_fire_and_forget_failures_total{path=\"broadcast\"} 7\n",
+            ),
+            "broadcast label missing or wrong value; got:\n{}",
+            body
+        );
+
+        // Now bump the forward counter and confirm the broadcast value is unchanged
+        // (i.e. one label line per counter, no shared mutation).
+        state
+            .metrics
+            .persist_fire_and_forget_failures_forward
+            .fetch_add(3, Ordering::Relaxed);
+
+        let (_status, body) = metrics(State(state.clone())).await;
+        assert!(
+            body.contains(
+                "ilink_hub_persist_fire_and_forget_failures_total{path=\"forward_to\"} 3\n",
+            ),
+            "forward_to label not updated; got:\n{}",
+            body
+        );
+        assert!(
+            body.contains(
+                "ilink_hub_persist_fire_and_forget_failures_total{path=\"broadcast\"} 7\n",
+            ),
+            "broadcast label changed unexpectedly; got:\n{}",
+            body
+        );
     }
 }

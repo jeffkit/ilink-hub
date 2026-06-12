@@ -82,17 +82,21 @@
 
 ### Decisions
 
-- Added a new `persist_fire_and_forget_failures: AtomicU64` field to the `Metrics` struct in `src/hub/mod.rs`, with a doc-comment explaining the counter's semantics (every background persist task that returns an error increments it; a non-zero value means context-token mappings were silently dropped on the dispatch hot-path).
+- Added two `AtomicU64` fields to the `Metrics` struct in `src/hub/mod.rs`, split per call site so operators can distinguish per-message single-row failures from per-broadcast batch failures:
+  - `persist_fire_and_forget_failures_forward: AtomicU64` — incremented by the `ForwardTo` fire-and-forget persist.
+  - `persist_fire_and_forget_failures_broadcast: AtomicU64` — incremented by the `Broadcast` fire-and-forget persist.
+  Doc-comments explain that a non-zero value means context-token mappings were silently dropped on the dispatch hot-path.
 - Changed `HubState::metrics` from `Metrics` (value) to `Arc<Metrics>` so the `tokio::spawn`-ed fire-and-forget persist tasks in `dispatch_message` can `clone()` the handle and increment the counter on error. `Metrics::new()` is wrapped in `Arc::new` at construction. All other call sites (`.metrics.fetch_add(1, ...)`) auto-deref through the `Arc` and need no change.
-- Wired the counter into both fire-and-forget persist sites in `src/hub/mod.rs`:
-  - The single-row `persist_context_token` spawn in `RoutingDecision::ForwardTo` (around line 289).
-  - The batched `persist_context_tokens_batch` spawn in `RoutingDecision::Broadcast` (around line 370).
-  In both, the failure branch now logs the existing `tracing::warn!` and additionally does `metrics.persist_fire_and_forget_failures.fetch_add(1, Ordering::Relaxed)`.
-- Added a unit test `persist_fire_and_forget_failure_increments_metric` in `src/hub/mod.rs::tests`. The test holds the only connection of an in-memory SQLite pool (`store.pool().begin()`), then spawns a tokio task that calls `persist_context_tokens_batch` using the same fire-and-forget shape as the broadcast dispatch path. It advances paused virtual time past the pool's acquire timeout to force a failure, then asserts the counter is `>= 1`.
+- Wired the counters into both fire-and-forget persist sites in `src/hub/mod.rs`:
+  - The single-row `persist_context_token` spawn in `RoutingDecision::ForwardTo` (around line 289) bumps `persist_fire_and_forget_failures_forward` on error.
+  - The batched `persist_context_tokens_batch` spawn in `RoutingDecision::Broadcast` (around line 370) bumps `persist_fire_and_forget_failures_broadcast` on error.
+  In both, the failure branch logs the existing `tracing::warn!` and additionally does `metrics.<field>.fetch_add(1, Ordering::Relaxed)`.
+- Wired both counters into the Prometheus `/metrics` endpoint (`src/server/routes.rs::metrics`) as `ilink_hub_persist_fire_and_forget_failures_total{path="forward_to"}` and `...{path="broadcast"}`. Operators can now `rate(...) > 0` on either label directly from a scrape — the README's alerting guidance is implementable as-written.
+- Added a unit test `persist_fire_and_forget_failure_increments_metric` in `src/hub/mod.rs::tests`. The test holds the only connection of an in-memory SQLite pool (`store.pool().begin()`), then spawns a tokio task that calls `persist_context_tokens_batch` using the same fire-and-forget shape as the broadcast dispatch path. It advances paused virtual time past the pool's acquire timeout to force a failure, then asserts (a) the broadcast counter is `>= 1` and (b) the forward counter is `0` (i.e. the two counters are independent).
 - Documented the design trade-off in a new `## Design Trade-offs` section of `README.md`, with a `### Broadcast persist is fire-and-forget` subsection covering:
   - The pro: tail latency on the dispatch hot-path stays at queue-push speed; DB contention cannot stall message delivery.
   - The con: a failed persist silently drops the `real_ctx → vctx` mapping; the next inbound message from the same user may be assigned a new vctx and orphan per-backend sessions.
-  - The observability story: the new counter (and its Prometheus export name) plus the recommended alert rule (`rate(...) > 0`).
+  - The observability story: both counters (and their Prometheus export names with `path` labels) plus the recommended alert rule (`rate(...) > 0`).
   - The escape hatch for callers who need strict durability: replace the `tokio::spawn` with an awaited write (or wrap it in a retry-with-backoff task and a bounded persistence backlog queue).
 
 ### Problems

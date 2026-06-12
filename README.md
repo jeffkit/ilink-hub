@@ -312,14 +312,15 @@ return. This is a deliberate trade-off:
   the same user sends a message they may be assigned a new vctx, and any per-backend
   session that was keyed to the old vctx becomes orphaned in `backend_sessions_v2`.
 
-To make this trade-off **observable** rather than silent, the Hub exposes the
-`persist_fire_and_forget_failures` counter on the in-process `Metrics` struct (and
-on the Prometheus `/metrics` endpoint as `ilink_persist_fire_and_forget_failures_total`).
-Both fire-and-forget persist sites — the per-message single-row call in
-`dispatch_message::RoutingDecision::ForwardTo` and the per-broadcast batched call in
-`RoutingDecision::Broadcast` — increment the counter on error. A non-zero rate here
-indicates context-token durability is being lost; alert on
-`rate(...) > 0` rather than scraping absolute totals.
+To make this trade-off **observable** rather than silent, the Hub exposes two
+counters on the in-process `Metrics` struct and on the Prometheus `/metrics`
+endpoint as `ilink_hub_persist_fire_and_forget_failures_total{path="forward_to"}`
+and `ilink_hub_persist_fire_and_forget_failures_total{path="broadcast"}`. The
+per-message (`ForwardTo`) site bumps the `forward_to` counter on error; the
+per-broadcast (`Broadcast`) site bumps the `broadcast` counter on error. A
+non-zero rate on either label indicates context-token durability is being lost;
+alert on `rate(...) > 0` rather than scraping absolute totals. The `path` label
+lets operators distinguish single-row failures from per-broadcast batch failures.
 
 If you require strict durability, replace the `tokio::spawn` in `src/hub/mod.rs` with
 an awaited write (or wrap it in a retry-with-backoff task and a bounded
