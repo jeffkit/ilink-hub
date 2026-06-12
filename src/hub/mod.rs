@@ -52,6 +52,8 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
+    /// Number of messages missed because the dispatcher lagged behind the broadcast channel.
+    pub dispatcher_lagged: AtomicU64,
 }
 
 impl Metrics {
@@ -63,6 +65,7 @@ impl Metrics {
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
+            dispatcher_lagged: AtomicU64::new(0),
         }
     }
 }
@@ -214,6 +217,10 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
                 }
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!(skipped = n, "dispatcher lagged behind upstream");
+                    state
+                        .metrics
+                        .dispatcher_lagged
+                        .fetch_add(n, Ordering::Relaxed);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     info!("upstream broadcast channel closed, dispatcher exiting");

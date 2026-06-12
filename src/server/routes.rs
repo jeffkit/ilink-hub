@@ -856,6 +856,7 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
     let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
     let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
+    let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
     let upstream_polls_ok = state.upstream.polls_ok.load(Ordering::Relaxed);
     let upstream_polls_err = state.upstream.polls_err.load(Ordering::Relaxed);
     let relogin_attempts = state.upstream.relogin_attempts.load(Ordering::Relaxed);
@@ -934,6 +935,13 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     out.push_str(&format!(
         "ilink_hub_sendmessage_errors_total {}\n",
         sendmessage_errors
+    ));
+
+    out.push_str("# HELP ilink_hub_dispatcher_lagged_total Number of messages missed because the dispatcher lagged behind the broadcast channel\n");
+    out.push_str("# TYPE ilink_hub_dispatcher_lagged_total counter\n");
+    out.push_str(&format!(
+        "ilink_hub_dispatcher_lagged_total {}\n",
+        dispatcher_lagged
     ));
 
     out.push_str("# HELP ilink_hub_relogin_attempts_total Number of QR re-login attempts (manual or automatic)\n");
