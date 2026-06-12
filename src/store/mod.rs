@@ -883,10 +883,7 @@ mod store_tests {
             .tempdir_in("target")
             .unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let db_url = format!(
-            "sqlite:{}",
-            db_path.to_str().unwrap()
-        );
+        let db_url = format!("sqlite:{}", db_path.to_str().unwrap());
 
         let store = Store::connect(&db_url).await.expect("connect");
 
