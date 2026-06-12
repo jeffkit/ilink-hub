@@ -378,6 +378,36 @@ pub async fn pair_confirm(
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty());
 
+    let check_result = {
+        let pairing = state.pairing.read().await;
+        if let Some(session) = pairing.get(&code) {
+            match session.public_status() {
+                crate::hub::pairing::PairingStatus::Expired => Err(PairingError::Expired),
+                crate::hub::pairing::PairingStatus::Confirmed => Err(PairingError::AlreadyConfirmed),
+                _ => Ok(()),
+            }
+        } else {
+            Err(PairingError::NotFound)
+        }
+    };
+
+    if let Err(e) = check_result {
+        return match e {
+            PairingError::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "pairing session not found" })),
+            ),
+            PairingError::Expired => (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "error": "pairing session expired" })),
+            ),
+            PairingError::AlreadyConfirmed => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "pairing already confirmed" })),
+            ),
+        };
+    }
+
     let vtoken = register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
 
     let confirm_result = {

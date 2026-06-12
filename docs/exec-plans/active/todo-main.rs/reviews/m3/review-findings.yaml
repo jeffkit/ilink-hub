@@ -1,0 +1,55 @@
+milestone: M3
+title: "M3 — 质量门"
+date: 2026-06-12
+verdict: pass
+summary: >
+  M3 质量门中所有 HIGH 严重级别的安全和并发问题均已修复并补齐对抗性测试。这包括：未授权配对确认导致合法凭证被越权覆盖并锁定的安全漏洞（通过在写入和注册前先行校验配对码有效性来防止越权），以及 Relay 服务器在 HTTP 客户端取消连接时发生 pending_requests 异步取消导致的内存泄露问题（通过引入同步 Mutex 和 Drop 守卫 guard 实现 RAII 自动清理解决）。所有测试和 Clippy 检查已全部通过。
+findings:
+  - id: pair-confirm-auth-bypass-lockout
+    title: "未授权的配对确认请求可越权覆盖已有客户端凭证造成永久锁定"
+    severity: High
+    file: "src/server/pairing.rs"
+    description: >
+      在 `pair_confirm` 处理函数中，系统首先调用 `register_client_in_hub` 将新 client 的 vtoken 落库（并在 name 发生 ON CONFLICT 时执行 UPDATE），随后才对配对码 `code` 执行 `pairing.confirm` 进行有效性校验。
+      由于该接口无需 admin token 认证，攻击者可直接通过公共 Relay 向 Hub 发送伪造的 `POST /hub/pair/{invalid_code}/confirm`，请求体中包含已存在的合法客户端名称（例如 `mac-home`）。
+      尽管由于 code 错误导致最终返回 404，但 `Store::upsert_client` 已在之前被执行，使得合法客户端的 vtoken 被强行修改并落库，造成合法客户端在下一次 getupdates 时返回 401 凭证错误，被永久踢出并锁定。
+    recommendation: >
+      修改 `pair_confirm` 处理逻辑：先执行 `pairing.confirm` 验证配对码是否合法，如果成功，再调用 `register_client_in_hub` 完成注册和落库。这样可以在校验不通过时阻止对 registry 和数据库的任意更新，或者在发生错误时进行显式事务回滚。
+  - id: relay-pending-request-leak-on-cancel
+    title: "HTTP 客户端连接断开/取消导致 Relay 挂起的请求无限泄露"
+    severity: High
+    file: "src/relay/server.rs"
+    description: >
+      在 `forward_to_hub` 中，当向 Hub 发送请求后，程序在 `tokio::time::timeout(REQUEST_TIMEOUT, rx).await` 处等待 Hub 侧的响应。
+      如果在响应到达前，发起 HTTP 请求的手机端（客户端）主动断开连接或触发超时，Axum 会取消该 handler 异步任务，这会导致 `forward_to_hub` 在 await 处被立即 Drop。
+      由于缺少 RAII 自动清理机制，`state.pending.write().await.remove(&request_id)` 清理语句将无法被执行，导致生成的 `request_id` 和对应的 `oneshot::Sender` 永久残留在 `pending` HashMap 中。攻击者可通过发送并断开大量请求，导致 Relay 服务器内存耗尽崩溃。
+    recommendation: >
+      将 `pending` 映射的锁改为同步的 `std::sync::Mutex`，并为请求上下文实现一个 RAII Guard（实现 `Drop` 特征），在 Guard 被 drop 时，利用同步锁安全地从 map 中清除 `request_id`。
+  - id: rate-limiter-inactive-keys-memory-leak
+    title: "RateLimiter 未能对非活跃键的过期事件进行清理造成内存泄漏"
+    severity: Medium
+    file: "src/relay/ratelimit.rs"
+    description: >
+      在 `RateLimiter::allow` 中，内存回收逻辑为 `if inner.buckets.len() > 10_000 { inner.buckets.retain(|_, v| !v.is_empty()); }`。
+      然而，`bucket.retain(|t| now - *t < self.window_ms)` 仅在当前请求的 `key` 被访问时才会被执行。对于历史存在但之后再无任何请求的非活跃 key，它们的 `v` 依然包含过期的历史时间戳，因此 `v.is_empty()` 始终为 `false`，从而无法被 `retain` 清理。
+      当并发请求的 IP 数量很大时，该 Map 将不受限制地持续增长，造成内存缓慢泄漏（DoS 隐患）。
+    recommendation: >
+      在 cleanup 分支中，迭代所有的 buckets 时，首先对每个 bucket 执行内部的 `v.retain(|t| now - *t < self.window_ms)` 清理，之后再执行 `!v.is_empty()` 过滤。
+  - id: getupdates-cancel-cancellation-safety-stuck
+    title: "getupdates 轮询在任务被取消时导致消息在队列中无限期延迟"
+    severity: Medium
+    file: "src/server/routes.rs"
+    description: >
+      在 `getupdates` 处理器中，系统无条件调用 `wait_notify_or_shutdown` 阻塞等待通知，然后再调用 `state.queue.drain(&vtoken)`。
+      若消息在此期间被推入队列，`Notify` 变为已激活。但如果客户端在 `notified().await` 成功返回后，但在 `drain` 被调用前，因 HTTP 链接断开导致该 Axum 异步任务被取消，那么 `Notify` 的许可证已经被消耗，而消息依然遗留在 `pending` 队列中。
+      当下一次客户端重新请求 `getupdates` 时，由于队列非空但 `Notify` 许可证为 0，程序将由于无条件调用 `wait_notify` 而强制阻塞 30 秒，直到有全新消息到达或超时，导致已有的消息面临严重延迟。
+    recommendation: >
+      在 `getupdates` 中，先尝试 `drain` 队列。如果非空，直接返回消息；只有在队列为空时，才执行 `wait_notify_or_shutdown`，并在唤醒后再次进行 `drain`。
+  - id: cli-http-client-no-timeout
+    title: "CLI 客户端缺少 HTTP 超时设置可导致进程无限挂起"
+    severity: Medium
+    file: "src/main.rs"
+    description: >
+      在 `src/main.rs` 的 `register_client` 与 `list_clients` 逻辑中，使用 `reqwest::Client::new()` 默认构造客户端，未指定任何超时限制。如果在网络异常或 Hub 端无限挂起时，CLI 工具也将永久卡死。
+    recommendation: >
+      统一使用 `reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build()?` 并正确处理 Result，设置合理的超时时间限制。
