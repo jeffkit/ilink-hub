@@ -211,6 +211,17 @@ Hub 在 `getupdates` 下发的 JSON 里会带 **`ilink_hub_session_id`**；用 `
 
 `args` 以 **JSON/YAML 数组** 传给进程，**不经过 shell**，可避免常见注入；请勿自行拼 `sh -c` 再把用户原文塞进去。
 
+::: danger 安全警告：注入风险
+**不要**在配置中将 `{{MESSAGE}}` 作为 shell `-c` 参数的一部分（例如 `command: bash`, `args: ["-c", "echo {{MESSAGE}}"]`）。这样做会导致严重的 shell 命令行注入安全漏洞。
+如果需要将用户消息作为输入，推荐使用 `stdin: message` 模式，将消息内容通过标准输入（stdin）安全地传递给子进程：
+```yaml
+profiles:
+  my-command:
+    command: /usr/local/bin/my-script
+    stdin: message
+```
+:::
+
 ::: warning 安全
 Bridge 与 Hub 管理员权限无关：任何能向该微信会话发消息的人，都可能触发你配置的命令。请控制 Hub 暴露范围，并阅读 [安全建议](/deployment/security)。
 :::

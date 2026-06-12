@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
@@ -14,18 +15,90 @@ use super::protocol::RelayMessage;
 const RECONNECT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
+/// RFC 7230 §6.1 hop-by-hop headers that must not be forwarded by a proxy.
+const HOP_BY_HOP_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Spawn a background task that maintains a relay connection and forwards HTTP to local Hub.
-pub fn spawn_relay_client(identity: DeviceIdentity, hub_base: String, relay_ws_url: String) {
+///
+/// Returns when `shutdown` flips to `true`, performing a clean exit so the relay server
+/// observes a normal WebSocket close instead of an unexpected drop.
+pub fn spawn_relay_client(
+    identity: DeviceIdentity,
+    hub_base: String,
+    relay_ws_url: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(run_relay_loop(identity, hub_base, relay_ws_url, shutdown));
+}
+
+/// Reconnect loop body, factored out so tests can `await` it directly.
+pub async fn run_relay_loop(
+    identity: DeviceIdentity,
+    hub_base: String,
+    relay_ws_url: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let device_id = identity.device_id().to_string();
-    tokio::spawn(async move {
-        loop {
-            match run_session(&identity, &device_id, &hub_base, &relay_ws_url).await {
-                Ok(()) => info!("relay session ended normally"),
-                Err(e) => warn!(error = %e, "relay session error"),
-            }
-            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+    // If shutdown is already true at startup (e.g. shutdown raced with startup
+    // ordering), exit immediately rather than connecting once and dropping the
+    // socket on the way out.
+    if *shutdown.borrow() {
+        info!("relay client skipped (shutdown already signalled at spawn)");
+        return;
+    }
+    loop {
+        // Per-iteration shutdown check: between iterations the receiver may
+        // have been notified; cheap to poll again before kicking off I/O.
+        if *shutdown.borrow() {
+            info!("relay client shutting down (pre-iteration)");
+            return;
         }
-    });
+        let session_shutdown = shutdown.clone();
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("relay client shutting down");
+                    return;
+                }
+            }
+            res = run_session(
+                &identity,
+                &device_id,
+                &hub_base,
+                &relay_ws_url,
+                session_shutdown,
+            ) => {
+                match res {
+                    Ok(SessionExit::Shutdown) => {
+                        info!("relay session observed shutdown");
+                        return;
+                    }
+                    Ok(SessionExit::EndedNormally) => info!("relay session ended normally"),
+                    Err(e) => warn!(error = %e, "relay session error"),
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)) => {}
+        }
+    }
+}
+
+/// Why a `run_session` future returned.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionExit {
+    /// Session exited cleanly without a request triggering shutdown.
+    EndedNormally,
+    /// Shutdown was observed while the session was active.
+    Shutdown,
 }
 
 async fn run_session(
@@ -33,12 +106,20 @@ async fn run_session(
     device_id: &str,
     hub_base: &str,
     relay_ws_url: &str,
-) -> Result<()> {
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<SessionExit> {
     info!(url = %relay_ws_url, device_id = %device_id, "connecting to pairing relay");
 
-    let (ws, _) = connect_async(relay_ws_url)
-        .await
-        .map_err(|e| anyhow::anyhow!("connect {relay_ws_url}: {e}"))?;
+    // Race the connect handshake against shutdown so a SIGTERM during a slow
+    // TCP handshake does not hold the task open past the kernel's timeout.
+    let ws = tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+        res = connect_async(relay_ws_url) => match res {
+            Ok((ws, _)) => ws,
+            Err(e) => anyhow::bail!("connect {relay_ws_url}: {e}"),
+        },
+    };
     let (mut write, mut read) = ws.split();
 
     let timestamp = unix_now();
@@ -48,16 +129,32 @@ async fn run_session(
         timestamp,
         signature: identity.sign_register(timestamp)?,
     };
-    write
-        .send(Message::Text(register.to_json()?.into()))
-        .await?;
+    // Same race for the register write — if shutdown lands while the write is
+    // queued, drop the future rather than block on the WebSocket send.
+    let send_fut = write.send(Message::Text(register.to_json()?.into()));
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+        res = send_fut => res?,
+    }
 
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
         .build()?;
 
-    while let Some(msg) = read.next().await {
-        let msg = msg?;
+    loop {
+        // Read the next message or react to shutdown before doing any work on
+        // the message — this also covers idle keep-alive (no message => wait).
+        let msg = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+            msg = read.next() => match msg {
+                Some(Ok(m)) => m,
+                Some(Err(e)) => return Err(e.into()),
+                None => return Ok(SessionExit::EndedNormally),
+            },
+        };
+
         if !msg.is_text() {
             continue;
         }
@@ -98,9 +195,14 @@ async fn run_session(
                         body: Some(r#"{"error":"forbidden path"}"#.into()),
                     }
                 } else {
-                    match forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref())
-                        .await
-                    {
+                    let forward_fut =
+                        forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref());
+                    let res = tokio::select! {
+                        biased;
+                        _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+                        res = forward_fut => res,
+                    };
+                    match res {
                         Ok((status, headers, body)) => RelayMessage::Response {
                             id,
                             status,
@@ -115,18 +217,40 @@ async fn run_session(
                         },
                     }
                 };
-                write.send(Message::Text(reply.to_json()?.into())).await?;
+                // Race the reply write against shutdown too: an in-flight reply
+                // must not hold the task open past a SIGTERM.
+                let send_fut = write.send(Message::Text(reply.to_json()?.into()));
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+                    res = send_fut => res?,
+                }
             }
             RelayMessage::Ping => {
-                write
-                    .send(Message::Text(RelayMessage::Pong.to_json()?.into()))
-                    .await?;
+                let send_fut = write.send(Message::Text(RelayMessage::Pong.to_json()?.into()));
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
+                    res = send_fut => res?,
+                }
             }
             _ => {}
         }
     }
+}
 
-    Ok(())
+/// Resolve when `shutdown` flips to `true`. Used as one arm of a `select!`
+/// race so that an in-flight I/O future can be dropped the moment shutdown
+/// is signalled, regardless of how long the I/O would otherwise take.
+async fn wait_for_shutdown(shutdown: &mut watch::Receiver<bool>) {
+    // Already signalled — return immediately without consuming a notification.
+    if *shutdown.borrow() {
+        return;
+    }
+    // Wait for the next change. We don't care *what* it changed to here — the
+    // caller will re-check the borrow() after this resolves if it needs to
+    // distinguish "shutdown" from "spurious change".
+    let _ = shutdown.changed().await;
 }
 
 async fn forward_to_hub(
@@ -149,7 +273,7 @@ async fn forward_to_hub(
     };
 
     for (k, v) in headers {
-        if k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("content-length") {
+        if is_blocked_forward_header(k) {
             continue;
         }
         req = req.header(k, v);
@@ -172,9 +296,297 @@ async fn forward_to_hub(
     Ok((status, resp_headers, body_text))
 }
 
+/// `true` if `name` matches a header that must never be forwarded from the
+/// untrusted relay side to the local hub. Covers the full RFC 7230 §6.1
+/// hop-by-hop set plus `host` and `content-length` which would otherwise be
+/// re-derived by reqwest from the request URL.
+fn is_blocked_forward_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if lower == "host" || lower == "content-length" {
+        return true;
+    }
+    HOP_BY_HOP_HEADERS.iter().any(|h| *h == lower)
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use tokio::sync::watch;
+
+    fn test_identity() -> DeviceIdentity {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        DeviceIdentity::for_testing(
+            "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            B64.encode(signing_key.to_bytes()),
+        )
+    }
+
+    /// Bind a TcpListener on an OS-assigned port, then drop it so the kernel
+    /// holds a brief TIME_WAIT / refused state on that port. Using port 0 is
+    /// more portable than `127.0.0.1:1` because it cannot collide with an
+    /// unrelated process that happens to bind low ports in a sandbox.
+    async fn refused_addr() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        drop(listener);
+        addr.to_string()
+    }
+
+    /// If `shutdown` is already true at spawn time, the loop must exit immediately
+    /// without ever calling `run_session` (and therefore without opening any WebSocket).
+    #[tokio::test]
+    async fn relay_loop_returns_immediately_when_shutdown_already_true() {
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).expect("send shutdown");
+        let identity = test_identity();
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_relay_loop(
+                identity,
+                "http://127.0.0.1:1".to_string(),
+                "ws://127.0.0.1:1/ws/pairing".to_string(),
+                rx,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "run_relay_loop did not return within 200ms when shutdown was signalled at spawn"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "loop took {}ms to exit; expected near-instant",
+            start.elapsed().as_millis()
+        );
+    }
+
+    /// When `run_session` fails (e.g. unreachable relay URL) and the loop falls
+    /// into the `RECONNECT_SECS` sleep, sending `shutdown` must abort the sleep
+    /// and return promptly — well under the 5s reconnect interval.
+    #[tokio::test]
+    async fn relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled() {
+        let unreachable = refused_addr().await;
+        let (tx, rx) = watch::channel(false);
+        let identity = test_identity();
+        let loop_handle = tokio::spawn(run_relay_loop(
+            identity,
+            format!("http://{unreachable}"),
+            format!("ws://{unreachable}/ws/pairing"),
+            rx,
+        ));
+
+        // Give the loop time to attempt connect_async and fall into the
+        // 5s reconnect sleep.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx.send(true).expect("send shutdown");
+
+        // The sleep arm must abort via the select!'s `shutdown.changed()` arm.
+        // Allow a generous bound (RECONNECT_SECS is 5s, so anything <2s proves
+        // shutdown was honoured).
+        match tokio::time::timeout(Duration::from_secs(2), loop_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("relay loop task panicked: {e}"),
+            Err(_) => panic!("relay loop did not exit within 2s of shutdown signal"),
+        }
+    }
+
+    /// `spawn_relay_client` must return synchronously (it just spawns a task) so the
+    /// caller's startup sequence is not blocked by relay connectivity.
+    #[tokio::test]
+    async fn spawn_relay_client_returns_without_blocking() {
+        let identity = test_identity();
+        let (_tx, rx) = watch::channel(false);
+        let start = std::time::Instant::now();
+        spawn_relay_client(
+            identity,
+            "http://127.0.0.1:1".to_string(),
+            "ws://127.0.0.1:1/ws/pairing".to_string(),
+            rx,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "spawn_relay_client blocked for {elapsed:?} (expected <50ms)"
+        );
+    }
+
+    // ── Adversarial tests for F-1: shutdown must interrupt every in-flight
+    //    I/O inside `run_session`, not just the outer reconnect sleep. ─────
+
+    /// Bind a TcpListener that accepts the TCP connection but never completes
+    /// the WebSocket upgrade — i.e. `connect_async` is mid-handshake. The
+    /// shutdown signal must still drop the task within a small bound, even
+    /// though the handshake would otherwise hang for the OS TCP timeout.
+    #[tokio::test]
+    async fn relay_loop_exits_during_held_handshake_when_shutdown_signalled() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("local_addr");
+
+        // Hold the half-open connections open so `connect_async` never
+        // returns. We drop the listener only after the test asserts exit;
+        // otherwise the kernel RSTs the new SYN and the test no longer
+        // exercises the handshake-stuck code path.
+        let hold = tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                // Keep the socket open by parking it in a task that
+                // never reads or writes. Drop happens when the test
+                // ends and the outer task is cancelled.
+                tokio::spawn(async move {
+                    let _hold = sock;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let (tx, rx) = watch::channel(false);
+        let identity = test_identity();
+        let loop_handle = tokio::spawn(run_relay_loop(
+            identity,
+            format!("http://{addr}"),
+            format!("ws://{addr}/ws/pairing"),
+            rx,
+        ));
+
+        // Give the loop time to enter connect_async and block on the
+        // handshake. connect_async sends the HTTP Upgrade request and waits
+        // for the 101 Switching Protocols response; until our accept loop
+        // responds, that future never resolves.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        tx.send(true).expect("send shutdown");
+
+        match tokio::time::timeout(Duration::from_secs(1), loop_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("relay loop task panicked: {e}"),
+            Err(_) => panic!(
+                "relay loop did not exit within 1s of shutdown while handshake was held — \
+                 the in-flight connect_async is not interruptible"
+            ),
+        }
+
+        hold.abort();
+        let _ = hold.await;
+    }
+
+    /// Header pass-through must strip both the simple blocklist (host,
+    /// content-length) and the full RFC 7230 hop-by-hop set. This is
+    /// exercised indirectly by `forward_to_hub`; the unit test pins the
+    /// predicate so a future refactor cannot silently drop one entry.
+    #[test]
+    fn hop_by_hop_header_predicate_blocks_all_rfc7230_hop_by_hop() {
+        for h in HOP_BY_HOP_HEADERS {
+            assert!(
+                is_blocked_forward_header(h),
+                "hop-by-hop header {h:?} must be blocked"
+            );
+            assert!(
+                is_blocked_forward_header(&h.to_uppercase()),
+                "hop-by-hop header {h:?} must be blocked (case-insensitive)"
+            );
+        }
+        assert!(is_blocked_forward_header("host"));
+        assert!(is_blocked_forward_header("Host"));
+        assert!(is_blocked_forward_header("content-length"));
+        assert!(is_blocked_forward_header("Content-Length"));
+
+        // Headers that should still pass through.
+        assert!(!is_blocked_forward_header("authorization"));
+        assert!(!is_blocked_forward_header("x-custom-header"));
+        assert!(!is_blocked_forward_header("user-agent"));
+    }
+
+    /// Test that when the relay client receives a request message and starts
+    /// forwarding it to the hub (which takes a long time/hangs), the shutdown
+    /// signal still interrupts the task immediately.
+    #[tokio::test]
+    async fn relay_loop_exits_during_http_forward_when_shutdown_signalled() {
+        // 1. Mock WebSocket server for the relay client to connect to
+        let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ws listener");
+        let ws_addr = ws_listener.local_addr().expect("local_addr");
+
+        let mock_ws = tokio::spawn(async move {
+            if let Ok((stream, _)) = ws_listener.accept().await {
+                if let Ok(mut ws_stream) = tokio_tungstenite::accept_async(stream).await {
+                    // Read Register message
+                    if let Some(Ok(Message::Text(_))) = ws_stream.next().await {
+                        // Send Request message to trigger forward_to_hub
+                        let req = RelayMessage::Request {
+                            id: "req-1".to_string(),
+                            method: "GET".to_string(),
+                            path: "/hub/pair/abc".to_string(),
+                            headers: HashMap::new(),
+                            body: None,
+                        };
+                        let _ = ws_stream
+                            .send(Message::Text(req.to_json().unwrap().into()))
+                            .await;
+
+                        // Keep connection open
+                        std::future::pending::<()>().await;
+                    }
+                }
+            }
+        });
+
+        // 2. Mock Hub HTTP server that accepts connection but hangs
+        let hub_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind hub listener");
+        let hub_addr = hub_listener.local_addr().expect("local_addr");
+
+        let mock_hub = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = hub_listener.accept().await {
+                // Read request headers to clear the buffer
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                // Hang forever to simulate slow hub
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let (tx, rx) = watch::channel(false);
+        let identity = test_identity();
+        let loop_handle = tokio::spawn(run_relay_loop(
+            identity,
+            format!("http://{hub_addr}"),
+            format!("ws://{ws_addr}/ws/pairing"),
+            rx,
+        ));
+
+        // Give the loop time to connect, register, receive request, and enter forward_to_hub
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // Signal shutdown
+        tx.send(true).expect("send shutdown");
+
+        // The loop must abort mid-forwarding and exit quickly.
+        match tokio::time::timeout(Duration::from_secs(2), loop_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("relay loop task panicked: {e}"),
+            Err(_) => panic!(
+                "relay loop did not exit within 2s of shutdown while HTTP forwarding was stuck"
+            ),
+        }
+
+        mock_ws.abort();
+        mock_hub.abort();
+        let _ = mock_ws.await;
+        let _ = mock_hub.await;
+    }
 }

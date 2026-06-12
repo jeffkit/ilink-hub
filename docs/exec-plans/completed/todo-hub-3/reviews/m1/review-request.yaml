@@ -1,0 +1,11 @@
+milestone: m1
+title: Fix MISC-01 (LRU Hotness in `resolve_full`)
+status: completed
+description: |
+  Modified `resolve_full` in `src/hub/queue.rs` to take `&mut self` and use `get` instead of `peek` to correctly update the LRU cache priority.
+  Acquired write lock on `ctx_map` in `src/server/routes.rs` before calling `resolve_full`.
+verification:
+  - cargo fmt --check passed
+  - cargo clippy -- -D warnings passed
+  - cargo test passed (including new unit test `test_resolve_full_updates_lru_hotness` verifying LRU cache promotion)
+  - cargo build passed

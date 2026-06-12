@@ -484,19 +484,28 @@ async fn run_cli(
         .spawn()
         .with_context(|| format!("failed to spawn `{command}`"))?;
 
+    let dur = Duration::from_secs(cfg.timeout_secs.max(1));
+
     if matches!(cfg.stdin, StdinMode::Message) {
         let mut stdin = child
             .stdin
             .take()
             .context("stdin pipe missing for stdin: message")?;
-        stdin
-            .write_all(message.as_bytes())
-            .await
-            .context("write stdin")?;
-        stdin.shutdown().await.context("shutdown stdin")?;
+
+        let write_fut = async {
+            stdin
+                .write_all(message.as_bytes())
+                .await
+                .context("write stdin")?;
+            stdin.shutdown().await.context("shutdown stdin")?;
+            Ok::<(), anyhow::Error>(())
+        };
+
+        tokio::time::timeout(dur, write_fut).await.map_err(|_| {
+            anyhow::anyhow!("CLI stdin write timed out after {}s", cfg.timeout_secs)
+        })??;
     }
 
-    let dur = Duration::from_secs(cfg.timeout_secs.max(1));
     let output = tokio::time::timeout(dur, child.wait_with_output())
         .await
         .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?
@@ -723,6 +732,52 @@ mod tests {
             resolve_bridge_executable(),
             PathBuf::from(BRIDGE_BINARY_FILE)
         );
+    }
+
+    #[tokio::test]
+    async fn test_stdin_write_timeout() {
+        // Use `sleep` without absolute path for cross-platform compatibility.
+        // On macOS /bin/sleep exists; ubuntu-24.04+ GitHub Actions runners expose
+        // sleep only via PATH (/usr/bin/sleep), not necessarily at /bin/sleep.
+        let sleep_cmd = if cfg!(target_os = "macos") {
+            "/bin/sleep"
+        } else {
+            "sleep"
+        };
+        let yaml = format!(
+            "command: {sleep_cmd}\nargs: [\"10\"]\nstdin: message\ntimeout_secs: 1\n"
+        );
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        // Create a large message that will fill the OS pipe buffer and block if not read
+        let large_msg = "A".repeat(128 * 1024);
+
+        let start = std::time::Instant::now();
+        let res = run_cli(
+            profile,
+            "test_profile",
+            &large_msg,
+            "session-123",
+            "session-name",
+            "user-123",
+            "ctx-123",
+        )
+        .await;
+
+        let elapsed = start.elapsed();
+        assert!(
+            res.is_err(),
+            "Expected stdin write to timeout, but it succeeded: {:?}",
+            res
+        );
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("timed out") || err_msg.contains("stdin"),
+            "Expected timeout error message, got: {}",
+            err_msg
+        );
+        assert!(elapsed.as_secs() < 3, "Took too long: {:?}", elapsed);
     }
 }
 

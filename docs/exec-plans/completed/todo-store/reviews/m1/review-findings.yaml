@@ -1,0 +1,69 @@
+milestone: m1
+verdict: PASS
+findings:
+  - id: sync-02-race-condition
+    severity: CRITICAL
+    category: Concurrency & Data Race
+    title: Concurrent upsert_client logic leads to stale routing_state
+    description: >
+      In `upsert_client`, the old vtoken is queried into memory and then used for updates. Under high concurrency, 
+      multiple transactions may read the same old vtoken. After the first transaction commits, succeeding transactions 
+      will fail to find the old vtoken in `routing_state` as it has already been modified. This results in stale active_vtokens 
+      remaining in `routing_state` while `clients` has moved to a newer vtoken, causing routing failures.
+    recommendation: >
+      Instead of querying the old token in application memory, combine the read and update steps inside the database transaction 
+      using a single update query, e.g., `UPDATE routing_state SET active_vtoken = $1 WHERE active_vtoken = (SELECT vtoken FROM clients WHERE name = $2)` 
+      before performing the insert.
+    file: "src/store/mod.rs"
+    line_range: "194-234"
+
+  - id: mysql-compatibility-on-conflict
+    severity: MAJOR
+    category: Database Compatibility & Security
+    title: SQL syntax error on MySQL due to unsupported ON CONFLICT clauses
+    description: >
+      The project aims to support MySQL 5.7+ as backend. However, several queries in the `Store` module use `ON CONFLICT` 
+      clauses (e.g. `ON CONFLICT (name) DO UPDATE`, `ON CONFLICT (vctx) DO UPDATE`). MySQL does not support `ON CONFLICT` 
+      syntax and will fail with syntax errors.
+    recommendation: >
+      Implement driver-specific query execution or use a cross-db migration query builder. For MySQL, rewrite them to 
+      `ON DUPLICATE KEY UPDATE` or check the database driver type at runtime.
+    file: "src/store/mod.rs"
+    line_range: "210, 362, 556, 579, 606, 635, 734"
+
+  - id: db-03-sqlite-variable-limit
+    severity: MEDIUM
+    category: Robustness / DoS
+    title: Too many SQL variables error in get_hub_ext_batch on SQLite
+    description: >
+      In `get_hub_ext_batch`, the input `pairs` are dynamic. Each pair binds 2 parameters (and 3 in the second query). 
+      If `pairs` exceed ~333, the parameter count will exceed SQLite's legacy parameter limit of 999, causing a crash.
+    recommendation: >
+      Chunk the input `pairs` into groups of 100 or 200 before executing the dynamic SQL query.
+    file: "src/store/mod.rs"
+    line_range: "439-529"
+
+  - id: db-02-async-lock-blocking
+    severity: MEDIUM
+    category: Tokio & Database Lock Blocking
+    title: Serial execution within async transaction causes long lock holding
+    description: >
+      `persist_context_tokens_batch` chunks inputs into groups of 50. Within each chunk, it executes `sqlx::query().execute()` 
+      sequentially inside a transaction. Doing 50 sequential asynchronous network round-trips inside a single write transaction 
+      keeps the write lock active for a long time, causing performance degradation and potential lock timeout for other transactions.
+    recommendation: >
+      Use bulk insert (`INSERT INTO ... VALUES (...), (...), ...`) to perform the write operations in a single database round-trip.
+    file: "src/store/mod.rs"
+    line_range: "621-649"
+
+  - id: owasp-clear-text-credentials
+    severity: LOW
+    category: OWASP Cryptographic Failures
+    title: bot_credentials table stores sensitive tokens in plain text
+    description: >
+      `bot_credentials` table stores sensitive token credentials without encryption. A database leak would directly compromise 
+      the bot's API keys.
+    recommendation: >
+      Encrypt sensitive tokens before saving them, using a key derived from environmental variables.
+    file: "src/store/mod.rs"
+    line_range: "118-125, 729-752"

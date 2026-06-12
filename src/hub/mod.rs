@@ -38,6 +38,23 @@ pub use router::{HubCommand, Router, RoutingDecision};
 
 pub use ilink_status as IlinkStatus;
 
+// ─── Concurrency limits ───────────────────────────────────────────────────────
+
+/// Maximum number of concurrent `getupdates` long-polls allowed for a single vtoken.
+///
+/// A healthy backend has exactly one bridge process polling its vtoken at a time.
+/// When two or more bridge processes share one credential/token, they race for
+/// the destructive `drain` of the per-vtoken message queue and inbound messages
+/// get stolen non-deterministically (split-brain). To stop a malicious or
+/// misconfigured client from holding an unbounded number of long-polls (which
+/// would saturate the Tokio worker pool), the Hub caps the concurrent poll
+/// count per vtoken at this value and rejects additional polls with HTTP 429.
+///
+/// SEC-003: a single vtoken must not be able to exhaust Hub resources. The
+/// cap is intentionally small — anything beyond ~3 is already a configuration
+/// problem worth surfacing in the operator logs.
+pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3;
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
 
 pub struct Metrics {
@@ -84,15 +101,33 @@ impl Default for Metrics {
 /// lets the Hub surface that misconfiguration instead of failing silently.
 #[derive(Default)]
 pub struct PollTracker {
-    counts: StdMutex<HashMap<String, usize>>,
+    /// Per-vtoken concurrent poll counter. Public for test-only access so
+    /// integration tests can poison the mutex to verify the let-Ok
+    /// panic-safety path (F-M2-2); production code should only call
+    /// `enter` / rely on `Drop`.
+    pub counts: StdMutex<HashMap<String, usize>>,
 }
 
 impl PollTracker {
     /// Register a new active poll for `vtoken`. Returns the number of polls now concurrently
     /// active for that vtoken (always >= 1) and a guard that decrements the count on drop.
+    ///
+    /// F-M2-2: never panic on mutex poisoning. If the counts mutex is poisoned, the
+    /// guard is still produced but the count is reported as 0 (which means the 429
+    /// gate won't trip on this vtoken) and the drop handler becomes a best-effort
+    /// no-op. A poisoned `counts` map is a process-wide bug, but it must not take
+    /// the Tokio worker down on every subsequent long-poll.
     pub fn enter(self: &Arc<Self>, vtoken: &str) -> (usize, PollGuard) {
         let count = {
-            let mut counts = self.counts.lock().unwrap();
+            let Ok(mut counts) = self.counts.lock() else {
+                return (
+                    0,
+                    PollGuard {
+                        tracker: Arc::clone(self),
+                        vtoken: vtoken.to_string(),
+                    },
+                );
+            };
             let c = counts.entry(vtoken.to_string()).or_insert(0);
             *c += 1;
             *c
@@ -116,7 +151,11 @@ pub struct PollGuard {
 
 impl Drop for PollGuard {
     fn drop(&mut self) {
-        let mut counts = self.tracker.counts.lock().unwrap();
+        // F-M2-2: best-effort decrement; a poisoned mutex here would otherwise
+        // propagate a panic into the Tokio worker that called the handler.
+        let Ok(mut counts) = self.tracker.counts.lock() else {
+            return;
+        };
         if let Some(c) = counts.get_mut(&self.vtoken) {
             *c = c.saturating_sub(1);
             if *c == 0 {
@@ -823,7 +862,7 @@ async fn resolve_vctx_for_message(
         None
     };
 
-    let mut ctx_map = state.ctx_map.write().await;
+    let ctx_map = state.ctx_map.write().await;
     if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
         // Only seed if nothing else raced in while we held the lock released.
         if !ctx_map.has_conversation(key) {
@@ -969,6 +1008,50 @@ mod tests {
         assert_eq!(c4, 1);
     }
 
+    /// SEC-003: the poll tracker must surface that the per-vtoken cap has
+    /// been exceeded. The handler in src/server/routes.rs uses
+    /// `count > MAX_CONCURRENT_POLLS_PER_VTOKEN` to gate the 429 reply; this
+    /// test pins the boundary so a future refactor that silently clamps
+    /// the count to MAX (or that returns a stale value) is caught.
+    #[test]
+    fn poll_tracker_caps_concurrent() {
+        let tracker = Arc::new(PollTracker::default());
+        // Hold MAX guards so the (MAX+1)th enter must observe a count
+        // strictly greater than MAX.
+        let mut guards = Vec::with_capacity(MAX_CONCURRENT_POLLS_PER_VTOKEN);
+        for expected in 1..=MAX_CONCURRENT_POLLS_PER_VTOKEN {
+            let (c, g) = tracker.enter("vt-cap");
+            assert_eq!(
+                c, expected,
+                "enter #{expected} must report {expected} active polls"
+            );
+            guards.push(g);
+        }
+        // The (MAX+1)th enter must see count == MAX+1 > MAX — this is the
+        // signal the handler uses to return 429.
+        let (over, g_over) = tracker.enter("vt-cap");
+        assert_eq!(
+            over,
+            MAX_CONCURRENT_POLLS_PER_VTOKEN + 1,
+            "the (MAX+1)th concurrent poll must be observable above the cap"
+        );
+        assert!(
+            over > MAX_CONCURRENT_POLLS_PER_VTOKEN,
+            "the cap is the 429 boundary; the handler gates on this"
+        );
+        drop(g_over);
+        // After dropping the over-cap guard, count returns to MAX and a
+        // fresh enter must NOT cross the boundary — this is the recovery
+        // path that lets a legitimate client reconnect after a burst.
+        let (back_to_max, g_back_to_max) = tracker.enter("vt-cap");
+        assert_eq!(
+            back_to_max,
+            MAX_CONCURRENT_POLLS_PER_VTOKEN + 1,
+            "the freshly entered guard again pushes the count to MAX+1"
+        );
+        drop(g_back_to_max);
+        drop(guards);
+    }
     /// Verify that concurrent calls to register_client_in_hub (registry → router lock order)
     /// never deadlock against each other or against route-reading.
     ///

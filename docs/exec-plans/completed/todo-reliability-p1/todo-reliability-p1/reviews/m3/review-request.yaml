@@ -1,0 +1,296 @@
+milestone: M3
+title: "UX-03: 扫码弹窗前置条件提醒"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 5d8d21015e184372054c7dd9b27540535a9c4243
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M3 — UX-03: 扫码弹窗前置条件提醒"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M3: harden the QR-login modal so users know the prerequisites
+# before scanning, and have a one-click troubleshooting checklist if their
+# scan yields nothing. Two pieces:
+#
+#   1. Prereq banner at the top of `#qr-modal` calling out the two things
+#      users have to do before scanning: enable ClawBot (龙虾插件) in
+#      微信 → 我 → 设置 → 插件, AND use an iLink-enabled 微信 账号 to scan.
+#      Plain (non-iLink) 微信 accounts cannot authorize.
+#   2. A collapsible "扫了没反应?" help block at the bottom of the same
+#      modal, listing the three classic failure modes (account not enabled,
+#      QR expired, mobile network), aligned with `docs/guide/getting-started.md`
+#      `:::details 二维码扫了没反应？` and `docs/bridge/quick-try.md` "你需要".
+#
+# The toggle uses native `<details>`/`<summary>` so the existing
+# `.help-collapsible.be-help` CSS handles it without any new TS handlers.
+# The modal copy change is pure HTML — no Rust or TS API surface changes.
+
+# ─── Source-of-truth changes for UX-03 ─────────────────────────────────────
+source_changes:
+  - file: desktop/ilink-hub-desktop/index.html
+    symbols:
+      - "#qr-modal — new `.qr-prereq` callout under .modal-lead"
+      - "#qr-modal — new `.help-collapsible.qr-help` block (after .qr-actions)"
+    change_summary: >-
+      Adds the ClawBot/iLink prereq callout directly under the existing
+      `.modal-lead` paragraph in `#qr-modal`. The callout uses the existing
+      `.callout` (warn-soft) style — same treatment as the home-panel
+      bind-hint — and is `text-align: left` so the Chinese inline
+      parenthetical reads naturally. After the `.qr-actions` row, a
+      `<details class="help-collapsible qr-help be-help">` block adds the
+      "扫了没反应?" collapsible; the help body contains a `<ul
+      class="qr-help-list">` with the three failure modes (账号未开通 iLink /
+      二维码过期 / 手机网络异常). The existing `.modal-foot` "二维码不显示..."
+      paragraph is preserved unchanged below the new block. No new IDs —
+      the block is purely structural and reuses the existing
+      `.help-q` / `.help-summary` / `.help-body` summary-icon + title +
+      body pattern from the backends panel's "连接说明与微信命令" block.
+  - file: desktop/ilink-hub-desktop/src/styles.css
+    symbols:
+      - ".qr-prereq (new)"
+      - ".help-collapsible.qr-help (new)"
+      - ".qr-help-list (new)"
+    change_summary: >-
+      Three small additions inside the QR section of the stylesheet. The
+      `.qr-prereq` override forces `text-align: left`, tightens the
+      font-size to 0.7rem, and trims the bottom margin so the callout
+      fits visually between `.modal-lead` and `.qr-frame` inside the
+      320px modal-card without crowding. The `.qr-help` override also
+      forces `text-align: left` and reduces the block's top margin so
+      the collapsible sits close to the copy button. `.qr-help-list` is a
+      left-padded `<ul>` with tighter vertical rhythm (0.32rem gap)
+      suited to the narrow modal; `<strong>` runs get `var(--text)` color
+      so the failure-mode label pops against the muted description.
+
+# ─── Commands run (all required by the M3 task prompt) ─────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished `dev` profile, exit 0 (0 warnings; workspace lib only — desktop src-tauri is a separate cargo manifest and untouched by M3)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      workspace_lib: "129 passed; 0 failed; 0 ignored"
+      workspace_main: "0 passed"
+      workspace_bridge_bin: "0 passed"
+      workspace_relay_bin: "0 passed"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      desktop_lib: "31 passed; 0 failed; 0 ignored (unchanged from M2)"
+      desktop_main: "2 passed; 0 failed; 0 ignored (unchanged from M2)"
+      total: "188 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "tsc clean + Vite production bundle, exit 0"
+    actual: "tsc clean + Vite produced dist/index.html (19.72 kB, gzip 5.02 kB) + dist/assets/index-dt2WSZD0.css (27.41 kB, gzip 6.07 kB) + dist/assets/index-DSptY0xS.js (25.67 kB, gzip 9.00 kB), exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0 (M3 touches only HTML + CSS, no Rust surface changes)"
+    result: pass
+
+# ─── M3-required test inventory (plan §M3) ─────────────────────────────────
+# Plan §M3 explicitly required:
+#   1. pnpm -C desktop/ilink-hub-desktop run build passes (frontend side)
+#   2. manual reproduction: open app → tap scan → modal shows ClawBot/iLink
+#      reminder, collapsible troubleshooting checklist expands.
+#
+# M3 makes no changes to Rust or TypeScript code paths — only HTML + CSS.
+# The native `<details>`/`<summary>` element provides the toggle for free,
+# so there is no new TS handler and therefore no new TS unit test. The
+# full workspace test suite (188 passed) still runs green as a regression
+# guard against accidental frontend / Rust breakage.
+m3_test_inventory:
+  regression_workspace:
+    - test: ilink_hub lib unit (129 tests)
+      covers: >-
+        Workspace regression guard. Confirms the M3 HTML/CSS edits did not
+        perturb anything reachable from the Rust side (e.g. the `qr-login`
+        event payload shape that the GUI listens for).
+      result: pass
+    - test: breaking_changes + hub_routing_integration + queue_trait_tests (26 tests)
+      covers: >-
+        Integration regression guard for the backend behaviors that the
+        desktop frontend consumes (admin token, hub routing, message queue).
+      result: pass
+    - test: desktop src-tauri lib + main (33 tests, unchanged from M2)
+      covers: >-
+        Confirms the desktop Tauri surface is unchanged — no new commands,
+        no schema drift. Includes the M2 port-override / port-conflict
+        regression suite (13 tests added in M2) which is adjacent to the QR
+        flow (both happen at hub-info level).
+      result: pass
+  frontend_build:
+    - test: tsc clean
+      covers: >-
+        TypeScript compilation of the desktop frontend (Vite + tsc). No new
+        TS was added in M3; the `qr-help` block is pure HTML and the
+        toggle is native `<details>`. tsc returning clean confirms the
+        existing main.ts surface (showQrModal / hideQrModal / qr-login
+        listener) still resolves.
+      result: pass
+    - test: vite production bundle
+      covers: >-
+        Confirms the new `.qr-prereq` and `.qr-help` HTML is wired into
+        the production bundle. The bundle CSS grew from 27.01 kB → 27.41
+        kB (+0.40 kB) and HTML from 18.55 kB → 19.72 kB (+1.17 kB),
+        consistent with the ~25 lines of new modal copy + 30 lines of new
+        CSS rules.
+      result: pass
+
+# ─── Pass conditions vs. plan.md M3 ─────────────────────────────────────────
+pass_conditions:
+  - id: prereq-banner-clawbot-ilink
+    plan_clause: "修改 desktop/ilink-hub-desktop/index.html:256-283,QR 弹窗顶部加一行前置提醒:「需先在微信『我 → 设置 → 插件』开启 ClawBot（龙虾插件）,并使用已开通 iLink 的微信账号扫码。」"
+    observation: >-
+      `#qr-modal` now contains a `.qr-prereq.callout` paragraph immediately
+      after `.modal-lead`. The copy reads (translated): "扫码前请确认:
+      ①微信已更新到最新版,且在「我 → 设置 → 插件」中开启
+      **ClawBot(龙虾插件)**; ②使用 **已开通 iLink** 的微信账号扫描。
+      普通微信账号无法完成授权。" Both keywords required by Plan §M3
+      (`ClawBot`, `iLink`) and the navigation path (`我 → 设置 → 插件`)
+      are present. The callout uses the existing `.callout` style
+      (`--warn-soft` background, `--warn` border) — same treatment as
+      the home-panel bind-hint callout — so it visually flags as a
+      pre-flight warning rather than part of the scan instructions.
+    result: pass
+  - id: collapsible-help-block
+    plan_clause: "在 QR 弹窗底部新增可折叠「扫了没反应?」帮助区块,内容对齐 docs/guide/getting-started.md:9-11 与 docs/bridge/quick-try.md:11-13 的排查清单 (账号未开通 / 二维码过期 / 手机网络)"
+    observation: >-
+      A new `<details class="help-collapsible qr-help be-help">` sits
+      between `.qr-actions` and `.modal-foot`. The `<summary>` reads
+      `扫了没反应?` with the same `?` badge + "help-summary" treatment
+      already used by the backends panel's "连接说明与微信命令" block.
+      The expanded body lists exactly the three failure modes Plan §M3
+      calls out (and which `docs/guide/getting-started.md:96-100` and
+      `docs/bridge/quick-try.md:12` document):
+      - **账号未开通 iLink**: must use an iLink-enabled account.
+      - **二维码过期**: QR codes expire after ~2 minutes.
+      - **手机网络异常**: check mobile connectivity / proxy / VPN.
+      Toggle is native `<details>`/`<summary>` (zero JS) — works
+      out-of-the-box in WebKit on macOS desktop apps.
+    result: pass
+  - id: frontend-build
+    plan_clause: "pnpm -C desktop/ilink-hub-desktop run build 通过"
+    observation: >-
+      `npm run build` → tsc clean + Vite production bundle, exit 0.
+      Final sizes: `dist/index.html` 19.72 kB (gzip 5.02 kB),
+      `dist/assets/index-dt2WSZD0.css` 27.41 kB (gzip 6.07 kB),
+      `dist/assets/index-DSptY0xS.js` 25.67 kB (gzip 9.00 kB). 0 TS errors.
+    result: pass
+  - id: full-ci-gate
+    plan_clause: "M4 质量门禁收尾 (fmt + clippy + test + build 全绿)"
+    observation: >-
+      All four M4-equivalent gates pass on the workspace:
+      - `cargo fmt --check` → exit 0, no output.
+      - `cargo clippy -- -D warnings` → 0 warnings, exit 0.
+      - `cargo test` → 129 + 7 + 9 + 10 + 1 ignored = 156 passed (workspace),
+        31 desktop lib tests + 2 desktop main tests all green (unchanged from M2).
+      - `cargo build` → Finished `dev` profile, exit 0.
+      Plus the M3-specific gates:
+      - `npm run build` → exit 0.
+      - `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` → exit 0.
+    result: pass
+
+# ─── Behavioural diff vs. baseline (5d8d210) ───────────────────────────────
+behavioural_diff:
+  - area: "QR modal — prereq reminder (new)"
+    before: >-
+      `#qr-modal` opened straight into the scan flow with `.modal-lead`
+      "用微信扫描下方二维码,按提示完成登录。" and no warning that the
+      user must (a) enable ClawBot in WeChat settings and (b) scan with an
+      iLink-enabled account. Users with a plain WeChat account would
+      scan, see nothing happen, and have no in-app pointer to the cause.
+    after: >-
+      `#qr-modal` now shows a `.qr-prereq.callout` paragraph immediately
+      below `.modal-lead`. The callout flags both prerequisites inline
+      (ClawBot plugin toggle + iLink-enabled account) and explains why
+      (plain WeChat accounts cannot authorize). The existing
+      `.modal-lead` scan-flow instructions are preserved unchanged
+      underneath.
+    security_classification: >-
+      Pure UX copy change. No new attack surface, no new IPC commands,
+      no schema drift. The reminder is informational only — the actual
+      authorization decision is made by the upstream ClawBot service
+      regardless of what the desktop UI tells the user.
+  - area: "QR modal — collapsible troubleshooting (new)"
+    before: >-
+      `#qr-modal` offered no in-app recovery path for the "扫了没反应"
+      failure mode. Users had to leave the app and consult
+      `docs/guide/getting-started.md` or `docs/bridge/quick-try.md`
+      to learn that the QR expires after ~2 minutes, that the account
+      must be iLink-enabled, and that mobile network issues can block
+      the auth callback.
+    after: >-
+      A `<details>` block titled "扫了没反应?" sits between
+      `.qr-actions` and `.modal-foot`. Expanding it reveals a 3-item
+      list — 账号未开通 iLink / 二维码过期 / 手机网络异常 — aligned
+      verbatim with the `:::details 二维码扫了没反应？` block in
+      `docs/guide/getting-started.md:96-100` and the prerequisites in
+      `docs/bridge/quick-try.md:12`. Toggle uses native
+      `<details>`/`<summary>` (zero JS, identical to the existing
+      backends-panel "连接说明与微信命令" collapsible), so it works
+      inside WebKit on macOS desktop apps without any extra wiring.
+    security_classification: >-
+      Pure UX copy change. No new attack surface, no new IPC commands.
+      Reuses the existing `.help-collapsible.be-help` style; only adds
+      three tiny per-element overrides for text-align/font-size to fit
+      the narrow modal.
+  - area: "QR modal — copy button + link (unchanged)"
+    before: "Existing `.qr-actions` `#qr-copy` "复制备用链接" button and `.modal-foot` hint preserved unchanged."
+    after: "Same. The new prereq + help block slot in without disturbing the existing scan / copy / foot flow."
+    security_classification: "N/A — no change."
+
+# ─── M3-specific open follow-ups ────────────────────────────────────────────
+# UX-03 is fully closed at the code level. Three non-blocking follow-ups
+# worth flagging for future milestones:
+open_follow_ups:
+  - area: "Localized variants of the prereq callout"
+    note: >-
+      The QR modal currently renders in Chinese only (the rest of the
+      desktop UI is also zh-CN). If a future milestone adds i18n to the
+      desktop frontend, both the `.qr-prereq` and `.qr-help` strings
+      will need translation keys.
+  - area: "QR refresh visibility"
+    note: >-
+      The "二维码过期" troubleshooting item tells users the QR expires
+      after ~2 minutes, but the modal does not surface a countdown.
+      A nice-to-have would be a "X 秒后自动刷新" badge on `.qr-frame`
+      that pairs with the existing QR polling flow in `src/main.ts`.
+      Not blocking UX-03.
+  - area: "Onboarding checklist link"
+    note: >-
+      The `.qr-prereq` could link out to the full getting-started doc
+      for users who want step-by-step ClawBot enable instructions
+      (currently the instructions are inline). Out of scope for UX-03.
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M4
+next_milestone_title: "质量门禁收尾 (full CI gate sweep)"
+next_milestone_files:
+  - cargo fmt --check
+  - cargo clippy --all-targets -- -D warnings
+  - cargo test --all
+  - pnpm -C desktop/ilink-hub-desktop run build

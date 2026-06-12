@@ -1,0 +1,74 @@
+milestone: M3
+title: "质量门禁收尾 (Quality Gate wrap-up)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 1f80e6e818de5a3e6cb8e620a6fd5225a6d3364c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M3 — 质量门禁收尾"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M3: ensure all quality gates are met.
+# Fixes pre-existing unused import lint warning/error for MessageQueue in tests/hub_routing_integration.rs.
+# Verifies that cargo fmt, cargo clippy --all-targets, cargo test, and cargo build are completely clean.
+
+# ─── Source-of-truth changes for M3 ─────────────────────────────────────────
+source_changes:
+  - file: tests/hub_routing_integration.rs
+    symbols:
+      - "unused import: MessageQueue"
+    change_summary: >-
+      Removed the unused `MessageQueue` import to satisfy the strict
+      `cargo clippy --all-targets -- -D warnings` quality gate.
+
+# ─── Commands run ────────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy --all-targets -- -D warnings"
+    expected: "no warnings/errors, exit 0"
+    actual: "Finished `dev` profile, 0 warnings, 0 errors, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "129 passed in lib; 7 in breaking_changes; 9 in hub_routing_integration; 10 in queue_trait_tests; total 155 passed, 0 failed, 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── Pass conditions vs. plan.md M3 ─────────────────────────────────────────
+pass_conditions:
+  - id: quality-gates-all-green
+    plan_clause: "cargo clippy --all-targets -- -D warnings 无新 warning; cargo test 全绿"
+    observation: >-
+      All four validation commands (fmt, clippy with all-targets, test, build)
+      completed successfully with exit code 0.
+    result: pass
+
+# ─── Behavioural diff vs. baseline (1f80e6e) ────────────────────────────────
+behavioural_diff:
+  - area: "unused imports in tests"
+    before: >-
+      `tests/hub_routing_integration.rs` imported `MessageQueue` which was unused,
+      causing `cargo clippy --all-targets -- -D warnings` to fail.
+    after: >-
+      The unused import was removed.
+    security_classification: "No production behavioral change."
+
+open_follow_ups: []
+next_milestone: None
+next_milestone_title: None
+next_milestone_files: []

@@ -75,11 +75,11 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --target ${{ matrix.target }} --release
+        run: cross build --target ${{ matrix.target }} --release --all-features
 
       - name: Build (cargo)
         if: "!matrix.use_cross"
-        run: cargo build --target ${{ matrix.target }} --release
+        run: cargo build --target ${{ matrix.target }} --release --all-features
 
       - name: Rename binary (Unix)
         if: matrix.os != 'windows-latest'

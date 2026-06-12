@@ -1,0 +1,518 @@
+milestone: M1
+title: "Adversarial security & concurrency review of M1 — SEC-001 pair_confirm atomicization"
+reviewer: "rust-sec-concurrency-specialist"
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1
+base_commit: 048a723e816f76e1e65846226005e33b2afc1019
+combined_commit_under_review: 1961dc3f6a1b1c0b1f6f6a36c5e9c4e1f1e9c0a0  # SEC-001/003/013 (M1 scope only)
+fix_commit: 7d8f4e2c0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d  # see git log post-review
+scope:
+  - "SEC-001 portion of commit 1961dc3: pair_confirm Option A (register outside pairing write lock, then atomic confirm under lock, rollback on non-Ok)"
+  - "src/server/pairing.rs: register_client_in_hub, unregister_client_in_hub, rollback_speculative_register (new), pair_confirm, pair_confirm_rate_limiter, origin_matches_device_base, check_origin_or_referer (new)"
+  - "src/hub/pairing.rs: PairingRegistry::create, get, mark_scanned, confirm; new PairingError variants; constant_time_eq; generate_csrf; is_expired / should_evict / CONFIRMED_TTL"
+  - "src/hub/registry.rs: ClientRegistry::register / register_with_vtoken now return (vtoken, is_new)"
+  - "tests/hub_routing_integration.rs: pair_confirm_race_yields_single_winner_and_no_orphan_vtoken, concurrent_register_and_pair_confirm_does_not_deadlock, rollback_preserves_legit_client_when_name_collides, rollback_cas_aborts_when_legit_re_register_happened, register_returns_is_new_flag"
+  - "tests/breaking_changes.rs: pair_confirm_handler_rejects_no_origin_no_referer, pair_confirm_handler_rejects_foreign_origin"
+  - "src/hub/pairing.rs unit tests: confirmed_sessions_are_evicted_after_confirmed_ttl"
+  - "src/server/pairing.rs unit tests: check_origin_or_referer_rejects_missing_headers, check_origin_or_referer_rejects_garbage, check_origin_or_referer_accepts_well_formed_referer"
+
+# ─── Method ──────────────────────────────────────────────────────────────────
+# Re-read review-request.yaml against actual source. For each claim in the
+# request (lock-order F-M1-1, orphan rollback F-M1-2, MAX_PAIRING_SESSIONS
+# F-M1-3, AlreadyConfirmed-before-NotScanned F-M3-4, CSRF constant-time,
+# Origin/Referer allowlist, rate limiter), try to construct a counter-example
+# that breaks the claim. Findings are organised by severity (CRITICAL first),
+# with CWE / OWASP references and concrete remediation.
+
+# ─── Update log ──────────────────────────────────────────────────────────────
+# 2026-06-12 — initial adversarial review. CRITICAL: rollback evicts legitimate
+# clients when attacker supplies a colliding name. HIGH: Origin/Referer
+# allowlist silently passes when both headers are absent. HIGH: Confirmed
+# PairingSessions are immortal → unbounded memory. MEDIUM/LOW findings: see
+# below. Verdict: NEEDS_FIX.
+#
+# 2026-06-12 — second pass after the F-M1-A/B/C fixes landed. All three
+# blocking findings are resolved with two layers of defence (is_new flag in
+# the registry + CAS in the rollback helper; explicit Missing/NotAllowed
+# error type for the origin check; CONFIRMED_TTL eviction). Five new tests
+# cover the fixes end-to-end and the helper unit tests cover the policy in
+# isolation. Verdict: PASS.
+
+# ─── Findings ────────────────────────────────────────────────────────────────
+findings:
+
+  # ─── CRITICAL ──────────────────────────────────────────────────────────────
+  - id: F-M1-A
+    severity: CRITICAL
+    cwe: CWE-863, CWE-284
+    category: authorization / orphan rollback
+    title: "rollback_speculative_register deletes a LEGITIMATE client when attacker supplies a colliding name"
+    evidence:
+      - "src/server/pairing.rs:160-181 — register_client_in_hub calls registry.register(name, label); the registry reuses the existing vtoken if `name` is already registered (src/hub/registry.rs:57-90 register_with_vtoken returns the existing vtoken)."
+      - "src/server/pairing.rs:471-500 — rollback_speculative_register calls registry.remove(name). remove() deletes BOTH the name→vtoken mapping AND the by_vtoken entry, regardless of whether the entry was a fresh insert or a pre-existing one (src/hub/registry.rs:126-133)."
+      - "src/server/pairing.rs:497 — store.delete_client_by_name(name) is unconditional; a row belonging to the legitimate client is also deleted."
+      - "src/server/pairing.rs:590-619 — pair_confirm calls register_client_in_hub (reusing the legit vtoken) BEFORE the pairing lock; on any non-Ok confirm the rollback deletes the legit client."
+      - "src/hub/registry.rs:194-211 — upsert_client SQL UPDATE also rewrites the legitimate client's label/last_seen even when register() reused the vtoken."
+    why_it_matters: >
+      Attack flow (no admin token required; only requires a non-rate-limited
+      request, a guessable/known victim name, and an active pairing code):
+        1. Legitimate client A is paired as name="alice" with vtoken="vhub_abc".
+        2. A user opens the device's QR pair page → code=pair_xyz, status=Scanned, csrf minted.
+        3. Attacker (who never visited the page, but knows or guesses "alice"
+           and "pair_xyz") sends:
+              POST /hub/pair/pair_xyz/confirm
+              Body: {"name":"alice","label":null}
+              X-Pair-CSRF: wrong-token   # or right-token if leaked via pair_page
+              (no Origin, no Referer)
+        4. The handler passes the (permissive) Origin/Referer check, reads
+           the wrong CSRF, calls register_client_in_hub("alice") which
+           REUSES vhub_abc, then takes the pairing write lock, calls
+           confirm() with the wrong CSRF → Err(CsrfMismatch).
+        5. Rollback runs: registry.remove("alice") DELETES the legitimate
+           client. router.remove_routes_for_vtoken clears alice's routes.
+           queue.remove_client("vhub_abc") wipes alice's message queue.
+           store.clear_routes_for_vtoken + delete_client_by_name purge the DB.
+        6. Legitimate bridge A is now completely gone from the Hub.
+
+      The rate limiter (1/(code,ip)/60s) caps the attack frequency but does
+      NOT prevent the attack on its first request per stolen code. The
+      Origin/Referer allowlist silently allows requests with NEITHER header
+      (see F-M1-B), so a curl/wget attacker bypasses the cross-origin guard.
+      An attacker who can sniff one valid code (or use the 60s cooldown to
+      wait for a fresh QR) can evict every paired client whose name is
+      guessable. CWE-863 (Incorrect Authorization) + CWE-284 (Improper Access
+      Control).
+    fix: >
+      Two complementary fixes are needed; either alone leaves a residual hole:
+
+      (a) Distinguish "speculative re-registration of an existing name" from
+          "speculative insertion of a NEW name". Have register_client_in_hub
+          return both the vtoken AND a boolean is_new. Only rollback when
+          is_new; otherwise the speculative call was a no-op merge and the
+          legitimate entry is preserved.
+
+      (b) Make the rollback code path do nothing if the vtoken it's about to
+          delete does not match the in-memory registry entry that existed
+          BEFORE the speculative register (i.e. compare-and-swap on
+          by_vtoken[vt].name == name). If the entry's name was changed by
+          a legitimate re-registration between register() and rollback(),
+          abort the rollback.
+
+      Until (a) lands, this is a critical pre-existing authorization gap
+      that the M1 fix made observable rather than created — but the M1
+      rollback is the place that converts a benign CSRF mismatch into a
+      destructive DB write, so M1 owns the fix.
+
+    # ─── Resolution ───────────────────────────────────────────────────────
+    resolution:
+      status: RESOLVED
+      fix_commit: 7d8f4e2c0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d
+      mechanism: |
+        Two complementary defences, both implemented:
+
+        (a) ClientRegistry::register / register_with_vtoken now return
+            `(vtoken, is_new)` — `is_new = true` only on a fresh insert.
+            `register_client_in_hub` propagates the flag, and the
+            pair_confirm handler now keys the rollback call on it:
+            `if is_new { rollback_speculative_register(...) }`.
+
+        (b) The rollback helper itself short-circuits via a CAS check on
+            `by_name[name]`. If the entry was rewritten (legitimate
+            re-register slipped in between register and rollback), the
+            helper returns early and refuses to evict. This is the
+            defence-in-depth layer for callers that mis-pass `is_new`.
+
+        Together, both layers guarantee that a colliding name cannot
+        evict a pre-existing legitimate client. `is_new` is the primary
+        gate; the CAS is the belt-and-braces check.
+      tests:
+        - "tests/hub_routing_integration.rs::rollback_preserves_legit_client_when_name_collides"
+        - "tests/hub_routing_integration.rs::rollback_cas_aborts_when_legit_re_register_happened"
+        - "tests/hub_routing_integration.rs::register_returns_is_new_flag"
+        - "src/hub/registry.rs::registered_count_single_vs_multi (asserts is_new1)"
+        - "src/hub/registry.rs::register_same_name_reuses_vtoken (asserts is_new2=false)"
+
+  - id: F-M1-B
+    severity: HIGH
+    cwe: CWE-346, CWE-942
+    category: authorization / CORS-like header policy
+    title: "Origin/Referer allowlist silently passes when NEITHER header is present"
+    evidence:
+      - "src/server/pairing.rs:543-575 — the if/else if chain has no terminating `else` rejection. If `origin` is absent AND `referer` is absent, control falls through to the CSRF check with no origin validation."
+      - "src/server/pairing.rs:551-552 — comment 'Some clients omit Origin on same-origin POSTs' is wrong: Chrome 76+, Firefox 73+, Safari 13+ all send Origin on POST by default. The Referer fallback was added for paranoia but is now a downgrade."
+    why_it_matters: >
+      A bare `curl` / `wget` / `python-requests` POST with no Origin and no
+      Referer bypasses the cross-origin guard entirely. This converts
+      F-M1-A from "needs a guessed victim name + an active pairing code" to
+      "needs a guessed victim name + an active pairing code" — the same,
+      but the missing Origin gate was supposed to be the wall that kept
+      drive-by exploits out. Without it, the only defenses against the
+      F-M1-A exploit are the rate limiter (1/(code,ip)/60s) and the CSRF
+      check. The CSRF check is broken in F-M1-A's failure path, and the
+      rate limiter is reset on restart. CWE-346 (Origin Validation Error)
+      + CWE-942 (Permissive Cross-domain Policy).
+    fix: >
+      Replace the if/else-if chain with a strict `if !present(origin)
+      && !present(referer) { return 403 }` branch. If you must allow
+      "same-origin POSTs that omit Origin", document that the browser
+      behavior you are relying on is, e.g., `Sec-Fetch-Site: same-origin`
+      and key the allowlist off that header (which IS reliable across
+      modern browsers and is the recommended CORS-CSRF defense). At a
+      minimum, the CSRF single-use token (already in place) plus the
+      fixed rollback in F-M1-A keep the residual risk bounded; do not
+      ship M1 with the no-header pass-through.
+
+    # ─── Resolution ───────────────────────────────────────────────────────
+    resolution:
+      status: RESOLVED
+      fix_commit: 7d8f4e2c0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d
+      mechanism: |
+        The Origin/Referer policy is now extracted into
+        `check_origin_or_referer(Option<&str>, Option<&str>) -> Result<(), OriginCheckError>`
+        with an explicit `OriginCheckError::Missing` variant. The handler
+        requires at least one header to be present and validates it
+        against the device's pair-public-url allowlist. A bare-curl /
+        drive-by request with neither header returns 403 with
+        `{"error":"origin header required"}`. The string-compare fallback
+        in `origin_matches_device_base` already handled malformed URLs
+        safely, so the only behavioural change is the terminating `else`
+        rejection. A foreign Origin is rejected as `origin not allowed`.
+      tests:
+        - "tests/breaking_changes.rs::pair_confirm_handler_rejects_no_origin_no_referer"
+        - "tests/breaking_changes.rs::pair_confirm_handler_rejects_foreign_origin"
+        - "src/server/pairing.rs::check_origin_or_referer_rejects_missing_headers"
+        - "src/server/pairing.rs::check_origin_or_referer_rejects_garbage"
+        - "src/server/pairing.rs::check_origin_or_referer_accepts_well_formed_referer"
+
+  - id: F-M1-C
+    severity: HIGH
+    cwe: CWE-400, CWE-770
+    category: resource-exhaustion / memory leak
+    title: "Confirmed PairingSessions are immortal — sessions HashMap grows without bound over time"
+    evidence:
+      - "src/hub/pairing.rs:35-37 — is_expired returns false when status == Confirmed regardless of age (the only time check is `created_at.elapsed() > TTL`, gated on status != Confirmed)."
+      - "src/hub/pairing.rs:68-71 — purge_expired retains all Confirmed sessions unconditionally (`!is_expired() || status == Confirmed`)."
+      - "src/hub/pairing.rs:73-92 — create() caps at MAX_PAIRING_SESSIONS=1024, but this cap is the LIVE set, which after 10 minutes is entirely Confirmed. New create() calls always succeed because purge_expired never trims Confirmed entries."
+    why_it_matters: >
+      A single user opening 1024 pairing QRs (over the day, or 1024
+      distinct scanner attempts) and confirming them produces 1024
+      immortal entries. After the operator's 1024th confirmation, every
+      additional create() succeeds (it sees 1024 already-Confirmed sessions
+      and the cap is evaluated against the LIVE set which never shrinks),
+      so the HashMap grows unboundedly. Each entry is ~150 bytes of strings
+      + a PairingSession (3 Options, 3 Strings, Instant, PairingStatus).
+      At 10000 entries that's ~1.5 MB; at 1M entries ~150 MB → OOM. The
+      F-M1-3 cap (1024 sessions) is effectively neutered by the
+      immortal-Confirmed behaviour. CWE-400 (Uncontrolled Resource
+      Consumption) + CWE-770 (Allocation of Resources Without Limits).
+    fix: >
+      Add a TTL or LRU bound for Confirmed sessions. Two options:
+      (a) change is_expired to `created_at.elapsed() > CONFIRMED_TTL`
+          (e.g. 24h) for Confirmed sessions, then drop them in
+          purge_expired. The session is no longer needed once confirmed —
+          the vtoken, name, label are now persisted in the registry and
+          the store.
+      (b) Drop Confirmed sessions immediately after `confirm()` returns
+          Ok, and have get() reconstruct a "confirmed" view on demand
+          from the registry. (More invasive; option (a) is simpler.)
+
+    # ─── Resolution ───────────────────────────────────────────────────────
+    resolution:
+      status: RESOLVED
+      fix_commit: 7d8f4e2c0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d
+      mechanism: |
+        Option (a) is implemented. `PairingSession` now has two expiry
+        predicates:
+          - `is_expired`  — keeps the pre-existing live-set semantics for
+            `get()` / `public_status()`. Live (Wait/Scanned) sessions
+            expire after PAIRING_TTL (10min).
+          - `should_evict` — used by `purge_expired`. Confirmed sessions
+            live CONFIRMED_TTL (24h) past their created_at, then are
+            dropped. Live sessions still use PAIRING_TTL.
+
+        Splitting these into two predicates preserves the public
+        "confirmed stays visible" behaviour of get() while letting
+        purge_expired trim the live set. The MAX_PAIRING_SESSIONS=1024
+        cap is now evaluated against an evictable set, so the cap
+        behaves as designed over time. The unit test
+        `confirmed_sessions_are_evicted_after_confirmed_ttl` backdates
+        `created_at` to exercise the eviction path without sleeping.
+      tests:
+        - "src/hub/pairing.rs::confirmed_sessions_are_evicted_after_confirmed_ttl"
+
+  # ─── HIGH ─────────────────────────────────────────────────────────────────
+  - id: F-M1-D
+    severity: HIGH
+    cwe: CWE-362
+    category: TOCTOU / race
+    title: "is_first is computed under registry lock but the router set_default happens after the lock is released — concurrent first-time registers can both call set_default"
+    evidence:
+      - "src/server/pairing.rs:160-170 — `is_first = registry.all_clients().len() == 1` is evaluated INSIDE the registry write guard, but `set_default` is called OUTSIDE the guard."
+      - "src/hub/router.rs:125-127 — set_default is unconditional: `self.default_client = Some(vtoken)`."
+    why_it_matters: >
+      Two concurrent first-time registers (clients A and B) can both
+      observe `len() == 1` (if their own register() happens before the
+      other's) and both set_default on the router. The second set_default
+      silently clobbers the first's default. This is not a security
+      vulnerability per se, but it can break the "first registered client
+      is the default" invariant that the dispatcher relies on for fallback
+      routing, and it makes the M1 race-test `concurrent_register_and_pair_confirm_does_not_deadlock`
+      leave the router in a non-deterministic state. CWE-362.
+    fix: >
+      Either (a) move set_default INSIDE the registry write guard (but
+      that re-introduces a registry+router nested-hold under the registry
+      lock — verify the lock order remains registry→router), or (b) make
+      set_default a no-op when the router already has a default
+      (`if self.default_client.is_none() { ... }`), or (c) compute
+      is_first against an atomic counter that the registry holds.
+      Option (b) is the smallest change.
+
+  # ─── MEDIUM ───────────────────────────────────────────────────────────────
+  - id: F-M1-E
+    severity: MEDIUM
+    cwe: CWE-208
+    category: side-channel / timing
+    title: "constant_time_eq returns early on length mismatch — observable timing on CSRF header length"
+    evidence:
+      - "src/hub/pairing.rs:182-191 — function returns `false` immediately when `a.len() != b.len()`, which is observable as a timing difference."
+      - "src/hub/pairing.rs:142-147 — caller in confirm() returns CsrfMismatch on the same path; the side channel reveals only the LENGTH of the legitimate token (32 chars / 16 bytes), not its content."
+    why_it_matters: >
+      This is a low-severity side channel: it tells an attacker that the
+      session's CSRF is exactly 16 bytes, which is already implied by
+      the public generate_csrf() implementation. In practice the timing
+      differential is at most a few cycles, exploitable only from the
+      same machine. CWE-208 (Observable Timing Discrepancy). Worth
+      fixing for hygiene, not for blocking the milestone.
+    fix: >
+      Use `subtle::ConstantTimeEq::ct_eq` (already in the cargo
+      dependency tree of similar projects) or restructure to always do
+      `len_a ^ len_b | 0` first and accumulate the per-byte diff so
+      the function takes the same time on equal and unequal lengths.
+
+  - id: F-M1-F
+    severity: MEDIUM
+    cwe: CWE-754
+    category: error-handling
+    title: "register_client_in_hub silently logs and continues when store.upsert_client fails"
+    evidence:
+      - "src/server/pairing.rs:172-178 — `if let Err(e) = state.store.upsert_client(...).await { warn!(...) }` — the error is logged and dropped. The handler still proceeds with the in-memory vtoken and calls confirm()."
+      - "src/server/pairing.rs:590-597 — the in-memory registry now holds a vtoken that has NO persistent row. The store.delete_client_by_name on rollback will succeed (delete on missing row is a no-op)."
+      - "src/hub/mod.rs:1014-1019 — the M0 test concurrent_register_and_route_does_not_deadlock also calls register_client_in_hub and does not assert store state."
+    why_it_matters: >
+      A persistent DB failure (disk full, migration not run, permissions)
+      leaves a ghost client in the in-memory registry that disappears on
+      the next Hub restart. Operators will see "alice is online" in
+      /list, the dispatcher will try to push messages to it, and the
+      bridge restart will silently fail to re-register (it will reuse
+      the same name → same vtoken, and the store update path has the
+      same swallow-log behaviour). CWE-754 (Improper Check for
+      Unusual or Exceptional Conditions).
+    fix: >
+      Either (a) fail the handler with 500 if upsert_client errors, or
+      (b) have register_client_in_hub return Result<(vtoken, is_new), Error>
+      and let the handler decide. Note: option (a) makes the M1 race
+      test slightly stricter (the test will start failing if the
+      in-memory store is mis-configured), which is desirable.
+
+  - id: F-M1-G
+    severity: MEDIUM
+    cwe: CWE-754
+    category: error-handling / consistency
+    title: "rollback_speculative_register silently swallows queue/store errors — partial rollback leaves ghost state"
+    evidence:
+      - "src/server/pairing.rs:483-499 — every store/queue call is wrapped in `if let Err(e) = ...` with a warn! but no escalation."
+      - "src/server/pairing.rs:471-478 — if registry.remove succeeds but pick_default_after_remove reads a stale state, the wrong vtoken is passed to the router."
+    why_it_matters: >
+      A partial rollback is worse than a clean rollback. The M1 plan
+      guarantees "no orphan vtoken/queue/store row" — if any one of
+      queue.remove_client / store.clear_routes_for_vtoken /
+      store.delete_client_by_name fails, the guarantee is broken and
+      the operator has no metric to detect it. There is no test that
+      exercises a failing-queue scenario; the existing 5-racer test
+      assumes every store call succeeds.
+    fix: >
+      At minimum, add a `metrics.pair_confirm_rollback_failures`
+      counter (or extend Metrics) and increment it on each swallowed
+      error. Even better: bubble partial-failures to a structured
+      `PairingError::PartialRollback { registry: bool, queue: bool,
+      store: bool }` variant and log at error level. The M2/M3 plans
+      already touch Metrics; this is a low-cost addition.
+
+  - id: F-M1-H
+    severity: MEDIUM
+    cwe: CWE-754
+    category: error-handling / unhandled variant
+    title: "confirm() return-value match in handler is missing the new PairingError variants — future additions will silently 500"
+    evidence:
+      - "src/server/pairing.rs:620-645 — the match in the non-Ok branch covers NotFound, Expired, AlreadyConfirmed, NotScanned, CsrfMismatch, TooManySessions. Adding a new PairingError variant will cause a non-exhaustive match compile error in dev, but if the handler is ever wrapped in a catch_unwind or the match is `#[non_exhaustive]`, the new variant falls through to 500."
+    why_it_matters: >
+      This is more of a maintenance hazard than a current bug. The
+      current 6 variants are handled. But the spec for SEC-013 / M3
+      introduces CsrfMismatch and NotScanned in the same commit — and
+      any future SEC-XXX that adds a new error will be a silent 500
+      (or, with `#[non_exhaustive]`, a panic in dev and a 500 in
+      release) unless the handler is updated. CWE-754.
+    fix: >
+      Add `#[non_exhaustive]` to PairingError (forcing a wildcard arm),
+      and add a regression test that constructs a synthetic unknown
+      error variant (or refactor to a from/into string-id mapping).
+      The current exhaustive match is fine, but the failure mode on
+      drift is hidden.
+
+  - id: F-M1-I
+    severity: MEDIUM
+    cwe: CWE-674
+    category: unbounded iteration / performance
+    title: "PairConfirmRateLimiter HashMap is unbounded — DoS via (code, ip) tuple explosion"
+    evidence:
+      - "src/server/pairing.rs:118-141 — attempts is a HashMap<(String, String), Instant> with no size cap."
+      - "src/server/pairing.rs:49-50 — limit is 1/(code,ip)/60s; with 1024 codes (MAX_PAIRING_SESSIONS) and an attacker controlling N IPs, the HashMap reaches 1024 * N entries before the 60s window expires."
+      - "src/server/pairing.rs:127-139 — the only retention is `attempts.retain(|_, t| now.duration_since(*t) < WINDOW)`, which removes per-insert, not per-attack-burst."
+    why_it_matters: >
+      An attacker who can mint 1024 codes (capped at MAX_PAIRING_SESSIONS,
+      10-minute lifetime) and pairs each with a pair_confirm request
+      from a fresh IP gets 1024 entries per burst. Each entry is
+      (String, String, Instant) — 80-100 bytes plus HashMap overhead.
+      With 10k distinct IPs (botnet or simply a /8), that's ~1 MB per
+      burst, refreshing every 60s. Not catastrophic, but a
+      motivated attacker can push this to hundreds of MB before the
+      60s window expels the entries. CWE-674 / CWE-770.
+    fix: >
+      Cap the attempts HashMap to e.g. 4096 entries with an LRU-style
+      trim, OR cap on the (code, *) projection so one attacker can't
+      inflate the map by spraying IPs. A simple `if attempts.len() >=
+      MAX { return false; }` at the top of check_and_record is enough
+      to bound memory; legitimate traffic is well under that cap.
+
+  # ─── LOW ──────────────────────────────────────────────────────────────────
+  - id: F-M1-J
+    severity: LOW
+    cwe: CWE-1004
+    category: logging hygiene
+    title: "csrf is rendered into HTML in pair_page — log redaction of csrf itself is not exercised"
+    evidence:
+      - "src/server/pairing.rs:449-463 — the csrf is interpolated into PAIR_HTML_TEMPLATE and rendered to the client. This is intentional (the client uses it for the confirm fetch)."
+      - "src/server/pairing.rs:451-458 — if csrf is None the handler returns 500 with no log of which session was affected."
+    why_it_matters: >
+      Low: the 500 branch is unreachable in practice (csrf is minted
+      on every mark_scanned and Scanned/Wait sessions always have one),
+      but if it is ever hit, the operator gets no diagnostic. Also,
+      the csrf is currently logged nowhere at info or warn level — if
+      the rotate-csrf policy ever changes, there is no audit trail.
+      CWE-1004 (sensitive cookie without HttpOnly flag) is
+      NOT applicable here (csrf is a request header, not a cookie),
+      but the principle applies.
+    fix: >
+      Add a one-line `debug!(code = %code, "csrf re-minted on re-scan")`
+      in mark_scanned to give operators visibility. Optional.
+
+  - id: F-M1-K
+    severity: LOW
+    cwe: CWE-1188
+    category: code-hygiene
+    title: "mark_scanned comment says 'mint or refresh' but the code only mints when csrf is None"
+    evidence:
+      - "src/hub/pairing.rs:108-113 — comment claims the CSRF is refreshed on every scan; the actual code is `if session.csrf.is_none() { session.csrf = Some(generate_csrf()); }`."
+    why_it_matters: >
+      Comment drift. A future maintainer reading the comment will
+      "fix" the code to refresh on every scan, breaking single-use
+      semantics in a way that is not caught by any test (no test
+      re-scans after a partial confirm). CWE-1188.
+    fix: >
+      Either change the comment to match the code ('csrf is set on
+      the first scan and not refreshed on re-scan') or change the
+      code to refresh on every scan AND add a test that asserts the
+      old token is invalidated.
+
+  - id: F-M1-L
+    severity: LOW
+    cwe: CWE-209
+    category: information disclosure
+    title: "confirm() error from get() includes code in the response indirectly via errmsg string and label"
+    evidence:
+      - "src/hub/pairing.rs:128-131 — NotFound/Expired/Expired paths do not include the code in the error. Good."
+      - "src/server/pairing.rs:622-644 — errmsg strings are fixed ('pairing session not found', 'pairing session expired', etc.) and do not echo back user-supplied data. Good."
+    why_it_matters: >
+      Verified non-issue. The errmsg strings are all static literals
+      and do not include the code, name, or csrf from the request.
+      No information disclosure. Listed for completeness so a future
+      reviewer doesn't re-investigate.
+    fix: none required.
+
+# ─── Claims in review-request.yaml — verification status ────────────────────
+# Each claim in the request is annotated with the finding that catches it
+# (if any) or "verified" (if the source matches the claim and no exploit
+# was found).
+claim_audit:
+  - claim: "F-M1-1 (lock-order) resolved by Option A (register OUTSIDE pairing write lock)"
+    status: verified
+    note: "src/server/pairing.rs:588-598 — register_client_in_hub runs first; pairing.write() is taken after. The deadlock test (concurrent_register_and_pair_confirm_does_not_deadlock) exercises the path. No caller of register_client_in_hub holds state.pairing.write() — verified by grep across src/."
+  - claim: "F-M1-2 (orphan rollback) resolved by rollback_speculative_register"
+    status: PARTIALLY_RESOLVED
+    note: "F-M1-A — the helper exists and runs on every non-Ok path, but the helper does not distinguish 'fresh insert' from 'reuse of existing vtoken' when the supplied name is already registered. This converts a benign CSRF mismatch into a destructive DB write."
+  - claim: "F-M1-3 (MAX_PAIRING_SESSIONS) cap"
+    status: PARTIALLY_RESOLVED
+    note: "F-M1-C — cap is correctly enforced for LIVE sessions, but Confirmed sessions are never purged, so the cap is effectively unbounded over time. Fix: add a Confirmed-session TTL."
+  - claim: "F-M3-4 (AlreadyConfirmed before NotScanned)"
+    status: verified
+    note: "src/hub/pairing.rs:137-150 — order is AlreadyConfirmed → CSRF → NotScanned. Test confirm_after_concurrent_attempt_returns_only_one_winner and csrf_token_consumed_after_confirm both pin the ordering."
+  - claim: "CSRF single-use on confirm success"
+    status: verified
+    note: "src/hub/pairing.rs:142-147 — session.csrf = None after a successful match. No path re-mints it until mark_scanned runs again."
+  - claim: "CSRF constant-time compare"
+    status: PARTIALLY_RESOLVED
+    note: "F-M1-E — the function is correct on equal-length inputs but returns early on length mismatch. Use the `subtle` crate for strict constant-time."
+  - claim: "Origin/Referer allowlist (F-M3-1)"
+    status: NOT_RESOLVED
+    note: "F-M1-B — the if/else-if chain has no terminating `else` rejection. Requests with neither header pass silently. This is the regression that makes F-M1-A exploitable from curl."
+  - claim: "PairConfirmRateLimiter (1/(code,ip)/60s)"
+    status: PARTIALLY_RESOLVED
+    note: "F-M1-I — the limiter works as designed, but the underlying HashMap is unbounded. Add a hard size cap."
+  - claim: "5-racer test asserts exactly 1 winner and 4 AlreadyConfirmed losers"
+    status: verified
+    note: "tests/hub_routing_integration.rs:432-525 — assertions at lines 499, 500, 509, 521 are all correct. The test does NOT exercise the colliding-name rollback path (F-M1-A); all 5 racers use distinct names."
+  - claim: "Lock-order deadlock test (6 register × 4 pair_confirm, 5s timeout)"
+    status: verified
+    note: "tests/hub_routing_integration.rs:353-420 — uses multi_thread + join_all + tokio::time::timeout. Test does not assert lock-acquisition order directly; relies on timeout. Sufficient for the regression F-M1-1 was about."
+  - claim: "pass_conditions.lock-internalized (state check + CSRF + Scanned + commit all under pairing.write())"
+    status: verified
+    note: "src/hub/pairing.rs:127-156 — every step in confirm() runs with &mut self. The PairingSession is mutated in place; no intermediate state is observable to a second racing caller."
+  - claim: "pass_conditions.no-orphan-vtoken (registry holds exactly 1 name after 5 racers)"
+    status: RESOLVED
+    note: "Verified end-to-end. Pre-fix this held only for collision-free name sets; F-M1-A was the gap. Post-fix, rollback is gated on `is_new` AND has a CAS on `by_name[name]` — both layers verified by rollback_preserves_legit_client_when_name_collides and rollback_cas_aborts_when_legit_re_register_happened."
+
+# ─── Verdict ─────────────────────────────────────────────────────────────────
+verdict: PASS
+blocking_findings: []
+resolved_blocking_findings:
+  - id: F-M1-A
+    summary: "CRITICAL — rollback evicts legitimate clients on colliding name (CWE-863, CWE-284)"
+    resolution: "RESOLVED — ClientRegistry::register / register_with_vtoken now return (vtoken, is_new); pair_confirm gates rollback on is_new; rollback helper has a CAS guard on by_name[name] as defence in depth. Tests: rollback_preserves_legit_client_when_name_collides, rollback_cas_aborts_when_legit_re_register_happened, register_returns_is_new_flag."
+  - id: F-M1-B
+    summary: "HIGH — Origin/Referer check silently passes when both headers absent (CWE-346, CWE-942)"
+    resolution: "RESOLVED — extracted check_origin_or_referer helper with explicit OriginCheckError::Missing; handler now rejects requests with neither header as 403 origin header required. Tests: pair_confirm_handler_rejects_no_origin_no_referer, pair_confirm_handler_rejects_foreign_origin, plus three unit tests on the helper."
+  - id: F-M1-C
+    summary: "HIGH — Confirmed PairingSessions immortal, MAX_PAIRING_SESSIONS cap neutered (CWE-400, CWE-770)"
+    resolution: "RESOLVED — added CONFIRMED_TTL=24h and split is_expired / should_evict so Confirmed sessions are evicted by purge_expired after the TTL while the public get()/public_status() view still reports Confirmed. Test: confirmed_sessions_are_evicted_after_confirmed_ttl backdates created_at past the TTL."
+non_blocking:
+  - F-M1-D  # HIGH — set_default race; defer to M2 cleanup if not in scope
+  - F-M1-E  # MEDIUM — constant-time_eq length early-return
+  - F-M1-F  # MEDIUM — upsert_client error swallowed
+  - F-M1-G  # MEDIUM — rollback partial-failure swallowed
+  - F-M1-H  # MEDIUM — non-exhaustive PairingError hazard
+  - F-M1-I  # MEDIUM — rate-limiter HashMap unbounded
+  - F-M1-J  # LOW — csrf rendering diagnostic
+  - F-M1-K  # LOW — mark_scanned comment drift
+  - F-M1-L  # LOW — verified non-issue
+
+# ─── Notes for the M2/M3 review-pass owner ──────────────────────────────────
+# F-M1-A, F-M1-B, and F-M1-C must be resolved before this milestone can
+# certify. Suggested split:
+#   F-M1-A  → src/hub/registry.rs (return is_new from register) +
+#             src/server/pairing.rs (rollback only when is_new)
+#   F-M1-B  → src/server/pairing.rs:543-575 (add terminating else rejection)
+#   F-M1-C  → src/hub/pairing.rs:35-71 (add Confirmed TTL or drop-on-confirm)
+# All three are small, mechanical, and have deterministic test coverage.
+# F-M1-D, F-M1-E, F-M1-F, F-M1-G, F-M1-I can be batched into a single
+# "M1 hardening" follow-up commit; they are correctness/efficiency, not
+# authorization or data integrity.

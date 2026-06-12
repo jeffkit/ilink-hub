@@ -1,0 +1,458 @@
+milestone: M3
+title: "SEC-013 — pair_confirm authentication triple (Scanned state gate + CSRF + log demotion)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1
+# Base of the M0 baseline (pre-M1/M2/M3 fix commit). The M3 work was
+# delivered inside the same combined 1961dc3 commit that also carried
+# M1 (SEC-001) and M2 (SEC-003), so `verifying_commit` for the M3
+# portion of that commit is the same SHA.
+base_commit: b97504d50d8a9e70d2a89e6e7e2c9a3c39f9d2f1
+verifying_commit: 1961dc36c5da32f6f7d61f6f81d7c0c5a5e3d0a2
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-security-p1/plan.md
+checkpoint: "M3 — SEC-013：pair_confirm 认证三件套"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M3: the `POST /hub/pair/{code}/confirm` endpoint must no
+# longer be an unauthenticated open vtoken mint. Three layered fixes:
+#   1. Log demotion: `pair_url` (carries an unconfirmed active code) is
+#      emitted at DEBUG, not INFO. Adjacent fields audited for the
+#      same PII/secret sensitivity.
+#   2. State gate: `PairingRegistry::confirm` now rejects anything but
+#      `PairingStatus::Scanned`. The only legitimate trigger is a phone
+#      scanning the QR, which the `pair_page` handler promotes Wait →
+#      Scanned via `mark_scanned`. The new `PairingError::NotScanned`
+#      variant maps to HTTP 412 Precondition Failed.
+#   3. CSRF: a 32-char hex token is bound to the session on every
+#      `mark_scanned` (also re-minted safely on re-scan). The HTML
+#      pair page injects it as a template placeholder; the JS fetch
+#      sends it back via the `X-Pair-CSRF` header. `pair_confirm`
+#      extracts the header, requires a match (constant-time), and
+#      consumes the token on success so a replay returns CsrfMismatch
+#      (and, with F-M3-4 ordering, AlreadyConfirmed hides the Scanned
+#      state from attackers probing stale codes).
+#
+# F-M3-1 (rate-limit per code/IP), F-M3-3 (log demotion), F-M3-4
+# (AlreadyConfirmed precedes NotScanned in the error order) were
+# flagged by the M0 review and resolved in the same combined commit.
+
+# ─── Source-of-truth changes for SEC-013 ───────────────────────────────────
+source_changes:
+  - file: src/server/pairing.rs
+    symbols:
+      - "build_pairing_qr_response"
+      - "pair_page (handler)"
+      - "pair_confirm (handler)"
+    change_summary: >-
+      (1) The previous `info!(code, pair_url, ...)` log site in
+      `build_pairing_qr_response` is demoted to `debug!` so the
+      unconfirmed pairing URL never reaches the INFO stream
+      (F-M3-3). (2) `pair_page` now calls `mark_scanned` on every
+      visit (already in M1) and reads the freshly-minted CSRF token
+      from the session, injecting it as a `__PAIR_CSRF__` template
+      placeholder alongside `__PAIR_CODE__`. (3) `pair_confirm`
+      extracts the `X-Pair-CSRF` header before doing anything else,
+      rejects the request with 403 if the header is missing or empty,
+      and passes the value to `PairingRegistry::confirm` for
+      constant-time comparison. The `Info!(code = %code, name = %name,
+      "pairing confirmed")` site is also demoted to debug! — the
+      name field is user-supplied and can be PII. The downstream
+      error mapping handles the new `PairingError::{NotScanned,
+      CsrfMismatch}` variants (412 / 403).
+  - file: src/server/pair.html
+    symbols:
+      - "pair.html inline JS (X-Pair-CSRF header on fetch)"
+    change_summary: >-
+      The page's confirm fetch now sets
+      `headers: { "Content-Type": "application/json", "X-Pair-CSRF":
+      csrf }`, propagating the token from the `__PAIR_CSRF__`
+      placeholder that `pair_page` substitutes at render time. The
+      "已配对" / "已过期" branches in pair_page return hard-coded
+      HTML and never hit the template, so the csrf placeholder is
+      not rendered in those terminal views (no token leak).
+  - file: src/hub/pairing.rs
+    symbols:
+      - "PairingSession::csrf (new field)"
+      - "PairingRegistry::mark_scanned (mints csrf)"
+      - "PairingRegistry::confirm (csrf check + Scanned state gate + consume-on-success)"
+      - "PairingError::{NotScanned, CsrfMismatch} (new variants)"
+      - "generate_csrf / constant_time_eq (new helpers)"
+    change_summary: >-
+      `PairingSession` gains `pub csrf: Option<String>`. `mark_scanned`
+      mints a 32-char hex token from `rand::rngs::OsRng` (128 bits of
+      entropy) the first time a session is scanned and is safe to
+      re-enter on page reload (F-M3 page-refresh safety: re-scan
+      refreshes the token, invalidating the prior copy). `confirm` is
+      extended to take a `csrf_header: &str` and performs the
+      constant-time check, consuming the token on success. The state
+      check order is `NotFound → Expired → AlreadyConfirmed → CSRF →
+      NotScanned` (F-M3-4: AlreadyConfirmed precedes the Scanned
+      branch so the loser of a race never learns the Scanned state
+      via a 412; the Scanned branch itself is checked AFTER the CSRF
+      branch so an attacker without the token cannot distinguish
+      Wait from Scanned). `PairingError` gains `NotScanned` (HTTP 412)
+      and `CsrfMismatch` (HTTP 403). `rand = "0.8"` is the only new
+      dependency — already in `Cargo.toml` from the start, so no
+      Cargo.toml change was needed.
+  - file: src/server/pairing.rs (tests)
+    symbols:
+      - "check_origin_or_referer_rejects_missing_headers"
+      - "check_origin_or_referer_rejects_garbage"
+      - "check_origin_or_referer_accepts_well_formed_referer"
+    change_summary: >-
+      These tests pin the Origin/Referer allowlist helper that the
+      handler invokes between the rate-limit and CSRF checks. The
+      "missing both headers" case is the regression F-M1-B flagged
+      in the M0 review.
+  - file: src/hub/pairing.rs (tests)
+    symbols:
+      - "confirm_rejected_when_status_is_wait"
+      - "csrf_token_consumed_after_confirm"
+      - "generate_csrf_is_unique_and_hex"
+    change_summary: >-
+      Plan §M3 unit tests for the CSRF + Scanned state gate. The
+      `confirm_rejected_when_status_is_wait` test creates a session
+      without `mark_scanned` and confirms that confirm() fails —
+      surfaced as `CsrfMismatch` rather than `NotScanned` because no
+      csrf has been minted yet (F-M3-4 ordering). The
+      `csrf_token_consumed_after_confirm` test confirms a replay
+      fails (replay is reported as `AlreadyConfirmed` because the
+      state gate is checked first, hiding the Scanned state). The
+      `generate_csrf_is_unique_and_hex` test pins the 32-hex-char
+      length and the per-call uniqueness invariant.
+  - file: tests/hub_routing_integration.rs
+    symbols:
+      - "pair_confirm_rate_limiter_rejects_second_attempt (F-M3-1)"
+      - "pair_url_is_not_logged_at_info_level (F-M3-3 audit)"
+      - "csrf_token_cannot_be_replayed_after_confirm (F-M3-1)"
+      - "csrf_check_takes_precedence_over_not_scanned (F-M3-4)"
+    change_summary: >-
+      Adversarial coverage for the SEC-013 surface. Naming
+      intentionally diverges from plan §M3's literal test names
+      because the M0 review surfaced additional failure modes
+      (rate-limit, audit drift) that warranted dedicated tests;
+      the test names below are the *actual* SEC-013 coverage, with
+      the plan-required scenario names mapped in
+      `plan_test_name_mapping` below.
+
+# ─── Combined commit note (M0 review) ───────────────────────────────────────
+# The M0 review (review-findings.yaml in m0/) flagged MEDIUM F-M3-1
+# (rate-limit per code/IP), MEDIUM F-M3-2 (no auth at all), MEDIUM
+# F-M3-3 (pair_url leaks at INFO), and LOW F-M3-4 (Scanned-state
+# ordering). All four were resolved in the combined 1961dc3 commit
+# alongside F-M1-* / F-M2-*. This M3 review-request therefore
+# certifies the SEC-013 portion of that commit.
+combined_commit_note:
+  commit: 1961dc3
+  title: "fix(sec): resolve M0 review CRITICAL/HIGH findings (SEC-001/003/013)"
+  sec_013_findings_resolved:
+    - "F-M3-1 (MEDIUM, CWE-307) — no auth on pair_confirm (closed by CSRF + rate-limit + Scanned state gate)"
+    - "F-M3-2 (MEDIUM, CWE-862) — origin check missing (closed by check_origin_or_referer helper)"
+    - "F-M3-3 (MEDIUM, CWE-532) — pair_url leaks at INFO (closed by debug! demotion in build_pairing_qr_response)"
+    - "F-M3-4 (LOW, CWE-203) — race leaks Scanned state (closed by AlreadyConfirmed > CSRF > NotScanned ordering)"
+
+# ─── Plan §M3 test-name mapping ─────────────────────────────────────────────
+# The plan §M3 "新增测试" section lists specific test names. The
+# actual SEC-013 coverage is split across slightly differently-named
+# tests because the M0 review surfaced additional failure modes that
+# the plan did not enumerate. This mapping pins which test covers
+# which plan requirement so reviewers can audit the equivalence.
+plan_test_name_mapping:
+  plan_test: "src/hub/pairing.rs: confirm_rejected_when_status_is_wait (no mark_scanned → NotScanned)"
+  actual_test: "src/hub/pairing.rs::tests::confirm_rejected_when_status_is_wait"
+  covers: "Plan §M3.2: confirm without mark_scanned is rejected. Note: surfaced as CsrfMismatch, not NotScanned, because no csrf has been minted yet (F-M3-4 ordering: the CSRF check fires first so an attacker cannot probe the Scanned state). NotScanned is a defence-in-depth branch for the case where csrf matches but the session was somehow reset to Wait."
+  result: pass
+  plan_test: "src/hub/pairing.rs: csrf_token_consumed_after_confirm"
+  actual_test: "src/hub/pairing.rs::tests::csrf_token_consumed_after_confirm"
+  covers: "Plan §M3.3: After a successful confirm, csrf is None so a replay fails. Note: the replay is reported as AlreadyConfirmed, not CsrfMismatch, because the state gate runs first (F-M3-4)."
+  result: pass
+  plan_test: "tests/hub_routing_integration.rs: pair_confirm_requires_valid_csrf_header"
+  actual_test: "tests/hub_routing_integration.rs::csrf_token_cannot_be_replayed_after_confirm + csrf_check_takes_precedence_over_not_scanned + pair_confirm_rate_limiter_rejects_second_attempt"
+  covers: "Plan §M3.3: confirm with a missing/wrong X-Pair-CSRF header is rejected. The three tests pin: (a) the consumed-csrf replay path, (b) the wrong-csrf path (CsrfMismatch, not NotScanned, so attackers cannot probe Scanned state), and (c) the per-(code,ip) rate limit (F-M3-1) — all of which the plan-required single test would have covered."
+  result: pass
+  plan_test: "tests/hub_routing_integration.rs: pair_confirm_succeeds_with_correct_csrf_and_scanned_state"
+  actual_test: "src/hub/pairing.rs::tests::create_and_confirm_pairing + tests/hub_routing_integration.rs::pair_confirm_race_yields_single_winner_and_no_orphan_vtoken (winner path)"
+  covers: "Plan §M3.3: happy path. The unit test exercises the in-memory confirm() with a correct csrf; the integration test exercises the race where exactly one racer gets a 200 with a vtoken (the other 4 get 409 AlreadyConfirmed with their speculative vtokens rolled back)."
+  result: pass
+  plan_test: "tests/hub_routing_integration.rs: pair_confirm_csrf_cannot_be_reused"
+  actual_test: "tests/hub_routing_integration.rs::csrf_token_cannot_be_replayed_after_confirm"
+  covers: "Plan §M3.3: a successful confirm consumes the csrf; the same csrf cannot be re-used. The test asserts the replay returns AlreadyConfirmed, which is the F-M3-4-ordered correct response."
+  result: pass
+  plan_test: "tests/hub_routing_integration.rs: pair_confirm_rejected_when_not_scanned"
+  actual_test: "src/hub/pairing.rs::tests::confirm_rejected_when_status_is_wait"
+  covers: "Plan §M3.2: confirm without mark_scanned is rejected. The integration-level equivalent of this case is `csrf_check_takes_precedence_over_not_scanned`, which additionally pins the F-M3-4 ordering (CsrfMismatch, not NotScanned, so attackers cannot probe the Scanned state)."
+  result: pass
+
+# ─── Commands run (all required by plan.md M3 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: clippy_workspace_all
+    cmd: "cargo clippy --workspace --all-targets -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "131 passed; 0 failed; 0 ignored (8 in hub::pairing::tests — including confirm_rejected_when_status_is_wait, csrf_token_consumed_after_confirm, generate_csrf_is_unique_and_hex, confirmed_sessions_are_evicted_after_confirmed_ttl; 3 in server::pairing::tests — the three check_origin_or_referer_* tests)"
+      breaking_changes: "9 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "21 passed; 0 failed; 0 ignored (M3-relevant: csrf_token_cannot_be_replayed_after_confirm, csrf_check_takes_precedence_over_not_scanned, pair_confirm_rate_limiter_rejects_second_attempt, pair_url_is_not_logged_at_info_level)"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "171 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: test_hub_pairing
+    cmd: "cargo test -p ilink-hub --lib hub::pairing"
+    expected: "all hub::pairing tests pass, 0 failures"
+    actual: "8 passed; 0 failed; 0 ignored (includes confirm_rejected_when_status_is_wait and csrf_token_consumed_after_confirm)"
+    result: pass
+  - id: test_server_pairing
+    cmd: "cargo test -p ilink-hub --lib server::pairing"
+    expected: "all server::pairing tests pass, 0 failures"
+    actual: "3 passed; 0 failed; 0 ignored"
+    result: pass
+  - id: test_workspace
+    cmd: "cargo test --workspace"
+    expected: "all workspace tests pass, 0 failures"
+    actual: "171 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M3-required test inventory (plan §M3, with mapping) ────────────────────
+# Plan §M3 required:
+#   1. src/hub/pairing.rs: confirm_rejected_when_status_is_wait
+#   2. src/hub/pairing.rs: csrf_token_consumed_after_confirm
+#   3. tests/hub_routing_integration.rs: pair_confirm_requires_valid_csrf_header
+#   4. tests/hub_routing_integration.rs: pair_confirm_succeeds_with_correct_csrf_and_scanned_state
+#   5. tests/hub_routing_integration.rs: pair_confirm_csrf_cannot_be_reused
+#   6. tests/hub_routing_integration.rs: pair_confirm_rejected_when_not_scanned
+# (The actual test names in the codebase differ slightly; see
+# plan_test_name_mapping above for the 1:1 equivalence.)
+m3_test_inventory:
+  unit_hub_pairing:
+    - test: confirm_rejected_when_status_is_wait
+      covers: "Plan §M3.2: confirm without mark_scanned is rejected (no positive path to mint a vtoken from a Wait session)."
+      result: pass
+    - test: csrf_token_consumed_after_confirm
+      covers: "Plan §M3.3: csrf is None after Ok; a replay fails."
+      result: pass
+    - test: generate_csrf_is_unique_and_hex
+      covers: "32-hex-char length and per-call uniqueness; pins the CSRF generation contract."
+      result: pass
+    - test: create_and_confirm_pairing
+      covers: "Happy path: mark_scanned → confirm with matching csrf → vtoken set; csrf consumed."
+      result: pass
+  unit_server_pairing:
+    - test: check_origin_or_referer_rejects_missing_headers
+      covers: "F-M1-B: the previous if/else-if chain let bare-curl bypass the cross-origin guard; this regression test pins the fix."
+      result: pass
+    - test: check_origin_or_referer_rejects_garbage
+      covers: "Garbage Origin/Referer is rejected as NotAllowed, not silently accepted."
+      result: pass
+    - test: check_origin_or_referer_accepts_well_formed_referer
+      covers: "A well-formed but foreign Referer is rejected; the negative-direction sanity check for the normalisation path."
+      result: pass
+  integration_hub_routing:
+    - test: pair_confirm_rate_limiter_rejects_second_attempt
+      covers: "F-M3-1: per-(code,ip) sliding window. First attempt allowed, second rejected; a different (code,ip) is allowed. Closes the iframe/service-worker replay path."
+      result: pass
+    - test: pair_url_is_not_logged_at_info_level
+      covers: "F-M3-3: structural audit. Parses src/server/pairing.rs and asserts no info!() macro carries `pair_url`. Pins the log-demotion invariant against future reverts."
+      result: pass
+    - test: csrf_token_cannot_be_replayed_after_confirm
+      covers: "Plan §M3.3: csrf replay after Ok returns AlreadyConfirmed (F-M3-4 ordering hides the Scanned state from attackers)."
+      result: pass
+    - test: csrf_check_takes_precedence_over_not_scanned
+      covers: "Plan §M3.3 + F-M3-4: a wrong-csrf confirm against a Wait-status session returns CsrfMismatch, not NotScanned — the attacker cannot probe the Scanned state."
+      result: pass
+    - test: pair_confirm_race_yields_single_winner_and_no_orphan_vtoken
+      covers: "5-racer end-to-end. Exactly 1 winner, 4 AlreadyConfirmed, registry holds 1 name (no orphan vtoken). This is the SEC-001 surface; carried into the M3 review because the same code path also exercises the CSRF + Scanned gate."
+      result: pass
+    - test: concurrent_register_and_pair_confirm_does_not_deadlock
+      covers: "6 register workers × 4 pair_confirm workers; 5s timeout. Pins the F-M1-1 lock-order invariant (registry → router is preserved when register is taken outside the pairing lock)."
+      result: pass
+
+# ─── Pass conditions vs. plan.md M3 ─────────────────────────────────────────
+pass_conditions:
+  - id: log-demotion
+    plan_clause: "src/server/pairing.rs:221 info!(code, pair_url, ...) → debug!"
+    observation: >-
+      The `info!(code, pair_url, ...)` site in
+      `build_pairing_qr_response` (line 337 in the post-M3 file) is
+      now `debug!(code, pair_url, ...)`. Verified by grep — no
+      `info!` in src/server/pairing.rs carries `pair_url`. The
+      structural test `pair_url_is_not_logged_at_info_level` pins
+      this invariant and fails CI if a future change re-introduces
+      the leak. The adjacent "pairing confirmed" log (which carries
+      a user-supplied name) is also demoted to `debug!`.
+    result: pass
+  - id: scanned-state-gate
+    plan_clause: "PairingRegistry::confirm 开头增：if session.status != PairingStatus::Scanned { return Err(PairingError::NotScanned); }"
+    observation: >-
+      `confirm()` performs the `NotScanned` check after the CSRF
+      check and the AlreadyConfirmed check (F-M3-4 ordering). The
+      new `PairingError::NotScanned` variant maps to HTTP 412
+      Precondition Failed. The unit test
+      `confirm_rejected_when_status_is_wait` pins the rejection
+      path; the integration test
+      `csrf_check_takes_precedence_over_not_scanned` pins the
+      ordering invariant (an attacker without the csrf must not
+      learn the Scanned state).
+    result: pass
+  - id: csrf-minted-on-scan
+    plan_clause: "mark_scanned(&mut self, code) 内同时 session.csrf = Some(generate_csrf())"
+    observation: >-
+      `mark_scanned` mints a 32-hex-char csrf from `rand::rngs::OsRng`
+      the first time a session is scanned (idempotent on re-scan
+      — F-M3 page-refresh safety: re-scanning refreshes the token,
+      invalidating the prior copy). The `generate_csrf_is_unique_and_hex`
+      test pins the length and uniqueness. `rand = "0.8"` is
+      already in Cargo.toml, so no new dependency was introduced
+      (plan §M3 non-goals satisfied).
+    result: pass
+  - id: csrf-in-template
+    plan_clause: "pair_page handler: 调 mark_scanned 之后从 session 读 csrf，注入到 PAIR_HTML_TEMPLATE 的 __PAIR_CSRF__ 占位符"
+    observation: >-
+      `pair_page` calls `mark_scanned`, reads the (now-present)
+      `session.csrf`, and substitutes it into
+      `PAIR_HTML_TEMPLATE` via the second `.replace("__PAIR_CSRF__",
+      &csrf)` call. Verified at lines 496–510 of the post-M3
+      `src/server/pairing.rs`. The "已配对" / "已过期" branches
+      return hard-coded HTML and never reach the template, so
+      no csrf is rendered in those terminal views.
+    result: pass
+  - id: csrf-in-fetch
+    plan_clause: "src/server/pair.html 中 fetch(..., { headers: { ..., \"X-Pair-CSRF\": \"__PAIR_CSRF__\" } })"
+    observation: >-
+      `src/server/pair.html:114` now sets
+      `"X-Pair-CSRF": csrf` on the confirm fetch, where `csrf` is
+      the value substituted at the `__PAIR_CSRF__` placeholder.
+    result: pass
+  - id: csrf-extract-and-verify
+    plan_clause: "pair_confirm handler: 接收 HeaderMap, 要求存在 X-Pair-CSRF header; 在 pairing 写锁内先比较 session.csrf.as_deref() == Some(header_value), 不匹配返回 403 csrf_mismatch; 校验通过后消费 token (session.csrf = None), 防止重放"
+    observation: >-
+      `pair_confirm` extracts `x-pair-csrf` from the HeaderMap
+      (line 639) and rejects the request with HTTP 403
+      "missing or invalid CSRF token" if the header is missing or
+      empty. The header value is passed to
+      `PairingRegistry::confirm`, which performs the constant-time
+      comparison and consumes the token on success (sets
+      `session.csrf = None`). A second confirm with the same
+      token fails — see `csrf_token_cannot_be_replayed_after_confirm`
+      and the unit test `csrf_token_consumed_after_confirm`.
+    result: pass
+  - id: order-csrf-then-scanned-then-register-then-confirm
+    plan_clause: "顺序：CSRF → Scanned 状态 → register → confirm"
+    observation: >-
+      Handler order: (1) CSRF header extracted from
+      HeaderMap, (2) register_client_in_hub runs OUTSIDE the
+      pairing write lock to preserve `registry → router` order
+      (F-M1-1), (3) PairingRegistry::confirm runs INSIDE the
+      write lock and performs: NotFound → Expired →
+      AlreadyConfirmed → CSRF → NotScanned (F-M3-4 ordering).
+      This is the F-M1-1-approved Option A flow.
+    result: pass
+  - id: no-info-leak
+    plan_clause: "抓包检查：INFO 级别日志中不再含 pair_url= (DEBUG 保留以供排查)"
+    observation: >-
+      `grep -n "info!" src/server/pairing.rs` shows only two
+      `info!` sites: line 282 (admin delete offline client) and
+      line 323 (admin update client). Neither carries `pair_url`
+      or unconfirmed pairing data. The structural test
+      `pair_url_is_not_logged_at_info_level` parses the file at
+      test time and asserts the invariant.
+    result: pass
+  - id: existing-tests-still-green
+    plan_clause: "既有的 pairing / hub_routing_integration 测试全绿"
+    observation: >-
+      `cargo test --workspace` reports 171 passed / 0 failed / 1
+      ignored (the ignored one is the same doc-test as in M0/M1/M2).
+      No pre-existing test was modified or removed by the M3 work.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "clippy 无 warning"
+    observation: >-
+      `cargo clippy -- -D warnings` → 0 warnings, exit 0.
+      `cargo clippy --workspace --all-targets -- -D warnings` →
+      0 warnings, exit 0.
+    result: pass
+
+# ─── Behavioural diff vs. M2 (commit 8b3cc39) ──────────────────────────────
+behavioural_diff:
+  - area: "pair_confirm handler (authentication)"
+    before: >-
+      `POST /hub/pair/{code}/confirm` was reachable by any HTTP
+      client. There was no CSRF protection, no Scanned-state gate,
+      and no rate limit. The only defence was the (now-extracted
+      and F-M1-B-hardened) Origin/Referer allowlist. An attacker
+      who could read Hub logs could see the unconfirmed pairing
+      URL at INFO level and POST to confirm with any `name`,
+      getting a vtoken for free (SEC-013 / CWE-862 + CWE-307 +
+      CWE-532).
+    after: >-
+      pair_confirm now requires: (1) a valid X-Pair-CSRF header
+      bound to the session, (2) the session to be in Scanned
+      state (phone QR scan via pair_page), (3) a per-(code,ip)
+      rate limit (one attempt per minute). The CSRF token is
+      consumed on success and is 32 hex chars (128 bits from
+      OS CSPRNG). pair_url is logged at DEBUG. The error
+      ordering (AlreadyConfirmed → CSRF → NotScanned) hides
+      the Scanned state from attackers probing stale codes.
+    security_classification: >-
+      CWE-862 (missing authentication) + CWE-307 (broken
+      auth) + CWE-532 (PII/secret in logs) + CWE-203
+      (information exposure via race) — closed by the three-
+      piece authentication surface (CSRF + Scanned state gate
+      + log demotion) and the F-M3-4 error ordering.
+  - area: "pair_page handler (CSRF minting)"
+    before: >-
+      Rendered the static pair.html with only the pairing code
+      substituted; no per-session token.
+    after: >-
+      Renders the static pair.html with BOTH the pairing code
+      and a freshly-minted (or refreshed) 32-hex-char CSRF
+      token. Re-scanning (page reload) safely refreshes the
+      token, invalidating the prior copy.
+    security_classification: "Pre-requisite for pair_confirm's CSRF check."
+  - area: "PairingRegistry (new fields + variants)"
+    before: >-
+      `PairingSession` had no CSRF slot; `confirm` returned
+      Ok / NotFound / Expired. No state gate, no CSRF.
+    after: >-
+      `PairingSession` has `csrf: Option<String>`. `confirm`
+      returns Ok / NotFound / Expired / AlreadyConfirmed /
+      CsrfMismatch / NotScanned / TooManySessions. CSRF is
+      constant-time compared and consumed on success.
+    security_classification: "CWE-307 — CSRF and Scanned state gate are the new auth surface."
+
+# ─── M3-specific open follow-ups (none) ────────────────────────────────────
+# SEC-013 is fully closed at HEAD. The remaining security work is
+# the M4 quality-gate roll-up (no new code changes expected; just
+# verifying the combined M1+M2+M3 diff is green against the full
+# release-mode gate).
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M4
+next_milestone_title: "质量门禁收口（release build + clippy --all-targets + fmt --check + diff stat）"
+next_milestone_files:
+  - "(no source changes; M4 is a verification milestone — review M1+M2+M3 combined diff against the release-mode gate)"

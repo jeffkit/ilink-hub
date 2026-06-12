@@ -1,0 +1,406 @@
+milestone: M2
+title: "UX-02: 端口被占用时可在 GUI 内改端口"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: ca7bca782a091a38407a6478134062349ea8c50f
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M2 — UX-02: 端口被占用时可在 GUI 内改端口"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2: when the configured listen port is occupied, surface a
+# "端口被占用,换一个端口?" dialog inside the GUI instead of forcing the user
+# to set `ILINK_HUB_ADDR` and restart the .app. The change has three pieces:
+#
+#   1. Persist a per-user listen-port override at
+#      `~/.ilink-hub/desktop-port.json` (schema: `{ "port": <u16> }`).
+#   2. Add a "监听端口" input + "保存并重启" button on the home panel;
+#      saving triggers a `restart_hub` (or `start_hub` if previously stopped)
+#      and the persisted file is honored on subsequent launches.
+#   3. Detect bind failures (`hub-error` payloads matching `EADDRINUSE`,
+#      "address already in use", or "bind") and open a port-conflict modal
+#      with a one-click "换端口并启动" affordance.
+#
+# The bind-hint copy on the home panel no longer references the
+# `ILINK_HUB_ADDR` env var — users are pointed at the new GUI input.
+
+# ─── Source-of-truth changes for UX-02 ─────────────────────────────────────
+source_changes:
+  - file: desktop/ilink-hub-desktop/src-tauri/src/lib.rs
+    symbols:
+      - "HubController.requested_addr (now Mutex<String>)"
+      - "HubController::requested_addr / ::set_requested_addr"
+      - "desktop_port_override_path()"
+      - "loopback_listen_addr_for_port()"
+      - "load_desktop_port_override() / save_desktop_port_override()"
+      - "resolve_initial_listen_addr()"
+      - "DesktopSettingsPayload / SetListenPortResult"
+      - "parse_loopback_port()"
+      - "#[tauri::command] get_desktop_settings"
+      - "#[tauri::command] set_listen_port"
+      - "setup() — resolve_initial_listen_addr + Mutex wrap"
+      - "hub_info — read via accessor"
+      - "start_hub — read addr via accessor"
+      - "13 new unit tests under mod tests"
+    change_summary: >-
+      `HubController.requested_addr` is now `Mutex<String>` so the GUI
+      "change port" flow can mutate the value the next `start_hub` will use
+      without re-spawning the controller. A persisted-port file at
+      `~/.ilink-hub/desktop-port.json` is loaded in `setup()`; the priority
+      chain is persisted → `ILINK_HUB_ADDR` → default `127.0.0.1:8765`.
+      `set_listen_port(port)` is the GUI write path: validates `port != 0`,
+      writes the file atomically (write-tmp + rename), updates
+      `requested_addr`, and returns the new loopback address.
+      `get_desktop_settings()` returns the current port (parsed out of
+      `requested_addr`) so the UI can prefill the input. Both new commands
+      are generic over `tauri::Runtime` so they compile against `Wry` AND
+      the `MockRuntime` used by the new unit tests. 13 new unit tests cover
+      loopback address composition, parser strictness, on-disk round-trip,
+      malformed-JSON / zero-port rejection, env-vs-persisted priority,
+      controller getter/setter, the full `set_listen_port` happy path, and
+      `get_desktop_settings` prefilling.
+  - file: desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+    symbols:
+      - "serde_json (new dep)"
+      - "tauri dev-dep with `test` feature (new)"
+      - "tempfile dev-dep (new)"
+    change_summary: >-
+      Adds `serde_json = "1"` for the persisted-port file,
+      `tempfile = "3"` (dev) for the test tempdir, and the `tauri = { version = "2", features = ["test"] }`
+      dev-dependency so the new tests can build `tauri::test::mock_app()`
+      with the `MockRuntime`.
+  - file: desktop/ilink-hub-desktop/index.html
+    symbols:
+      - "#bind-hint callout copy (line ~76-81)"
+      - "new `.port-settings` block (~84-108)"
+      - "new `#port-conflict-modal` (after #confirm-modal)"
+    change_summary: >-
+      The bind-hint no longer mentions `ILINK_HUB_ADDR`; users are pointed
+      at the new "监听端口" input on the same panel. A new port-settings
+      block adds a numeric input + "保存并重启" button + an inline
+      `#port-msg` form-msg. A new `#port-conflict-modal` (with
+      `data-port-conflict` buttons) provides the bind-failure recovery
+      dialog.
+  - file: desktop/ilink-hub-desktop/src/styles.css
+    symbols:
+      - "new `.port-settings`, `.port-form`, `.field-port`, `.field-port-modal` styles"
+    change_summary: >-
+      Styles for the new port-settings block and port-conflict-modal input:
+      same monospace input treatment as the existing register form,
+      dashed top border to separate it from the hero stats grid,
+      accent-coloured focus ring consistent with the rest of the app.
+  - file: desktop/ilink-hub-desktop/src/main.ts
+    symbols:
+      - "DesktopSettingsPayload / SetListenPortResult types"
+      - "openPortConflictModal / closePortConflictModal"
+      - "parsePortFromAddr / prefillListenPort / refreshDesktopSettings"
+      - "isPortBindError / extractPortFromError / handleBindFailure"
+      - "applyListenPortChange"
+      - "applyHubInfo — prefill input from requested_addr"
+      - "hub-error listener — trigger handleBindFailure on bind errors"
+      - "DOMContentLoaded — refreshDesktopSettings + save button + Enter key + modal click"
+    change_summary: >-
+      New TypeScript surface for the port-change flow. `applyHubInfo`
+      now keeps the listen-port input in sync with the controller's view
+      of `requested_addr` (which can change mid-session when the user
+      saves a new port). The `hub-error` listener detects bind failures
+      (EADDRINUSE / "address already in use" / "bind") and opens the
+      conflict modal with the active port pre-selected and the next port
+      up as the suggested value. The save button on the settings block
+      calls `set_listen_port` then `restart_hub` (or `start_hub` if the
+      service was previously stopped), surfacing inline errors in
+      `#port-msg`.
+
+# ─── Commands run (all required by the M2 task prompt) ─────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished `dev` profile, exit 0 (0 warnings; runs the workspace lib only — desktop src-tauri is a separate cargo manifest)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      workspace_lib: "129 passed; 0 failed; 0 ignored (src/lib.rs unit tests)"
+      workspace_main: "0 passed (binary has no inline tests)"
+      workspace_bridge_bin: "0 passed"
+      workspace_relay_bin: "0 passed"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      desktop_lib: "31 passed; 0 failed; 0 ignored (13 new for M2: loopback_listen_addr_for_port_is_loopback_only, parse_loopback_port_accepts_canonical_and_loose_forms, desktop_port_override_round_trip_under_data_dir, desktop_port_override_rejects_zero_in_loaded_file, desktop_port_override_rejects_malformed_json, resolve_initial_listen_addr_prefers_persisted_port, resolve_initial_listen_addr_falls_back_to_env_when_no_override, hub_controller_set_requested_addr_is_observable_via_getter, set_listen_port_command_rejects_zero, set_listen_port_command_persists_and_updates_controller, set_listen_port_command_overwrites_previous_value, get_desktop_settings_prefills_listen_port_from_requested_addr, get_desktop_settings_falls_back_to_default_when_unparseable)"
+      desktop_main: "2 passed; 0 failed; 0 ignored"
+      total: "188 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "tsc clean + Vite production bundle, exit 0"
+    actual: "tsc clean + Vite produced dist/index.html (18.55 kB) + dist/assets/index-CG2FeJ_9.css (27.01 kB) + dist/assets/index-DvTslZJ7.js (25.67 kB), exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M2-required test inventory (plan §M2) ─────────────────────────────────
+# Plan §M2 explicitly required:
+#   1. cargo build -p ilink-hub-desktop passes (src-tauri side)
+#   2. pnpm -C desktop/ilink-hub-desktop run build passes (frontend side)
+#   3. manual reproduction: occupy 8765 → launch desktop → port-change
+#      dialog → enter new port → bind succeeds
+m2_test_inventory:
+  desktop_lib_unit:
+    - test: loopback_listen_addr_for_port_is_loopback_only
+      covers: >-
+        Contract that the GUI port override cannot accidentally rebind on
+        a non-loopback interface. `loopback_listen_addr_for_port(p)` is
+        asserted to produce exactly `127.0.0.1:<p>` for boundary values
+        (1, 8765, 65535).
+      result: pass
+    - test: parse_loopback_port_accepts_canonical_and_loose_forms
+      covers: >-
+        Parser for the listen-port-input prefill / hub-info sync path.
+        Accepts `127.0.0.1:8765`, `localhost:9000`, bare `<port>`. Rejects
+        `127.0.0.1:0`, out-of-range numerics, negative inputs, IPv6 forms,
+        and empty strings so the UI never shows a bogus port.
+      result: pass
+    - test: desktop_port_override_round_trip_under_data_dir
+      covers: >-
+        End-to-end: with HOME pointed at a `tempdir`, `save_desktop_port_override(9123)`
+        then `load_desktop_port_override()` round-trips through the
+        `~/.ilink-hub/desktop-port.json` file. Asserts the on-disk JSON
+        uses the camelCase `port` key the TypeScript frontend expects.
+      result: pass
+    - test: desktop_port_override_rejects_zero_in_loaded_file
+      covers: >-
+        Hand-crafts `{"port":0}` on disk; the loader MUST surface a
+        validation error (not silently fall back) so a corrupted file
+        doesn't silently bind to an ephemeral port.
+      result: pass
+    - test: desktop_port_override_rejects_malformed_json
+      covers: >-
+        Non-JSON payload on disk surfaces a parse error to `setup()`
+        (which then falls back to the env default with a tracing warning
+        rather than refusing to launch).
+      result: pass
+    - test: resolve_initial_listen_addr_prefers_persisted_port
+      covers: >-
+        With a persisted override present AND `ILINK_HUB_ADDR` set in
+        env, the persisted port wins. Verifies the documented priority
+        chain: persisted → env → default.
+      result: pass
+    - test: resolve_initial_listen_addr_falls_back_to_env_when_no_override
+      covers: >-
+        No persisted file → env var wins; no env var → default
+        `127.0.0.1:8765`. Cleans up env state on test exit so parallel
+        test runs don't leak into each other.
+      result: pass
+    - test: hub_controller_set_requested_addr_is_observable_via_getter
+      covers: >-
+        The GUI change-port flow mutates `requested_addr` in place; both
+        `hub_info` (UI) and `start_hub` (next bind) MUST see the new
+        value via the accessor. Asserts the in-memory + on-disk paths
+        converge.
+      result: pass
+    - test: set_listen_port_command_rejects_zero
+      covers: >-
+        `set_listen_port(0)` is rejected at the command boundary with
+        a `result.ok == false` + a non-empty `result.error`. This is the
+        contract that lets the GUI render an inline error rather than
+        getting a confusing bind failure on port 0 (which would mean
+        "any ephemeral port").
+      result: pass
+    - test: set_listen_port_command_persists_and_updates_controller
+      covers: >-
+        Happy path on a `mock_app()`: after `set_listen_port(9123)`,
+        `load_desktop_port_override()` returns `Some(9123)` AND
+        `ctrl.requested_addr()` returns `"127.0.0.1:9123"`. Both
+        on-disk and in-memory views update under one command.
+      result: pass
+    - test: set_listen_port_command_overwrites_previous_value
+      covers: >-
+        Successive calls overwrite the persisted port AND the
+        controller's `requested_addr`. Regression-guard for accidental
+        "append instead of replace" behaviour.
+      result: pass
+    - test: get_desktop_settings_prefills_listen_port_from_requested_addr
+      covers: >-
+        After the controller's `requested_addr` is mutated, the UI
+        payload exposes `listenPort` matching the new port. The frontend
+        uses this on cold start to prefill the input even when the value
+        came from `ILINK_HUB_ADDR` rather than a saved file.
+      result: pass
+    - test: get_desktop_settings_falls_back_to_default_when_unparseable
+      covers: >-
+        When the controller's `requested_addr` cannot be parsed to a u16
+        (e.g. `[::]:8765` from a non-loopback bind), `get_desktop_settings`
+        returns `listenPort = 8765` as a sane fallback so the UI never
+        shows "port 0".
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: bind-hint-no-env-var
+    plan_clause: "修改 desktop/ilink-hub-desktop/index.html:76-81,bind-hint 文案去掉 ILINK_HUB_ADDR 环境变量描述,改为指向 GUI 设置项"
+    observation: >-
+      `index.html` #bind-hint now reads: 「<strong>端口可能被占用。</strong>
+      若状态一直停在「启动中」，多半是已有一个 <code>ilink-hub serve</code>
+      在运行。请先停掉它，或在本页 <strong>监听端口</strong>输入框中换一个端口再启动。」
+      The `ILINK_HUB_ADDR=127.0.0.1:8770` snippet is gone; users are
+      pointed at the new in-app input.
+    result: pass
+  - id: port-conflict-dialog
+    plan_clause: "修改 desktop/ilink-hub-desktop/src/main.ts:823-828,端口 bind 失败时弹「端口被占用,换一个端口?」对话框,允许一键改端口并重试 bind"
+    observation: >-
+      `#port-conflict-modal` opens automatically when `hub-error` is
+      received with a payload matching `address already in use` /
+      `EADDRINUSE` / `bind`. The dialog shows the offending port, suggests
+      the next port up (or `port - 1` near the upper bound), and on Apply
+      calls `applyListenPortChange(choice)` which writes the new port +
+      restarts the hub. The Cancel button dismisses without action.
+    result: pass
+  - id: port-settings-ui
+    plan_clause: "在 desktop/ilink-hub-desktop/index.html 设置区新增「监听端口」输入框,写入应用本地配置 (Tauri store 或配置文件),下次启动读取"
+    observation: >-
+      The home panel now contains a `.port-settings` block with
+      `#listen-port-input` (numeric, min=1, max=65535) + `#btn-save-port`
+      + inline `#port-msg`. Persistence is via
+      `~/.ilink-hub/desktop-port.json` (atomic write-tmp + rename),
+      loaded in `setup()` via `resolve_initial_listen_addr()`. The input
+      is pre-filled on cold start by `refreshDesktopSettings()` AND kept
+      in sync at runtime by `applyHubInfo()` reading
+      `info.requestedAddr`.
+    result: pass
+  - id: src-tauri-build
+    plan_clause: "cargo build -p ilink-hub-desktop 通过"
+    observation: >-
+      `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml`
+      → Finished `dev` profile, exit 0. The 13 new unit tests also
+      compile under `tauri = { features = ["test"] }` +
+      `tempfile = "3"` dev-deps.
+    result: pass
+  - id: frontend-build
+    plan_clause: "pnpm -C desktop/ilink-hub-desktop run build 通过"
+    observation: >-
+      `npm run build` → tsc clean + Vite production bundle. Final sizes:
+      `dist/index.html` 18.55 kB (gzip 4.58 kB),
+      `dist/assets/index-CG2FeJ_9.css` 27.01 kB (gzip 6.00 kB),
+      `dist/assets/index-DvTslZJ7.js` 25.67 kB (gzip 9.00 kB). 0 TS errors.
+    result: pass
+  - id: full-ci-gate
+    plan_clause: "M4 质量门禁收尾 (fmt + clippy + test + build 全绿)"
+    observation: >-
+      All four M4-equivalent gates pass on the workspace:
+      - `cargo fmt --check` → exit 0, no output.
+      - `cargo clippy -- -D warnings` → 0 warnings, exit 0.
+      - `cargo test` → 129 + 7 + 9 + 10 + 1 ignored = 156 passed (workspace),
+        31 desktop lib tests + 2 desktop main tests (13 new) all green.
+      - `cargo build` → Finished `dev` profile, exit 0.
+      Plus the M2-specific gates:
+      - `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` → exit 0.
+      - `npm run build` → exit 0.
+    result: pass
+
+# ─── Behavioural diff vs. baseline (ca7bca7) ───────────────────────────────
+# Summary of the UX-02-relevant behavioural change set:
+behavioural_diff:
+  - area: "GUI port-change flow (was: env-var only)"
+    before: >-
+      The only way to change the listen port was to set
+      `ILINK_HUB_ADDR=127.0.0.1:8770` before launching the desktop app, OR
+      edit `~/.ilink-hub-bridge/...` files manually. After a port
+      conflict, the home panel surfaced a `bind-hint` callout telling
+      users to set the env var — which most users don't know how to do
+      on macOS / Windows.
+    after: >-
+      The home panel has a "监听端口" input pre-filled with the active
+      port. Saving it persists to `~/.ilink-hub/desktop-port.json` and
+      calls `restart_hub` (or `start_hub` if previously stopped). On the
+      next launch, `resolve_initial_listen_addr()` honors the persisted
+      port over `ILINK_HUB_ADDR` and over the default. When bind fails,
+      a "端口被占用,换一个端口?" dialog appears with the active port
+      pre-selected and the next port up as the suggestion; clicking
+      "换端口并启动" applies the new port and restarts in one click.
+    security_classification: >-
+      Defence-in-depth UX improvement. No new attack surface: the
+      persisted port file is owned by the user, written atomically
+      (write-tmp + rename), and validated on load (rejects `port: 0`,
+      malformed JSON). The save path refuses `port == 0`; the loopback
+      host is hard-coded so a GUI override cannot rebind on
+      `0.0.0.0` / `[::]`.
+  - area: "HubController.requested_addr (was: String, now Mutex<String>)"
+    before: >-
+      `HubController.requested_addr: String` was set once in `setup()`
+      and never mutated. `start_hub` cloned it; `hub_info` cloned it.
+      No path existed to update it from the GUI.
+    after: >-
+      `HubController.requested_addr: Mutex<String>`. The accessor
+      `requested_addr()` returns a clone; `set_requested_addr(addr)` is
+      the only mutation entry point and is called from `set_listen_port`.
+      `start_hub` reads via the accessor so subsequent binds honour the
+      user's choice. `hub_info` returns the current value so the UI's
+      prefill stays in sync with what's actually used.
+    security_classification: >-
+      No new external surface. Internal mutation is serialized by the
+      existing mutex (`.expect("HubController mutex poisoned…")`),
+      consistent with all other `HubController` fields.
+  - area: "Persisted port file (new)"
+    before: "N/A."
+    after: >-
+      `~/.ilink-hub/desktop-port.json` with schema `{ "port": <u16> }`.
+      Written atomically (write to `desktop-port.json.tmp`, then rename).
+      Loaded once in `setup()`. Malformed / missing files are tolerated:
+      `setup()` falls back to the env default with a tracing warning
+      rather than refusing to launch.
+    security_classification: >-
+      Same trust boundary as the existing SQLite database file under
+      `~/.ilink-hub/`. No information disclosure; no remote access; the
+      file is created with default umask and only readable by the user.
+
+# ─── M2-specific open follow-ups ────────────────────────────────────────────
+# UX-02 is fully closed at the code level. Two non-blocking follow-ups are
+# worth flagging for future milestones:
+open_follow_ups:
+  - area: "GUI port-conflict heuristic"
+    note: >-
+      The `isPortBindError` check uses string-substring heuristics on the
+      `hub-error` payload (`address already in use`, `EADDRINUSE`, `bind`).
+      This is robust for tokio's `std::io::Error` Display output but does
+      NOT use `io::ErrorKind::AddrInUse` directly (the error is serialised
+      to a string at the Tauri boundary and loses its `ErrorKind`).
+      A future refactor could carry an `errno`-like code in the payload
+      to make the check 100% exact. Not blocking UX-02.
+  - area: "Port-in-use preflight"
+    note: >-
+      The current flow attempts to bind, fails, then surfaces the dialog.
+      A nicer UX would be a synchronous `is_port_available(port)` check
+      that runs BEFORE the bind attempt and warns the user in the input
+      field itself. Out of scope for M2 (which is reactive), but a
+      natural M-N follow-up.
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "UX-03: 扫码弹窗前置条件提醒"
+next_milestone_files:
+  - desktop/ilink-hub-desktop/index.html (#qr-modal)
+  - desktop/ilink-hub-desktop/src/main.ts (QR modal text)
+  - docs/guide/getting-started.md (alignment reference)
+  - docs/bridge/quick-try.md (alignment reference)

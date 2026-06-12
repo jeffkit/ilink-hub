@@ -87,8 +87,7 @@ impl UpstreamClient {
     /// `X-WECHAT-UIN`: random uint32 as decimal string, then base64-encoded.
     fn random_uin(&self) -> String {
         use base64::Engine;
-        use rand::Rng;
-        let uint32: u32 = rand::thread_rng().gen();
+        let uint32: u32 = rand::random::<u32>();
         base64::engine::general_purpose::STANDARD.encode(uint32.to_string().as_bytes())
     }
 

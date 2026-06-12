@@ -76,17 +76,54 @@
             <p id="bind-hint" class="callout" hidden>
               <strong>端口可能被占用。</strong>
               若状态一直停在「启动中」，多半是已有一个
-              <code>ilink-hub serve</code> 在运行。请先停掉它，或设置
-              <code>ILINK_HUB_ADDR=127.0.0.1:8770</code> 后重启本应用。
+              <code>ilink-hub serve</code> 在运行。请先停掉它，或在本页
+              <strong>监听端口</strong>输入框中换一个端口再启动。
             </p>
+
+            <section class="block port-settings" aria-label="端口设置">
+              <header class="be-header">
+                <div class="be-header-main">
+                  <h2 class="be-title">监听端口</h2>
+                  <p class="be-lead">
+                    Hub 在本机监听的端口（<code>127.0.0.1:&lt;port&gt;</code>）。
+                    保存后会重启服务以应用新端口；端口被占用时这里也会弹出对话框。
+                  </p>
+                </div>
+              </header>
+              <div class="port-form form-row">
+                <label class="field field-port">
+                  <span class="field-label">端口号</span>
+                  <input
+                    type="number"
+                    id="listen-port-input"
+                    min="1"
+                    max="65535"
+                    step="1"
+                    placeholder="8765"
+                    autocomplete="off"
+                    inputmode="numeric"
+                  />
+                </label>
+                <button type="button" id="btn-save-port" class="btn btn-primary btn-sm">
+                  保存并重启
+                </button>
+              </div>
+              <p id="port-msg" class="form-msg" hidden></p>
+            </section>
           </section>
 
           <footer class="actions">
-            <button type="button" id="btn-stop" class="btn btn-danger btn-block" disabled>
+            <button type="button" id="btn-stop" class="btn btn-danger btn-block" disabled hidden>
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <rect x="6" y="6" width="12" height="12" rx="2" />
               </svg>
               停止服务
+            </button>
+            <button type="button" id="btn-start" class="btn btn-primary btn-block" hidden>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="6 4 20 12 6 20 6 4" />
+              </svg>
+              启动服务
             </button>
           </footer>
         </div>
@@ -270,6 +307,11 @@
         </div>
         <h3>微信扫码登录</h3>
         <p class="modal-lead">用<strong>微信</strong>扫描下方二维码，按提示完成登录。</p>
+        <p class="qr-prereq callout">
+          扫码前请确认：①微信已更新到最新版，且在「我 → 设置 → 插件」中开启
+          <strong>ClawBot（龙虾插件）</strong>；②使用
+          <strong>已开通 iLink</strong> 的微信账号扫描。普通微信账号无法完成授权。
+        </p>
         <div class="qr-frame">
           <img id="qr-img" alt="微信登录二维码" />
           <div class="qr-loading" id="qr-loading" aria-hidden="true"></div>
@@ -278,6 +320,19 @@
         <div class="qr-actions">
           <button type="button" id="qr-copy" class="btn btn-ghost btn-sm">复制备用链接</button>
         </div>
+        <details class="help-collapsible qr-help be-help">
+          <summary class="help-summary">
+            <span class="help-q" aria-hidden="true">?</span>
+            <span class="help-summary-text">扫了没反应？</span>
+          </summary>
+          <div class="help-body">
+            <ul class="qr-help-list">
+              <li><strong>账号未开通 iLink</strong>：必须用「已开通 iLink」的微信账号扫码，普通微信账号无法授权。</li>
+              <li><strong>二维码过期</strong>：二维码有效期约 2 分钟，过期后关闭弹窗重新触发即可拿到新码。</li>
+              <li><strong>手机网络异常</strong>：扫码后没有跳出授权页，请检查手机是否联网、是否开启了代理或 VPN。</li>
+            </ul>
+          </div>
+        </details>
         <p class="modal-foot">二维码不显示时，可复制链接发到手机微信里打开。</p>
       </div>
     </div>
@@ -290,6 +345,31 @@
         <div class="modal-actions">
           <button type="button" id="confirm-cancel" class="btn btn-ghost btn-sm" data-confirm="cancel">取消</button>
           <button type="button" id="confirm-ok" class="btn btn-danger btn-sm" data-confirm="ok">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="port-conflict-modal" class="modal" hidden aria-modal="true" role="dialog" aria-labelledby="port-conflict-title">
+      <div class="modal-backdrop" data-port-conflict="cancel"></div>
+      <div class="modal-card modal-card-sm">
+        <h3 id="port-conflict-title">端口被占用</h3>
+        <p id="port-conflict-message" class="confirm-message"></p>
+        <label class="field field-port-modal">
+          <span class="field-label">换一个端口</span>
+          <input
+            type="number"
+            id="port-conflict-input"
+            min="1"
+            max="65535"
+            step="1"
+            autocomplete="off"
+            inputmode="numeric"
+          />
+        </label>
+        <p id="port-conflict-msg" class="form-msg" hidden></p>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-ghost btn-sm" data-port-conflict="cancel">取消</button>
+          <button type="button" class="btn btn-primary btn-sm" data-port-conflict="apply">换端口并启动</button>
         </div>
       </div>
     </div>

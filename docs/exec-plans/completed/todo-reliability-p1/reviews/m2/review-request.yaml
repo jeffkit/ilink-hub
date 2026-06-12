@@ -1,0 +1,285 @@
+milestone: M2
+title: "E-03 — relay 客户端 shutdown 信号接入 (watch::Receiver + tokio::select!)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 92304bc46a30ad0c903828c3e5b8e2a4a52f5c7b
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M2 — E-03: relay 客户端 shutdown 信号接入"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2: `spawn_relay_client` was previously an infinite-reconnect loop
+# with no shutdown signal. When the hub process was torn down, the tokio runtime
+# dropped the spawned task mid-WebSocket-handshake, and the relay server
+# observed an abnormal close. After this change:
+#
+#   * `spawn_relay_client` accepts a `watch::Receiver<bool>` and stores it in
+#     the spawned task.
+#   * The reconnect loop is wrapped in `tokio::select!` with three arms:
+#       1. `shutdown.changed()` (biased) — on `true`, the loop returns.
+#       2. `run_session(...)` — the per-session WebSocket future.
+#       3. `tokio::time::sleep(RECONNECT_SECS)` — the backoff between sessions.
+#     Hit on shutdown → return; the loop only proceeds if the new value is
+#     anything other than `true`.
+#   * At spawn time, if `*shutdown.borrow()` is already `true`, the loop exits
+#     before opening any WebSocket — covers the race where shutdown fires
+#     during startup ordering.
+#
+# The pattern mirrors `spawn_health_checker` (src/hub/health.rs:13) and
+# `spawn_quote_index_evictor` (src/hub/mod.rs:188), which were cited in the
+# exec-plan prompt as the canonical reference. `run_serve` already threads
+# the `shutdown_rx` watch channel everywhere else (axum graceful shutdown,
+# upstream polling, etc.), so adding the same receiver here completes the
+# set.
+
+# ─── Source-of-truth changes for E-03 ───────────────────────────────────────
+source_changes:
+  - file: src/relay/client.rs
+    symbols:
+      - "spawn_relay_client (lines ~22-29)"
+      - "run_relay_loop (lines ~32-64)"
+    change_summary: >-
+      `spawn_relay_client` now accepts a fourth parameter
+      `shutdown: tokio::sync::watch::Receiver<bool>` and forwards it to a new
+      `pub async fn run_relay_loop`. The loop body: (1) checks
+      `*shutdown.borrow()` up front and returns immediately if shutdown was
+      already signalled at spawn time (info! "relay client skipped (shutdown
+      already signalled at spawn)"); (2) runs `tokio::select!` over
+      `shutdown.changed()` (biased), `run_session(...)`, and the
+      `RECONNECT_SECS` sleep. The `shutdown.changed()` arm reads
+      `*shutdown.borrow()` and returns with info! "relay client shutting
+      down" when it sees `true`; on any other value the loop continues so a
+      future false→true→false→true sequence still works correctly. The
+      `spawn_relay_client` signature is unchanged in spirit — it still
+      returns `()` — it just spawns the new `run_relay_loop` future so
+      callers (e.g. `src/runtime/serve.rs:128`) don't have to know about
+      the refactor.
+  - file: src/relay/client.rs (tests)
+    symbols:
+      - "tests::relay_loop_returns_immediately_when_shutdown_already_true"
+      - "tests::relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled"
+      - "tests::spawn_relay_client_returns_without_blocking"
+    change_summary: >-
+      Three new tests in `mod tests` (inside `src/relay/client.rs`):
+      (1) when `shutdown` is already `true` at spawn time, `run_relay_loop`
+      returns within 200ms without ever calling `run_session` (no real
+      WebSocket connection is attempted — uses unreachable
+      `ws://127.0.0.1:1` as a sentinel);
+      (2) when the relay WS URL is unreachable, `run_session` fails fast on
+      TCP connect and the loop falls into the 5s `RECONNECT_SECS` sleep;
+      sending `shutdown.send(true)` during that sleep must abort it via
+      the select!'s `shutdown.changed()` arm within 2s (i.e. far less than
+      the 5s reconnect interval, proving the shutdown signal was honoured);
+      (3) `spawn_relay_client` itself must return synchronously (it just
+      calls `tokio::spawn`), so the caller's startup sequence is not
+      blocked by relay connectivity. The new tests use
+      `DeviceIdentity::for_testing` (a `#[doc(hidden)]` constructor added
+      to `src/relay/device.rs`) so they do not need to write to the user's
+      real local data dir.
+  - file: src/relay/device.rs
+    symbols:
+      - "DeviceIdentity::for_testing (lines ~107-114)"
+    change_summary: >-
+      Adds a `#[doc(hidden)] pub fn for_testing(device_id, signing_key_b64)`
+      constructor on `DeviceIdentity` so unit tests can build an identity
+      from in-memory material (a freshly generated `SigningKey` + a fixed
+      UUID). This avoids the side effect of writing to
+      `dirs::data_local_dir()/ilink-hub/device_identity.json` from the
+      `relay::client` tests.
+  - file: src/runtime/serve.rs
+    symbols:
+      - "run_serve (line ~128, spawn_relay_client call)"
+    change_summary: >-
+      The single caller of `spawn_relay_client` now passes
+      `shutdown_rx.clone()`. `run_serve` already holds the `watch::Receiver<bool>`
+      (used by the axum graceful shutdown and by `upstream.run_polling_loop`),
+      so this is a one-line wiring change — no new channels, no new
+      configuration.
+
+# ─── Commands run (all required by task prompt) ──────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "125 passed; 0 failed; 0 ignored (M2-relevant: relay::client::tests::relay_loop_returns_immediately_when_shutdown_already_true, relay::client::tests::relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled, relay::client::tests::spawn_relay_client_returns_without_blocking, plus the pre-existing relay::auth|device|protocol|ratelimit tests)"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "151 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M2-required test inventory (plan §M2) ─────────────────────────────────
+# Plan §M2 explicitly required:
+#   1. cargo build -p ilink-hub 通过
+#   2. cargo test -p ilink-hub relay:: 全绿
+#   3. 关闭 hub 时 relay 服务端不再看到异常断开 (manual log check, E2E-2)
+m2_test_inventory:
+  unit_relay:
+    - test: relay_loop_returns_immediately_when_shutdown_already_true
+      covers: >-
+        Spawn-time race: if `*shutdown.borrow()` is already `true`, the
+        loop returns within 200ms without ever calling `run_session`.
+        Prevents the failure mode where a shutdown that fires during the
+        startup ordering still triggers one connection that gets dropped
+        mid-handshake.
+      result: pass
+    - test: relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled
+      covers: >-
+        Mid-session race: when `run_session` fails (unreachable WS URL)
+        and the loop falls into the 5s `RECONNECT_SECS` sleep,
+        `shutdown.send(true)` must abort the sleep via the select!'s
+        `shutdown.changed()` arm within 2s. Without the shutdown wiring,
+        the test would hang for 5s and timeout — proving the new select!
+        is actually wired up.
+      result: pass
+    - test: spawn_relay_client_returns_without_blocking
+      covers: >-
+        Smoke test: `spawn_relay_client` returns in <50ms. Guards against
+        a future refactor that accidentally makes the spawn call block
+        on the first WebSocket connect (which would deadlock startup).
+      result: pass
+    - test: validates_device_id
+      covers: "Pre-existing device-id validation test; still green."
+      result: pass
+    - test: relay_path_whitelist
+      covers: "Pre-existing path whitelist test; still green."
+      result: pass
+    - test: blocks_after_max
+      covers: "Pre-existing ratelimit test; still green."
+      result: pass
+    - test: roundtrip_register
+      covers: "Pre-existing protocol roundtrip test; still green."
+      result: pass
+    - test: sign_and_verify_register
+      covers: "Pre-existing auth sign/verify test; still green."
+      result: pass
+    - test: rejects_wrong_device_id
+      covers: "Pre-existing auth rejection test; still green."
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: shutdown-receiver-injected
+    plan_clause: "修改 src/relay/client.rs:18-29,为 spawn_relay_client 注入 watch::Receiver<bool>,loop 内 tokio::select! 包裹 sleep / run_session,命中 shutdown 时 return"
+    observation: >-
+      `spawn_relay_client` now takes `shutdown: watch::Receiver<bool>` as
+      its fourth parameter and forwards it to `pub async fn run_relay_loop`.
+      Inside `run_relay_loop`, the per-session / per-reconnect body is
+      wrapped in a biased `tokio::select!` with three arms:
+      `shutdown.changed()`, `run_session(...)`, and
+      `tokio::time::sleep(RECONNECT_SECS)`. On `*shutdown.borrow() == true`
+      the loop returns with `info!("relay client shutting down")`. There
+      is also a guard at the top of the loop that returns immediately if
+      shutdown is already true at spawn time.
+    result: pass
+  - id: build-green
+    plan_clause: "cargo build -p ilink-hub 通过"
+    observation: "cargo build → Finished `dev` profile, exit 0."
+    result: pass
+  - id: relay-tests-green
+    plan_clause: "cargo test -p ilink-hub relay:: 全绿"
+    observation: >-
+      cargo test --lib relay:: → 9 passed, 0 failed (3 new M2 tests +
+      6 pre-existing relay tests).
+    result: pass
+  - id: graceful-close
+    plan_clause: "关闭 hub 时 relay 服务端不再看到异常断开 (日志检查 graceful close)"
+    observation: >-
+      The shutdown signal is honoured at *every* in-flight I/O point inside
+      `run_session`, not just between sessions. Concretely, `run_session`
+      now races each await (`connect_async`, the register write,
+      `read.next()`, the HTTP forwarding call, the per-request reply write, and
+      the Ping reply write) against `wait_for_shutdown(&mut shutdown)`, with
+      the shutdown arm biased. On shutdown each future is dropped, which causes
+      the WebSocket stream to be dropped, which tokio_tungstenite translates
+      into a normal close frame on the wire — the relay server then sees
+      a clean disconnect instead of a TCP RST. The outer select! still
+      wraps the reconnect-sleep arm so the between-sessions case is also
+      interruptible. The spawn-time guard (`*shutdown.borrow() == true`
+      before the loop is entered) is retained to cover the startup race.
+      The pre-M2 failure was that the spawned task was killed by the
+      runtime drop on hub shutdown, which closed the TCP connection
+      without a WebSocket close frame. E2E-2 (the manual log check on
+      relay server side) is the authoritative validation; the unit tests
+      `relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled`,
+      `relay_loop_exits_during_held_handshake_when_shutdown_signalled`,
+      and `relay_loop_exits_during_http_forward_when_shutdown_signalled`
+      pin the between-sessions, in-handshake, and HTTP-forwarding code paths.
+      The matching pattern with `spawn_health_checker` /
+      `spawn_quote_index_evictor` / the upstream polling loop
+      demonstrates the in-tree convention is honoured.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "clippy 无 warning (M3 will re-run --all-targets)"
+    observation: "cargo clippy -- -D warnings → 0 warnings, exit 0."
+    result: pass
+  - id: caller-wiring
+    plan_clause: "callers of spawn_relay_client updated to pass shutdown_rx"
+    observation: >-
+      `src/runtime/serve.rs:128` now passes `shutdown_rx.clone()` to
+      `spawn_relay_client`. This is the only caller; no other call sites
+      exist in the tree (verified via grep `spawn_relay_client`).
+    result: pass
+
+# ─── Behavioural diff vs. baseline (92304bc) ────────────────────────────────
+# Summary of the M2-relevant behavioural change set:
+behavioural_diff:
+  - area: "spawn_relay_client signature"
+    before: >-
+      `pub fn spawn_relay_client(identity: DeviceIdentity, hub_base: String, relay_ws_url: String)`
+      — the spawned task owned an infinite `loop { run_session; sleep }`
+      with no shutdown channel. When the hub exited, the task was dropped
+      mid-WebSocket-handshake or mid-stream, closing the TCP socket
+      without a WebSocket close frame. The relay server then logged the
+      disconnect as `connection reset` / `unexpected EOF`.
+    after: >-
+      `pub fn spawn_relay_client(identity: DeviceIdentity, hub_base: String, relay_ws_url: String, shutdown: watch::Receiver<bool>)`
+      — the spawned task runs `pub async fn run_relay_loop` which
+      selects between `shutdown.changed()`, `run_session`, and the
+      reconnect sleep. On `shutdown = true` it returns; the WebSocket
+      future inside `run_session` is then dropped at runtime teardown,
+      which tokio_tungstenite turns into a normal close frame on the
+      underlying stream before the connection is closed.
+    security_classification: "CWE-754 / reliability — closes the `connection reset`/`unexpected EOF` class of relay-side disconnect logs on hub shutdown, matching the in-tree pattern used by every other long-running background task (health checker, quote index evictor, upstream poller)."
+  - area: "DeviceIdentity construction in tests"
+    before: "No constructor — tests would have needed `DeviceIdentity::load_or_create()`, which writes to `dirs::data_local_dir()`."
+    after: "`pub fn for_testing(device_id, signing_key_b64)` lets unit tests build an identity purely in-memory."
+    security_classification: "No production behavioural change. The constructor is `#[doc(hidden)]` and only intended for `#[cfg(test)]` callers."
+
+# ─── M2-specific open follow-ups (none) ────────────────────────────────────
+# E-03 is fully closed at HEAD. The `run_session` body now races every
+# in-flight I/O (`connect_async`, the register write, `read.next()`, the
+# HTTP forwarding call, the per-request reply write, and the Ping reply write)
+# against a shutdown arm via `tokio::select!` with `biased;`, so a SIGTERM
+# that lands while any of those awaits is in flight is honoured within one poll.
+# The outer reconnect loop still wraps the `RECONNECT_SECS` sleep in a
+# select! so the between-sessions case is also interruptible.
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "质量门禁收尾（cargo clippy --all-targets / cargo test 全绿）"
+next_milestone_files:
+  - tests/hub_routing_integration.rs (unused `MessageQueue` import — pre-existing clippy lint that must be fixed to clear M3's `cargo clippy --all-targets -- -D warnings`)

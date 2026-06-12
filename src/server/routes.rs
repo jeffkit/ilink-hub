@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::{debug, error, warn};
 
-use crate::hub::{HubState, MessageQueue};
+use crate::hub::{HubState, MessageQueue, MAX_CONCURRENT_POLLS_PER_VTOKEN};
 use crate::ilink::types::*;
 use crate::server::pairing::register_client_in_hub;
 
@@ -123,7 +123,8 @@ pub async fn register(
         );
     }
 
-    let vtoken = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let (vtoken, _is_new) =
+        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
     (
         StatusCode::OK,
@@ -156,8 +157,61 @@ pub async fn getupdates(
         );
     };
 
+    // SEC-003: gate concurrent long-polls per vtoken BEFORE doing any
+    // registry work. The tracker increments the count and returns a guard;
+    // dropping the guard decrements (via Drop) regardless of whether we
+    // ultimately serve the long-poll or bail with 429. A poisoned counts
+    // mutex returns count=0 (F-M2-2) — we then fall through to the
+    // 429-without-guard path which is always safe.
+    let (concurrent_polls, poll_guard) = state.poll_tracker.enter(&vtoken);
+    if concurrent_polls > MAX_CONCURRENT_POLLS_PER_VTOKEN {
+        // Over the per-vtoken cap — drop the guard so the count returns to
+        // MAX, then reject.  We do NOT proceed to mark_seen / wait_notify:
+        // the request is over-budget and may indicate an attacker (or a
+        // misconfigured bridge) trying to exhaust Hub resources.
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            concurrent = concurrent_polls,
+            cap = MAX_CONCURRENT_POLLS_PER_VTOKEN,
+            "getupdates rejected: too many concurrent long-polls for this vtoken"
+        );
+        drop(poll_guard);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetUpdatesResponse {
+                ret: Some(429),
+                errcode: None,
+                errmsg: Some("too many concurrent polls for this vtoken".to_string()),
+                msgs: None,
+                get_updates_buf: None,
+            }),
+        );
+    }
+
+    // Split-brain detection: more than one (but still under the cap)
+    // concurrent long-poll means two bridge processes share one
+    // credential/token and will compete for this vtoken's queue (drain is
+    // a destructive read), so inbound messages get stolen
+    // non-deterministically.  Anything strictly above MAX has already been
+    // rejected above; we only warn for the legal-but-suspicious 1 < n <= MAX
+    // range.
+    if concurrent_polls > 1 {
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            concurrent = concurrent_polls,
+            "multiple bridges are long-polling the same vtoken — they share one credential/token \
+             and will steal each other's messages. Give each backend its own registration \
+             instead of reusing a token."
+        );
+    }
+
     {
-        let registry = state.registry.read().await;
+        // F-M2-1: collapse the read (existence) + write (mark_seen) into a
+        // single write guard. Holding two separate locks creates a stale-
+        // online window where evict_stale could flip `online=false` between
+        // the read and the mark_seen. With one guard, the vtoken existence
+        // check and the last-seen timestamp bump are atomic w.r.t. evict_stale.
+        let mut registry = state.registry.write().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
             return (
@@ -171,10 +225,6 @@ pub async fn getupdates(
                 }),
             );
         }
-    }
-
-    {
-        let mut registry = state.registry.write().await;
         registry.mark_seen(&vtoken);
     }
 
@@ -281,16 +331,14 @@ pub async fn sendmessage(
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
         let ctx_map = state.ctx_map.read().await;
-        ctx_map
-            .resolve_full(&vctx)
-            .map(|(r, p)| (r.to_string(), p.to_string()))
+        ctx_map.resolve_full(&vctx)
     }
     .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
         match state.store.resolve_context_token_full(&vctx).await {
             Ok(Some((r, p))) => {
-                let mut ctx_map = state.ctx_map.write().await;
+                let ctx_map = state.ctx_map.write().await;
                 ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
@@ -473,8 +521,8 @@ pub async fn getconfig(
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
         let real_ctx = {
-            let mut ctx_map = state.ctx_map.write().await;
-            ctx_map.resolve(vctx).map(str::to_string)
+            let ctx_map = state.ctx_map.read().await;
+            ctx_map.resolve(vctx)
         };
         if let Some(real) = real_ctx {
             req.context_token = Some(real);

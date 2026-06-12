@@ -13,8 +13,16 @@
 //! group id) so a quote-reply in one conversation can never resolve to a message the Hub
 //! sent into a *different* conversation.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
+
+fn calculate_hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
 
 use super::router::{HubCommand, RoutingDecision};
 
@@ -64,14 +72,18 @@ struct ContentEntry {
     /// Approximate epoch-ms when the Hub sent this message (tiebreaker against the quoted
     /// `ref_msg.create_time_ms`).
     created_ms: i64,
+    /// Logical sequence number to break ties and ensure deterministic eviction.
+    seq: u64,
     deadline: Instant,
 }
 
 /// In-memory index with TTL eviction (no persistence yet).
 #[derive(Debug, Default)]
 pub struct QuoteRouteIndex {
-    /// Content signature → outbound origins (scoped per conversation).
-    by_content: HashMap<String, Vec<ContentEntry>>,
+    /// Content signature hash → outbound origins (scoped per conversation).
+    by_content: HashMap<u64, Vec<ContentEntry>>,
+    /// Monotonically increasing counter to assign unique logical sequence numbers.
+    next_seq: u64,
 }
 
 const INDEX_TTL: Duration = Duration::from_secs(86400 * 7);
@@ -79,6 +91,8 @@ const INDEX_TTL: Duration = Duration::from_secs(86400 * 7);
 const MAX_CONTENT_ENTRIES_PER_KEY: usize = 32;
 /// Length (in chars) of the prefix key used to tolerate WeChat truncating long quoted text.
 const CONTENT_PREFIX_CHARS: usize = 48;
+/// Cap the total number of content signature keys in the index to prevent memory exhaustion.
+const MAX_BY_CONTENT_KEYS: usize = 10_000;
 
 impl QuoteRouteIndex {
     /// Index an outbound message by its exact rendered text so a later quote-reply in the
@@ -90,14 +104,41 @@ impl QuoteRouteIndex {
     pub fn register_outbound_content(&mut self, scope: &str, text: &str, origin: QuoteOrigin) {
         let now_ms = now_millis();
         let deadline = Instant::now() + INDEX_TTL;
-        for key in content_keys(text) {
+
+        // Evict expired entries first to free up space.
+        self.evict_expired();
+
+        for key_str in content_keys(text) {
+            let key = calculate_hash(&key_str);
+            if !self.by_content.contains_key(&key) && self.by_content.len() >= MAX_BY_CONTENT_KEYS {
+                // Find the oldest key to evict.
+                let mut oldest_key: Option<u64> = None;
+                let mut oldest_ms = i64::MAX;
+                let mut oldest_seq = u64::MAX;
+                for (k, bucket) in &self.by_content {
+                    if let Some(entry) = bucket.iter().min_by_key(|e| (e.created_ms, e.seq)) {
+                        if entry.created_ms < oldest_ms
+                            || (entry.created_ms == oldest_ms && entry.seq < oldest_seq)
+                        {
+                            oldest_ms = entry.created_ms;
+                            oldest_seq = entry.seq;
+                            oldest_key = Some(*k);
+                        }
+                    }
+                }
+                if let Some(k) = oldest_key {
+                    self.by_content.remove(&k);
+                }
+            }
             let bucket = self.by_content.entry(key).or_default();
             bucket.push(ContentEntry {
                 scope: scope.to_string(),
                 origin: origin.clone(),
                 created_ms: now_ms,
+                seq: self.next_seq,
                 deadline,
             });
+            self.next_seq = self.next_seq.wrapping_add(1);
             if bucket.len() > MAX_CONTENT_ENTRIES_PER_KEY {
                 let overflow = bucket.len() - MAX_CONTENT_ENTRIES_PER_KEY;
                 bucket.drain(0..overflow);
@@ -115,7 +156,8 @@ impl QuoteRouteIndex {
         ref_ms: Option<i64>,
     ) -> Option<QuoteOrigin> {
         let now = Instant::now();
-        for key in content_keys(text) {
+        for key_str in content_keys(text) {
+            let key = calculate_hash(&key_str);
             let Some(bucket) = self.by_content.get(&key) else {
                 continue;
             };
@@ -123,9 +165,9 @@ impl QuoteRouteIndex {
                 .iter()
                 .filter(|e| now <= e.deadline && e.scope == scope)
                 .min_by_key(|e| match ref_ms {
-                    Some(ms) => (e.created_ms - ms).abs(),
+                    Some(ms) => (e.created_ms as i128 - ms as i128).abs(),
                     // No quoted timestamp: prefer the most recent send (smallest negative age).
-                    None => -e.created_ms,
+                    None => -(e.created_ms as i128),
                 });
             if let Some(entry) = best {
                 return Some(entry.origin.clone());
@@ -390,7 +432,7 @@ mod tests {
         let mut idx = QuoteRouteIndex::default();
         let text = "完成了";
         idx.by_content.insert(
-            format!("full:{text}"),
+            calculate_hash(&format!("full:{text}")),
             vec![
                 ContentEntry {
                     scope: SCOPE.into(),
@@ -401,6 +443,7 @@ mod tests {
                         session_name: Some("s-old".into()),
                     },
                     created_ms: 1_000_000_000_000,
+                    seq: 0,
                     deadline: Instant::now() + INDEX_TTL,
                 },
                 ContentEntry {
@@ -412,6 +455,7 @@ mod tests {
                         session_name: Some("s-new".into()),
                     },
                     created_ms: 1_000_000_050_000,
+                    seq: 1,
                     deadline: Instant::now() + INDEX_TTL,
                 },
             ],
@@ -469,5 +513,113 @@ mod tests {
                 cmd: HubCommand::Help
             })
         ));
+    }
+
+    #[test]
+    fn register_outbound_content_respects_limit() {
+        let mut idx = QuoteRouteIndex::default();
+        // Register 10,000 distinct messages
+        for i in 0..10000 {
+            idx.register_outbound_content(
+                SCOPE,
+                &format!("msg_{}", i),
+                QuoteOrigin::Client {
+                    vtoken: format!("vt_{}", i),
+                    name: "n".into(),
+                    label: None,
+                    session_name: None,
+                },
+            );
+        }
+        assert_eq!(idx.by_content.len(), 10000);
+
+        // Register one more. This should evict the oldest key (msg_0).
+        idx.register_outbound_content(
+            SCOPE,
+            "msg_overflow",
+            QuoteOrigin::Client {
+                vtoken: "vt_overflow".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        // The count should still be 10,000
+        assert_eq!(idx.by_content.len(), 10000);
+
+        // msg_overflow should be present and resolve successfully
+        let user = quote_reply("reply", "msg_overflow", None);
+        let origin = idx
+            .resolve_user_quote(SCOPE, &user)
+            .expect("resolve overflow");
+        match origin {
+            QuoteOrigin::Client { vtoken, .. } => assert_eq!(vtoken, "vt_overflow"),
+            _ => panic!("expected client"),
+        }
+
+        // msg_0 should be evicted and fail to resolve
+        let user_evicted = quote_reply("reply", "msg_0", None);
+        assert!(idx.resolve_user_quote(SCOPE, &user_evicted).is_none());
+
+        // However, registering an existing key (like msg_1) should still succeed and update the entries
+        idx.register_outbound_content(
+            SCOPE,
+            "msg_1",
+            QuoteOrigin::Client {
+                vtoken: "vt_updated".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        assert_eq!(idx.by_content.len(), 10000);
+        let user_updated = quote_reply("reply", "msg_1", None);
+        let origin = idx
+            .resolve_user_quote(SCOPE, &user_updated)
+            .expect("resolve");
+        match origin {
+            QuoteOrigin::Client { vtoken, .. } => assert_eq!(vtoken, "vt_updated"),
+            _ => panic!("expected client"),
+        }
+    }
+
+    #[test]
+    fn resolve_by_content_overflow_protection_min() {
+        let mut idx = QuoteRouteIndex::default();
+        let text = "overflow_min";
+        idx.register_outbound_content(
+            SCOPE,
+            text,
+            QuoteOrigin::Client {
+                vtoken: "vt".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        // Using i64::MIN as ref_ms should not panic
+        let user = quote_reply("reply", text, Some(i64::MIN));
+        let origin = idx.resolve_user_quote(SCOPE, &user);
+        assert!(origin.is_some());
+    }
+
+    #[test]
+    fn resolve_by_content_overflow_protection_max() {
+        let mut idx = QuoteRouteIndex::default();
+        let text = "overflow_max";
+        idx.register_outbound_content(
+            SCOPE,
+            text,
+            QuoteOrigin::Client {
+                vtoken: "vt".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        // Using i64::MAX as ref_ms should not panic
+        let user = quote_reply("reply", text, Some(i64::MAX));
+        let origin = idx.resolve_user_quote(SCOPE, &user);
+        assert!(origin.is_some());
     }
 }

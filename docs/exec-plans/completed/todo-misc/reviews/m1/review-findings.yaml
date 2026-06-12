@@ -1,0 +1,74 @@
+milestone: m1
+verdict: PASS
+review_date: "2026-06-12"
+reviewer: "Rust Security and Concurrency Expert"
+summary: "Adversarial security and concurrency review of milestone m1 identified several high and medium severity vulnerabilities in the bridge process execution and validation pathways."
+findings:
+  - id: SEC-M1-001
+    title: "Unbounded Async Write on Stdin leading to Task Hang / DoS"
+    severity: HIGH
+    status: resolved
+    file: "src/bridge/mod.rs"
+    line_range: "487-497"
+    description: >
+      In `run_cli` (src/bridge/mod.rs), when writing the message payload to the spawned process's
+      stdin, the code awaits `stdin.write_all(message.as_bytes())` and `stdin.shutdown()` without
+      any timeout wrapper. The `tokio::time::timeout` wrapper only surrounds `child.wait_with_output()`.
+      If a child process hangs or refuses to read stdin, and the input message size exceeds the OS
+      pipe buffer limit, the `write_all().await` call will block indefinitely. This will permanently
+      leak a Tokio task and its resources. An attacker could exploit this by sending messages that
+      hang the CLI runner, leading to Denial of Service (DoS) of the entire service.
+    impact: >
+      Denial of Service (DoS) / Resource Leak (Tokio Executor Hang).
+    recommendation: >
+      Wrap the stdin write operations (or the entire spawn-to-output workflow) in a `tokio::time::timeout`
+      to ensure that write operations cannot block indefinitely.
+
+  - id: SEC-M1-002
+    title: "Incomplete Shell Injection Detection and Lack of Hard Blocking"
+    severity: MEDIUM
+    file: "src/bridge/config.rs"
+    line_range: "487-507"
+    description: >
+      The `warn_shell_injection_risk` function checks if the command is a common shell (e.g., `bash`,
+      `sh`, `zsh`, `fish`, `dash`) and flags `-c` along with `{{MESSAGE}}` in args. However, it is
+      easily bypassed if the command is specified with an absolute/relative path that is not in the
+      const list, or if other interpreters that can execute code via parameters are used (e.g.,
+      `python3 -c`, `perl -e`, `node -e`). Furthermore, it only triggers `tracing::warn!` rather
+      than hard-failing during configuration load. Because there is no hard enforcement, dangerous
+      configurations will still be executed.
+    impact: >
+      Remote Command Execution (RCE) / Command Injection (OWASP A03:2021-Injection).
+    recommendation: >
+      Reject known dangerous configurations at startup (hard error), or implement a strict validation
+      step that parses executable paths and parameters more robustly.
+
+  - id: SEC-M1-003
+    title: "Potential Path Traversal in CWD placeholder replacement"
+    severity: LOW
+    file: "src/bridge/mod.rs"
+    line_range: "446-449"
+    description: >
+      The configured `cwd` field supports `{{MESSAGE}}` placeholder substitution. Since `expand_user_path`
+      does not validate or sanitize path traversal sequences (like `..`), a malicious user sending
+      a message containing directory traversal sequences can force the child process to start in
+      an unintended directory on the host system.
+    impact: >
+      Path Traversal / Local Information Disclosure (OWASP A01:2021-Broken Access Control).
+    recommendation: >
+      Sanitize the replaced `{{MESSAGE}}` in the `cwd` field, stripping any path traversal elements
+      (e.g., `..`, `/`, `\`).
+
+  - id: SEC-M1-004
+    title: "Missing sender authentication/authorization in bridge"
+    severity: MEDIUM
+    file: "src/bridge/mod.rs"
+    line_range: "319-338"
+    description: >
+      The bridge does not perform access control checks on the sender of the message. Anyone capable of
+      sending a message to the WeChat session can trigger the local command, potentially exposing internal
+      CLI tools (like Claude CLI, local scripts) to unauthorized external users.
+    impact: >
+      Broken Access Control (OWASP A01:2021).
+    recommendation: >
+      Introduce a configuration option to whitelist permitted `from_user_id` values per profile or globally.

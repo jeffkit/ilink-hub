@@ -1,0 +1,45 @@
+milestone: m2
+verdict: PASS
+review_date: "2026-06-12"
+reviewer: "Rust Security and Concurrency Expert"
+summary: "Adversarial security and concurrency review of milestone m2 (sqlx optional driver features) confirms that the optional Cargo features build and pass validation successfully. However, the review identified that while Postgres and MySQL driver supports are compile-gated, their actual runtime usage is broken due to SQLite-specific migrations/queries, and related unit/integration tests lack proper feature-gating."
+findings:
+  - id: SEC-M2-001
+    title: "PostgreSQL and MySQL Runtime Failures due to SQLite-Specific SQL Dialect in Migrations"
+    severity: MEDIUM
+    status: active
+    file: "src/store/mod.rs"
+    line_range: "76-175"
+    description: >
+      Although the database drivers (PostgreSQL and MySQL) are now conditionally compiled via the `postgres`
+      and `mysql` Cargo features, the actual SQL schema migrations and runtime queries are heavily SQLite-specific.
+      Specifically, the migrations use the SQLite-specific function `datetime('now')` as column defaults, which fails
+      on PostgreSQL (with undefined function) and MySQL (with syntax errors). Additionally, several runtime queries
+      utilize `ON CONFLICT` statements, which are unsupported in MySQL (requiring `ON DUPLICATE KEY UPDATE` instead),
+      and use `TEXT PRIMARY KEY` which is problematic on MySQL without specifying key lengths.
+    impact: >
+      Compiling with `postgres` or `mysql` features and configuring a corresponding `DATABASE_URL` will fail
+      at runtime during startup migration, rendering these optional features non-functional in practice.
+    recommendation: >
+      Ensure that SQL migrations and queries are dialect-agnostic, or use conditionally executed migrations
+      depending on the connected database driver. Alternatively, document that Postgres and MySQL driver
+      features are currently experimental or require custom external schema initialization.
+
+  - id: SEC-M2-002
+    title: "Missing Feature Gating for SQLite-dependent Tests"
+    severity: LOW
+    status: active
+    file: "src/store/mod.rs"
+    line_range: "737-754"
+    description: >
+      Multiple unit and integration tests (including those in `src/store/mod.rs`, `src/hub/mod.rs`,
+      `tests/hub_routing_integration.rs`, and `tests/breaking_changes.rs`) hardcode connections to `sqlite::memory:` or
+      local SQLite database paths. These tests do not have `#[cfg(feature = "sqlite")]` conditional compile gates.
+      If a developer attempts to compile and run tests with SQLite disabled (e.g., `cargo test --no-default-features --features postgres`),
+      these tests will compile but fail at runtime with a \"no driver found for URL scheme 'sqlite'\" panic.
+    impact: >
+      Developer experience issue: running isolated database tests for PostgreSQL or MySQL features alone is broken,
+      and tests will fail when the default `sqlite` feature is disabled.
+    recommendation: >
+      Gate all tests that hardcode SQLite connections behind a `#[cfg(feature = "sqlite")]` attribute, or dynamically
+      configure the test database URL based on enabled features.

@@ -1,0 +1,26 @@
+milestone: "m2"
+title: "Fix [D-01] sqlx Optional Driver Features"
+description: >
+  Introduced feature flags to Cargo.toml to make PostgreSQL and MySQL optional database drivers.
+  Set SQLite as the default driver. Updated build scripts (Dockerfile and GitHub Actions workflows)
+  to build with all features to ensure official release artifacts retain all driver support.
+  Updated documentation (README.md, docs/reference/configuration.md, docs/guide/installation.md)
+  to explain this breaking change and instruct how to compile with specific feature flags.
+files_changed:
+  - Cargo.toml
+  - Dockerfile
+  - .github/workflows/ci.yml
+  - .github/workflows/release.yml
+  - README.md
+  - docs/reference/configuration.md
+  - docs/guide/installation.md
+validation:
+  commands:
+    - cargo check --no-default-features --features sqlite
+    - cargo check --features postgres
+    - cargo check --features mysql
+    - cargo fmt --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+    - cargo test --all-features
+    - cargo build --all-features
+  status: "Passed"
