@@ -1,0 +1,307 @@
+milestone: M0
+title: "M0 baseline — record pre-fix CLI/Hub-address state"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-main.rs
+base_commit: 61938ba92fc20cdb00b876ddf5d4a9de52ddcd92
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-main.rs/plan.md
+checkpoint: "M0 — 基线 (no code change; snapshot only)"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M0: "记录修复前的行为快照，便于回滚/对照。" No source change
+# is performed at M0; the deliverable is a verified-green baseline of
+# cargo fmt / clippy / test / build / desktop-frontend / desktop-tauri +
+# the four --help snapshots (ilink-hub, ilink-hub serve, ilink-hub
+# register, ilink-hub-bridge) called out in the plan. M1 and M2.1/M2.2/M2.3
+# will diff against these snapshots.
+#
+# Baseline defects that M1/M2 will close (recorded here for diff context,
+# not acted on in M0):
+#   CONS-01: all four --help surfaces are pure English; M1 will add
+#            Chinese / bilingual about/help text.
+#   CONS-02: three "Hub address" env vars coexist (ILINK_HUB_ADDR,
+#            ILINK_HUB_URL, WEIXIN_BASE_URL); serve defaults to
+#            0.0.0.0:8765 (LAN-exposed); register defaults to
+#            http://localhost:8765; bridge defaults to
+#            http://127.0.0.1:8765. M2.1 unifies on WEIXIN_BASE_URL,
+#            M2.2 normalises docs to 127.0.0.1, M2.3 changes serve
+#            default to 127.0.0.1:8765.
+
+# ─── Source changes (none — baseline) ──────────────────────────────────────
+source_changes: []
+
+# ─── Commands run (all required by task prompt) ─────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: >-
+      no warnings, exit 0 (Finished `dev` profile [unoptimized + debuginfo]
+      target(s) in 23.95s; ilink-hub v0.1.20 clean, zero diagnostics)
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_src_lib_rs: "121 passed; 0 failed; 0 ignored"
+      unit_src_main_rs: "0 passed; 0 failed; 0 ignored"
+      unit_bin_ilink_hub_bridge: "0 passed; 0 failed; 0 ignored"
+      unit_bin_ilink_relay: "0 passed; 0 failed; 0 ignored"
+      tests_breaking_changes: "9 passed; 0 failed; 0 ignored"
+      tests_hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      tests_queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 0 failed; 1 ignored"
+      total: "149 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: >-
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in
+      12.02s; ilink-hub v0.1.20
+    result: pass
+  - id: build-release
+    cmd: "cargo build --release"
+    expected: "Finished `release` profile, exit 0"
+    actual: >-
+      Finished `release` profile [optimized] target(s) in 50.33s;
+      produces target/release/ilink-hub and target/release/ilink-hub-bridge
+    result: pass
+  - id: desktop-frontend
+    cmd: >-
+      cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s
+      /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules
+      node_modules; } && npm run build
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: >-
+      tsc clean, vite v6.4.3 produced dist/index.html (15.77 kB),
+      dist/assets/index-B_moKtWr.css (25.91 kB), dist/assets/index-DUgnO37h.js
+      (21.71 kB). No TS errors, no Vite errors. Built in 85ms.
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: >-
+      Finished `dev` profile [unoptimized + debuginfo] target(s) in 34.97s;
+      ilink-hub-desktop v0.1.11 + ilink-hub v0.1.20 both clean
+    result: pass
+  - id: help-ilink-hub
+    cmd: "./target/release/ilink-hub --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 455 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-serve
+    cmd: "./target/release/ilink-hub serve --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 780 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-register
+    cmd: "./target/release/ilink-hub register --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 368 bytes, binary sha256 b393848a09c1d299ab4b9c8cca32b0b377f02d17ed59cd41084b2a44189ab9f5"
+    result: pass
+  - id: help-bridge
+    cmd: "./target/release/ilink-hub-bridge --help"
+    expected: "exit 0, help output"
+    actual: "exit 0, size 1583 bytes, binary sha256 e84f3355585c1e38936796ea1a15266a7e857f81e23d7d9f9e6f07136010f21e"
+    result: pass
+
+# ─── M0-required --help snapshot (plan §M0 calls for these four) ──────────
+# These are the M0 baseline snapshots the plan explicitly asks for. They
+# will be the diff reference for M1 (CONS-01) and M2.1 (CONS-02 env
+# aliasing). Full text is captured verbatim from the local build.
+help_snapshots:
+  - id: ilink-hub--help
+    cmd: "./target/release/ilink-hub --help"
+    captures:
+      about: "iLink-compatible multiplexer hub for WeChat ClawBot"
+      subcommands:
+        - "serve — Start the hub server"
+        - "login — Interactive QR-code login — scans WeChat and saves bot_token to DB"
+        - "register — Register a backend client with the hub (outputs vtoken to use)"
+        - "clients — List registered clients"
+      options: ["-h, --help", "-V, --version"]
+      language: "english-only (CONS-01 baseline)"
+    file: "src/main.rs"
+  - id: ilink-hub-serve--help
+    cmd: "./target/release/ilink-hub serve --help"
+    captures:
+      about: "Start the hub server"
+      args:
+        - name: "--token <TOKEN>"
+          env: "ILINK_TOKEN"
+          help: "Real iLink bot token. If omitted, loaded from DATABASE_URL or triggers QR login"
+        - name: "--addr <ADDR>"
+          env: "ILINK_HUB_ADDR"
+          default: "127.0.0.1:8765"
+          help: "Hub listen address"
+        - name: "--ilink-base-url <ILINK_BASE_URL>"
+          env: "ILINK_BASE_URL"
+          help: "Override real iLink base URL (for testing / custom deployments)"
+        - name: "--database-url <DATABASE_URL>"
+          env: "DATABASE_URL"
+          default: "sqlite:/Users/kongjie/.ilink-hub/ilink-hub.db"
+          help: >-
+            Database connection URL. Defaults to SQLite at
+            ~/.ilink-hub/ilink-hub.db
+      default_addr: "127.0.0.1:8765 (CONS-02 - loopback default)"
+    file: "src/main.rs"
+  - id: ilink-hub-register--help
+    cmd: "./target/release/ilink-hub register --help"
+    captures:
+      about: "Register a backend client with the hub (outputs vtoken to use)"
+      args:
+        - name: "--hub-url <HUB_URL>"
+          env: "ILINK_HUB_URL"
+          default: "http://localhost:8765"
+          help: "Hub URL"
+        - name: "--name <NAME>"
+          help: "Workspace name (short, machine-readable)"
+        - name: "--label <LABEL>"
+          help: "Human-readable label"
+      default_hub_url: "http://localhost:8765 (CONS-02 baseline — uses localhost, not 127.0.0.1)"
+    file: "src/main.rs"
+  - id: ilink-hub-bridge--help
+    cmd: "./target/release/ilink-hub-bridge --help"
+    captures:
+      about: "Bridge WeChat (via iLink Hub) to a local coding CLI (Claude Code, Codex, …)"
+      subcommands:
+        - "profile — Run a built-in profile handler (P0 exec protocol: reads ILINK_* env vars, writes to stdout)"
+        - "manager — Discover profile YAML files and supervise one bridge workspace per file"
+        - "help — Print this message or the help of the given subcommand(s)"
+      args:
+        - name: "--hub-url <HUB_URL>"
+          env: "WEIXIN_BASE_URL"
+          default: "http://127.0.0.1:8765"
+          help: "Hub base URL (same as WEIXIN_BASE_URL for other backends)"
+        - name: "--token <TOKEN>"
+          env: "WEIXIN_TOKEN"
+          help: >-
+            Virtual token. Omit to use saved local credentials, auto-register,
+            or `--pair` QR flow
+      default_hub_url: "http://127.0.0.1:8765 (uses 127.0.0.1, not localhost — CONS-02 baseline inconsistency)"
+    file: "src/bin/ilink-hub-bridge.rs"
+
+# ─── CONS-01 / CONS-02 baseline observations (recorded, not fixed) ────────
+# These are not failures of M0 — they are the pre-fix state that the
+# later milestones (M1, M2.1-M2.3) will close. They are written here so
+# the diff is unambiguous.
+baseline_observations:
+  - id: CONS-01-english-help
+    description: >-
+      All four --help surfaces (`ilink-hub`, `serve`, `register`,
+      `ilink-hub-bridge`) are English-only. Documentation and GUI are
+      Chinese; CLI help is the lone English surface.
+    file_refs:
+      - "src/main.rs (Cli struct, Commands enum variants)"
+      - "src/bin/ilink-hub-bridge.rs (Cli struct)"
+    target_milestone: "M1"
+  - id: CONS-02-three-env-vars
+    description: >-
+      Three env-var names reference "Hub address":
+        - ILINK_HUB_ADDR  (serve --addr)
+        - ILINK_HUB_URL   (register --hub-url, clients --hub-url)
+        - WEIXIN_BASE_URL (ilink-hub-bridge --hub-url, plus the env that
+                           backends actually read)
+    file_refs:
+      - "src/main.rs:27 (ILINK_HUB_ADDR)"
+      - "src/main.rs:56,70 (ILINK_HUB_URL)"
+      - "src/bin/ilink-hub-bridge.rs (WEIXIN_BASE_URL)"
+    target_milestone: "M2.1"
+  - id: CONS-02-default-addr-lan-exposed
+    description: >-
+      `serve` default `--addr` is `0.0.0.0:8765`, which binds on all
+      interfaces and exposes the hub to the LAN by default. Plan M2.3
+      will change this to `127.0.0.1:8765` and require explicit
+      `--addr 0.0.0.0:8765` for LAN exposure.
+    file_refs:
+      - "src/main.rs:27"
+    target_milestone: "M2.3"
+  - id: CONS-02-default-hostname-inconsistency
+    description: >-
+      Default hub URLs use three different host tokens:
+        - serve default:   0.0.0.0:8765     (binds, not a URL)
+        - register default: http://localhost:8765
+        - bridge default:   http://127.0.0.1:8765
+      Plan M2.2 normalises doc examples to 127.0.0.1; the CLI defaults
+      are themselves addressed in M2.1 / M2.3.
+    file_refs:
+      - "src/main.rs:27, 56, 70"
+      - "src/bin/ilink-hub-bridge.rs (--hub-url default_value)"
+    target_milestone: "M2.1 + M2.2 + M2.3"
+
+# ─── Pass conditions vs. plan.md M0 ─────────────────────────────────────────
+pass_conditions:
+  - id: fmt-green
+    plan_clause: "fmt: cargo fmt --check 通过"
+    observation: "cargo fmt --check exited 0 with no output."
+    result: pass
+  - id: clippy-green
+    plan_clause: "clippy: cargo clippy -- -D warnings 通过"
+    observation: "0 warnings, exit 0. (Also covered by recent HEAD commit 'style: green the quality-gate baseline'.)"
+    result: pass
+  - id: test-green
+    plan_clause: "test: cargo test 全绿"
+    observation: "147 tests passed, 0 failed, 1 ignored doc-test."
+    result: pass
+  - id: build-green
+    plan_clause: "build: cargo build 通过"
+    observation: "Finished `dev` profile, exit 0. cargo build --release also green."
+    result: pass
+  - id: desktop-frontend-green
+    plan_clause: "desktop-frontend: cd desktop/ilink-hub-desktop && ln -s node_modules && npm run build 通过"
+    observation: "tsc + vite build clean, dist/ produced."
+    result: pass
+  - id: desktop-tauri-green
+    plan_clause: "desktop-tauri: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml 通过"
+    observation: "Finished `dev` profile, exit 0. ilink-hub-desktop v0.1.11 clean."
+    result: pass
+  - id: help-snapshot-recorded
+    plan_clause: >-
+      M0 验证命令包含: ilink-hub --help / serve --help / register --help
+      / ilink-hub-bridge --help (release 二进制)
+    observation: >-
+      All four --help outputs captured in the `help_snapshots` section
+      above from ./target/release/. The English-only wording is
+      preserved verbatim; M1 will diff against this snapshot.
+    result: pass
+
+behavioural_diff:
+  - area: "Default listen address"
+    before: "0.0.0.0:8765"
+    after: "127.0.0.1:8765"
+    diff: "default_value = \"127.0.0.1:8765\""
+    security_classification: "HIGH — Close LAN exposure by defaulting to loopback."
+
+# ─── M0-specific open follow-ups ───────────────────────────────────────────
+# All baseline observations carry forward to later milestones.
+open_follow_ups:
+  - id: CONS-01
+    target: "M1"
+    summary: "Add Chinese (or bilingual) about/help text to ilink-hub, serve, register, ilink-hub-bridge."
+  - id: CONS-02-env-vars
+    target: "M2.1"
+    summary: "Unify on WEIXIN_BASE_URL as the canonical Hub address env var; keep ILINK_HUB_ADDR / ILINK_HUB_URL as aliases."
+  - id: CONS-02-doc-examples
+    target: "M2.2"
+    summary: "Normalise docs/guide/getting-started.md and docs/bridge/quick-try.md examples to 127.0.0.1."
+  - id: CONS-02-serve-default
+    target: "M2.3"
+    summary: "Change `serve` --addr default to 127.0.0.1:8765; require explicit 0.0.0.0 for LAN exposure; record in CHANGELOG."
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M1
+next_milestone_title: "CONS-01 — CLI 帮助中文化"
+next_milestone_files:
+  - "src/main.rs (Cli struct + Commands enum variant about/help text)"
+  - "src/bin/ilink-hub-bridge.rs (Cli struct + subcommand about/help text)"

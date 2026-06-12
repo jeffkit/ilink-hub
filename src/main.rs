@@ -9,7 +9,10 @@ use ilink_hub::{
 
 #[derive(Parser)]
 #[command(name = "ilink-hub")]
-#[command(version, about = "iLink-compatible multiplexer hub for WeChat ClawBot")]
+#[command(
+    version,
+    about = "微信 ClawBot 的 iLink 兼容多路复用 Hub / iLink-compatible multiplexer hub for WeChat ClawBot"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -17,14 +20,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the hub server
+    /// 启动 Hub 服务器 / Start the hub server
     Serve {
         /// Real iLink bot token. If omitted, loaded from DATABASE_URL or triggers QR login.
         #[arg(long, env = "ILINK_TOKEN")]
         token: Option<String>,
 
         /// Hub listen address
-        #[arg(long, default_value = "0.0.0.0:8765", env = "ILINK_HUB_ADDR")]
+        #[arg(long, default_value_t = get_addr_default(), env = "WEIXIN_BASE_URL")]
         addr: String,
 
         /// Override real iLink base URL (for testing / custom deployments)
@@ -50,10 +53,10 @@ enum Commands {
         ilink_base_url: Option<String>,
     },
 
-    /// Register a backend client with the hub (outputs vtoken to use)
+    /// 向 Hub 注册客户端（输出可用的 vtoken） / Register a backend client with the hub (outputs vtoken to use)
     Register {
         /// Hub URL
-        #[arg(long, default_value = "http://localhost:8765", env = "ILINK_HUB_URL")]
+        #[arg(long, default_value_t = get_hub_url_default(), env = "WEIXIN_BASE_URL")]
         hub_url: String,
 
         /// Workspace name (short, machine-readable)
@@ -67,7 +70,7 @@ enum Commands {
 
     /// List registered clients
     Clients {
-        #[arg(long, default_value = "http://localhost:8765", env = "ILINK_HUB_URL")]
+        #[arg(long, default_value_t = get_hub_url_default(), env = "WEIXIN_BASE_URL")]
         hub_url: String,
     },
 }
@@ -91,6 +94,7 @@ async fn main() -> Result<()> {
             ilink_base_url,
             database_url,
         } => {
+            let addr = extract_host_port(&addr).unwrap_or(addr);
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let shutdown_tx_clone = shutdown_tx.clone();
             tokio::spawn(async move {
@@ -204,4 +208,69 @@ async fn list_clients(hub_url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn extract_host_port(s: &str) -> Option<String> {
+    let s = s.trim();
+    if let Ok(url) = reqwest::Url::parse(s) {
+        if let Some(host) = url.host_str() {
+            let port = url.port().unwrap_or(8765);
+            return Some(format!("{}:{}", host, port));
+        }
+    }
+    if s.contains(':') {
+        return Some(s.to_string());
+    }
+    None
+}
+
+fn get_addr_default() -> String {
+    if let Ok(val) = std::env::var("WEIXIN_BASE_URL") {
+        if !val.trim().is_empty() {
+            if let Some(addr) = extract_host_port(&val) {
+                return addr;
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_ADDR") {
+        if !val.trim().is_empty() {
+            if let Some(addr) = extract_host_port(&val) {
+                return addr;
+            } else {
+                return val.trim().to_string();
+            }
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_URL") {
+        if !val.trim().is_empty() {
+            if let Some(addr) = extract_host_port(&val) {
+                return addr;
+            }
+        }
+    }
+    "127.0.0.1:8765".to_string()
+}
+
+fn get_hub_url_default() -> String {
+    if let Ok(val) = std::env::var("WEIXIN_BASE_URL") {
+        if !val.trim().is_empty() {
+            return val.trim().to_string();
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_URL") {
+        if !val.trim().is_empty() {
+            return val.trim().to_string();
+        }
+    }
+    if let Ok(val) = std::env::var("ILINK_HUB_ADDR") {
+        if !val.trim().is_empty() {
+            let val_trimmed = val.trim();
+            if val_trimmed.starts_with("http://") || val_trimmed.starts_with("https://") {
+                return val_trimmed.to_string();
+            } else {
+                return format!("http://{}", val_trimmed);
+            }
+        }
+    }
+    "http://localhost:8765".to_string()
 }

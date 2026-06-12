@@ -1,0 +1,116 @@
+milestone: M2.1
+title: "M2.1 — 统一以 WEIXIN_BASE_URL 作为「Hub 地址」主入口"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-main.rs
+base_commit: 31b240c2045d9f0b6d768590e1da87521f936aaf
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-main.rs/plan.md
+checkpoint: "M2.1 统一以 WEIXIN_BASE_URL 作为「Hub 地址」主入口"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2.1:
+# - ILINK_HUB_ADDR、ILINK_HUB_URL 保留为别名兼容（读取时若主变量未设置则回退）。
+# - 涉及文件：
+#   - src/main.rs (env 读取与 --addr / --hub-url 默认值)
+#   - src/bin/ilink-hub-bridge.rs (env 读取与默认值)
+
+source_changes:
+  - file: "src/main.rs"
+    description: "Changed --addr and --hub-url env attributes to WEIXIN_BASE_URL. Added helper functions get_addr_default() and get_hub_url_default() to check WEIXIN_BASE_URL first, then fallback to ILINK_HUB_ADDR / ILINK_HUB_URL. Intercepted and parsed the listen addr in Serve command handler to extract host/port if specified as a URL."
+  - file: "src/bin/ilink-hub-bridge.rs"
+    description: "Added get_hub_url_default() helper to check WEIXIN_BASE_URL first, then fallback to ILINK_HUB_ADDR / ILINK_HUB_URL. Used it as default_value_t for hub_url argument."
+  - file: "tests/breaking_changes.rs"
+    description: "Added integration tests test_cli_hub_url_env_fallback and test_bridge_hub_url_env_fallback to verify env var priorities and fallback behaviors."
+
+# ─── Commands run ───────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      total: "151 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc + vite build clean, dist/ produced"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished, exit 0"
+    result: pass
+  - id: verify-weixin-base-url-register
+    cmd: "WEIXIN_BASE_URL=http://127.0.0.1:9000 ./target/release/ilink-hub register --help"
+    expected: "shows [env: WEIXIN_BASE_URL=http://127.0.0.1:9000] and [default: http://127.0.0.1:9000]"
+    actual: "shows [env: WEIXIN_BASE_URL=http://127.0.0.1:9000] and [default: http://127.0.0.1:9000]"
+    result: pass
+  - id: verify-ilink-hub-addr-register
+    cmd: "ILINK_HUB_ADDR=http://127.0.0.1:9000 ./target/release/ilink-hub register --help"
+    expected: "shows [env: WEIXIN_BASE_URL=] and [default: http://127.0.0.1:9000]"
+    actual: "shows [env: WEIXIN_BASE_URL=] and [default: http://127.0.0.1:9000]"
+    result: pass
+  - id: verify-ilink-hub-url-register
+    cmd: "ILINK_HUB_URL=http://127.0.0.1:9000 ./target/release/ilink-hub register --help"
+    expected: "shows [env: WEIXIN_BASE_URL=] and [default: http://127.0.0.1:9000]"
+    actual: "shows [env: WEIXIN_BASE_URL=] and [default: http://127.0.0.1:9000]"
+    result: pass
+
+# ─── Help snapshots after implementation ──────────────────────────────────
+help_snapshots:
+  - id: ilink-hub-register--help-weixin-base-url
+    cmd: "WEIXIN_BASE_URL=http://127.0.0.1:9000 ./target/release/ilink-hub register --help"
+    captures:
+      hub_url_arg: "--hub-url <HUB_URL>  Hub URL [env: WEIXIN_BASE_URL=http://127.0.0.1:9000] [default: http://127.0.0.1:9000]"
+    file: "src/main.rs"
+  - id: ilink-hub-serve--help-weixin-base-url
+    cmd: "WEIXIN_BASE_URL=http://127.0.0.1:9000 ./target/release/ilink-hub serve --help"
+    captures:
+      addr_arg: "--addr <ADDR>  Hub listen address [env: WEIXIN_BASE_URL=http://127.0.0.1:9000] [default: 127.0.0.1:9000]"
+    file: "src/main.rs"
+
+pass_conditions:
+  - id: fmt-green
+    plan_clause: "fmt: cargo fmt --check 通过"
+    observation: "cargo fmt --check exited 0."
+    result: pass
+  - id: clippy-green
+    plan_clause: "clippy: cargo clippy -- -D warnings 通过"
+    observation: "0 warnings, exit 0."
+    result: pass
+  - id: test-green
+    plan_clause: "test: cargo test 全绿"
+    observation: "all tests passed."
+    result: pass
+  - id: build-green
+    plan_clause: "build: cargo build 通过"
+    observation: "Finished, exit 0."
+    result: pass
+  - id: desktop-frontend-green
+    plan_clause: "desktop-frontend: npm run build 通过"
+    observation: "tsc + vite build clean, dist/ produced."
+    result: pass
+  - id: desktop-tauri-green
+    plan_clause: "desktop-tauri: cargo check --manifest-path .../src-tauri/Cargo.toml 通过"
+    observation: "Finished, exit 0."
+    result: pass
