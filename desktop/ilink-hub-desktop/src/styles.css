@@ -1755,6 +1755,42 @@ body {
   justify-content: center;
 }
 
+.qr-prereq {
+  text-align: left;
+  margin: 0 0 0.7rem;
+  font-size: 0.7rem;
+  line-height: 1.55;
+}
+
+.help-collapsible.qr-help {
+  text-align: left;
+  margin: 0.55rem 0 0;
+}
+
+.qr-help .help-body {
+  padding: 0.6rem 0.7rem;
+}
+
+.qr-help-list {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.32rem;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.qr-help-list li {
+  margin: 0;
+}
+
+.qr-help-list strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
 .modal-foot {
   margin: 0.7rem 0 0;
   font-size: 0.68rem;

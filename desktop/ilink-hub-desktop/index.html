@@ -307,6 +307,11 @@
         </div>
         <h3>微信扫码登录</h3>
         <p class="modal-lead">用<strong>微信</strong>扫描下方二维码，按提示完成登录。</p>
+        <p class="qr-prereq callout">
+          扫码前请确认：①微信已更新到最新版，且在「我 → 设置 → 插件」中开启
+          <strong>ClawBot（龙虾插件）</strong>；②使用
+          <strong>已开通 iLink</strong> 的微信账号扫描。普通微信账号无法完成授权。
+        </p>
         <div class="qr-frame">
           <img id="qr-img" alt="微信登录二维码" />
           <div class="qr-loading" id="qr-loading" aria-hidden="true"></div>
@@ -315,6 +320,19 @@
         <div class="qr-actions">
           <button type="button" id="qr-copy" class="btn btn-ghost btn-sm">复制备用链接</button>
         </div>
+        <details class="help-collapsible qr-help be-help">
+          <summary class="help-summary">
+            <span class="help-q" aria-hidden="true">?</span>
+            <span class="help-summary-text">扫了没反应？</span>
+          </summary>
+          <div class="help-body">
+            <ul class="qr-help-list">
+              <li><strong>账号未开通 iLink</strong>：必须用「已开通 iLink」的微信账号扫码，普通微信账号无法授权。</li>
+              <li><strong>二维码过期</strong>：二维码有效期约 2 分钟，过期后关闭弹窗重新触发即可拿到新码。</li>
+              <li><strong>手机网络异常</strong>：扫码后没有跳出授权页，请检查手机是否联网、是否开启了代理或 VPN。</li>
+            </ul>
+          </div>
+        </details>
         <p class="modal-foot">二维码不显示时，可复制链接发到手机微信里打开。</p>
       </div>
     </div>

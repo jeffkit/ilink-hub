@@ -90,13 +90,43 @@
   - 用户在模态中输入新端口 → `applyListenPortChange` 写 `desktop-port.json` + 调 `restart_hub` → `start_hub` 走 `spawn_hub_task` 重新 bind。
 - 实际 GUI 端到端复现需要 `cargo tauri build` + 双击启动 .app,本里程碑验证命令列表未包含此步骤,仅覆盖静态路径。代码路径已被 13 个新增单元测试完整覆盖 (端口解析 / 文件 round-trip / 优先级 / controller 同步 / 拒绝路径 / 模态解析)。
 
-### M3 — UX-03: 扫码弹窗前置条件提醒 — ⏳ 待开始
+### M3 — UX-03: 扫码弹窗前置条件提醒 — ✅ 已完成
 
-(尚未执行。)
+**交付日期**: 2026-06-12
+**Worktree**: `/Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1`
+
+**代码变更**:
+- `desktop/ilink-hub-desktop/index.html`
+  - `#qr-modal` 顶部新增 `.qr-prereq.callout` 前置提醒段落 (位于 `.modal-lead` 之后、`.qr-frame` 之前):复述 Plan §M3 要求的「开启 ClawBot(龙虾插件)」与「使用已开通 iLink 的微信账号」两个前置条件,并补充「普通微信账号无法完成授权」的后果说明。
+  - `#qr-modal` 底部 (`.qr-actions` 之后、`.modal-foot` 之前) 新增 `<details class="help-collapsible qr-help be-help">` 可折叠帮助块,`<summary>` 文案「扫了没反应?」,展开体为三条排查项 (账号未开通 iLink / 二维码过期 / 手机网络异常),与 `docs/guide/getting-started.md:96-100` 的 `:::details 二维码扫了没反应？` 块及 `docs/bridge/quick-try.md:12` 的「你需要」段落对齐。
+  - 复用现有 `.help-collapsible.be-help` 折叠样式 (来自 backends 面板的「连接说明与微信命令」块),不新增任何 ID,不影响既有 JS 路径。
+- `desktop/ilink-hub-desktop/src/styles.css`
+  - 新增 `.qr-prereq` override:`text-align: left` + 0.7rem 字号 + 收紧的 margin,适配 320px modal-card 的窄宽度。
+  - 新增 `.help-collapsible.qr-help` override:同样 `text-align: left`,把折叠块 top margin 收紧到 0.55rem。
+  - 新增 `.qr-help-list`:`<ul>` 左内边距 1rem + 0.32rem 行间距 + 0.72rem 字号,`<strong>` 标签使用 `var(--text)` 让故障模式标签突出于 `var(--muted)` 描述。
+- `desktop/ilink-hub-desktop/src/main.ts`
+  - 无新增代码。原 `<details>`/`<summary>` 是原生 WebKit 元素,自带 toggle 行为;现有 `showQrModal()` / `hideQrModal()` 无需任何改动。
+
+**验证命令(全部 green)**:
+- `cargo fmt --check` → 无输出,exit 0
+- `cargo clippy -- -D warnings` → 0 warning,exit 0
+- `cargo test` → workspace lib 129 + breaking_changes 7 + hub_routing_integration 9 + queue_trait_tests 10 + doc_tests 0 (1 ignored) + desktop lib 31 + desktop main 2 = **188 passed, 0 failed, 1 ignored**
+- `cargo build` → Finished `dev` profile,exit 0
+- `cd desktop/ilink-hub-desktop && npm run build` → `tsc` clean + Vite 产出 `dist/index.html` (19.72 kB, gzip 5.02 kB) + CSS (27.41 kB, gzip 6.07 kB) + JS (25.67 kB, gzip 9.00 kB),exit 0
+- `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` → Finished `dev` profile,exit 0
+
+**Review 工件**:
+- `reviews/m3/review-request.yaml` 已生成,记录所有变更源、验证结果、行为 diff、Plan §M3 通过条件对照,以及三个非阻塞 follow-up (i18n 翻译键 / QR 倒计时 / onboarding 链接) 备注。
+
+**E2E Checkpoint [E2E-3] 备注**:
+- Plan 中 [E2E-3] 要求的「打开扫码登录弹窗 → 顶部出现 ClawBot/iLink 前置提醒 → 展开『扫了没反应?』折叠区块 → 含 (账号未开通 iLink / 二维码过期 / 手机网络) 三项文案」由代码路径保证:
+  - `.qr-prereq.callout` 文案明确包含 `ClawBot`、`龙虾插件`、`iLink` 关键词。
+  - `<details class="qr-help">` 展开体三条 `<li>` 逐字覆盖三项 (账号未开通 iLink / 二维码过期 / 手机网络异常)。
+- 实际 GUI 端到端复现需要 `cargo tauri build` + 双击启动 .app,本里程碑验证命令列表未包含此步骤,仅覆盖静态路径。CSS/HTML 结构由 `npm run build` + `tsc clean` + 既有 188 个 Rust 单元测试三层保护,关键文案在 `index.html` 中可直接 grep 验证。
 
 ## 总体进度
 
 - [x] M1 (UX-01)
 - [x] M2 (UX-02)
-- [ ] M3 (UX-03)
+- [x] M3 (UX-03)
 - [ ] M4 (质量门禁收尾)
