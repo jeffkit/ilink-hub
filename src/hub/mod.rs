@@ -261,10 +261,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         RoutingDecision::HubInternal(cmd) => {
             handle_hub_command(state, msg, cmd).await;
         }
-        RoutingDecision::ForwardTo {
-            vtoken,
-            session_override,
-        } => {
+        RoutingDecision::ForwardTo { vtoken, session_override } => {
             let real_ctx = match msg.context_token.clone() {
                 Some(ctx) if !ctx.is_empty() => ctx,
                 _ => {
@@ -272,77 +269,38 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     return;
                 }
             };
-
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
             let group_id = msg.group_id.clone();
 
             let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &peer_user_id,
-                group_id.as_deref(),
-                None,
+                &state, &real_ctx, &peer_user_id, group_id.as_deref(), None,
             )
             .await;
 
             let store = state.store.clone();
-            let vctx_clone = vctx.clone();
+            let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
             tokio::spawn(async move {
-                if let Err(e) = store
-                    .persist_context_token(&vctx_clone, &real_ctx, &peer_user_id)
-                    .await
-                {
+                if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
                     warn!(error = %e, "failed to persist context_token mapping");
                 }
             });
 
             let hub_ext =
                 build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
-
             msg.context_token = Some(vctx);
             msg.ilink_hub_ext = hub_ext;
-
-            match state.queue.push(&vtoken, msg).await {
-                Ok(false) => {
-                    state
-                        .metrics
-                        .messages_dispatched
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Ok(true) => {
-                    state
-                        .metrics
-                        .messages_dropped
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push message to queue");
-                    state
-                        .metrics
-                        .messages_dropped
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            push_to_queue(&state, &vtoken, msg).await;
         }
         RoutingDecision::Broadcast => {
             let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
             let online = {
                 let registry = state.registry.read().await;
-                registry
-                    .online_clients()
-                    .iter()
-                    .map(|c| c.vtoken.clone())
-                    .collect::<Vec<_>>()
+                registry.online_clients().iter().map(|c| c.vtoken.clone()).collect::<Vec<_>>()
             };
 
             if online.is_empty() {
                 warn!(from_user_id, "no online clients to dispatch to");
-                state
-                    .metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-
-                // Notify the user that no AI backends are available
+                state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
                 if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
                     let to_uid = msg.from_user_id.as_deref().unwrap_or("");
                     let reply_text = build_no_backend_reply(msg.text());
@@ -356,10 +314,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         Ok(_) => {}
                     }
                 } else {
-                    warn!(
-                        from_user_id,
-                        "no context_token in message, cannot send no-clients reply"
-                    );
+                    warn!(from_user_id, "no context_token in message, cannot send no-clients reply");
                 }
                 return;
             }
@@ -371,47 +326,36 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     return;
                 }
             };
-
             let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
             let group_id = msg.group_id.clone();
 
-            // Use the conversation-stable (unscoped) vctx for every backend, so a backend's
-            // session namespace is identical whether a message arrives via `/use` (directed)
-            // or broadcast. Sessions are keyed by (vctx, vtoken), so one shared vctx still
-            // isolates per-backend sessions while keeping continuity across routing modes.
+            // Shared vctx per conversation: sessions are isolated by (vctx, vtoken) so
+            // each backend stays independent, while routing-mode changes (broadcast → /use)
+            // don't break session continuity.
             let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &peer_user_id,
-                group_id.as_deref(),
-                None,
+                &state, &real_ctx, &peer_user_id, group_id.as_deref(), None,
             )
             .await;
-            let vctx_by_vtoken: Vec<(String, String)> = online
-                .iter()
-                .map(|vtoken| (vtoken.clone(), vctx.clone()))
-                .collect();
+            let vctx_by_vtoken: Vec<(String, String)> =
+                online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
 
-            // Batch-persist all vctx→real_ctx mappings in one transaction (fire-and-forget).
+            // Batch-persist in one transaction (fire-and-forget).
             {
-                let persist_entries: Vec<(String, String, String)> = vctx_by_vtoken
+                let entries: Vec<(String, String, String)> = vctx_by_vtoken
                     .iter()
-                    .map(|(_, vctx)| (vctx.clone(), real_ctx.clone(), peer_user_id.clone()))
+                    .map(|(_, vc)| (vc.clone(), real_ctx.clone(), peer_user_id.clone()))
                     .collect();
                 let store = state.store.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = store.persist_context_tokens_batch(&persist_entries).await {
+                    if let Err(e) = store.persist_context_tokens_batch(&entries).await {
                         warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
                     }
                 });
             }
 
-            // Batch-fetch HubExt session data for all (vctx, vtoken) pairs — 2 queries total
-            // instead of 2×N.
-            let pairs: Vec<(String, String)> = vctx_by_vtoken
-                .iter()
-                .map(|(vtoken, vctx)| (vctx.clone(), vtoken.clone()))
-                .collect();
+            // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
+            let pairs: Vec<(String, String)> =
+                vctx_by_vtoken.iter().map(|(vt, vc)| (vc.clone(), vt.clone())).collect();
             let hub_ext_data = state.store.get_hub_ext_batch(&pairs).await.unwrap_or_default();
 
             for (vtoken, vctx) in vctx_by_vtoken {
@@ -422,34 +366,43 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         session_name: Some(session_name.clone()),
                         cli_session_id: None,
                     });
-
                 let mut msg_clone = msg.clone();
                 msg_clone.context_token = Some(vctx);
                 msg_clone.ilink_hub_ext = hub_ext;
-                match state.queue.push(&vtoken, msg_clone).await {
-                    Ok(false) => {
-                        state
-                            .metrics
-                            .messages_dispatched
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(true) => {
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push broadcast message");
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
+                push_to_queue(&state, &vtoken, msg_clone).await;
             }
         }
     }
+}
+
+/// Push a prepared message to the per-client queue and update metrics.
+async fn push_to_queue(state: &HubState, vtoken: &str, msg: WeixinMessage) {
+    match state.queue.push(vtoken, msg).await {
+        Ok(false) => {
+            state.metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(true) => {
+            state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push message to queue");
+            state.metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Resolve the vctx and currently routed vtoken for a Hub command from a given user.
+/// Returns `None` if no backend is selected (broadcasts a NO_BACKEND message via the caller).
+async fn resolve_vctx_and_vtoken(
+    state: &HubState,
+    real_ctx: &str,
+    from_user_id: &str,
+    group_id: Option<&str>,
+) -> (String, Option<String>) {
+    let vctx =
+        resolve_vctx_for_message(state, real_ctx, from_user_id, group_id, None).await;
+    let vtoken = state.router.lock().await.get_route(from_user_id).map(str::to_string);
+    (vctx, vtoken)
 }
 
 async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCommand) {
@@ -587,21 +540,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         HubCommand::Help => build_help_text(),
 
         HubCommand::SessionList => {
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &from_user_id,
-                msg.group_id.as_deref(),
-                None,
-            )
-            .await;
-            // Session commands operate on the backend the user is currently routed to.
-            let vtoken = state
-                .router
-                .lock()
-                .await
-                .get_route(&from_user_id)
-                .map(|s| s.to_string());
+            let (vctx, vtoken) =
+                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
+                    .await;
             match vtoken {
                 None => messages::NO_BACKEND.to_string(),
                 Some(vtoken) => {
@@ -653,20 +594,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionNew(ref session_name, ref initial_uuid) => {
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &from_user_id,
-                msg.group_id.as_deref(),
-                None,
-            )
-            .await;
-            let vtoken = state
-                .router
-                .lock()
-                .await
-                .get_route(&from_user_id)
-                .map(|s| s.to_string());
+            let (vctx, vtoken) =
+                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
+                    .await;
             match vtoken {
                 None => messages::NO_BACKEND.to_string(),
                 Some(vtoken) => {
@@ -692,20 +622,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionUse(ref session_name) => {
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &from_user_id,
-                msg.group_id.as_deref(),
-                None,
-            )
-            .await;
-            let vtoken = state
-                .router
-                .lock()
-                .await
-                .get_route(&from_user_id)
-                .map(|s| s.to_string());
+            let (vctx, vtoken) =
+                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
+                    .await;
             match vtoken {
                 None => messages::NO_BACKEND.to_string(),
                 Some(vtoken) => {
@@ -741,20 +660,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
         }
 
         HubCommand::SessionDelete(ref session_name) => {
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &from_user_id,
-                msg.group_id.as_deref(),
-                None,
-            )
-            .await;
-            let vtoken = state
-                .router
-                .lock()
-                .await
-                .get_route(&from_user_id)
-                .map(|s| s.to_string());
+            let (vctx, vtoken) =
+                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
+                    .await;
             match vtoken {
                 None => messages::NO_BACKEND.to_string(),
                 Some(vtoken) => {

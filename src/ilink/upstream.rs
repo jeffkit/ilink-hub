@@ -325,7 +325,6 @@ impl UpstreamClient {
                                 ctx = msg.context_token.as_deref().unwrap_or("(none)"),
                                 text = msg.text().unwrap_or("(none)"),
                                 has_item_list = msg.item_list.is_some(),
-                                item_list = ?msg.item_list,
                                 "received upstream message"
                             );
                             let _ = tx.send(msg);
