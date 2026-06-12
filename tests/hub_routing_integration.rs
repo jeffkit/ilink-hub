@@ -68,7 +68,7 @@ async fn single_client_receives_dispatched_message() {
     // Give dispatcher a moment to process.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 1, "client should receive exactly one message");
     assert_eq!(msgs[0].text(), Some("hello"));
 }
@@ -87,7 +87,7 @@ async fn no_online_clients_message_is_dropped() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // No vtokens registered → nothing to drain.
-    let sizes = state.queue.queue_sizes().await.unwrap();
+    let sizes = state.clients.queue.queue_sizes().await.unwrap();
     assert!(sizes.is_empty() || sizes.values().all(|&s| s == 0));
 }
 
@@ -103,7 +103,7 @@ async fn two_clients_both_receive_broadcast_message() {
 
     // Mark both clients as online (normally done by getupdates handler).
     {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry.mark_seen(&vtoken_a);
         registry.mark_seen(&vtoken_b);
     }
@@ -112,7 +112,7 @@ async fn two_clients_both_receive_broadcast_message() {
     // through to Broadcast. (With a default set, the message would ForwardTo
     // one client only.)
     {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(&vtoken_a, None);
         router.remove_routes_for_vtoken(&vtoken_b, None);
     }
@@ -125,8 +125,8 @@ async fn two_clients_both_receive_broadcast_message() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let msgs_a = state.queue.drain(&vtoken_a).await.unwrap();
-    let msgs_b = state.queue.drain(&vtoken_b).await.unwrap();
+    let msgs_a = state.clients.queue.drain(&vtoken_a).await.unwrap();
+    let msgs_b = state.clients.queue.drain(&vtoken_b).await.unwrap();
 
     assert_eq!(msgs_a.len(), 1, "client A should receive the message");
     assert_eq!(msgs_b.len(), 1, "client B should receive the message");
@@ -161,7 +161,7 @@ async fn single_default_client_receives_forward_to_message() {
 
     // Mark both online, but only the default is set as routing target.
     {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry.mark_seen(&vtoken_default);
         registry.mark_seen(&vtoken_other);
     }
@@ -174,8 +174,8 @@ async fn single_default_client_receives_forward_to_message() {
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let msgs_default = state.queue.drain(&vtoken_default).await.unwrap();
-    let msgs_other = state.queue.drain(&vtoken_other).await.unwrap();
+    let msgs_default = state.clients.queue.drain(&vtoken_default).await.unwrap();
+    let msgs_other = state.clients.queue.drain(&vtoken_other).await.unwrap();
 
     assert_eq!(
         msgs_default.len(),
@@ -203,12 +203,12 @@ async fn same_user_gets_stable_virtual_context_token() {
     tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs1 = state.queue.drain(&vtoken).await.unwrap();
+    let msgs1 = state.clients.queue.drain(&vtoken).await.unwrap();
 
     tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs2 = state.queue.drain(&vtoken).await.unwrap();
+    let msgs2 = state.clients.queue.drain(&vtoken).await.unwrap();
 
     assert_eq!(msgs1.len(), 1);
     assert_eq!(msgs2.len(), 1);
@@ -233,7 +233,7 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 1);
     let vctx = msgs[0].context_token.clone().unwrap();
 
@@ -243,7 +243,7 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
     let real_ctx = {
-        let mut ctx_map = state.ctx_map.write().await;
+        let mut ctx_map = state.routing.ctx_map.write().await;
         ctx_map.resolve(&vctx).map(str::to_string)
     };
     if let Some(real) = real_ctx {
@@ -280,7 +280,7 @@ async fn bot_echo_messages_are_not_dispatched() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert!(
         msgs.is_empty(),
         "bot echo messages should not be dispatched to clients"
@@ -308,7 +308,7 @@ async fn messages_queued_in_fifo_order() {
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 5);
     for (i, msg) in msgs.iter().enumerate() {
         assert_eq!(msg.text(), Some(format!("msg-{i}").as_str()));

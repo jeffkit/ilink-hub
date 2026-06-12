@@ -102,10 +102,10 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
             store: store.clone(),
             ilink_base_url: ilink_base_url.or(Some(base_url)),
             qr_login_ui,
-            qr_tx: Some(state.qr_tx.clone()),
-            qr_last_ready: Some(state.qr_last_ready.clone()),
-            ilink_status: Some(state.ilink_status.clone()),
-            relogin_rx: Some(state.relogin_tx.subscribe()),
+            qr_tx: Some(state.ilink.qr_tx.clone()),
+            qr_last_ready: Some(state.ilink.qr_last_ready.clone()),
+            ilink_status: Some(state.ilink.ilink_status.clone()),
+            relogin_rx: Some(state.ilink.relogin_tx.subscribe()),
         });
         tokio::spawn(async move {
             upstream_clone
@@ -239,7 +239,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_clients().await {
         Ok(clients) => {
             let count = clients.len();
-            let mut registry = state.registry.write().await;
+            let mut registry = state.clients.registry.write().await;
             for c in clients {
                 registry.register_with_vtoken(
                     c.name.clone(),
@@ -257,7 +257,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_routes().await {
         Ok(routes) => {
             let count = routes.len();
-            let mut router = state.router.lock().await;
+            let mut router = state.routing.router.lock().await;
             for (from_user, vtoken) in routes {
                 router.set_route(&from_user, vtoken);
             }
@@ -271,7 +271,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_recent_context_tokens(500).await {
         Ok(entries) => {
             let count = entries.len();
-            let mut ctx_map = state.ctx_map.write().await;
+            let mut ctx_map = state.routing.ctx_map.write().await;
             for (vctx, real_ctx, peer_user_id) in entries {
                 ctx_map.seed_full(vctx, real_ctx, peer_user_id);
             }

@@ -115,3 +115,36 @@
   - `cargo build` (exit 0)
   - `grep -q "metrics" src/hub/mod.rs` (exit 0 — plan M4 verification clause)
 - Created `docs/exec-plans/active/todo-hub-2/reviews/m4/review-request.yaml`.
+
+## Milestone 5: Fix [A-01] Refactor `HubState` struct
+
+### Decisions
+
+- Split the previously-monolithic `HubState` struct (which exposed ~14 public fields) into three cohesive sub-states plus cross-cutting fields:
+  - `IlinkConnState` — owns the iLink upstream `UpstreamClient`, the graceful-shutdown `watch::Receiver<bool>`, the upstream status `Arc<AtomicU8>`, the QR-event broadcast `Sender<QrLoginUiEvent>` + last-ready replay slot, and the relogin-trigger broadcast `Sender<()>`. Anything that mutates only when iLink connects, logs in, or sends a QR-ready event lives here.
+  - `RoutingState` — owns the per-message dispatch `Mutex<Router>`, the conversation `RwLock<ContextTokenMap>`, and the `Mutex<QuoteRouteIndex>` used for quote-reply routing. Pure in-memory; no I/O.
+  - `ClientState` — owns the registered backend `RwLock<ClientRegistry>`, the in-flight pairing `RwLock<PairingRegistry>`, the per-vtoken `Arc<dyn MessageQueue>`, and the `Arc<PollTracker>` for long-poll concurrency detection.
+- `HubState` itself now holds the three sub-states (`ilink`, `routing`, `clients`) plus the cross-cutting `Arc<Store>` and `Arc<Metrics>`. The cross-cutting fields stay on `HubState` because they are touched by code from multiple sub-states (dispatcher writes metrics, store is read by routing helpers, etc.).
+- Field paths changed from `state.x` to `state.<sub-state>.x` across the dispatcher, hub-command handler, server routes (`routes.rs`), pairing handlers (`server/pairing.rs`), runtime entry point (`runtime/serve.rs`), and health checker (`hub/health.rs`). Each call site now expresses the smallest sub-state grouping it actually needs.
+- Tightened the internal helper signature: `push_to_queue` no longer takes `&HubState`; it takes `&Arc<dyn MessageQueue>` and `&Metrics` directly. Both dispatcher paths wire those in explicitly via `&state.clients.queue` and `&state.metrics`.
+- Added five unit tests in `src/hub/mod.rs::tests`:
+  - `hub_state_new_populates_all_sub_states` — asserts every sub-state is wired with sensible defaults (upstream reachable, iLink status starts at UNKNOWN, routing/registry empty, metrics at zero).
+  - `sub_states_are_independently_usable` — exercises each sub-state through its `state.<sub-state>.x` field path without touching the rest of `HubState` (router set_route round-trip, queue push, upstream poll counters).
+  - `sub_state_structs_carry_expected_fields` — compile-time check that touches every documented field of each sub-state, so accidental field removal breaks the test.
+  - `hub_state_metrics_are_shared_with_sub_state_paths` — verifies that the `Arc<Metrics>` shared via `state.metrics` is the same instance any spawned task would observe (production pattern).
+  - `quote_index_evictor_takes_sub_state_path` — confirms the quote-index evictor's lock is reachable through the new `state.routing.quote_index` path.
+
+### Problems
+
+- First draft of `sub_states_are_independently_usable` called `state.ilink.upstream.send_message(...)` to demonstrate reachability. The production `UpstreamClient::send_message` makes a real HTTP POST against the configured `base_url`, which would have made the test flaky / slow. Resolved by switching the assertion to a counter read (`state.ilink.upstream.polls_ok.load(...)`) which proves the field path is wired without crossing the network boundary.
+- The first test-helper `make_state` was synchronous, which left callers having to `.await` the already-built `Arc<HubState>` (yielding "Arc is not a future" errors). Resolved by making `make_state` itself `async fn` so the inner `Store::connect(...)` is awaited inside the helper, and callers receive a ready `Arc<HubState>`.
+
+### Outcome
+
+- Verified that `HubState` is now decomposed into cohesive sub-states. External callers continue to operate against the same `Arc<HubState>` handle; the change is purely structural and does not alter behaviour, lock order, or visibility. Internal helpers express the smallest slice of state they need.
+- All verification commands passed completely:
+  - `cargo fmt --check` (exit 0)
+  - `cargo clippy -- -D warnings` (exit 0)
+  - `cargo test` (158 passed: 132 lib + 7 + 9 + 10 integration; 0 failed; 1 ignored doctest)
+  - `cargo build` (exit 0)
+- Created `docs/exec-plans/active/todo-hub-2/reviews/m5/review-request.yaml`.

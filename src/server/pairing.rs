@@ -91,14 +91,14 @@ pub async fn register_client_in_hub(
 ) -> String {
     // Lock order: registry → router (always).
     let (vtoken, is_first) = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         let vtoken = registry.register(name.clone(), label.clone());
         let is_first = registry.all_clients().len() == 1;
         (vtoken, is_first)
     };
 
     if is_first {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.set_default(vtoken.clone());
     }
 
@@ -127,7 +127,7 @@ pub async fn unregister_client_in_hub(
     name: &str,
 ) -> Result<(), UnregisterClientError> {
     let vtoken = {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         let Some(client) = registry.get_by_name(name) else {
             return Err(UnregisterClientError::NotFound);
         };
@@ -139,18 +139,18 @@ pub async fn unregister_client_in_hub(
 
     // Lock order: registry → router (always). Drop registry before acquiring router.
     let new_default = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         if !registry.remove(name) {
             return Err(UnregisterClientError::NotFound);
         }
         registry.pick_default_after_remove(&vtoken)
     };
     {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(&vtoken, new_default);
     }
 
-    if let Err(e) = state.queue.remove_client(&vtoken).await {
+    if let Err(e) = state.clients.queue.remove_client(&vtoken).await {
         warn!(error = %e, vtoken = %crate::redact_token(&vtoken), "failed to remove client queue");
     }
 
@@ -191,7 +191,7 @@ pub async fn update_client_in_hub(
 
     let label_for_store = label.clone();
     let vtoken = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry
             .update_client(old_name, new_name, label)
             .map_err(|e| match e {
@@ -229,7 +229,7 @@ fn build_pairing_qr_response(code: String) -> GetQrcodeResponse {
 
 async fn create_pairing_qr(state: &HubState) -> GetQrcodeResponse {
     let code = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         pairing.create()
     };
     build_pairing_qr_response(code)
@@ -260,7 +260,7 @@ pub async fn get_bot_qrcode_post(
 
 async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusResponse {
     let session = {
-        let pairing = state.pairing.read().await;
+        let pairing = state.clients.pairing.read().await;
         pairing.get(qrcode)
     };
 
@@ -321,7 +321,7 @@ pub async fn pair_page(
     Path(code): Path<String>,
 ) -> impl IntoResponse {
     let session = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         if pairing.get(&code).is_some() {
             pairing.mark_scanned(&code);
         }
@@ -381,7 +381,7 @@ pub async fn pair_confirm(
     let vtoken = register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
 
     let confirm_result = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         pairing.confirm(&code, name.clone(), label, vtoken.clone())
     };
 

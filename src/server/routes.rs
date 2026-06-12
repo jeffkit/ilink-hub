@@ -152,7 +152,7 @@ pub async fn getupdates(
     };
 
     {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
             return (
@@ -169,7 +169,7 @@ pub async fn getupdates(
     }
 
     {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry.mark_seen(&vtoken);
     }
 
@@ -177,7 +177,7 @@ pub async fn getupdates(
     // bridge processes share one credential/token and will compete for this vtoken's queue
     // (drain is a destructive read), so inbound messages get stolen non-deterministically.
     // The guard is held for the whole handler so the count reflects truly-concurrent polls.
-    let (concurrent_polls, _poll_guard) = state.poll_tracker.enter(&vtoken);
+    let (concurrent_polls, _poll_guard) = state.clients.poll_tracker.enter(&vtoken);
     if concurrent_polls > 1 {
         warn!(
             vtoken = %redact_token(&vtoken),
@@ -190,17 +190,27 @@ pub async fn getupdates(
 
     // Use timeout from legacy field if provided, otherwise 30s
     let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
-    let mut shutdown_rx = state.shutdown.clone();
-    let notified =
-        wait_notify_or_shutdown(state.queue.as_ref(), &mut shutdown_rx, &vtoken, poll_secs).await;
-    if !notified && *state.shutdown.borrow() {
+    let mut shutdown_rx = state.ilink.shutdown.clone();
+    let notified = wait_notify_or_shutdown(
+        state.clients.queue.as_ref(),
+        &mut shutdown_rx,
+        &vtoken,
+        poll_secs,
+    )
+    .await;
+    if !notified && *state.ilink.shutdown.borrow() {
         debug!(vtoken = %redact_token(&vtoken), "getupdates returning early due to shutdown");
     }
 
-    let messages = state.queue.drain(&vtoken).await.unwrap_or_else(|e| {
-        error!(error = %e, vtoken = %redact_token(&vtoken), "queue drain failed");
-        vec![]
-    });
+    let messages = state
+        .clients
+        .queue
+        .drain(&vtoken)
+        .await
+        .unwrap_or_else(|e| {
+            error!(error = %e, vtoken = %redact_token(&vtoken), "queue drain failed");
+            vec![]
+        });
 
     debug!(vtoken = %redact_token(&vtoken), count = messages.len(), "getupdates returning");
 
@@ -252,7 +262,7 @@ pub async fn sendmessage(
     tracing::Span::current().record("vtoken", redact_token(&vtoken));
 
     {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "sendmessage rejected: unknown virtual token");
             state
@@ -275,7 +285,7 @@ pub async fn sendmessage(
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
-        let ctx_map = state.ctx_map.read().await;
+        let ctx_map = state.routing.ctx_map.read().await;
         ctx_map
             .resolve_full(&vctx)
             .map(|(r, p)| (r.to_string(), p.to_string()))
@@ -285,7 +295,7 @@ pub async fn sendmessage(
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
         match state.store.resolve_context_token_full(&vctx).await {
             Ok(Some((r, p))) => {
-                let mut ctx_map = state.ctx_map.write().await;
+                let mut ctx_map = state.routing.ctx_map.write().await;
                 ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
@@ -355,7 +365,7 @@ pub async fn sendmessage(
         msg.ensure_outbound();
 
         let (client_meta, registered_count) = {
-            let reg = state.registry.read().await;
+            let reg = state.clients.registry.read().await;
             (
                 reg.get_by_vtoken(&vtoken)
                     .map(|i| (i.name.clone(), i.label.clone())),
@@ -398,6 +408,7 @@ pub async fn sendmessage(
                 session_name: active_session,
             };
             state
+                .routing
                 .quote_index
                 .lock()
                 .await
@@ -408,7 +419,7 @@ pub async fn sendmessage(
         req.base_info = Some(BaseInfo::default());
     }
 
-    match state.upstream.send_message(req).await {
+    match state.ilink.upstream.send_message(req).await {
         Ok(resp) => Json(resp),
         Err(e) => Json(SendMessageResponse::err(
             500,
@@ -428,14 +439,14 @@ pub async fn sendtyping(
         return Json(serde_json::json!({"ret": 401, "errmsg": "Missing Authorization"}));
     };
     {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "sendtyping rejected: unknown virtual token");
             return Json(serde_json::json!({"ret": 401, "errmsg": UNKNOWN_VTOKEN_MSG}));
         }
     }
 
-    let _ = state.upstream.send_typing(req).await;
+    let _ = state.ilink.upstream.send_typing(req).await;
     Json(serde_json::json!({"ret": 0}))
 }
 
@@ -454,7 +465,7 @@ pub async fn getconfig(
         });
     };
     {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getconfig rejected: unknown virtual token");
             return Json(GetConfigResponse {
@@ -468,7 +479,7 @@ pub async fn getconfig(
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
         let real_ctx = {
-            let mut ctx_map = state.ctx_map.write().await;
+            let mut ctx_map = state.routing.ctx_map.write().await;
             ctx_map.resolve(vctx).map(str::to_string)
         };
         if let Some(real) = real_ctx {
@@ -481,7 +492,7 @@ pub async fn getconfig(
         req.base_info = Some(BaseInfo::default());
     }
 
-    match state.upstream.get_config(req).await {
+    match state.ilink.upstream.get_config(req).await {
         Ok(resp) => Json(resp),
         Err(e) => Json(GetConfigResponse {
             ret: Some(500),
@@ -507,7 +518,7 @@ pub async fn getuploadurl(
         });
     };
     {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getuploadurl rejected: unknown virtual token");
             return Json(GetUploadUrlResponse {
@@ -519,7 +530,7 @@ pub async fn getuploadurl(
         }
     }
 
-    match state.upstream.get_upload_url(req).await {
+    match state.ilink.upstream.get_upload_url(req).await {
         Ok(resp) => Json(resp),
         Err(e) => Json(GetUploadUrlResponse {
             ret: 500,
@@ -543,7 +554,7 @@ pub async fn admin_clients(
         );
     }
 
-    let registry = state.registry.read().await;
+    let registry = state.clients.registry.read().await;
     let clients: Vec<_> = registry
         .all_clients()
         .iter()
@@ -755,7 +766,7 @@ pub async fn admin_ilink_status(
             }),
         );
     }
-    let code = state.ilink_status.load(Ordering::Relaxed);
+    let code = state.ilink.ilink_status.load(Ordering::Relaxed);
     let status = match code {
         crate::hub::ilink_status::CONNECTED => "connected",
         crate::hub::ilink_status::NEEDS_LOGIN => "needs_login",
@@ -775,7 +786,7 @@ pub async fn admin_ilink_relogin(
             Json(serde_json::json!({"error": "Unauthorized"})),
         );
     }
-    let _ = state.relogin_tx.send(());
+    let _ = state.ilink.relogin_tx.send(());
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
@@ -798,8 +809,8 @@ pub async fn admin_ilink_qr_stream(
         return Err(StatusCode::UNAUTHORIZED);
     }
     // Grab the cached Ready event before subscribing, so we don't miss it.
-    let cached = state.qr_last_ready.lock().await.clone();
-    let rx = state.qr_tx.subscribe();
+    let cached = state.ilink.qr_last_ready.lock().await.clone();
+    let rx = state.ilink.qr_tx.subscribe();
 
     let s = stream::unfold((cached, rx), |(cached, mut rx)| async move {
         // Replay cached Ready event on first poll if present.
@@ -830,7 +841,7 @@ pub async fn admin_ui() -> axum::response::Html<&'static str> {
 
 pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String) {
     let (online, total, client_names_by_vtoken) = {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         let online = registry.online_clients().len() as u64;
         let total = registry.all_clients().len() as u64;
         let names: std::collections::HashMap<String, String> = registry
@@ -841,7 +852,7 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
         (online, total, names)
     };
 
-    let queue_sizes = state.queue.queue_sizes().await.unwrap_or_else(|e| {
+    let queue_sizes = state.clients.queue.queue_sizes().await.unwrap_or_else(|e| {
         error!(error = %e, "queue_sizes failed");
         std::collections::HashMap::new()
     });
@@ -851,9 +862,13 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
     let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
     let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
-    let upstream_polls_ok = state.upstream.polls_ok.load(Ordering::Relaxed);
-    let upstream_polls_err = state.upstream.polls_err.load(Ordering::Relaxed);
-    let relogin_attempts = state.upstream.relogin_attempts.load(Ordering::Relaxed);
+    let upstream_polls_ok = state.ilink.upstream.polls_ok.load(Ordering::Relaxed);
+    let upstream_polls_err = state.ilink.upstream.polls_err.load(Ordering::Relaxed);
+    let relogin_attempts = state
+        .ilink
+        .upstream
+        .relogin_attempts
+        .load(Ordering::Relaxed);
     let persist_faf_failures_forward = state
         .metrics
         .persist_fire_and_forget_failures_forward
@@ -862,8 +877,8 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
         .metrics
         .persist_fire_and_forget_failures_broadcast
         .load(Ordering::Relaxed);
-    let ilink_status = state.ilink_status.load(Ordering::Relaxed);
-    let ctx_map_size = state.ctx_map.read().await.len();
+    let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
+    let ctx_map_size = state.routing.ctx_map.read().await.len();
 
     let mut out = String::with_capacity(1024);
 
