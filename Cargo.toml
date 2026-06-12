@@ -80,6 +80,7 @@ qrcode = { version = "0.14", features = ["svg"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+subtle = "2.6.1"
 serde_norway = "0.9.42"
 
 [dev-dependencies]

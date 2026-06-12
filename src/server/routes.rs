@@ -66,7 +66,8 @@ fn check_admin_auth(headers: &HeaderMap) -> bool {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.strip_prefix("Bearer "))
             .unwrap_or("");
-        return provided == required;
+        use subtle::ConstantTimeEq;
+        return provided.as_bytes().ct_eq(required.as_bytes()).unwrap_u8() == 1;
     }
     // No token configured — only allow if the operator explicitly opts in to insecure mode.
     insecure_no_auth()
@@ -1030,5 +1031,25 @@ mod shutdown_poll_tests {
         wait_shutdown_signal(&mut shutdown_rx).await;
 
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+}
+
+#[cfg(test)]
+mod admin_auth_tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    #[tokio::test]
+    async fn test_check_admin_auth_wrong_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrong-token-here".parse().unwrap());
+        assert!(!check_admin_auth(&headers));
+    }
+
+    #[tokio::test]
+    async fn test_check_admin_auth_empty_headers() {
+        let headers = HeaderMap::new();
+        let is_insecure = insecure_no_auth();
+        assert_eq!(check_admin_auth(&headers), is_insecure);
     }
 }
