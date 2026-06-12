@@ -30,7 +30,16 @@ impl Store {
         // For SQLite :memory: databases each new physical connection gets its own
         // fresh (empty) database. To ensure DDL and DML share the same in-memory
         // instance we pin the pool to a single connection.
-        let pool = if url.contains(":memory:") {
+        //
+        // For file-type SQLite, the same single-connection pin is required to
+        // avoid SQLITE_BUSY (5) errors: SQLite's file-level write lock means a
+        // long write transaction (e.g. `persist_context_tokens_batch`) and a
+        // concurrent read (e.g. `get_active_session_name`) executed on two
+        // different physical connections race on the same lock. The
+        // default `busy_timeout` of 5s for sqlite connections is kept so
+        // the rare case of contention from the migration runner's `acquire`
+        // during shutdown still has a chance to drain.
+        let pool = if url.starts_with("sqlite:") {
             sqlx::pool::PoolOptions::<sqlx::Any>::new()
                 .max_connections(1)
                 .connect(url)
@@ -750,5 +759,115 @@ mod store_tests {
             "list_recent_context_tokens failed: {:?}",
             r.err()
         );
+    }
+
+    /// Regression test for DB-01: file-type SQLite must pin the pool to a
+    /// single connection so that concurrent write transactions and reads
+    /// from different physical connections cannot race on the SQLite file
+    /// lock and return `SQLITE_BUSY` (5).
+    ///
+    /// Before the fix, `AnyPool::connect(url)` for `sqlite:/path/to.db`
+    /// defaulted to 10 connections. With multiple tasks issuing write
+    /// transactions (`persist_context_tokens_batch`,
+    /// `set_active_session_name`) and reads (`get_active_session_name`)
+    /// concurrently, two physical connections would race on the
+    /// file-level EXCLUSIVE write lock; once a writer's lock-hold time
+    /// exceeded the default `busy_timeout` (5s), a competing transaction
+    /// would surface `SQLITE_BUSY`. The fix collapses the pool to
+    /// `max_connections(1)` for any `sqlite:` URL, which serializes
+    /// transactions on a single connection (no second connection means
+    /// no second contender for the file lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn file_sqlite_serializes_concurrent_read_and_write_without_busy() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("concurrent.db");
+        let url = format!("sqlite:{}", db_path.display());
+        let store = std::sync::Arc::new(Store::connect(&url).await.expect("connect"));
+
+        // The fix is structural: the pool must be sized to a single
+        // connection for any sqlite URL. Verify the invariant first
+        // (fast, deterministic, pinpoints regressions), then run a
+        // multi-task mixed read/write workload that would surface
+        // SQLITE_BUSY on a multi-connection pool with a non-default
+        // (small) busy_timeout. The structural assertion is the
+        // canonical regression guard.
+        assert_eq!(
+            store.pool.options().get_max_connections(),
+            1,
+            "SQLite pool must be pinned to max_connections(1) to avoid SQLITE_BUSY"
+        );
+
+        // Seed one row so the read path has a target.
+        store
+            .persist_context_token("vctx-seed", "real-ctx-seed", "peer-seed")
+            .await
+            .expect("seed");
+        store
+            .set_active_session_name("vctx-seed", "vtoken-seed", "default")
+            .await
+            .expect("seed active session");
+
+        let mut handles = Vec::new();
+
+        // Batch-write task: hammer persist_context_tokens_batch with bulk
+        // entries to lengthen each transaction and increase the chance of a
+        // write/write race on the file lock. Each task runs 20 iterations of
+        // a 200-entry batch.
+        for w in 0..8 {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                for i in 0..20 {
+                    let entries: Vec<(String, String, String)> = (0..200)
+                        .map(|j| {
+                            (
+                                format!("vctx-w{w}-i{i}-j{j}"),
+                                format!("real-ctx-w{w}-i{i}-j{j}"),
+                                format!("peer-w{w}-i{i}-j{j}"),
+                            )
+                        })
+                        .collect();
+                    store
+                        .persist_context_tokens_batch(&entries)
+                        .await
+                        .expect("batch write must not fail");
+                }
+            }));
+        }
+
+        // Single-row write task: hammer set_active_session_name (a
+        // write transaction) on a different row each time so we are
+        // exercising the same physical-connection file-lock path.
+        for w in 0..4 {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                for i in 0..200 {
+                    let vctx = format!("vctx-active-w{w}-i{i}");
+                    let vtoken = format!("vtoken-active-w{w}-i{i}");
+                    store
+                        .set_active_session_name(&vctx, &vtoken, "default")
+                        .await
+                        .expect("set_active_session_name must not fail");
+                }
+            }));
+        }
+
+        // Reader task: hammer get_active_session_name.
+        for r in 0..4 {
+            let store = std::sync::Arc::clone(&store);
+            handles.push(tokio::spawn(async move {
+                for i in 0..200 {
+                    let vtoken = format!("ignored-vtoken-r{r}-i{i}");
+                    let name = store
+                        .get_active_session_name("vctx-seed", &vtoken)
+                        .await
+                        .expect("read must not fail");
+                    assert_eq!(name, "default");
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task join");
+        }
     }
 }
