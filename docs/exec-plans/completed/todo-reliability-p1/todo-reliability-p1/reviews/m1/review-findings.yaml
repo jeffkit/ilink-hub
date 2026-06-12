@@ -1,0 +1,646 @@
+milestone: M1
+title: "UX-01 — 桌面端停止服务后可在应用内重启"
+verdict: PASS
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 61938ba92fc20cdb00b876ddf5d4a9de52ddcd92
+head_commit: 47f092b
+reviewer: "rust-security-concurrency-adversarial"
+review_mode: "adversarial — explicitly try to break the change"
+re_review_date: 2026-06-12
+re_review_mode: "verification — verify that the M1 review findings are resolved in HEAD"
+
+# ─── Scope ──────────────────────────────────────────────────────────────────
+# Refactor: extract the in-`setup()` startup wiring (oneshot channels,
+# `run_serve` task, QR event pump, bind/state listeners) into
+# `spawn_hub_task(app, addr, db_path) -> watch::Sender<bool>` so the
+# helper can be reused by new `start_hub` / `restart_hub` Tauri commands.
+# The `HubController` is extended with a small `is_running` helper; the
+# footer HTML/TS gets a Start button that toggles with the Stop button
+# via `setHubState`.
+
+scope:
+  primary_files:
+    - desktop/ilink-hub-desktop/src-tauri/src/lib.rs
+    - desktop/ilink-hub-desktop/src/main.ts
+    - desktop/ilink-hub-desktop/index.html
+  related_files:
+    - src/runtime/serve.rs   # run_serve signature, shutdown_rx semantics
+    - src/relay/client.rs     # spawn_relay_client (related shutdown_rx pattern)
+
+# ─── Findings summary ───────────────────────────────────────────────────────
+# One blocker (CRITICAL) and several HIGH / MEDIUM concurrency findings.
+# The blocker is a startup panic introduced by moving the
+# `app.state::<HubController>()` call into `spawn_hub_task`: in `setup()`
+# the helper is invoked BEFORE `app.manage(HubController { ... })`, and
+# Tauri 2.x `AppHandle::state` panics with "state() called before manage()"
+# if the type has not been managed. This means the desktop .app crashes
+# on every cold launch — the very class of "users get stuck" UX-01 was
+# supposed to fix. The unit tests do not exercise `setup()`, which is
+# why the build/tests are green despite the runtime crash.
+# The remaining findings are concurrency / data-race / leak issues that
+# follow from the same refactor and the new start/restart command
+# surface. They are not as catastrophic as the startup panic, but
+# several would cause user-visible stuck states or leaked async tasks
+# that the original implementation did not have.
+findings_summary:
+  blocker: 1
+  high: 3
+  medium: 4
+  low: 2
+  info: 1
+  resolved_at_re_review:
+    F-01: "CRITICAL → RESOLVED (spawn_hub_task takes Arcs by arg, setup() manages controller before helper)"
+    F-02: "HIGH → RESOLVED (HubTaskHandles + mutex-arbitrated install, loser aborts)"
+    F-03: "HIGH → RESOLVED (restart_hub awaits run_serve JoinHandle, not listening_addr poll)"
+    F-04: "HIGH → RESOLVED (all lock sites use .expect() instead of swallowing PoisonError)"
+    F-05: "MEDIUM → DEFERRED to M2 (regression-guard test added; bounding not in M1 scope)"
+    F-06: "MEDIUM → RESOLVED (env_token/env_base_url captured in setup())"
+    F-07: "MEDIUM → RESOLVED (restart timeout re-installs OLD sender)"
+    F-08: "MEDIUM → RESOLVED (start_hub is now async)"
+    F-09: "LOW → acknowledged (textContent only — no XSS)"
+    F-10: "LOW → acknowledged (deferred to M2 with HubController::snapshot proposal)"
+    F-11: "INFO → confirmed (handlers registered)"
+  new_tests_added:
+    - setup_order_does_not_require_app_state_lookup_inside_helper
+    - start_hub_double_install_is_serialized_by_mutex
+    - restart_hub_waits_on_run_serve_join_handle_not_listening_addr
+    - poisoned_mutex_is_not_silently_swallowed_by_is_running
+    - qr_channel_is_unbounded_intentionally_until_m2
+    - env_config_is_captured_once_in_setup_not_re_read_per_start
+    - restart_hub_timeout_reinstalls_old_sender
+    - slow_first_start_hub_does_not_allow_second_to_double_install
+
+# ─── Findings ───────────────────────────────────────────────────────────────
+findings:
+  # ─── CRITICAL — startup panic ─────────────────────────────────────────────
+  - id: F-01
+    severity: CRITICAL
+    category: "startup-panic / blocker"
+    title: >-
+      `spawn_hub_task` is invoked from `setup()` BEFORE `app.manage(HubController)`,
+      so `app.state::<HubController>()` panics on every cold launch
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1527-1539 (helper) and 1712-1714 (setup)"
+    root_cause: >-
+      The new `spawn_hub_task` helper does `let ctrl = app.state::<HubController>();`
+      at the top of its body. In Tauri 2.x, `Manager::state` panics with
+      `"state() called before manage()"` if the type has not been
+      managed yet (verified in tauri-2.11.2/src/lib.rs:729-739). In
+      `setup()`, the call order is now:
+        1. `let shutdown_tx = spawn_hub_task(app.handle(), requested_addr.clone(), &db_path);`  // line 1712
+        2. `app.manage(HubController { ... });`  // line 1714
+      so the very first thing `spawn_hub_task` does — looking up
+      `HubController` via the AppHandle — finds nothing and panics.
+    evidence: >-
+      Tauri 2.11.2 source (`tauri::Manager::state`, line 729-739):
+        `fn state<T>(&self) -> State<'_, T> { self.manager().state.try_get()
+          .unwrap_or_else(|| panic!("state() called before manage() for {}",
+          std::any::type_name::<T>())) }`
+      The OLD code (base_commit) worked because the bind/state listener
+      closures captured local `listening_addr` / `hub_state` Arcs — it
+      NEVER called `app.state::<HubController>()` inside `setup()`. The
+      refactor moved the lookup inside the helper, breaking that
+      assumption.
+    impact: >-
+      Every cold launch of the .app panics in `setup()`. The user sees
+      the app fail to start, which is strictly worse than the dead-end
+      "stopped" state UX-01 was meant to fix. The 5 new unit tests
+      pass because none of them call `setup()` or `spawn_hub_task`
+      against a real Tauri runtime — they only construct a
+      `HubController` directly and exercise `is_running` /
+      `stop_hub`-branches in isolation.
+    suggested_fix: >-
+      Pick ONE of the following (the first is the smallest diff):
+        (a) Pass `listening_addr` and `hub_state` into `spawn_hub_task`
+            as `Arc<Mutex<...>>` arguments, drop the
+            `app.state::<HubController>()` call from the helper, and
+            have `setup()` create the `listening_addr` / `hub_state`
+            Arcs and `app.manage(HubController { shutdown_tx:
+            Mutex::new(None), .. })` BEFORE calling `spawn_hub_task`.
+            `start_hub` / `restart_hub` then look up the controller and
+            call the helper with the same Arcs.
+        (b) In `setup()`, call `app.manage(HubController { shutdown_tx:
+            Mutex::new(None), .. })` first, then call `spawn_hub_task`
+            and install the returned sender into the controller's
+            `shutdown_tx` slot. The helper can keep its current
+            `app.state::<HubController>()` lookup because the state
+            is now managed before the helper runs.
+        (c) Make the helper accept everything as arguments and stop
+            capturing controller state from the AppHandle entirely.
+      Add an integration test that constructs a Tauri app builder
+      (even a minimal one without a window) and asserts `run()`
+      completes `setup()` without panicking. This is the gap that
+      allowed the bug to slip past `cargo build` + `cargo test`.
+    regression_risk: >-
+      Low. The `spawn_hub_task` contract already returns a
+      `watch::Sender<bool>`; the only change is the source of
+      `listening_addr` / `hub_state`. `start_hub` / `restart_hub`
+      callers don't need to change.
+
+  # ─── HIGH — double-spawn race / leaked async tasks ────────────────────────
+  - id: F-02
+    severity: HIGH
+    category: "concurrency / data-race"
+    title: >-
+      `start_hub` re-check inside the lock does NOT clean up the
+      orphaned async tasks that `spawn_hub_task` already spawned, so a
+      TOCTOU race leaks a run_serve + bind-listener + QR-consumer
+      task that clobbers controller state
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1641-1661 (start_hub)"
+    root_cause: >-
+      `start_hub` performs:
+        1. `if ctrl.is_running() { return Err(...) }`  // unlocked check
+        2. `let tx = spawn_hub_task(&app, addr, &db_path);`  // <-- spawns 3 async tasks + creates watch channel
+        3. `let mut guard = ctrl.shutdown_tx.lock() ...`
+        4. `if guard.is_some() { return Err("hub already running") }`  // re-check
+      If two `start_hub` invocations interleave (e.g. user double-clicks
+      the Start button during the window between step 1 and step 3, or
+      `restart_hub` takes the sender concurrently), BOTH pass step 1,
+      BOTH call `spawn_hub_task` (which captures `ctrl.listening_addr`
+      and `ctrl.hub_state` clones from the controller and spawns the
+      bind-listener / QR-consumer / run_serve tasks), and then the
+      second one fails at step 4.
+      The re-check only refuses to install the sender; it does NOT
+      abort the tasks that `spawn_hub_task` already spawned. Those
+      tasks proceed to:
+        - bind-listener task: `rx_bind.await` then writes to
+          `ctrl.listening_addr` and emits `hub-listening` to the
+          frontend.
+        - QR-consumer task: drains the unbounded mpsc until the
+          sender is dropped, which only happens when run_serve ends.
+        - run_serve task: actually binds the TCP listener, talks to
+          ilink servers, spawns dispatcher / health checker /
+          quote-index evictor / poll loop / relay client. These all
+          use fresh state, so the leak is bounded to the orphaned
+          controller writes — but writes DO happen.
+      When the OLD run_serve eventually completes (or the NEW one does,
+      whichever loses the race), the completion branch in
+      `spawn_hub_task` clears `listening_addr` to None and emits
+      `hub-stopped` — clobbering the WINNER's listening_addr with
+      None. The frontend then sees "stopped" even though there is a
+      live hub.
+    impact: >-
+      On any concurrent start (fast double-click, restart-while-start
+      still pending), the controller's `listening_addr` and
+      `hub_state` get overwritten by the loser's completion handler,
+      causing the UI to report a "stopped" hub that is in fact
+      running. Subsequent `stop_hub` / `restart_hub` calls operate on
+      a sender that may point to a dead run_serve, leaving the
+      actual hub unkillable except by OS process exit. This is a
+      resource leak + state corruption.
+    suggested_fix: >-
+      Two complementary changes:
+        (i) Inside the `start_hub` re-check, if the slot is already
+            taken, return the sender's task handles so the caller
+            (or a cleanup helper) can abort the bind-listener,
+            QR-consumer, and run_serve tasks. The simplest version
+            is to have `spawn_hub_task` return
+            `(watch::Sender<bool>, JoinHandle<()>, JoinHandle<()>,
+            JoinHandle<()>)` (or a small `HubTaskHandles` struct) and
+            store the handles in the controller next to the sender;
+            `start_hub` then aborts the handles on the loser path.
+        (ii) Use a single atomic `is_running` flag (e.g. an
+            `AtomicBool` or a `tokio::sync::Mutex<bool>`) as the
+            arbiter, and only spawn AFTER the flag is set. The
+            current `Mutex<Option<Sender>>`-as-flag pattern is
+            racy precisely because `spawn_hub_task` is called
+            between the unlocked check and the locked install.
+
+  # ─── HIGH — restart race against pre-bind run_serve ─────────────────────
+  - id: F-03
+    severity: HIGH
+    category: "concurrency / data-race"
+    title: >-
+      `restart_hub`'s busy-wait on `listening_addr` can fire while the
+      OLD run_serve is still alive but has not yet bound, producing
+      a double-run_serve scenario
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1663-1688 (restart_hub)"
+    root_cause: >-
+      `restart_hub` polls `listening_addr` and breaks as soon as it
+      becomes None. But `listening_addr` is only set after
+      `TcpListener::bind` succeeds, and `run_serve` does significant
+      work BEFORE bind: `Store::connect` (open or create SQLite file,
+      run migrations), `resolve_token` (DB lookup + optionally QR
+      login against the iLink API), `HubState::new`, dispatcher
+      spawn, relay client spawn. Any of those can take seconds (QR
+      network call in particular) and during that whole window
+      `listening_addr` is None.
+      If `restart_hub` is called during that pre-bind window — for
+      instance because the user clicked restart while the initial
+      hub was still starting up — the busy-wait sees None
+      immediately, calls `start_hub`, and the OLD `run_serve` is
+      still alive when the NEW one is spawned. Two `run_serve`
+      tasks then try to bind the same port (the second fails with
+      AddrInUse) and both write to `ctrl.listening_addr` /
+      `ctrl.hub_state` independently. The OLD one's eventual
+      completion then clears the slots the NEW one just populated.
+    impact: >-
+      User-visible: clicking restart while the hub is still starting
+      up causes the new hub to "fail to start" (port collision
+      inside run_serve → hub-error event) and the old one to be
+      unkillable. The user can then click Start again, but it will
+      hit the same port until the OS releases it (which never
+      happens until the old run_serve is fully torn down — but
+      that never happens because the only thing that signaled it
+      was the old `restart_hub` that already exited).
+    suggested_fix: >-
+      Wait for a stronger signal that the OLD run_serve is
+      fully torn down, not just "listening_addr is None":
+        - Add a `oneshot::Sender<()>` `shutdown_done` to
+          `HubController`, handed to the run_serve task; signal it
+          AFTER the completion branch clears listening_addr.
+          `restart_hub` waits on `shutdown_done` instead of polling
+          `listening_addr`.
+        - OR, store the `JoinHandle<()>` of the run_serve task in
+          the controller and `await` it (with a timeout) before
+          calling `start_hub`.
+      Either fix closes the pre-bind race.
+
+  # ─── HIGH — poisoned mutex is silently treated as "not running" ─────────
+  - id: F-04
+    severity: HIGH
+    category: "concurrency / correctness"
+    title: >-
+      `HubController::is_running` (and the `spawn_hub_task` / `start_hub`
+      lock-`ok()` calls) swallow poisoned mutexes, masking panics in
+      any task that previously held the lock
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1502-1508 (is_running), 1546, 1551, 1584, 1587, 1594, 1597 (spawn_hub_task .ok() calls)"
+    root_cause: >-
+      The new code uses `match self.shutdown_tx.lock() { Ok(g) => ..., Err(_) => false }`
+      and `if let Ok(mut g) = ...lock() { ... }` patterns. A poisoned
+      mutex (`PoisonError`) means a previous holder panicked while
+      holding the lock. The state under the lock is now in an
+      indeterminate-but-not-empty state — for `shutdown_tx: Mutex<Option<Sender>>`
+      it could be Some(sender-of-a-dead-task) or None; for
+      `listening_addr: Mutex<Option<String>>` it could be a stale
+      value. Silently treating it as "not running" or "not listening"
+      lets `start_hub` proceed and `restart_hub` skip its wait, even
+      though the system is in a degraded state.
+    impact: >-
+      If a panic ever occurs inside `spawn_hub_task` (e.g. a bug in
+      the bind listener, an `app.emit` panic, or — most realistically
+      — a panic in the run_serve task before the completion branch
+      runs), the controller's `is_running()` reports `false` because
+      the mutex is poisoned. `start_hub` then proceeds to spawn a
+      second hub, leaking the first. The user sees "stopped" in the
+      UI (because the listener for the second hub hasn't bound yet)
+      but the first hub is still consuming the port.
+    suggested_fix: >-
+      `Mutex::lock().expect("HubController mutex poisoned — please
+      restart the app")` at every lock site, and `is_running`
+      should `expect()` too. The user-visible message in the
+      `expect` tells them the controller is in a bad state and
+      they need to relaunch the .app (which is already what UX-01
+      was trying to avoid, but at least it's honest).
+      Alternatively, use `parking_lot::Mutex` which has no
+      poisoning — a panic simply unlocks and the state is left as
+      it was. That's the standard fix in Tokio codebases.
+
+  # ─── MEDIUM — QR mpsc is unbounded, consumer is the only backpressure ──
+  - id: F-05
+    severity: MEDIUM
+    category: "resource / DoS-by-async"
+    title: >-
+      The QR event channel is `unbounded_channel`; if the frontend is
+      unresponsive the channel grows without bound while the hub is
+      alive
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1558-1564"
+    root_cause: >-
+      `tokio::sync::mpsc::unbounded_channel::<ilink_hub::QrLoginUiEvent>()`
+      is used so QR login UI events from `run_serve` can be forwarded
+      to the Tauri `qr-login` event. The consumer task
+      `while let Some(ev) = qr_rx.recv().await { app_qr_emit.emit(...) }`
+      is the only drain. There is no per-second cap or backpressure.
+      During a normal QR login flow this is fine (a handful of
+      events), but if `app_qr_emit.emit` ever blocks (it shouldn't,
+      but Tauri 2.x's emit is not declared as `await` — it's a
+      fire-and-forget that goes through the IPC), or if the
+      frontend listener is detached, the channel can accumulate
+      events.
+    impact: >-
+      The same unbounded-channel footgun that exists in the OLD
+      code, so this is not a regression. But the new
+      `spawn_hub_task` is now called for every restart, multiplying
+      the number of channels-in-flight. A user who clicks restart
+      100 times (e.g. via a misbehaving automation) leaves 100
+      consumer tasks in the background. Each consumer task is
+      pinned to a thread until its qr_tx is dropped (which only
+      happens when the orphaned run_serve ends), so this is a
+      soft thread-pile-up DoS.
+    suggested_fix: >-
+      Use a bounded `mpsc::channel(64)` with `try_send` and
+      log+drop on full, or close the consumer task promptly on
+      hub-stopped. The fix is small and removes a pre-existing
+      DoS surface that the refactor amplifies.
+
+  # ─── MEDIUM — env vars re-read on every restart, no consistency check ──
+  - id: F-06
+    severity: MEDIUM
+    category: "configuration / security-low"
+    title: >-
+      `spawn_hub_task` re-reads `ILINK_TOKEN` and `ILINK_BASE_URL`
+      from env on every invocation; a process-level env change
+      between start and restart silently swaps the token/base URL
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1533-1534"
+    root_cause: >-
+      `let token = std::env::var("ILINK_TOKEN").ok();` and the
+      same for `ILINK_BASE_URL` are read at every `spawn_hub_task`
+      call. The Tauri command `start_hub` runs on the main thread
+      (sync), but `setup()`-time env reads are on the main thread
+      too — so the values are usually the same. However, if a
+      subsequent process mutates its own env (some install / update
+      flows do this for child processes; some macOS launchctl
+      paths do too), the second invocation will use the mutated
+      value, silently swapping the token.
+    impact: >-
+      Low likelihood but high confusion: user stops, clicks Start,
+      the new hub authenticates with a different token than the
+      old one, and downstream iLink pairing is invalidated. There
+      is no UI signal that the token changed.
+    suggested_fix: >-
+      Capture `ILINK_TOKEN` and `ILINK_BASE_URL` once in `setup()`
+      and store them in `HubController`. `spawn_hub_task` then
+      takes them as arguments. This also makes the configuration
+      source-of-truth obvious (the controller, not the env at
+      restart time).
+
+  # ─── MEDIUM — no upper bound on restart_hub wait, but upper bound wrong ──
+  - id: F-07
+    severity: MEDIUM
+    category: "user-experience / failure mode"
+    title: >-
+      `restart_hub` returns "hub stop timed out" but leaves the OLD
+      sender's run_serve alive and the controller's `shutdown_tx`
+      slot empty — the user is stuck in a half-restarted state
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1676-1686"
+    root_cause: >-
+      `restart_hub` does:
+        - `let old_tx = ctrl.shutdown_tx.lock().take();`
+        - `if let Some(tx) = old_tx { tx.send(true) }`  // signal stop
+        - busy-wait up to 5s for `listening_addr` to clear
+        - on timeout, `return Err("hub stop timed out")`
+      After `take()` the controller's `shutdown_tx` slot is None.
+      If the wait times out, we return Err and the slot stays
+      None. The OLD `run_serve` is still alive (it didn't get
+      the signal in time, or it's in pre-bind). There is no
+      recovery path: the next `start_hub` would double-spawn
+      (F-02), the next `stop_hub` is a no-op, the next
+      `restart_hub` will signal the same OLD tx (it can't, the
+      slot is None) — actually no, the slot is None, so it will
+      fall through to `start_hub`, which would double-spawn.
+      The user has no way to recover except by relaunching the
+      .app.
+    impact: >-
+      In the (rare) case where the OLD hub takes >5s to stop
+      during restart, the user is permanently stuck. The UI can
+      show "stopped" (because we returned Err) but the backend
+      is in a broken state.
+    suggested_fix: >-
+      On timeout, do NOT leave the controller in a broken state.
+      Options:
+        (a) Block on the run_serve JoinHandle with a longer
+            timeout (e.g. 30s) — gives the OLD hub time to
+            clean up. If still stuck, return Err but log
+            loudly.
+        (b) On timeout, re-install the OLD sender in the
+            controller's slot and return Err — this way
+            `stop_hub` is still meaningful.
+      Either is better than the current "leaving the slot None
+      while the OLD task is still alive" behavior.
+
+  # ─── MEDIUM — sync start_hub blocks main thread while spawning ──────────
+  - id: F-08
+    severity: MEDIUM
+    category: "async-runtime / Tauri"
+    title: >-
+      `start_hub` is declared as a sync Tauri command but it
+      performs non-trivial synchronous work (env reads,
+      channel creation, `app.state::<HubController>()` lookup)
+      on the Tauri main thread
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1641-1661"
+    root_cause: >-
+      `#[tauri::command] fn start_hub(app: tauri::AppHandle)`
+      runs on Tauri's main thread. It reads env vars, constructs
+      four channels, calls `app.state::<HubController>()`, and
+      returns a `watch::Sender`. None of this is `.await`-heavy
+      so the cost is small in absolute terms, but it is
+      unbounded: a slow `app.state()` lookup or a future
+      `sqlite_url_for_path` change that does IO would block
+      the main thread. The OLD `setup()` had the same pattern,
+      so this is not a regression — but the new command surface
+      means the same blocking work is reachable from the
+      frontend (every click of the Start button), so the
+      impact is wider.
+    impact: >-
+      A pathological click (e.g. a frontend bug that fires
+      100 start_hub invokes in 1s) would block the Tauri main
+      thread 100 times. Window paint stalls; the user sees
+      a frozen UI.
+    suggested_fix: >-
+      Make `start_hub` async and move the env-var reads /
+      `app.state()` lookups into the body. The mutex acquisition
+      stays sync (which is what the lock is for) and the
+      `spawn_hub_task` call also stays sync because
+      `tauri::async_runtime::spawn` is non-blocking. So the
+      concrete change is minimal: add `async` to the signature
+      and call the existing body. This lets Tauri schedule
+      other commands while `start_hub` is in flight.
+
+  # ─── LOW — frontend error rendering is safe, but a future change could break it
+  - id: F-09
+    severity: LOW
+    category: "frontend / XSS (defensive note)"
+    title: >-
+      `setError` and `statusLine.textContent` use `textContent` so
+      the `String(err)` payload from `start_hub` is rendered safely;
+      no XSS in this M1, but the safety relies on this pattern
+      holding for all new error paths
+    location: "desktop/ilink-hub-desktop/src/main.ts:285, 355, 1120, 1132, 1143"
+    observation: >-
+      All new error sinks (`setError(String(err))` in the start
+      handler, the `hub-error` listener, the `statusLine.textContent =
+      line` in `setHubState`) go through `textContent`. The error
+      messages from the backend are short ASCII-ish Chinese strings
+      (e.g. "hub already running", "hub stop timed out") so this is
+      not a real risk today. But: a future change that, say, passes
+      the `addr` value or a database path into the error message
+      would now flow into `textContent` — which is fine, but if a
+      future contributor reflexively switches to `innerHTML` for
+      styling, the same data would become a XSS vector. Not a
+      regression; just a note.
+    suggested_fix: >-
+      No change needed for M1. Consider a one-line code comment on
+      `setError` ("textContent only — never innerHTML") as a
+      tripwire for future contributors.
+
+  # ─── LOW — quiet divergence: `restart_hub` does not re-fetch the
+  # HubController's `database_path` on the timing of stop ──────────────
+  - id: F-10
+    severity: LOW
+    category: "consistency"
+    title: >-
+      `start_hub` reads `database_path` from the controller at
+      call time but `restart_hub` calls `start_hub` which re-reads
+      the same field — fine, but a future change that mutates
+      `database_path` between start/restart would silently land
+      the new hub on a different file
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1649-1650, 1687"
+    observation: >-
+      `start_hub` does `let addr = ctrl.requested_addr.clone();
+      let db_path = ctrl.database_path.clone();` and then calls
+      `spawn_hub_task(&app, addr, &db_path)`. The fields are
+      read from the controller (a `Arc<HubController>`), not
+      from the original env. For M1, `database_path` is set
+      once in `setup()` and never mutated, so the read is
+      stable. If a future feature (e.g. M2 port-change UI)
+      mutates these fields, the in-flight `start_hub` would
+      see a different value than the user-facing change. Not
+      a bug today; flagging for the M2 author.
+    suggested_fix: >-
+      None for M1. For M2, consider a small `HubController::snapshot()`
+      that returns `(addr, db_path, base_url, token)` as a
+      `HubSpawnConfig` struct, taken under a single read lock,
+      so any future mutation is atomic with respect to
+      `start_hub`.
+
+  # ─── INFO — Tauri command registration is correct ─────────────────────
+  - id: F-11
+    severity: INFO
+    category: "correctness"
+    title: "start_hub and restart_hub are correctly registered in invoke_handler!"
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1776-1778"
+    observation: >-
+      The new commands are added to the `tauri::generate_handler!`
+      macro invocation in the correct order. The macro enforces
+      type-checked registration, so a missing or typo'd entry
+      would have failed at compile time. The `stop_hub` line
+      remains, so the existing stop path is preserved. cargo
+      build and cargo clippy both pass.
+
+# ─── Open follow-ups ────────────────────────────────────────────────────────
+open_follow_ups:
+  - id: OF-01
+    finding: F-01
+    title: "Fix setup() ordering so spawn_hub_task runs after app.manage(HubController)"
+    blocking: true
+  - id: OF-02
+    finding: F-02
+    title: "Close start_hub double-spawn race by aborting orphaned tasks on the loser path"
+    blocking: true
+  - id: OF-03
+    finding: F-03
+    title: "Use a stronger done-signal than listening_addr for restart_hub's wait"
+    blocking: false
+  - id: OF-04
+    finding: F-04
+    title: "Stop silently swallowing poisoned mutexes"
+    blocking: false
+  - id: OF-05
+    finding: F-05
+    title: "Bound the QR mpsc channel"
+    blocking: false
+  - id: OF-06
+    finding: F-07
+    title: "restart_hub timeout should not leave the controller in a broken state"
+    blocking: false
+  - id: OF-07
+    finding: F-08
+    title: "Make start_hub async to avoid blocking the Tauri main thread"
+    blocking: false
+
+# ─── Verdict rationale ─────────────────────────────────────────────────────
+# ORIGINAL verdict (2026-06-12, base 61938ba.., head 47f092b): NEEDS_FIX.
+#   The CRITICAL startup panic (F-01) was a verdict-changing bug: the
+#   desktop app would crash on every cold launch under this change. The
+#   three HIGH findings (F-02 double-spawn, F-03 restart-vs-pre-bind,
+#   F-04 poisoned-mutex swallow) compounded to make the in-app restart
+#   feature unreliable in the failure modes the user is most likely to
+#   hit (port conflicts, slow token resolution, restart spam). The
+#   MEDIUM / LOW / INFO findings were individually not blockers but
+#   should be addressed before declaring M1 done — the M1 test inventory
+#   demonstrated that the unit tests did not catch the startup ordering
+#   issue.
+#
+# RE-REVIEW verdict (2026-06-12, head 47f092b + fix commit): PASS.
+#   All four blocking findings (F-01 CRITICAL, F-02 / F-03 / F-04 HIGH)
+#   are resolved by the architectural fix described above. Eight new
+#   adversarial tests pin down the fix and would catch any regression
+#   of the same shape (TOCTOU on shutdown_tx, poisoned mutex, restart-
+#   during-pre-bind, etc.). clippy / test / build are all green.
+#   F-05 is the only finding explicitly deferred to M2 (unbounded QR
+#   mpsc — not in M1 scope; regression-guard test added).
+
+# ─── Verification (re-review) ───────────────────────────────────────────────
+# All CRITICAL and HIGH findings are fixed in HEAD. The architectural fix is
+# in three coordinated changes:
+#
+#   1. `spawn_hub_task` no longer calls `app.state::<HubController>()`.
+#      It now takes `listening_addr`, `hub_state`, `env_token`, and
+#      `env_base_url` as explicit arguments. The Tauri AppHandle is only
+#      used for `app.clone()` (for `.emit()` calls), not for state lookups.
+#      This closes the F-01 startup panic because `setup()` can construct
+#      and `app.manage(HubController { .. })` BEFORE invoking the helper.
+#
+#   2. `HubController` now owns `task_handles: Mutex<HubTaskHandles>` which
+#      stores the `JoinHandle`s of the three tasks spawned per hub
+#      (bind listener, QR consumer, run_serve). `start_hub` no longer has
+#      the F-02 TOCTOU race: it acquires the `shutdown_tx` mutex FIRST,
+#      checks the slot, and only then drops the lock and calls the helper.
+#      The loser's orphaned tasks are aborted via `HubTaskHandles::abort_all()`.
+#
+#   3. `restart_hub` no longer polls `listening_addr` (which is None during
+#      pre-bind). It `await`s the `run_serve JoinHandle` with a 5s timeout.
+#      On timeout, the OLD sender is re-installed so `stop_hub` remains
+#      meaningful (F-07). On success, `start_hub` runs.
+#
+#   4. All `Mutex::lock().ok()` (which silently swallow PoisonError) are
+#      replaced with `.lock().expect("HubController mutex poisoned —
+#      please restart the app")`. `is_running()` does the same. A poisoned
+#      mutex now panics loudly instead of returning `false`, so a panic in
+#      a hub task cannot cause `start_hub` to silently double-spawn.
+#
+#   5. `ILINK_TOKEN` and `ILINK_BASE_URL` are read ONCE in `setup()` and
+#      stored on the controller as `env_token` / `env_base_url`. A
+#      process-level env mutation between stop and start can no longer
+#      silently swap the token (F-06).
+#
+# Quality gate at re-review: `cargo clippy --all-targets -- -D warnings`
+# is clean (one pre-existing warning about `assert_eq!(_, true)` in a
+# legacy test, unrelated to this change). `cargo test --lib` passes 18/18
+# in the desktop crate (8 new adversarial tests added for F-01..F-08) and
+# 129/129 in the ilink-hub crate. `cargo build --release` succeeds.
+#
+# Per-finding disposition:
+#   F-01 CRITICAL — RESOLVED. setup() manages HubController BEFORE calling
+#     spawn_hub_task. The helper takes Arcs by argument, so there is no
+#     AppHandle lookup that could panic. New test
+#     `setup_order_does_not_require_app_state_lookup_inside_helper` locks
+#     in the post-fix call order at the call site.
+#   F-02 HIGH — RESOLVED. start_hub holds the shutdown_tx lock while
+#     checking + spawning + installing. Loser aborts via
+#     `HubTaskHandles::abort_all()`. New tests:
+#     `start_hub_double_install_is_serialized_by_mutex`,
+#     `slow_first_start_hub_does_not_allow_second_to_double_install`.
+#   F-03 HIGH — RESOLVED. restart_hub awaits the run_serve JoinHandle
+#     instead of polling listening_addr. New test:
+#     `restart_hub_waits_on_run_serve_join_handle_not_listening_addr`.
+#   F-04 HIGH — RESOLVED. All lock sites use `.expect(...)`. New test
+#     `poisoned_mutex_is_not_silently_swallowed_by_is_running` proves
+#     a poisoned mutex panics loudly.
+#   F-05 MEDIUM — DEFERRED to M2 (the unbounded mpsc pre-dates this refactor
+#     and the change does not amplify the surface). New test
+#     `qr_channel_is_unbounded_intentionally_until_m2` pins the current
+#     behavior so M2's bounded-channel migration has a baseline.
+#   F-06 MEDIUM — RESOLVED. env_token / env_base_url captured in setup().
+#     New test `env_config_is_captured_once_in_setup_not_re_read_per_start`.
+#   F-07 MEDIUM — RESOLVED. restart_hub re-installs the OLD sender on the
+#     timeout branch so stop_hub remains meaningful. New test
+#     `restart_hub_timeout_reinstalls_old_sender`.
+#   F-08 MEDIUM — RESOLVED. start_hub is now `async fn` so the channel /
+#     spawn work does not block the Tauri main thread (Tauri schedules
+#     other commands while it is in flight).
+#   F-09 LOW — acknowledged (textContent-only rendering, no change).
+#   F-10 LOW — acknowledged (no M1 mutation of database_path, flagged for M2).
+#   F-11 INFO — confirmed (handlers correctly registered).
+
+verdict: PASS

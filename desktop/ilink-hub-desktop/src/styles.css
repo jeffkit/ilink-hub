@@ -1755,6 +1755,42 @@ body {
   justify-content: center;
 }
 
+.qr-prereq {
+  text-align: left;
+  margin: 0 0 0.7rem;
+  font-size: 0.7rem;
+  line-height: 1.55;
+}
+
+.help-collapsible.qr-help {
+  text-align: left;
+  margin: 0.55rem 0 0;
+}
+
+.qr-help .help-body {
+  padding: 0.6rem 0.7rem;
+}
+
+.qr-help-list {
+  margin: 0;
+  padding-left: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.32rem;
+  font-size: 0.72rem;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.qr-help-list li {
+  margin: 0;
+}
+
+.qr-help-list strong {
+  color: var(--text);
+  font-weight: 650;
+}
+
 .modal-foot {
   margin: 0.7rem 0 0;
   font-size: 0.68rem;
@@ -1784,4 +1820,82 @@ body {
 .toast.show {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
+}
+
+/* ---------- Port settings (home panel) ---------- */
+.port-settings {
+  margin-top: 0.9rem;
+  padding-top: 0.85rem;
+  border-top: 1px dashed var(--border);
+}
+
+.port-settings .be-title {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.port-settings .be-lead {
+  margin: 0.18rem 0 0.55rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.port-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.55rem;
+}
+
+.field-port {
+  max-width: 9rem;
+}
+
+.field-port input {
+  width: 100%;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.82rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono);
+}
+
+.field-port input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+.port-settings .btn {
+  margin-bottom: 1px;
+}
+
+/* Port-conflict modal input slot */
+.field-port-modal {
+  display: flex;
+  flex-direction: column;
+  gap: 0.22rem;
+  margin: 0.45rem 0 0.5rem;
+}
+
+.field-port-modal input {
+  width: 100%;
+  padding: 0.45rem 0.55rem;
+  font-size: 0.82rem;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono);
+}
+
+.field-port-modal input:focus {
+  outline: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  outline-offset: 0;
+  border-color: var(--accent);
+}
+
+#port-conflict-msg {
+  margin: 0 0 0.6rem;
 }

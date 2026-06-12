@@ -1,0 +1,198 @@
+milestone: M1
+title: "DB-01 — SQLite AnyPool 多连接并发修复（max_connections(1)）"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 61938ba92fc20cdb00b876ddf5d4a9de52ddcd92
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M1 — DB-01: SQLite AnyPool 多连接并发问题修复"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M1: collapse the file-type SQLite AnyPool to a single
+# connection (`max_connections(1)`) so that the file-level EXCLUSIVE
+# write lock cannot be contested by two physical connections. The
+# `busy_timeout` for SQLite connections is 5s by default in sqlx; with
+# a single connection, concurrent transactions queue on the same
+# connection (so the only wait is the queue, not the file lock), and
+# the default busy_timeout becomes a safety net for the rare shutdown
+# drain case rather than a primary defense.
+#
+# :memory: keeps the existing single-connection behavior (it was
+# already correct — each new physical connection to :memory: would
+# otherwise see a fresh empty database). After this change, every
+# `sqlite:` URL goes through the `max_connections(1)` branch, which
+# subsumes the `:memory:` case but is identical to it.
+
+# ─── Source-of-truth changes for DB-01 ─────────────────────────────────────
+source_changes:
+  - file: src/store/mod.rs
+    symbols:
+      - "Store::connect (lines ~20-48)"
+    change_summary: >-
+      The `let pool = if ...` branch in `Store::connect` now keys on
+      `url.starts_with("sqlite:")` instead of `url.contains(":memory:")`.
+      Both the in-memory and file-type SQLite cases use
+      `PoolOptions::<sqlx::Any>::new().max_connections(1).connect(url)`.
+      The non-SQLite (postgres/mysql) branch still uses `AnyPool::connect`.
+      The doc comment now explains the file-level write lock rationale
+      and notes that the default 5s `busy_timeout` remains in place as
+      a safety net for the migration-runner `acquire` path during
+      shutdown drain.
+  - file: src/store/mod.rs (tests)
+    symbols:
+      - "store_tests::file_sqlite_serializes_concurrent_read_and_write_without_busy"
+    change_summary: >-
+      New unit test under `mod store_tests` (in `src/store/mod.rs`)
+      that: (1) opens a file-type SQLite `Store` via `Store::connect`
+      against a `tempfile::tempdir()`-backed path; (2) asserts the
+      structural invariant `store.pool.options().get_max_connections()
+      == 1`; (3) seeds one row via `persist_context_token` and one
+      `set_active_session_name`; (4) spawns 8 batch-writer tasks
+      (20 iterations of 200 entries each), 4 single-row writer tasks
+      (200 iterations), and 4 reader tasks (200 iterations each) on
+      a multi-thread runtime (8 workers); (5) joins all tasks and
+      expects zero `SQLITE_BUSY` errors. The structural assertion
+      is the canonical regression guard: it fails on the pre-fix
+      code with `left: 10, right: 1`, and the concurrent workload
+      exercises the same code path that the production failure
+      targeted.
+
+# ─── Commands run (all required by plan.md M1 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "122 passed; 0 failed; 0 ignored (M1-relevant: store::store_tests::file_sqlite_serializes_concurrent_read_and_write_without_busy, store::store_tests::migration_runs_on_in_memory_sqlite)"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "148 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M1-required test inventory (plan §M1) ─────────────────────────────────
+# Plan §M1 explicitly required:
+#   1. cargo test -p ilink-hub store:: — all green
+#   2. manual reproduction: persist_context_tokens_batch and
+#      get_active_session_name concurrent, no SQLITE_BUSY
+m1_test_inventory:
+  unit_store:
+    - test: file_sqlite_serializes_concurrent_read_and_write_without_busy
+      covers: >-
+        Structural invariant (pool.options().get_max_connections() == 1
+        for any sqlite URL — fails on the pre-fix code with `left: 10,
+        right: 1`) AND a concurrent read/write workload
+        (8 batch-writer tasks × 20 iterations × 200 entries +
+         4 single-row-writer tasks × 200 iterations +
+         4 reader tasks × 200 iterations, on a multi-thread runtime
+         with 8 workers) that the production failure mode targeted.
+        Mirrors the manual reproduction step in plan §M1.
+      result: pass
+    - test: migration_runs_on_in_memory_sqlite
+      covers: "Pre-existing in-memory test still green (the fix subsumes :memory:). No behavioral change to :memory:."
+      result: pass
+
+# ─── Pass conditions vs. plan.md M1 ─────────────────────────────────────────
+pass_conditions:
+  - id: pool-pinned
+    plan_clause: "修改 src/store/mod.rs:34-41,为文件型 SQLite 路径 pin max_connections(1) 并启用 busy_timeout"
+    observation: >-
+      `Store::connect` now keys on `url.starts_with("sqlite:")` (not
+      `url.contains(":memory:")`) and uses
+      `PoolOptions::<sqlx::Any>::new().max_connections(1).connect(url)`
+      for every `sqlite:` URL. The 5s default `busy_timeout` is
+      retained as a safety net (sqlx's `SqliteConnectOptions::new`
+      sets `busy_timeout: Duration::from_secs(5)` by default), so the
+      plan's "pin max_connections(1) 并启用 busy_timeout" requirement
+      is satisfied — single connection removes the primary cause, the
+      default timeout handles the rare residual case during migration
+      drain.
+    result: pass
+  - id: build-green
+    plan_clause: "cargo build -p ilink-hub 通过"
+    observation: "cargo build → Finished `dev` profile, exit 0."
+    result: pass
+  - id: store-tests-green
+    plan_clause: "cargo test -p ilink-hub store:: 全绿"
+    observation: >-
+      cargo test -p ilink-hub --lib store:: → 2 passed, 0 failed
+      (migration_runs_on_in_memory_sqlite + the new
+      file_sqlite_serializes_concurrent_read_and_write_without_busy).
+    result: pass
+  - id: no-sqlite-busy
+    plan_clause: "手动复现: persist_context_tokens_batch 与 get_active_session_name 并发不返回 SQLITE_BUSY"
+    observation: >-
+      The new unit test exercises this exact pair (and
+      `set_active_session_name` as a third concurrent writer)
+      against a real file-backed SQLite DB on a multi-thread runtime.
+      The structural `get_max_connections() == 1` assertion is the
+      canonical regression guard: it fails on the pre-fix code with
+      `left: 10, right: 1`, which is the exact code path that caused
+      the production SQLITE_BUSY.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "clippy 无 warning (M3 will re-run --all-targets)"
+    observation: "cargo clippy -- -D warnings → 0 warnings, exit 0."
+    result: pass
+
+# ─── Behavioural diff vs. baseline (61938ba) ───────────────────────────────
+# Summary of the M1-relevant behavioural change set:
+behavioural_diff:
+  - area: "Store::connect (sqlite branch)"
+    before: >-
+      `let pool = if url.contains(":memory:") { PoolOptions::new().max_connections(1).connect(url).await? } else { AnyPool::connect(url).await? };`
+      For `sqlite:/path/to/file.db`, this called `AnyPool::connect(url)`
+      which uses sqlx's default `PoolOptions` (max_connections=10).
+      With 10 physical connections, two concurrent write transactions
+      (e.g. `persist_context_tokens_batch` + `set_active_session_name`)
+      could race on the file-level EXCLUSIVE write lock; once a writer's
+      lock-hold time exceeded the default 5s `busy_timeout`, the second
+      writer's transaction returned SQLITE_BUSY (5).
+    after: >-
+      `let pool = if url.starts_with("sqlite:") { PoolOptions::<sqlx::Any>::new().max_connections(1).connect(url).await? } else { AnyPool::connect(url).await? };`
+      For every `sqlite:` URL (file or :memory:), the pool is sized to
+      one physical connection. Concurrent transactions queue on that
+      single connection, eliminating the second-contender file-lock race.
+      The 5s default `busy_timeout` remains as a defense in depth.
+    security_classification: "CWE-754 (Improper Check for Unusual or Exceptional Conditions) / reliability — closes the SQLITE_BUSY crash class for the broadcast / dispatch path under concurrent write load."
+  - area: "in-memory sqlite"
+    before: "max_connections(1) (correct, because each new physical connection to :memory: yields a fresh empty DB)."
+    after: "max_connections(1) (unchanged, now reached via the unified `starts_with(\"sqlite:\")` branch)."
+    security_classification: "No behavioral change."
+
+# ─── M1-specific open follow-ups (none) ───────────────────────────────────
+# DB-01 is fully closed at HEAD. The default `busy_timeout` of 5s is
+# the residual safety net; if production telemetry ever surfaces
+# SQLITE_BUSY despite single-connection pinning, the next step would
+# be to expose `busy_timeout` as a config knob, but that is a
+# future work item and is not required by M1.
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M2
+next_milestone_title: "E-03: relay 客户端 shutdown 信号接入"
+next_milestone_files:
+  - src/relay/client.rs
+  - src/hub/mod.rs (callers of spawn_relay_client)
+  - src/runtime/serve.rs
