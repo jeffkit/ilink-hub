@@ -300,7 +300,7 @@ impl BridgeManager {
                     managed.restart_attempts = next_restart_attempts(
                         managed.restart_attempts,
                         now.duration_since(managed.last_start),
-                        self.opts.max_restart_backoff,
+                        self.opts.max_restart_backoff.saturating_mul(3),
                     );
                     let delay = restart_delay(
                         self.opts.restart_backoff,
@@ -320,7 +320,7 @@ impl BridgeManager {
                     managed.restart_attempts = next_restart_attempts(
                         managed.restart_attempts,
                         now.duration_since(managed.last_start),
-                        self.opts.max_restart_backoff,
+                        self.opts.max_restart_backoff.saturating_mul(3),
                     );
                     let delay = restart_delay(
                         self.opts.restart_backoff,
