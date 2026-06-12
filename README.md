@@ -294,6 +294,39 @@ WeChat receives reply ✓
 
 ---
 
+## Design Trade-offs
+
+### Broadcast persist is fire-and-forget
+
+When a message lands on the **broadcast** path (no `/use` route resolved, or hub-level
+`/broadcast <text>`), the Hub fans out to every online backend. Persisting the resulting
+`real_ctx → vctx` mapping into `context_token_map` is done inside a `tokio::spawn` task —
+the message is **not** held back from the per-client queue waiting for the DB write to
+return. This is a deliberate trade-off:
+
+- **Pro:** Tail latency on the dispatch hot-path stays at the speed of the queue push;
+  a slow / contended database (or a one-off `SQLITE_BUSY` under load) cannot stall
+  message delivery. The user keeps receiving replies while the persistence layer
+  catches up.
+- **Con:** If the persist call fails, the mapping is silently dropped. The next time
+  the same user sends a message they may be assigned a new vctx, and any per-backend
+  session that was keyed to the old vctx becomes orphaned in `backend_sessions_v2`.
+
+To make this trade-off **observable** rather than silent, the Hub exposes the
+`persist_fire_and_forget_failures` counter on the in-process `Metrics` struct (and
+on the Prometheus `/metrics` endpoint as `ilink_persist_fire_and_forget_failures_total`).
+Both fire-and-forget persist sites — the per-message single-row call in
+`dispatch_message::RoutingDecision::ForwardTo` and the per-broadcast batched call in
+`RoutingDecision::Broadcast` — increment the counter on error. A non-zero rate here
+indicates context-token durability is being lost; alert on
+`rate(...) > 0` rather than scraping absolute totals.
+
+If you require strict durability, replace the `tokio::spawn` in `src/hub/mod.rs` with
+an awaited write (or wrap it in a retry-with-backoff task and a bounded
+"persistence backlog" queue that the dispatcher drains before the next broadcast).
+
+---
+
 ## Security Recommendations
 
 - **Deploy behind HTTPS** — use a reverse proxy (Nginx, Caddy) with TLS

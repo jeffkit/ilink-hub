@@ -52,6 +52,12 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
+    /// Failures of the fire-and-forget `persist_context_token(s)_batch` calls on the
+    /// broadcast / fan-out dispatch path. Counts every background task that returned
+    /// an error, so a non-zero value means context-token mappings were dropped on the
+    /// floor (we keep delivering messages but lose durability of the real_ctx↔vctx
+    /// mapping for those rows). See `docs/exec-plans/active/todo-hub-2/plan.md` C-01.
+    pub persist_fire_and_forget_failures: AtomicU64,
 }
 
 impl Metrics {
@@ -63,6 +69,7 @@ impl Metrics {
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
+            persist_fire_and_forget_failures: AtomicU64::new(0),
         }
     }
 }
@@ -138,7 +145,7 @@ pub struct HubState {
     /// Quote-reply → backend / hub command (see [`quote_route`]).
     pub quote_index: Mutex<QuoteRouteIndex>,
     pub store: Arc<Store>,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
     /// Shared with Axum graceful shutdown; long-poll handlers exit early when this becomes `true`.
     pub shutdown: watch::Receiver<bool>,
     /// Current iLink upstream status (see [`ilink_status`] constants).
@@ -172,7 +179,7 @@ impl HubState {
             router: Mutex::new(Router::new(None)),
             quote_index: Mutex::new(QuoteRouteIndex::default()),
             store,
-            metrics: Metrics::new(),
+            metrics: Arc::new(Metrics::new()),
             shutdown,
             ilink_status: Arc::new(AtomicU8::new(ilink_status::UNKNOWN)),
             qr_tx,
@@ -286,9 +293,13 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
             let store = state.store.clone();
             let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
+            let metrics = state.metrics.clone();
             tokio::spawn(async move {
                 if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
                     warn!(error = %e, "failed to persist context_token mapping");
+                    metrics
+                        .persist_fire_and_forget_failures
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             });
 
@@ -367,9 +378,13 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     .map(|(_, vc)| (vc.clone(), real_ctx.clone(), peer_user_id.clone()))
                     .collect();
                 let store = state.store.clone();
+                let metrics = state.metrics.clone();
                 tokio::spawn(async move {
                     if let Err(e) = store.persist_context_tokens_batch(&entries).await {
                         warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
+                        metrics
+                            .persist_fire_and_forget_failures
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 });
             }
@@ -1097,5 +1112,67 @@ mod tests {
         let ext = hub_ext.unwrap();
         assert_eq!(ext.session_name, Some("override".to_string()));
         assert_eq!(ext.session_id, None);
+    }
+
+    /// `persist_fire_and_forget_failures` increments on broadcast-path persist errors.
+    ///
+    /// Spawns a tokio task using the exact fire-and-forget shape from the broadcast
+    /// dispatch path (see `dispatch_message` `RoutingDecision::Broadcast`). We use a
+    /// SQLite in-memory pool with a held transaction to force the persist call to
+    /// block, then advance virtual time past the pool's default acquire timeout
+    /// so the inner call returns an error. The metric must then reflect >= 1 failure,
+    /// proving the C-01 counter is wired to the same code that runs in production.
+    #[tokio::test]
+    async fn persist_fire_and_forget_failure_increments_metric() {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        tokio::time::pause();
+
+        let metrics = Arc::new(Metrics::new());
+        assert_eq!(
+            metrics
+                .persist_fire_and_forget_failures
+                .load(Ordering::Relaxed),
+            0,
+            "counter starts at zero"
+        );
+
+        // Hold the only pool connection so the background persist call cannot acquire
+        // a new one and the pool's acquire timeout will fire.
+        let _tx = store.pool().begin().await.unwrap();
+
+        let entries: Vec<(String, String, String)> = vec![(
+            "vctx-1".to_string(),
+            "real-1".to_string(),
+            "peer-1".to_string(),
+        )];
+
+        let store_clone = store.clone();
+        let metrics_clone = metrics.clone();
+        let task = tokio::spawn(async move {
+            // Same fire-and-forget shape used in dispatch_message::Broadcast.
+            if let Err(e) = store_clone.persist_context_tokens_batch(&entries).await {
+                warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
+                metrics_clone
+                    .persist_fire_and_forget_failures
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        // Advance virtual time so the pool acquire timeout fires (sqlx default is
+        // 30 seconds; we give it a generous buffer).
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        let _ = task.await;
+
+        assert!(
+            metrics
+                .persist_fire_and_forget_failures
+                .load(Ordering::Relaxed)
+                >= 1,
+            "counter must have been incremented after persist failure"
+        );
     }
 }
