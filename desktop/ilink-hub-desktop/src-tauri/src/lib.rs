@@ -422,7 +422,9 @@ fn delete_client_err(auth_required: bool, error: impl Into<String>) -> DeleteCli
     }
 }
 
-fn hub_state_from_app(app: &tauri::AppHandle) -> Result<Arc<ilink_hub::HubState>, DeleteClientResult> {
+fn hub_state_from_app(
+    app: &tauri::AppHandle,
+) -> Result<Arc<ilink_hub::HubState>, DeleteClientResult> {
     let Some(ctrl) = app.try_state::<HubController>() else {
         return Err(delete_client_err(false, "Hub 未初始化"));
     };
@@ -459,9 +461,7 @@ async fn hub_delete_client(app: tauri::AppHandle, name: String) -> DeleteClientR
             false,
             format!("后端「{name}」仍在线，请先停止对应进程后再删除"),
         ),
-        Err(UnregisterClientError::Store(e)) => {
-            delete_client_err(false, format!("删除失败: {e}"))
-        }
+        Err(UnregisterClientError::Store(e)) => delete_client_err(false, format!("删除失败: {e}")),
     }
 }
 
@@ -529,9 +529,7 @@ async fn hub_update_client(
         Err(UpdateClientError::NameTaken) => {
             update_client_err(false, format!("名称「{name}」已被占用"))
         }
-        Err(UpdateClientError::InvalidName) => {
-            update_client_err(false, "后端名称不能为空")
-        }
+        Err(UpdateClientError::InvalidName) => update_client_err(false, "后端名称不能为空"),
         Err(UpdateClientError::Store(e)) => update_client_err(false, format!("更新失败: {e}")),
     }
 }
@@ -1323,6 +1321,7 @@ async fn bridge_restart(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn claude_profile_wizard_generates_minimal_yaml() {
@@ -1402,6 +1401,94 @@ mod tests {
             Some("abc123")
         );
     }
+
+    fn make_hub_controller(running: bool) -> HubController {
+        HubController {
+            shutdown_tx: Mutex::new(if running {
+                Some(watch::channel(false).0)
+            } else {
+                None
+            }),
+            requested_addr: "127.0.0.1:8765".into(),
+            database_path: PathBuf::from("/tmp/ilink-hub-test.db"),
+            listening_addr: Arc::new(Mutex::new(None)),
+            hub_state: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[test]
+    fn hub_controller_is_running_reflects_shutdown_tx() {
+        let ctrl = make_hub_controller(true);
+        assert!(ctrl.is_running());
+
+        let ctrl = make_hub_controller(false);
+        assert!(!ctrl.is_running());
+
+        // Simulating a stop: take the sender, then is_running should flip to false.
+        let ctrl = make_hub_controller(true);
+        let taken = ctrl.shutdown_tx.lock().unwrap().take();
+        assert!(taken.is_some());
+        assert!(!ctrl.is_running());
+    }
+
+    #[test]
+    fn sqlite_url_for_path_handles_unix_and_windows_paths() {
+        assert_eq!(
+            sqlite_url_for_path(Path::new("/tmp/db.sqlite")),
+            "sqlite:/tmp/db.sqlite"
+        );
+        assert_eq!(
+            sqlite_url_for_path(Path::new("C:/data/db.sqlite")),
+            "sqlite:/C:/data/db.sqlite"
+        );
+        assert_eq!(
+            sqlite_url_for_path(Path::new("relative.sqlite")),
+            "sqlite:relative.sqlite"
+        );
+    }
+
+    #[test]
+    fn sqlite_url_for_path_normalizes_backslashes() {
+        // Backslashes are converted to forward slashes so the resulting URL is portable.
+        assert_eq!(
+            sqlite_url_for_path(Path::new("C:\\data\\db.sqlite")),
+            "sqlite:/C:/data/db.sqlite"
+        );
+    }
+
+    #[test]
+    fn stop_hub_signals_existing_tx_and_clears_handle() {
+        // Mirrors the runtime branch in stop_hub: a present sender signals shutdown,
+        // and the controller no longer reports running once the sender is taken.
+        let ctrl = make_hub_controller(true);
+        let mut rx = {
+            let (tx, rx) = watch::channel(false);
+            *ctrl.shutdown_tx.lock().unwrap() = Some(tx);
+            rx
+        };
+        assert!(ctrl.is_running());
+
+        let tx = ctrl
+            .shutdown_tx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("sender present");
+        tx.send(true).expect("receiver alive");
+        assert_eq!(*rx.borrow_and_update(), true);
+        assert!(!ctrl.is_running());
+    }
+
+    #[test]
+    fn stop_hub_is_noop_when_already_stopped() {
+        // Mirrors the runtime branch in stop_hub when shutdown_tx is already None:
+        // no sender to signal, but the call is still successful (idempotent).
+        let ctrl = make_hub_controller(false);
+        assert!(!ctrl.is_running());
+        let tx = ctrl.shutdown_tx.lock().unwrap().take();
+        assert!(tx.is_none());
+        assert!(!ctrl.is_running());
+    }
 }
 
 struct HubController {
@@ -1410,6 +1497,15 @@ struct HubController {
     database_path: PathBuf,
     listening_addr: Arc<Mutex<Option<String>>>,
     hub_state: Arc<Mutex<Option<Arc<ilink_hub::HubState>>>>,
+}
+
+impl HubController {
+    fn is_running(&self) -> bool {
+        match self.shutdown_tx.lock() {
+            Ok(g) => g.is_some(),
+            Err(_) => false,
+        }
+    }
 }
 
 /// Match Docker/README style: `sqlite:/absolute/path` (see `store::ensure_sqlite_file`).
@@ -1423,6 +1519,90 @@ fn sqlite_url_for_path(path: &std::path::Path) -> String {
     } else {
         format!("sqlite:{normalized}")
     }
+}
+
+/// Build a `run_serve` task that owns its own QR event channel, bind/state listeners,
+/// and shutdown receiver. Returns a fresh `watch::Sender` so the caller can keep the
+/// controller's `shutdown_tx` slot in sync for later `stop_hub` / `restart_hub`.
+fn spawn_hub_task(
+    app: &tauri::AppHandle,
+    addr: String,
+    db_path: &std::path::Path,
+) -> watch::Sender<bool> {
+    let database_url = sqlite_url_for_path(db_path);
+    let token = std::env::var("ILINK_TOKEN").ok();
+    let ilink_base_url = std::env::var("ILINK_BASE_URL").ok();
+
+    let (tx_bind, rx_bind) = tokio::sync::oneshot::channel::<String>();
+    let (tx_state, rx_state) = tokio::sync::oneshot::channel::<Arc<ilink_hub::HubState>>();
+
+    let ctrl = app.state::<HubController>();
+    let listening_for_task = ctrl.listening_addr.clone();
+    let hub_state_for_task = ctrl.hub_state.clone();
+    let app_for_bind = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        if let Ok(state) = rx_state.await {
+            if let Ok(mut g) = hub_state_for_task.lock() {
+                *g = Some(state);
+            }
+        }
+        if let Ok(s) = rx_bind.await {
+            if let Ok(mut g) = listening_for_task.lock() {
+                *g = Some(s.clone());
+            }
+            let _ = app_for_bind.emit("hub-listening", s);
+        }
+    });
+
+    let (qr_tx, mut qr_rx) = tokio::sync::mpsc::unbounded_channel::<ilink_hub::QrLoginUiEvent>();
+    let app_qr_emit = app.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(ev) = qr_rx.recv().await {
+            let _ = app_qr_emit.emit("qr-login", ev);
+        }
+    });
+
+    let opts = ilink_hub::ServeOptions {
+        token,
+        addr: addr.clone(),
+        ilink_base_url,
+        database_url,
+        on_listening: Some(tx_bind),
+        qr_login_ui: Some(qr_tx),
+        on_hub_state: Some(tx_state),
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let app_handle = app.clone();
+    let hub_state_for_shutdown = ctrl.hub_state.clone();
+    let listening_for_clear = ctrl.listening_addr.clone();
+
+    tauri::async_runtime::spawn(async move {
+        match ilink_hub::run_serve(opts, shutdown_rx).await {
+            Ok(()) => {
+                if let Ok(mut g) = hub_state_for_shutdown.lock() {
+                    *g = None;
+                }
+                if let Ok(mut g) = listening_for_clear.lock() {
+                    *g = None;
+                }
+                let _ = app_handle.emit("hub-stopped", ());
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "hub exited with error");
+                if let Ok(mut g) = hub_state_for_shutdown.lock() {
+                    *g = None;
+                }
+                if let Ok(mut g) = listening_for_clear.lock() {
+                    *g = None;
+                }
+                let _ = app_handle.emit("hub-error", e.to_string());
+            }
+        }
+    });
+
+    shutdown_tx
 }
 
 #[tauri::command]
@@ -1458,6 +1638,55 @@ async fn stop_hub(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn start_hub(app: tauri::AppHandle) -> Result<(), String> {
+    let ctrl = app
+        .try_state::<HubController>()
+        .ok_or_else(|| "hub not initialized".to_string())?;
+    if ctrl.is_running() {
+        return Err("hub already running".into());
+    }
+    let addr = ctrl.requested_addr.clone();
+    let db_path = ctrl.database_path.clone();
+    // Spawn before installing the sender so the helper's `tauri::async_runtime::spawn`
+    // happens on a thread that already has the Tauri runtime available.
+    let tx = spawn_hub_task(&app, addr, &db_path);
+    let mut guard = ctrl.shutdown_tx.lock().map_err(|e| e.to_string())?;
+    // Re-check inside the lock to close the race window between is_running() and the install.
+    if guard.is_some() {
+        return Err("hub already running".into());
+    }
+    *guard = Some(tx);
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_hub(app: tauri::AppHandle) -> Result<(), String> {
+    let Some(ctrl) = app.try_state::<HubController>() else {
+        return Err("hub not initialized".to_string());
+    };
+    let old_tx = ctrl.shutdown_tx.lock().map_err(|e| e.to_string())?.take();
+    if let Some(tx) = old_tx {
+        // Best-effort: signal stop; ignore error if the receiver already dropped.
+        let _ = tx.send(true);
+    }
+    // Wait until any prior run_serve has fully torn down before spawning a new one,
+    // so we don't race a `hub-stopped` / `hub-listening` emission against the new task.
+    let listening = ctrl.listening_addr.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let still_listening = listening.lock().map(|g| g.is_some()).unwrap_or(false);
+        if !still_listening {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("hub stop timed out".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    start_hub(app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1476,69 +1705,11 @@ pub fn run() {
 
             let requested_addr =
                 std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_string());
-            let database_url = sqlite_url_for_path(&db_path);
-            let token = std::env::var("ILINK_TOKEN").ok();
-            let ilink_base_url = std::env::var("ILINK_BASE_URL").ok();
 
-            let (tx_bind, rx_bind) = tokio::sync::oneshot::channel::<String>();
-            let (tx_state, rx_state) = tokio::sync::oneshot::channel::<Arc<ilink_hub::HubState>>();
             let listening_addr = Arc::new(Mutex::new(None::<String>));
             let hub_state = Arc::new(Mutex::new(None::<Arc<ilink_hub::HubState>>));
-            let listening_for_task = listening_addr.clone();
-            let hub_state_for_task = hub_state.clone();
-            let app_for_bind = app.handle().clone();
 
-            tauri::async_runtime::spawn(async move {
-                if let Ok(state) = rx_state.await {
-                    if let Ok(mut g) = hub_state_for_task.lock() {
-                        *g = Some(state);
-                    }
-                }
-                if let Ok(s) = rx_bind.await {
-                    if let Ok(mut g) = listening_for_task.lock() {
-                        *g = Some(s.clone());
-                    }
-                    let _ = app_for_bind.emit("hub-listening", s);
-                }
-            });
-
-            let (qr_tx, mut qr_rx) =
-                tokio::sync::mpsc::unbounded_channel::<ilink_hub::QrLoginUiEvent>();
-            let app_qr_emit = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                while let Some(ev) = qr_rx.recv().await {
-                    let _ = app_qr_emit.emit("qr-login", ev);
-                }
-            });
-
-            let opts = ilink_hub::ServeOptions {
-                token,
-                addr: requested_addr.clone(),
-                ilink_base_url,
-                database_url,
-                on_listening: Some(tx_bind),
-                qr_login_ui: Some(qr_tx),
-                on_hub_state: Some(tx_state),
-            };
-
-            let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let app_handle = app.handle().clone();
-            let hub_state_for_shutdown = hub_state.clone();
-
-            tauri::async_runtime::spawn(async move {
-                match ilink_hub::run_serve(opts, shutdown_rx).await {
-                    Ok(()) => {
-                        if let Ok(mut g) = hub_state_for_shutdown.lock() {
-                            *g = None;
-                        }
-                        let _ = app_handle.emit("hub-stopped", ());
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "hub exited with error");
-                        let _ = app_handle.emit("hub-error", e.to_string());
-                    }
-                }
-            });
+            let shutdown_tx = spawn_hub_task(app.handle(), requested_addr.clone(), &db_path);
 
             app.manage(HubController {
                 shutdown_tx: Mutex::new(Some(shutdown_tx)),
@@ -1602,7 +1773,9 @@ pub fn run() {
             bridge_start,
             bridge_stop,
             bridge_restart,
-            stop_hub
+            stop_hub,
+            start_hub,
+            restart_hub
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

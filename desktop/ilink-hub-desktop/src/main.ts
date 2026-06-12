@@ -364,6 +364,24 @@ function setHubState(state: HubState, line?: string) {
       collapseRegisterForm(true);
     }
   }
+
+  const btnStart = $<HTMLButtonElement>("#btn-start");
+  const btnStop = $<HTMLButtonElement>("#btn-stop");
+  // Footer button toggles between stop (danger) and start (primary) based on hub state.
+  // Stop is only meaningful when the hub is actually running; start is the recovery
+  // affordance for the stopped / starting-failed case so the user never gets stuck.
+  const showStart = state === "stopped" || state === "error";
+  const showStop = state === "running" || state === "starting";
+  if (btnStart) {
+    if (showStart) btnStart.removeAttribute("hidden");
+    else btnStart.setAttribute("hidden", "");
+    btnStart.disabled = state === "starting";
+  }
+  if (btnStop) {
+    if (showStop) btnStop.removeAttribute("hidden");
+    else btnStop.setAttribute("hidden", "");
+    btnStop.disabled = state !== "running";
+  }
 }
 
 function showQrModal() {
@@ -1085,8 +1103,11 @@ window.addEventListener("DOMContentLoaded", () => {
   });
 
   $("#btn-stop")?.addEventListener("click", async () => {
+    // Stop is a destructive action but no longer the only option — the footer
+    // exposes a Start button afterwards so an accidental click is recoverable.
+    // Keep the confirmation lightweight: explain consequence + default cancel.
     const ok = window.confirm(
-      "确定要停止本机 Hub 服务吗？微信中转将暂时不可用，已连接的后端会断开。",
+      "确定要停止本机 Hub 服务吗？停止后可在下方重新启动。\n\n微信中转将暂时不可用，已连接的后端会断开。",
     );
     if (!ok) return;
     try {
@@ -1097,6 +1118,20 @@ window.addEventListener("DOMContentLoaded", () => {
       if (btnStop) btnStop.disabled = true;
     } catch (err) {
       setError(String(err));
+    }
+  });
+
+  $("#btn-start")?.addEventListener("click", async () => {
+    const btnStart = $<HTMLButtonElement>("#btn-start");
+    if (btnStart) btnStart.disabled = true;
+    try {
+      setHubState("starting", "正在重新启动 Hub…");
+      await invoke("start_hub");
+      void refreshHubInfo();
+    } catch (err) {
+      setError(String(err));
+      setHubState("stopped", "启动失败，可重试。");
+      if (btnStart) btnStart.disabled = false;
     }
   });
 
