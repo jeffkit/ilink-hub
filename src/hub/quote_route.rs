@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tracing::warn;
 
 use super::router::{HubCommand, RoutingDecision};
 
@@ -79,6 +80,8 @@ const INDEX_TTL: Duration = Duration::from_secs(86400 * 7);
 const MAX_CONTENT_ENTRIES_PER_KEY: usize = 32;
 /// Length (in chars) of the prefix key used to tolerate WeChat truncating long quoted text.
 const CONTENT_PREFIX_CHARS: usize = 48;
+/// Cap the total number of content signature keys in the index to prevent memory exhaustion.
+const MAX_BY_CONTENT_KEYS: usize = 10_000;
 
 impl QuoteRouteIndex {
     /// Index an outbound message by its exact rendered text so a later quote-reply in the
@@ -91,6 +94,13 @@ impl QuoteRouteIndex {
         let now_ms = now_millis();
         let deadline = Instant::now() + INDEX_TTL;
         for key in content_keys(text) {
+            if !self.by_content.contains_key(&key) && self.by_content.len() >= MAX_BY_CONTENT_KEYS {
+                warn!(
+                    "QuoteRouteIndex limit reached ({}), skipping registration for key: {}",
+                    MAX_BY_CONTENT_KEYS, key
+                );
+                continue;
+            }
             let bucket = self.by_content.entry(key).or_default();
             bucket.push(ContentEntry {
                 scope: scope.to_string(),
@@ -469,5 +479,61 @@ mod tests {
                 cmd: HubCommand::Help
             })
         ));
+    }
+
+    #[test]
+    fn register_outbound_content_respects_limit() {
+        let mut idx = QuoteRouteIndex::default();
+        // Register 10,000 distinct messages
+        for i in 0..10000 {
+            idx.register_outbound_content(
+                SCOPE,
+                &format!("msg_{}", i),
+                QuoteOrigin::Client {
+                    vtoken: "vt".into(),
+                    name: "n".into(),
+                    label: None,
+                    session_name: None,
+                },
+            );
+        }
+        assert_eq!(idx.by_content.len(), 10000);
+
+        // Register one more, it should be skipped
+        idx.register_outbound_content(
+            SCOPE,
+            "msg_overflow",
+            QuoteOrigin::Client {
+                vtoken: "vt".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        // The count should still be 10,000 and msg_overflow should not be present
+        assert_eq!(idx.by_content.len(), 10000);
+        let user = quote_reply("reply", "msg_overflow", None);
+        assert!(idx.resolve_user_quote(SCOPE, &user).is_none());
+
+        // However, registering an existing key should still succeed and update the entries
+        idx.register_outbound_content(
+            SCOPE,
+            "msg_0",
+            QuoteOrigin::Client {
+                vtoken: "vt_updated".into(),
+                name: "n".into(),
+                label: None,
+                session_name: None,
+            },
+        );
+        assert_eq!(idx.by_content.len(), 10000);
+        let user_updated = quote_reply("reply", "msg_0", None);
+        let origin = idx
+            .resolve_user_quote(SCOPE, &user_updated)
+            .expect("resolve");
+        match origin {
+            QuoteOrigin::Client { vtoken, .. } => assert_eq!(vtoken, "vt_updated"),
+            _ => panic!("expected client"),
+        }
     }
 }
