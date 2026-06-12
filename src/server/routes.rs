@@ -280,7 +280,7 @@ pub async fn sendmessage(
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
     let (real_ctx, peer_user_id) = {
-        let ctx_map = state.ctx_map.read().await;
+        let mut ctx_map = state.ctx_map.write().await;
         ctx_map
             .resolve_full(&vctx)
             .map(|(r, p)| (r.to_string(), p.to_string()))

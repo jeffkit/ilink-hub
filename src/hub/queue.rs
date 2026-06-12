@@ -159,14 +159,10 @@ impl ContextTokenMap {
     }
 
     /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
-    /// Uses `peek` (no LRU promotion) to allow `&self` and read-lock access.
-    pub fn resolve_full(&self, vtoken: &str) -> Option<(&str, &str)> {
-        let real = self.v_to_real.peek(vtoken)?.as_str();
-        let peer = self
-            .v_to_peer
-            .peek(vtoken)
-            .map(String::as_str)
-            .unwrap_or("");
+    /// Uses `get` (updates LRU promotion) to correctly update the LRU cache priority.
+    pub fn resolve_full(&mut self, vtoken: &str) -> Option<(&str, &str)> {
+        let real = self.v_to_real.get(vtoken)?.as_str();
+        let peer = self.v_to_peer.get(vtoken).map(String::as_str).unwrap_or("");
         Some((real, peer))
     }
 
@@ -226,6 +222,32 @@ mod context_map_tests {
         m.seed_full("vctx_1".into(), "real".into(), "peer@x".into());
         assert_eq!(m.resolve("vctx_1"), Some("real"));
         assert_eq!(m.resolve_full("vctx_1"), Some(("real", "peer@x")));
+    }
+
+    #[test]
+    fn test_resolve_full_updates_lru_hotness() {
+        let mut m = ContextTokenMap::default();
+
+        let v0 = m.map("real-0".into(), "user-0".into(), None);
+        let v1 = m.map("real-1".into(), "user-1".into(), None);
+
+        // Access v0 to promote it
+        assert!(m.resolve_full(&v0).is_some());
+
+        // Insert more entries to trigger eviction (MAX_CTX_MAP_ENTRIES is 50,000)
+        for i in 2..=50000 {
+            m.map(format!("real-{}", i), format!("user-{}", i), None);
+        }
+
+        // v0 should be preserved, while v1 should be evicted
+        assert!(
+            m.resolve_full(&v0).is_some(),
+            "v0 should be preserved due to resolve_full promotion"
+        );
+        assert!(
+            m.resolve_full(&v1).is_none(),
+            "v1 should be evicted as the oldest unpromoted entry"
+        );
     }
 }
 
