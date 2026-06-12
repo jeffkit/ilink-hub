@@ -9,6 +9,18 @@ type HubInfo = {
   databasePath: string;
 };
 
+type DesktopSettingsPayload = {
+  listenPort: number;
+  requestedAddr: string;
+};
+
+type SetListenPortResult = {
+  ok: boolean;
+  requestedAddr: string;
+  listenPort: number;
+  error: string | null;
+};
+
 type HubClientRow = {
   name: string;
   label: string | null;
@@ -205,6 +217,47 @@ function openConfirmModal(message: string, title = "请确认"): Promise<boolean
   });
 }
 
+type PortConflictResolver = ((port: number | null) => void) | null;
+let portConflictResolver: PortConflictResolver = null;
+
+function closePortConflictModal(port: number | null) {
+  $("#port-conflict-modal")?.setAttribute("hidden", "");
+  const msg = $<HTMLElement>("#port-conflict-msg");
+  if (msg) {
+    msg.textContent = "";
+    msg.hidden = true;
+  }
+  const input = $<HTMLInputElement>("#port-conflict-input");
+  if (input) input.value = "";
+  if (portConflictResolver) {
+    portConflictResolver(port);
+    portConflictResolver = null;
+  }
+}
+
+function openPortConflictModal(
+  message: string,
+  suggestedPort: number,
+): Promise<number | null> {
+  return new Promise((resolve) => {
+    const modal = $<HTMLElement>("#port-conflict-modal");
+    const msg = $<HTMLElement>("#port-conflict-message");
+    const input = $<HTMLInputElement>("#port-conflict-input");
+    if (!modal || !msg || !input) {
+      resolve(null);
+      return;
+    }
+    msg.textContent = message;
+    input.value = String(suggestedPort);
+    portConflictResolver = resolve;
+    modal.removeAttribute("hidden");
+    requestAnimationFrame(() => {
+      input.focus();
+      input.select();
+    });
+  });
+}
+
 const actionIcon = {
   edit: `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path d="M12 20h9" />
@@ -344,6 +397,141 @@ function toggleRegisterForm() {
       $<HTMLInputElement>("#reg-name")?.focus();
     });
   }
+}
+
+// ─── Listen-port setting (M2 — UX-02) ───────────────────────────────────────
+
+let lastListenPort: number | null = null;
+
+function parsePortFromAddr(addr: string | null | undefined): number | null {
+  if (!addr) return null;
+  const trimmed = addr.trim();
+  if (!trimmed) return null;
+  // Accept 127.0.0.1:<port>, localhost:<port>, or a bare <port>.
+  const parts = trimmed.split(":");
+  if (parts.length === 1) {
+    const n = Number(parts[0]);
+    return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+  }
+  const portStr = parts[parts.length - 1];
+  const n = Number(portStr);
+  return Number.isInteger(n) && n >= 1 && n <= 65535 ? n : null;
+}
+
+function setPortMsg(msg: string | null, isError = true) {
+  const el = $<HTMLElement>("#port-msg");
+  if (!el) return;
+  if (!msg) {
+    el.textContent = "";
+    el.hidden = true;
+    return;
+  }
+  el.textContent = msg;
+  el.hidden = false;
+  el.style.color = isError ? "" : "var(--ok)";
+}
+
+function prefillListenPort(port: number | null) {
+  const input = $<HTMLInputElement>("#listen-port-input");
+  if (!input) return;
+  if (port !== null) {
+    input.value = String(port);
+    input.placeholder = String(port);
+    lastListenPort = port;
+  }
+}
+
+async function refreshDesktopSettings() {
+  try {
+    const s = await invoke<DesktopSettingsPayload>("get_desktop_settings");
+    prefillListenPort(s.listenPort);
+    return s;
+  } catch {
+    // Keep last known port; UI will fall back to whatever the input shows.
+    return null;
+  }
+}
+
+/** Heuristic: decide whether a hub-error payload points at a bind conflict. */
+function isPortBindError(message: string | null | undefined): boolean {
+  if (!message) return false;
+  const m = message.toLowerCase();
+  if (m.includes("address already in use")) return true;
+  if (m.includes("already in use")) return true;
+  if (m.includes("bind")) return true;
+  if (m.includes("eaddrinuse")) return true;
+  return false;
+}
+
+function extractPortFromError(message: string): number | null {
+  // Try to read back the offending port from the error text (e.g.
+  // "address already in use (os error 48) at 127.0.0.1:8765"). Falls back
+  // to the active requested_addr's port when nothing specific is parseable.
+  const m = String(message);
+  const re = /(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::\]):(\d{1,5})/i;
+  const hit = m.match(re);
+  if (hit) {
+    const n = Number(hit[1]);
+    if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
+  }
+  return lastListenPort;
+}
+
+async function applyListenPortChange(newPort: number): Promise<boolean> {
+  if (!Number.isInteger(newPort) || newPort < 1 || newPort > 65535) {
+    setPortMsg("端口必须在 1..=65535 之间");
+    return false;
+  }
+  const btn = $<HTMLButtonElement>("#btn-save-port");
+  if (btn) btn.disabled = true;
+  try {
+    const res = await invoke<SetListenPortResult>("set_listen_port", { port: newPort });
+    if (!res.ok) {
+      setPortMsg(res.error ?? "保存端口失败");
+      return false;
+    }
+    prefillListenPort(res.listenPort);
+    setPortMsg(`已保存为 ${res.listenPort}，正在重启 Hub…`, false);
+
+    // Restart the hub so the new port actually takes effect.
+    if (hubBaseUrl) {
+      // Service is up: stop + start (restart_hub drains run_serve first).
+      try {
+        await invoke("restart_hub");
+      } catch (err) {
+        setPortMsg(`重启失败：${String(err)}`);
+        return false;
+      }
+    } else {
+      // Service not running yet: just start it.
+      try {
+        await invoke("start_hub");
+      } catch (err) {
+        setPortMsg(`启动失败：${String(err)}`);
+        return false;
+      }
+    }
+    setHubState("starting", "正在重新启动 Hub…");
+    void refreshHubInfo();
+    return true;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function handleBindFailure(message: string) {
+  const activePort = extractPortFromError(message) ?? lastListenPort ?? 8765;
+  const suggested = activePort + 1 > 65535 ? Math.max(1, activePort - 1) : activePort + 1;
+  // Don't double-open if a modal is already up.
+  const existing = $<HTMLElement>("#port-conflict-modal");
+  if (existing && !existing.hidden) return;
+  const choice = await openPortConflictModal(
+    `当前端口 ${activePort} 已被占用，无法启动 Hub。请换一个端口再试。`,
+    suggested,
+  );
+  if (choice === null) return;
+  // Apply the chosen port; on failure, the inline form-msg surfaces the reason.
+  await applyListenPortChange(choice);
 }
 
 function setHubState(state: HubState, line?: string) {
@@ -804,6 +992,14 @@ function applyHubInfo(info: HubInfo) {
   const bindHint = $<HTMLElement>("#bind-hint");
   const btnStop = $<HTMLButtonElement>("#btn-stop");
 
+  // Keep the listen-port input in sync with the controller's view of the
+  // requested address (which may have been changed by the user since the
+  // input was last touched).
+  const requestedPort = parsePortFromAddr(info.requestedAddr);
+  if (requestedPort !== null) {
+    prefillListenPort(requestedPort);
+  }
+
   if (info.listeningAddr) {
     hubBaseUrl = info.hubBaseUrl ?? "";
     const displayUrl = hubBaseUrl || `http://${info.listeningAddr.replace(/^\/*/, "")}`;
@@ -1005,6 +1201,7 @@ function setActiveTab(which: "home" | "backends" | "bridge") {
 window.addEventListener("DOMContentLoaded", () => {
   document.body.dataset.activeTab = "home";
   void refreshHubInfo();
+  void refreshDesktopSettings();
 
   $("#tab-home")?.addEventListener("click", () => setActiveTab("home"));
   $("#tab-backends")?.addEventListener("click", () => setActiveTab("backends"));
@@ -1135,6 +1332,52 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
+  $("#btn-save-port")?.addEventListener("click", async () => {
+    const input = $<HTMLInputElement>("#listen-port-input");
+    if (!input) return;
+    const raw = input.value.trim();
+    const n = Number(raw);
+    if (!raw || !Number.isInteger(n) || n < 1 || n > 65535) {
+      setPortMsg("请输入 1..=65535 之间的端口号");
+      return;
+    }
+    setPortMsg(null);
+    await applyListenPortChange(n);
+  });
+
+  $("#listen-port-input")?.addEventListener("keydown", (e) => {
+    if ((e as KeyboardEvent).key === "Enter") {
+      $("#btn-save-port")?.dispatchEvent(new Event("click", { bubbles: true }));
+    }
+  });
+
+  $("#port-conflict-modal")?.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    const action = target.closest<HTMLElement>("[data-port-conflict]")?.dataset.portConflict;
+    if (action === "cancel") {
+      closePortConflictModal(null);
+      return;
+    }
+    if (action === "apply") {
+      const input = $<HTMLInputElement>("#port-conflict-input");
+      const msg = $<HTMLElement>("#port-conflict-msg");
+      const raw = input?.value.trim() ?? "";
+      const n = Number(raw);
+      if (!raw || !Number.isInteger(n) || n < 1 || n > 65535) {
+        if (msg) {
+          msg.textContent = "请输入 1..=65535 之间的端口号";
+          msg.hidden = false;
+        }
+        return;
+      }
+      if (msg) {
+        msg.textContent = "";
+        msg.hidden = true;
+      }
+      closePortConflictModal(n);
+    }
+  });
+
   $("#qr-copy")?.addEventListener("click", () => {
     if (lastQrLink) void copyToClipboard(lastQrLink, "链接已复制，可到微信里粘贴打开");
   });
@@ -1148,6 +1391,9 @@ window.addEventListener("DOMContentLoaded", () => {
     clearStatsUi();
     void refreshBridgeStatus();
     void refreshHubInfo();
+    if (isPortBindError(ev.payload)) {
+      void handleBindFailure(ev.payload);
+    }
   });
 
   void listen("hub-stopped", () => {

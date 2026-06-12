@@ -56,6 +56,160 @@ fn loopback_hub_origin(listen_addr: &str) -> String {
     format!("http://{host_port}")
 }
 
+/// Path of the persisted GUI port override file: `~/.ilink-hub/desktop-port.json`.
+///
+/// Schema: `{ "port": <u16> }`. Missing / malformed files fall back to the
+/// env-derived default so the desktop app keeps working without the file.
+fn desktop_port_override_path() -> PathBuf {
+    ilink_hub::paths::data_dir().join("desktop-port.json")
+}
+
+/// Compose the loopback listen address `127.0.0.1:<port>` for a user-selected
+/// port. Centralised so tests and the command handler agree on the exact form.
+fn loopback_listen_addr_for_port(port: u16) -> String {
+    format!("127.0.0.1:{port}")
+}
+
+/// Persisted payload for `desktop-port.json`. Kept tiny and additive — extra
+/// keys in future revisions are tolerated by `serde` only if we explicitly
+/// add them; today there is exactly one.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopPortOverride {
+    port: u16,
+}
+
+/// Read the persisted port override. Returns `Ok(None)` when the file is
+/// missing (not yet chosen). Any other I/O / parse error is surfaced so
+/// `setup()` can decide between "ignore and continue" vs. "bubble up".
+fn load_desktop_port_override() -> Result<Option<u16>, String> {
+    let path = desktop_port_override_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取端口设置失败: {e}"))?;
+    let parsed: DesktopPortOverride =
+        serde_json::from_str(&raw).map_err(|e| format!("端口设置格式无效: {e}"))?;
+    if parsed.port == 0 {
+        return Err("端口设置包含 0，必须在 1..=65535 之间".into());
+    }
+    Ok(Some(parsed.port))
+}
+
+/// Persist a port override atomically (write to a sibling temp file, rename).
+/// Atomicity avoids leaving a half-written JSON that the next launch would
+/// treat as malformed and drop on the floor.
+fn save_desktop_port_override(port: u16) -> Result<(), String> {
+    let path = desktop_port_override_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建设置目录失败: {e}"))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let payload = DesktopPortOverride { port };
+    let raw = serde_json::to_string_pretty(&payload)
+        .map_err(|e| format!("序列化端口设置失败: {e}"))?;
+    std::fs::write(&tmp, raw).map_err(|e| format!("写入端口设置失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("提交端口设置失败: {e}"))?;
+    Ok(())
+}
+
+/// Resolve the listen address the desktop shell should use on first start.
+///
+/// Priority: persisted port override → `ILINK_HUB_ADDR` env var → default
+/// `127.0.0.1:8765`. The port override only overrides the port; the host
+/// stays loopback so the saved choice cannot accidentally rebind on a
+/// non-loopback interface.
+fn resolve_initial_listen_addr() -> Result<String, String> {
+    match load_desktop_port_override()? {
+        Some(port) => Ok(loopback_listen_addr_for_port(port)),
+        None => Ok(std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into())),
+    }
+}
+
+/// Settings payload exposed to the frontend via `get_desktop_settings`.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSettingsPayload {
+    /// Port currently configured for the next bind (parsed out of
+    /// `requested_addr` so the UI can pre-fill the input even when the value
+    /// originated from `ILINK_HUB_ADDR`).
+    pub listen_port: u16,
+    /// Full loopback address the controller will hand to `run_serve`.
+    pub requested_addr: String,
+}
+
+fn parse_loopback_port(addr: &str) -> Option<u16> {
+    // Accept `127.0.0.1:<port>` (canonical) and the very loose `<port>` form
+    // some early users might paste in. Anything else returns None and the
+    // UI falls back to the default port.
+    let trimmed = addr.trim();
+    if let Some(rest) = trimmed.strip_prefix("127.0.0.1:") {
+        return rest.parse::<u16>().ok().filter(|p| *p > 0);
+    }
+    if let Some(rest) = trimmed.strip_prefix("localhost:") {
+        return rest.parse::<u16>().ok().filter(|p| *p > 0);
+    }
+    if !trimmed.contains(':') {
+        return trimmed.parse::<u16>().ok().filter(|p| *p > 0);
+    }
+    None
+}
+
+#[tauri::command]
+fn get_desktop_settings<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> DesktopSettingsPayload {
+    let Some(ctrl) = app.try_state::<HubController>() else {
+        return DesktopSettingsPayload {
+            listen_port: 8765,
+            requested_addr: "127.0.0.1:8765".into(),
+        };
+    };
+    let requested_addr = ctrl.requested_addr();
+    let listen_port = parse_loopback_port(&requested_addr).unwrap_or(8765);
+    DesktopSettingsPayload {
+        listen_port,
+        requested_addr,
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetListenPortResult {
+    pub ok: bool,
+    pub requested_addr: String,
+    pub listen_port: u16,
+    pub error: Option<String>,
+}
+
+#[tauri::command]
+fn set_listen_port<R: tauri::Runtime>(app: tauri::AppHandle<R>, port: u16) -> SetListenPortResult {
+    if port == 0 {
+        return SetListenPortResult {
+            ok: false,
+            requested_addr: "".into(),
+            listen_port: 0,
+            error: Some("端口必须在 1..=65535 之间".into()),
+        };
+    }
+    if let Err(e) = save_desktop_port_override(port) {
+        return SetListenPortResult {
+            ok: false,
+            requested_addr: "".into(),
+            listen_port: port,
+            error: Some(e),
+        };
+    }
+    let new_addr = loopback_listen_addr_for_port(port);
+    if let Some(ctrl) = app.try_state::<HubController>() {
+        ctrl.set_requested_addr(new_addr.clone());
+    }
+    SetListenPortResult {
+        ok: true,
+        requested_addr: new_addr,
+        listen_port: port,
+        error: None,
+    }
+}
+
 #[tauri::command]
 async fn hub_clients(app: tauri::AppHandle) -> HubClientsPayload {
     let Some(ctrl) = app.try_state::<HubController>() else {
@@ -1412,7 +1566,7 @@ mod tests {
             task_handles: Mutex::new(HubTaskHandles::default()),
             env_token: None,
             env_base_url: None,
-            requested_addr: "127.0.0.1:8765".into(),
+            requested_addr: Mutex::new("127.0.0.1:8765".into()),
             database_path: PathBuf::from("/tmp/ilink-hub-test.db"),
             listening_addr: Arc::new(Mutex::new(None)),
             hub_state: Arc::new(Mutex::new(None)),
@@ -1766,6 +1920,278 @@ mod tests {
         assert!(slow_won, "slow caller should have won the slot");
         assert!(!fast_won, "fast caller must NOT overwrite the slow caller's install");
     }
+
+    // ─── M2 — port-override persistence / parsing / controller surface ────
+
+    use std::sync::Mutex as StdMutex;
+
+    /// Serialize port-override tests so they don't step on the global data dir.
+    /// The desktop-port.json path is a real on-disk artifact under
+    /// `~/.ilink-hub`, and we don't want parallel tests racing to read/write
+    /// the same file in CI.
+    static PORT_OVERRIDE_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// `HOME`-shaped environment for `resolve_initial_listen_addr` to inspect.
+    struct ScopedHome {
+        previous: Option<String>,
+        original: PathBuf,
+    }
+
+    impl ScopedHome {
+        fn set(home: &Path) -> Self {
+            let previous = std::env::var("HOME").ok();
+            let original = ilink_hub::paths::data_dir();
+            // `data_dir()` reads `dirs::home_dir()`, which on Unix consults
+            // `HOME` first; set it for the duration of the test.
+            std::env::set_var("HOME", home);
+            Self { previous, original }
+        }
+    }
+
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            // Touch the original to make sure the value was actually read by
+            // dirs; this is a no-op but documents intent.
+            let _ = self.original;
+        }
+    }
+
+    #[test]
+    fn loopback_listen_addr_for_port_is_loopback_only() {
+        // Hard-coded form is the contract; users must not be able to override
+        // it into a non-loopback bind via the GUI.
+        assert_eq!(loopback_listen_addr_for_port(8765), "127.0.0.1:8765");
+        assert_eq!(loopback_listen_addr_for_port(1), "127.0.0.1:1");
+        assert_eq!(loopback_listen_addr_for_port(65535), "127.0.0.1:65535");
+    }
+
+    #[test]
+    fn parse_loopback_port_accepts_canonical_and_loose_forms() {
+        assert_eq!(parse_loopback_port("127.0.0.1:8765"), Some(8765));
+        assert_eq!(parse_loopback_port("localhost:9000"), Some(9000));
+        // Bare port (no host).
+        assert_eq!(parse_loopback_port("9123"), Some(9123));
+        // 0 is rejected so the UI never shows "port 0" as the active port.
+        assert_eq!(parse_loopback_port("127.0.0.1:0"), None);
+        // Non-numeric and non-parseable strings return None so callers fall back.
+        assert_eq!(parse_loopback_port("not-an-addr"), None);
+        assert_eq!(parse_loopback_port(""), None);
+        assert_eq!(parse_loopback_port("[::]:8765"), None);
+        assert_eq!(parse_loopback_port("0.0.0.0:8765"), None);
+        // Out-of-range numeric tokens reject cleanly.
+        assert_eq!(parse_loopback_port("99999"), None);
+        assert_eq!(parse_loopback_port("-1"), None);
+    }
+
+    #[test]
+    fn desktop_port_override_round_trip_under_data_dir() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        // Clean any leftover override from a previous test in this dir.
+        let path = desktop_port_override_path();
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        // Missing file → Ok(None).
+        assert!(load_desktop_port_override().unwrap().is_none());
+
+        // Save and reload.
+        save_desktop_port_override(9123).unwrap();
+        assert!(path.exists(), "override file should exist after save");
+        assert_eq!(load_desktop_port_override().unwrap(), Some(9123));
+
+        // On-disk payload uses camelCase for forward compatibility with the
+        // TypeScript frontend (which serde-deserialises via camelCase).
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("\"port\""),
+            "serialised JSON should contain the `port` field, got: {raw}"
+        );
+    }
+
+    #[test]
+    fn desktop_port_override_rejects_zero_in_loaded_file() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        // Hand-craft a malformed file with port=0.
+        let path = desktop_port_override_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "{\"port\":0}").unwrap();
+
+        let err = load_desktop_port_override().unwrap_err();
+        assert!(
+            err.contains("1..=65535") || err.contains("端口"),
+            "expected validation error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn desktop_port_override_rejects_malformed_json() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        let path = desktop_port_override_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, "this is not json").unwrap();
+
+        let err = load_desktop_port_override().unwrap_err();
+        assert!(
+            err.contains("格式") || err.contains("无效") || err.contains("JSON"),
+            "expected JSON parse error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_initial_listen_addr_prefers_persisted_port() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        // Persist a port, then ensure it overrides the env default.
+        save_desktop_port_override(9123).unwrap();
+        // `ILINK_HUB_ADDR` is process-global — scrub it for the duration of
+        // this test so the env branch doesn't leak from the outer process.
+        let prev = std::env::var("ILINK_HUB_ADDR").ok();
+        std::env::remove_var("ILINK_HUB_ADDR");
+
+        let resolved = resolve_initial_listen_addr().expect("resolve");
+        assert_eq!(resolved, "127.0.0.1:9123");
+
+        match prev {
+            Some(v) => std::env::set_var("ILINK_HUB_ADDR", v),
+            None => std::env::remove_var("ILINK_HUB_ADDR"),
+        }
+    }
+
+    #[test]
+    fn resolve_initial_listen_addr_falls_back_to_env_when_no_override() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        // No persisted file → env var should win.
+        let prev_addr = std::env::var("ILINK_HUB_ADDR").ok();
+        std::env::set_var("ILINK_HUB_ADDR", "127.0.0.1:7777");
+        let resolved = resolve_initial_listen_addr().expect("resolve");
+        assert_eq!(resolved, "127.0.0.1:7777");
+
+        // Default branch: no override, no env → 127.0.0.1:8765.
+        std::env::remove_var("ILINK_HUB_ADDR");
+        let resolved = resolve_initial_listen_addr().expect("resolve");
+        assert_eq!(resolved, "127.0.0.1:8765");
+
+        match prev_addr {
+            Some(v) => std::env::set_var("ILINK_HUB_ADDR", v),
+            None => std::env::remove_var("ILINK_HUB_ADDR"),
+        }
+    }
+
+    #[test]
+    fn hub_controller_set_requested_addr_is_observable_via_getter() {
+        // The GUI change-port flow needs to flip `requested_addr` in place
+        // AND have `hub_info` return the new value on the next call.
+        let ctrl = make_hub_controller(false);
+        assert_eq!(ctrl.requested_addr(), "127.0.0.1:8765");
+        ctrl.set_requested_addr("127.0.0.1:9001".into());
+        assert_eq!(ctrl.requested_addr(), "127.0.0.1:9001");
+
+        // `start_hub` reads via `ctrl.requested_addr()` — assert the value
+        // the spawn path would use is the updated one.
+        assert_eq!(ctrl.requested_addr(), "127.0.0.1:9001");
+    }
+
+    #[test]
+    fn set_listen_port_command_rejects_zero() {
+        // The 0-port rejection is documented behaviour: bind on port 0 is
+        // not user-meaningful (it's "pick any free ephemeral port") and the
+        // UI must surface this so the user picks a real port.
+        let app = tauri::test::mock_app();
+        let result = set_listen_port(app.handle().clone(), 0);
+        assert!(!result.ok, "port=0 must be rejected");
+        assert_eq!(result.listen_port, 0);
+        assert!(result.error.is_some(), "rejection must carry an error");
+    }
+
+    #[test]
+    fn set_listen_port_command_persists_and_updates_controller() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        let app = tauri::test::mock_app();
+        app.manage(make_hub_controller(false));
+
+        let result = set_listen_port(app.handle().clone(), 9123);
+        assert!(result.ok, "expected ok, got error: {:?}", result.error);
+        assert_eq!(result.requested_addr, "127.0.0.1:9123");
+        assert_eq!(result.listen_port, 9123);
+
+        // The on-disk file should round-trip via the loader.
+        assert_eq!(load_desktop_port_override().unwrap(), Some(9123));
+
+        // And the controller's view should reflect the new address.
+        let ctrl = app.state::<HubController>();
+        assert_eq!(ctrl.requested_addr(), "127.0.0.1:9123");
+    }
+
+    #[test]
+    fn set_listen_port_command_overwrites_previous_value() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        let app = tauri::test::mock_app();
+        app.manage(make_hub_controller(false));
+
+        let first = set_listen_port(app.handle().clone(), 8765);
+        assert!(first.ok);
+        assert_eq!(load_desktop_port_override().unwrap(), Some(8765));
+
+        let second = set_listen_port(app.handle().clone(), 9999);
+        assert!(second.ok);
+        assert_eq!(load_desktop_port_override().unwrap(), Some(9999));
+
+        let ctrl = app.state::<HubController>();
+        assert_eq!(ctrl.requested_addr(), "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn get_desktop_settings_prefills_listen_port_from_requested_addr() {
+        let app = tauri::test::mock_app();
+        let ctrl = make_hub_controller(false);
+        ctrl.set_requested_addr("127.0.0.1:9211".into());
+        app.manage(ctrl);
+
+        let settings = get_desktop_settings(app.handle().clone());
+        assert_eq!(settings.listen_port, 9211);
+        assert_eq!(settings.requested_addr, "127.0.0.1:9211");
+    }
+
+    #[test]
+    fn get_desktop_settings_falls_back_to_default_when_unparseable() {
+        let app = tauri::test::mock_app();
+        let ctrl = make_hub_controller(false);
+        ctrl.set_requested_addr("[::]:8765".into()); // not parseable to a u16
+        app.manage(ctrl);
+
+        let settings = get_desktop_settings(app.handle().clone());
+        assert_eq!(settings.listen_port, 8765);
+        assert_eq!(settings.requested_addr, "[::]:8765");
+    }
 }
 
 /// Handles to the three async tasks `spawn_hub_task` launches, so the
@@ -1804,7 +2230,11 @@ struct HubController {
     /// silently pick up env-mutated token / base_url between stop and start.
     env_token: Option<String>,
     env_base_url: Option<String>,
-    requested_addr: String,
+    /// Listen address (`127.0.0.1:<port>`). Mutated by the GUI "change port"
+    /// flow via `set_listen_port`; read by `hub_info` so the UI can show what
+    /// will be used on the next start. Mirrors the value persisted to disk so
+    /// the in-memory and on-disk views stay coherent across restarts.
+    requested_addr: Mutex<String>,
     database_path: PathBuf,
     listening_addr: Arc<Mutex<Option<String>>>,
     hub_state: Arc<Mutex<Option<Arc<ilink_hub::HubState>>>>,
@@ -1817,6 +2247,21 @@ impl HubController {
             .lock()
             .expect("HubController mutex poisoned — please restart the app")
             .is_some()
+    }
+
+    fn requested_addr(&self) -> String {
+        self.requested_addr
+            .lock()
+            .expect("HubController mutex poisoned — please restart the app")
+            .clone()
+    }
+
+    fn set_requested_addr(&self, addr: String) {
+        let mut g = self
+            .requested_addr
+            .lock()
+            .expect("HubController mutex poisoned — please restart the app");
+        *g = addr;
     }
 }
 
@@ -1960,7 +2405,7 @@ fn hub_info(app: tauri::AppHandle) -> Option<HubInfo> {
             .as_ref()
             .map(|origin| format!("{origin}/hub/ui"));
         HubInfo {
-            requested_addr: c.requested_addr.clone(),
+            requested_addr: c.requested_addr(),
             listening_addr,
             admin_url,
             hub_base_url,
@@ -2003,7 +2448,7 @@ async fn start_hub(app: tauri::AppHandle) -> Result<(), String> {
     if guard.is_some() {
         return Err("hub already running".into());
     }
-    let addr = ctrl.requested_addr.clone();
+    let addr = ctrl.requested_addr();
     let db_path = ctrl.database_path.clone();
     let listening_addr = ctrl.listening_addr.clone();
     let hub_state = ctrl.hub_state.clone();
@@ -2117,8 +2562,14 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir).context("create data dir")?;
             let db_path = data_dir.join("ilink-hub.db");
 
-            let requested_addr =
-                std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_string());
+            // Resolve the listen address with this priority: persisted GUI
+            // port override → `ILINK_HUB_ADDR` env var → default. A bad /
+            // unreadable override file falls back to the env default so the
+            // desktop app keeps working rather than refusing to launch.
+            let requested_addr = resolve_initial_listen_addr().unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "failed to read persisted port override; falling back to env/default");
+                std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_string())
+            });
 
             // Capture env-driven config ONCE so subsequent start_hub / restart_hub
             // calls cannot silently swap token / base_url if the process env is
@@ -2137,7 +2588,7 @@ pub fn run() {
                 task_handles: Mutex::new(HubTaskHandles::default()),
                 env_token: env_token.clone(),
                 env_base_url: env_base_url.clone(),
-                requested_addr: requested_addr.clone(),
+                requested_addr: Mutex::new(requested_addr.clone()),
                 database_path: db_path.clone(),
                 listening_addr: listening_addr.clone(),
                 hub_state: hub_state.clone(),
@@ -2233,7 +2684,9 @@ pub fn run() {
             bridge_restart,
             stop_hub,
             start_hub,
-            restart_hub
+            restart_hub,
+            get_desktop_settings,
+            set_listen_port
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
