@@ -28,3 +28,8 @@ sdk/python/dist/
 sdk/python/**/__pycache__/
 sdk/python/**/*.pyc
 sdk/python/**/*.egg-info/
+
+# flowx orchestration: keep config.json tracked, ignore run state and worktrees
+.flowx/runs/
+.flowx/prompt-*.md
+.worktrees/
