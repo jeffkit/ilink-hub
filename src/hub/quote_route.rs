@@ -232,7 +232,7 @@ fn collect_quoted_content(
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<(String, Option<i64>)> {
     let items = msg.item_list.as_ref()?;
-    for item in items {
+    for item in items.iter() {
         let Some(extra) = item.extra.as_object() else {
             continue;
         };
@@ -274,14 +274,14 @@ mod tests {
         WeixinMessage {
             message_type: Some(1),
             from_user_id: Some(SCOPE.into()),
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some(scope_text.into()),
                 }),
                 extra: ref_item,
                 voice_item: None,
-            }]),
+            }])),
             ..Default::default()
         }
     }
@@ -379,14 +379,14 @@ mod tests {
             },
         );
         let user = WeixinMessage {
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
                 text_item: Some(TextItem {
                     text: Some("hi".into()),
                 }),
                 extra: serde_json::Value::Object(Default::default()),
                 voice_item: None,
-            }]),
+            }])),
             ..Default::default()
         };
         assert!(idx.resolve_user_quote(SCOPE, &user).is_none());

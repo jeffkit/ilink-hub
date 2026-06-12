@@ -346,7 +346,7 @@ async fn sendtyping_error_propagation_test() {
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
 
-    let vtoken =
+    let (vtoken, _) =
         ilink_hub::server::pairing::register_client_in_hub(&state, "test-client".to_string(), None)
             .await;
 

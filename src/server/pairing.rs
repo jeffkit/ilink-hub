@@ -286,18 +286,18 @@ pub async fn register_client_in_hub(
     label: Option<String>,
 ) -> (String, bool) {
     // Lock order: registry → router (always). MUST NOT be called while
-    // `state.pairing.write()` is held; doing so would introduce a new
+    // `state.clients.pairing.write()` is held; doing so would introduce a new
     // `pairing → registry → router` lock order that deadlocks against any
     // future code path that takes registry+router and then pairing. (F-M1-1)
     let (vtoken, is_new, is_first) = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         let (vtoken, is_new) = registry.register(name.clone(), label.clone());
         let is_first = is_new && registry.all_clients().len() == 1;
         (vtoken, is_new, is_first)
     };
 
     if is_first {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.set_default(vtoken.clone());
     }
 
@@ -326,7 +326,7 @@ pub async fn unregister_client_in_hub(
     name: &str,
 ) -> Result<(), UnregisterClientError> {
     let vtoken = {
-        let registry = state.registry.read().await;
+        let registry = state.clients.registry.read().await;
         let Some(client) = registry.get_by_name(name) else {
             return Err(UnregisterClientError::NotFound);
         };
@@ -338,19 +338,19 @@ pub async fn unregister_client_in_hub(
 
     // Lock order: registry → router (always). Drop registry before acquiring router.
     let new_default = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         if !registry.remove(name) {
             return Err(UnregisterClientError::NotFound);
         }
         registry.pick_default_after_remove(&vtoken)
     };
     {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(&vtoken, new_default);
     }
 
-    if let Err(e) = state.queue.remove_client(&vtoken).await {
-        warn!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to remove client queue");
+    if let Err(e) = state.clients.queue.remove_client(&vtoken).await {
+        warn!(error = %e, vtoken = %crate::redact_token(&vtoken), "failed to remove client queue");
     }
 
     state
@@ -364,7 +364,7 @@ pub async fn unregister_client_in_hub(
         .await
         .map_err(UnregisterClientError::Store)?;
 
-    info!(client = %name, vtoken = %&vtoken[..vtoken.len().min(8)], "admin deleted offline client");
+    info!(client = %name, vtoken = %crate::redact_token(&vtoken), "admin deleted offline client");
     Ok(())
 }
 
@@ -390,7 +390,7 @@ pub async fn update_client_in_hub(
 
     let label_for_store = label.clone();
     let vtoken = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry
             .update_client(old_name, new_name, label)
             .map_err(|e| match e {
@@ -408,7 +408,7 @@ pub async fn update_client_in_hub(
     info!(
         old_name = %old_name,
         new_name = %new_name,
-        vtoken = %&vtoken[..vtoken.len().min(8)],
+        vtoken = %crate::redact_token(&vtoken),
         "admin updated client"
     );
     Ok(vtoken)
@@ -430,7 +430,7 @@ fn build_pairing_qr_response(code: String) -> GetQrcodeResponse {
 
 async fn create_pairing_qr(state: &HubState) -> GetQrcodeResponse {
     let code = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         match pairing.create() {
             Ok(code) => code,
             Err(PairingError::TooManySessions) => {
@@ -442,8 +442,6 @@ async fn create_pairing_qr(state: &HubState) -> GetQrcodeResponse {
                 };
             }
             Err(_) => {
-                // Other PairingError variants are not produced by create(); keep
-                // the match exhaustive so future variants are flagged.
                 return GetQrcodeResponse {
                     ret: -1,
                     qrcode: None,
@@ -481,7 +479,7 @@ pub async fn get_bot_qrcode_post(
 
 async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusResponse {
     let session = {
-        let pairing = state.pairing.read().await;
+        let pairing = state.clients.pairing.read().await;
         pairing.get(qrcode)
     };
 
@@ -542,7 +540,7 @@ pub async fn pair_page(
     Path(code): Path<String>,
 ) -> impl IntoResponse {
     let session = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         if pairing.get(&code).is_some() {
             pairing.mark_scanned(&code);
         }
@@ -611,7 +609,7 @@ pub async fn pair_page(
 /// legitimate entry was re-registered, the rollback aborts.
 pub async fn rollback_speculative_register(state: &HubState, name: &str, vtoken: &str) {
     let new_default = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         // CAS: only remove if the by_vtoken entry still maps `name → vtoken`.
         // If the entry was rewritten (legitimate re-register), the rollback
         // is a no-op and the legitimate client survives.
@@ -632,10 +630,10 @@ pub async fn rollback_speculative_register(state: &HubState, name: &str, vtoken:
         registry.pick_default_after_remove(vtoken)
     };
     {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(vtoken, new_default);
     }
-    if let Err(e) = state.queue.remove_client(vtoken).await {
+    if let Err(e) = state.clients.queue.remove_client(vtoken).await {
         warn!(
             error = %e,
             vtoken = %&vtoken[..vtoken.len().min(8)],
@@ -657,7 +655,7 @@ pub async fn rollback_speculative_register(state: &HubState, name: &str, vtoken:
 /// `POST /hub/pair/{code}/confirm` — approve pairing and issue vtoken.
 ///
 /// Lock ordering (F-M1-1 Option A): `register_client_in_hub` runs OUTSIDE the
-/// `state.pairing.write()` critical section, preserving the canonical
+/// `state.clients.pairing.write()` critical section, preserving the canonical
 /// `registry → router` invariant. The speculative vtoken is then offered
 /// under the pairing lock, which performs the atomic state check + CSRF
 /// verify + final commit. If confirm fails (AlreadyConfirmed, NotScanned,
@@ -748,7 +746,7 @@ pub async fn pair_confirm(
     // vtoken/queue/store row (F-M1-2). The rollback is gated on `is_new`
     // (F-M1-A) to prevent evicting a legitimate pre-existing client.
     let confirm_result = {
-        let mut pairing = state.pairing.write().await;
+        let mut pairing = state.clients.pairing.write().await;
         pairing.confirm(&code, name.clone(), label, vtoken.clone(), &csrf_header)
     };
 

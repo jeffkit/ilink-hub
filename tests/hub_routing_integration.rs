@@ -36,14 +36,14 @@ fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
         message_type: Some(1),
         from_user_id: Some(from_user.to_string()),
         context_token: Some(real_ctx.to_string()),
-        item_list: Some(vec![MessageItem {
+        item_list: Some(std::sync::Arc::new(vec![MessageItem {
             item_type: Some(1),
             text_item: Some(TextItem {
                 text: Some(text.to_string()),
             }),
             extra: serde_json::Value::Object(Default::default()),
             voice_item: None,
-        }]),
+        }])),
         ..Default::default()
     }
 }
@@ -72,7 +72,7 @@ async fn single_client_receives_dispatched_message() {
     // Give dispatcher a moment to process.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 1, "client should receive exactly one message");
     assert_eq!(msgs[0].text(), Some("hello"));
 }
@@ -91,7 +91,7 @@ async fn no_online_clients_message_is_dropped() {
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // No vtokens registered → nothing to drain.
-    let sizes = state.queue.queue_sizes().await.unwrap();
+    let sizes = state.clients.queue.queue_sizes().await.unwrap();
     assert!(sizes.is_empty() || sizes.values().all(|&s| s == 0));
 }
 
@@ -107,7 +107,7 @@ async fn two_clients_both_receive_broadcast_message() {
 
     // Mark both clients as online (normally done by getupdates handler).
     {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry.mark_seen(&vtoken_a);
         registry.mark_seen(&vtoken_b);
     }
@@ -116,7 +116,7 @@ async fn two_clients_both_receive_broadcast_message() {
     // through to Broadcast. (With a default set, the message would ForwardTo
     // one client only.)
     {
-        let mut router = state.router.lock().await;
+        let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(&vtoken_a, None);
         router.remove_routes_for_vtoken(&vtoken_b, None);
     }
@@ -129,8 +129,8 @@ async fn two_clients_both_receive_broadcast_message() {
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let msgs_a = state.queue.drain(&vtoken_a).await.unwrap();
-    let msgs_b = state.queue.drain(&vtoken_b).await.unwrap();
+    let msgs_a = state.clients.queue.drain(&vtoken_a).await.unwrap();
+    let msgs_b = state.clients.queue.drain(&vtoken_b).await.unwrap();
 
     assert_eq!(msgs_a.len(), 1, "client A should receive the message");
     assert_eq!(msgs_b.len(), 1, "client B should receive the message");
@@ -165,7 +165,7 @@ async fn single_default_client_receives_forward_to_message() {
 
     // Mark both online, but only the default is set as routing target.
     {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         registry.mark_seen(&vtoken_default);
         registry.mark_seen(&vtoken_other);
     }
@@ -178,8 +178,8 @@ async fn single_default_client_receives_forward_to_message() {
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let msgs_default = state.queue.drain(&vtoken_default).await.unwrap();
-    let msgs_other = state.queue.drain(&vtoken_other).await.unwrap();
+    let msgs_default = state.clients.queue.drain(&vtoken_default).await.unwrap();
+    let msgs_other = state.clients.queue.drain(&vtoken_other).await.unwrap();
 
     assert_eq!(
         msgs_default.len(),
@@ -207,12 +207,12 @@ async fn same_user_gets_stable_virtual_context_token() {
     tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs1 = state.queue.drain(&vtoken).await.unwrap();
+    let msgs1 = state.clients.queue.drain(&vtoken).await.unwrap();
 
     tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs2 = state.queue.drain(&vtoken).await.unwrap();
+    let msgs2 = state.clients.queue.drain(&vtoken).await.unwrap();
 
     assert_eq!(msgs1.len(), 1);
     assert_eq!(msgs2.len(), 1);
@@ -237,7 +237,7 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 1);
     let vctx = msgs[0].context_token.clone().unwrap();
 
@@ -247,8 +247,8 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
     let real_ctx = {
-        let ctx_map = state.ctx_map.read().await;
-        ctx_map.resolve(&vctx)
+        let mut ctx_map = state.routing.ctx_map.write().await;
+        ctx_map.resolve(&vctx).map(|s| s.to_string())
     };
     if let Some(real) = real_ctx {
         if let Some(msg) = send_req.msg.as_mut() {
@@ -284,7 +284,7 @@ async fn bot_echo_messages_are_not_dispatched() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert!(
         msgs.is_empty(),
         "bot echo messages should not be dispatched to clients"
@@ -312,7 +312,7 @@ async fn messages_queued_in_fifo_order() {
     }
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs = state.queue.drain(&vtoken).await.unwrap();
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
     assert_eq!(msgs.len(), 5);
     for (i, msg) in msgs.iter().enumerate() {
         assert_eq!(msg.text(), Some(format!("msg-{i}").as_str()));
@@ -360,7 +360,7 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
 
     // Pre-create a pairing session.
     let code = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         reg.create().expect("create pairing")
     };
 
@@ -390,7 +390,7 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
                 // Refresh scanned state and mint a CSRF token, then attempt
                 // confirm against the same code (the second+ attempt loses).
                 let csrf = {
-                    let mut reg = s.pairing.write().await;
+                    let mut reg = s.clients.pairing.write().await;
                     reg.mark_scanned(&code);
                     reg.get(&code).and_then(|sess| sess.csrf)
                 };
@@ -400,7 +400,7 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
                         ilink_hub::server::pairing::register_client_in_hub(&s, name.clone(), None)
                             .await;
                     let res = {
-                        let mut reg = s.pairing.write().await;
+                        let mut reg = s.clients.pairing.write().await;
                         reg.confirm(&code, name, None, vtoken, &csrf)
                     };
                     // We don't assert the result here — only the absence of
@@ -438,13 +438,13 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
     let state = make_state().await;
 
     let code = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         let code = reg.create().unwrap();
         reg.mark_scanned(&code);
         code
     };
     let csrf = {
-        let reg = state.pairing.read().await;
+        let reg = state.clients.pairing.read().await;
         reg.get(&code).and_then(|s| s.csrf).unwrap()
     };
 
@@ -458,13 +458,13 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
                 ilink_hub::server::pairing::register_client_in_hub(s.as_ref(), name.clone(), None)
                     .await;
             let res = {
-                let mut reg = s.pairing.write().await;
+                let mut reg = s.clients.pairing.write().await;
                 reg.confirm(&code, name.clone(), None, vtoken.clone(), &csrf)
             };
             if res.is_err() && is_new {
                 // Mirror the handler's rollback call (F-M1-A: only when fresh).
                 let new_default = {
-                    let mut registry = s.registry.write().await;
+                    let mut registry = s.clients.registry.write().await;
                     if registry.remove(&name) {
                         registry.pick_default_after_remove(&vtoken)
                     } else {
@@ -472,10 +472,10 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
                     }
                 };
                 {
-                    let mut router = s.router.lock().await;
+                    let mut router = s.routing.router.lock().await;
                     router.remove_routes_for_vtoken(&vtoken, new_default);
                 }
-                let _ = s.queue.remove_client(&vtoken).await;
+                let _ = s.clients.queue.remove_client(&vtoken).await;
                 let _ = s.store.clear_routes_for_vtoken(&vtoken).await;
                 let _ = s.store.delete_client_by_name(&name).await;
             }
@@ -505,7 +505,7 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
 
     // The losing vtokens MUST have been rolled back: no orphan entries in
     // the registry, no orphan queues.
-    let registry = state.registry.read().await;
+    let registry = state.clients.registry.read().await;
     let remaining: Vec<_> = (0..5)
         .map(|i| format!("race-client-{i}"))
         .filter(|n| registry.get_by_name(n).is_some())
@@ -520,7 +520,7 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
     // And the queue sizes for the rolled-back vtokens should be 0 (or
     // absent). The winner's vtoken is unknown here, so just verify the
     // count of distinct vtokens with any queued message is at most 1.
-    let sizes = state.queue.queue_sizes().await.unwrap();
+    let sizes = state.clients.queue.queue_sizes().await.unwrap();
     let vtokens_with_messages = sizes.iter().filter(|(_, &n)| n > 0).count();
     assert!(
         vtokens_with_messages <= 1,
@@ -547,13 +547,13 @@ async fn getupdates_mark_seen_runs_under_write_lock() {
 
     // Hold the registry write lock from outside; mark_seen-equivalent
     // operations on the new code path must not be able to interleave.
-    let guard = state.registry.write().await;
+    let guard = state.clients.registry.write().await;
     // While we hold the write lock, the registry is unreachable. After
     // we drop it, mark_seen must succeed.
     assert!(guard.get_by_vtoken(&vtoken).is_some());
     drop(guard);
 
-    let mut registry = state.registry.write().await;
+    let mut registry = state.clients.registry.write().await;
     registry.mark_seen(&vtoken);
     let info = registry.get_by_vtoken(&vtoken).unwrap();
     assert!(
@@ -610,7 +610,7 @@ async fn getupdates_returns_429_when_polls_exceed_cap() {
 
     // Build a HubState with the shutdown SENDER kept alive.  The shared
     // make_state() helper drops its sender; that makes
-    // `state.shutdown.changed()` return Err immediately, so
+    // `state.ilink.shutdown.changed()` return Err immediately, so
     // `wait_shutdown_signal` returns early and the long-poll handler
     // never blocks for the requested `timeout` window.  Keeping the
     // sender alive forces the long-poll to actually wait the full
@@ -665,7 +665,7 @@ async fn getupdates_returns_429_when_polls_exceed_cap() {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
         let n = state
-            .poll_tracker
+            .clients.poll_tracker
             .counts
             .lock()
             .map(|c| *c.get(&vtoken).unwrap_or(&0))
@@ -833,19 +833,19 @@ fn pair_url_is_not_logged_at_info_level() {
 async fn csrf_token_cannot_be_replayed_after_confirm() {
     let state = make_state().await;
     let code = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         let c = reg.create().unwrap();
         reg.mark_scanned(&c);
         c
     };
     let csrf = {
-        let reg = state.pairing.read().await;
+        let reg = state.clients.pairing.read().await;
         reg.get(&code).and_then(|s| s.csrf).unwrap()
     };
 
     // First confirm: success.
     {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         reg.confirm(&code, "first".into(), None, "vhub_1".into(), &csrf)
             .expect("first confirm must succeed");
     }
@@ -853,7 +853,7 @@ async fn csrf_token_cannot_be_replayed_after_confirm() {
     // Second confirm with the same (now consumed) csrf: must fail with
     // AlreadyConfirmed, NOT Ok.
     let res = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         reg.confirm(&code, "attacker".into(), None, "vhub_2".into(), &csrf)
     };
     assert!(
@@ -1051,17 +1051,17 @@ async fn rollback_preserves_legit_client_when_name_collides() {
 
     // 1. Pre-pair a legitimate client.
     let legit_vtoken = register(&state, "alice").await;
-    assert!(state.registry.read().await.get_by_name("alice").is_some());
+    assert!(state.clients.registry.read().await.get_by_name("alice").is_some());
 
     // 2. Build a pairing session (just like a real QR page render).
     let code = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         let c = reg.create().unwrap();
         reg.mark_scanned(&c);
         c
     };
     let _csrf = {
-        let reg = state.pairing.read().await;
+        let reg = state.clients.pairing.read().await;
         reg.get(&code).and_then(|s| s.csrf).unwrap()
     };
 
@@ -1079,7 +1079,7 @@ async fn rollback_preserves_legit_client_when_name_collides() {
     );
 
     let res = {
-        let mut reg = state.pairing.write().await;
+        let mut reg = state.clients.pairing.write().await;
         reg.confirm(
             &code,
             "alice".into(),
@@ -1103,7 +1103,7 @@ async fn rollback_preserves_legit_client_when_name_collides() {
     // 5. The legitimate client must still be in the registry and the
     //    store. This is the F-M1-A fix: pre-fix, this assertion failed
     //    because the unconditional rollback would have evicted alice.
-    let registry = state.registry.read().await;
+    let registry = state.clients.registry.read().await;
     let alice = registry
         .get_by_name("alice")
         .expect("legitimate alice must still be registered after colliding confirm");
@@ -1144,7 +1144,7 @@ async fn rollback_cas_aborts_when_legit_re_register_happened() {
     // defend against — a re-used vtoken would pass the CAS, since the
     // `is_new` gate above already covers that case).
     let replacement_vtoken = {
-        let mut registry = state.registry.write().await;
+        let mut registry = state.clients.registry.write().await;
         // Remove the existing entry entirely.
         assert!(registry.remove("alice"));
         // Re-insert a fresh ClientInfo with a different vtoken. The
@@ -1170,7 +1170,7 @@ async fn rollback_cas_aborts_when_legit_re_register_happened() {
     .await;
 
     // The legitimate replacement client must still be present.
-    let registry = state.registry.read().await;
+    let registry = state.clients.registry.read().await;
     let alice = registry
         .get_by_name("alice")
         .expect("replacement alice must survive the CAS-aborted rollback");

@@ -9,14 +9,14 @@ fn make_msg(content: &str) -> WeixinMessage {
     WeixinMessage {
         from_user_id: Some("user1".to_string()),
         context_token: Some("ctx1".to_string()),
-        item_list: Some(vec![MessageItem {
+        item_list: Some(std::sync::Arc::new(vec![MessageItem {
             item_type: Some(1),
             text_item: Some(TextItem {
                 text: Some(content.to_string()),
             }),
             extra: serde_json::Value::Object(serde_json::Map::new()),
             voice_item: None,
-        }]),
+        }])),
         ..Default::default()
     }
 }

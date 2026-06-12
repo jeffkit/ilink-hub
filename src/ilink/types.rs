@@ -129,7 +129,7 @@ pub struct WeixinMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_state: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub item_list: Option<Vec<MessageItem>>,
+    pub item_list: Option<std::sync::Arc<Vec<MessageItem>>>,
     /// Required for routing replies back to the correct conversation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_token: Option<String>,
@@ -183,12 +183,12 @@ impl WeixinMessage {
             message_state: Some(message_state::FINISH),
             from_user_id: Some(String::new()),
             client_id: Some(new_client_id()),
-            item_list: Some(vec![MessageItem {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(msg_type::TEXT),
                 text_item: Some(TextItem { text: Some(text) }),
                 voice_item: None,
                 extra: serde_json::Value::Object(Default::default()),
-            }]),
+            }])),
             ..Default::default()
         };
         msg.ensure_outbound();
