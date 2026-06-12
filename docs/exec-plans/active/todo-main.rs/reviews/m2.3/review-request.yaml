@@ -1,0 +1,105 @@
+milestone: M2.3
+title: "M2.3 — 调整 serve 默认监听为 127.0.0.1:8765"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-main.rs
+base_commit: 2ababb61c429380eaf0fc670dba3c2c22bbc5d74
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-main.rs/plan.md
+checkpoint: "M2.3 调整 serve 默认监听为 127.0.0.1:8765"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2.3:
+# - 默认监听地址由 0.0.0.0:8765 改为 127.0.0.1:8765。
+# - 需要 LAN/容器暴露时由用户显式传 0.0.0.0。
+# - 在 CHANGELOG 标注行为变更。
+
+source_changes:
+  - file: "CHANGELOG.md"
+    description: "Added a security section under [Unreleased] documenting the change of serve default listen address to 127.0.0.1:8765."
+
+# ─── Commands run ───────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      total: "154 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc + vite build clean, dist/ produced"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished, exit 0"
+    result: pass
+  - id: verify-serve-default
+    cmd: "ILINK_TOKEN=\"dummy:token\" ./target/release/ilink-hub serve & sleep 2 && lsof -i :8765 && curl -sf http://127.0.0.1:8765/health && pkill -f ilink-hub"
+    expected: "exited 0, lsof outputs localhost:8765 (LISTEN), curl returns health ok"
+    actual: "exited 0, lsof outputs localhost:8765, curl returns ok"
+    result: pass
+  - id: verify-serve-explicit-addr
+    cmd: "ILINK_TOKEN=\"dummy:token\" ./target/release/ilink-hub serve --addr 0.0.0.0:8765 & sleep 2 && lsof -i :8765 && pkill -f ilink-hub"
+    expected: "exited 0, lsof outputs *:8765 (LISTEN)"
+    actual: "exited 0, lsof outputs *:8765"
+    result: pass
+
+pass_conditions:
+  - id: fmt-green
+    plan_clause: "fmt: cargo fmt --check 通过"
+    observation: "cargo fmt --check exited 0."
+    result: pass
+  - id: clippy-green
+    plan_clause: "clippy: cargo clippy -- -D warnings 通过"
+    observation: "0 warnings, exit 0."
+    result: pass
+  - id: test-green
+    plan_clause: "test: cargo test 全绿"
+    observation: "all tests passed."
+    result: pass
+  - id: build-green
+    plan_clause: "build: cargo build 通过"
+    observation: "Finished, exit 0."
+    result: pass
+  - id: desktop-frontend-green
+    plan_clause: "desktop-frontend: npm run build 通过"
+    observation: "tsc + vite build clean, dist/ produced."
+    result: pass
+  - id: desktop-tauri-green
+    plan_clause: "desktop-tauri: cargo check --manifest-path .../src-tauri/Cargo.toml 通过"
+    observation: "Finished, exit 0."
+    result: pass
+  - id: behavior-default-loopback
+    plan_clause: "默认监听地址由 0.0.0.0:8765 改为 127.0.0.1:8765"
+    observation: "serve without args listens on 127.0.0.1:8765 only."
+    result: pass
+  - id: behavior-explicit-lan-exposure
+    plan_clause: "需要 LAN/容器暴露时由用户显式传 0.0.0.0"
+    observation: "serve with --addr 0.0.0.0:8765 listens on all interfaces."
+    result: pass
+  - id: changelog-updated
+    plan_clause: "在 CHANGELOG 标注行为变更"
+    observation: "Added security section documenting address change to CHANGELOG.md under [Unreleased]."
+    result: pass

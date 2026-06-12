@@ -142,6 +142,26 @@
 
 ---
 
-## M2.3 — CONS-02（待执行）
+## M2.3 — 调整 serve 默认监听为 127.0.0.1:8765
 
-按 `plan.md` 顺序串行执行，最后一步独立可验证。
+### Decisions
+- 将 `serve` 默认监听地址从 `0.0.0.0:8765` 调整为 `127.0.0.1:8765`（该安全性变更在 M0 修复中已预先引入，并在 M2.1 中合并了 `WEIXIN_BASE_URL` 解析逻辑）。
+- 在 `CHANGELOG.md` 的 `[Unreleased]` 中增加了关于监听地址调整的「安全变更」条目。
+- 后续需要局域网或容器内暴露时，由用户显式传递 `--addr 0.0.0.0:8765` 参数。
+- 本地在 macOS 上运行后台服务，并通过 `lsof -i :8765` 验证其在默认情况下仅监听 `localhost:8765`，而显式配置 `--addr 0.0.0.0:8765` 时能够正确监听在所有接口。
+
+### Problems
+- 验证命令中的 `ss -tlnp` 在 macOS 上不可用（报 `command not found: ss`），因此改为在 macOS 上等效的 `lsof -i :8765` 进行网络端口监听验证，效果完全一致。
+
+### Outcome
+- fmt: `cargo fmt --check` 成功通过。
+- clippy: `cargo clippy -- -D warnings` 通过，无任何 warnings。
+- test: `cargo test` 全绿通过（154 passed）。
+- build: `cargo build` 编译成功。
+- desktop-frontend: Vite 构建和 TypeScript 检查通过，成功输出 dist。
+- desktop-tauri: Tauri `src-tauri` 检查通过。
+- 验证命令结果：
+  - 默认启动：`lsof -i :8765` 输出 `TCP localhost:ultraseek-http (LISTEN)`。
+  - `/health` 请求：`curl -sf http://127.0.0.1:8765/health` 成功返回 `ok`。
+  - `--addr 0.0.0.0:8765` 启动：`lsof -i :8765` 输出 `TCP *:ultraseek-http (LISTEN)`。
+- 在 `reviews/m2.3/review-request.yaml` 中提交了审核请求。

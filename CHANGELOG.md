@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 安全变更
+
+- **默认监听地址**：`serve` 默认监听地址由 `0.0.0.0:8765` 调整为 `127.0.0.1:8765`，防止默认情况下对局域网暴露未授权的管理接口。如果需要外部暴露（例如在 Docker 容器、虚拟机或需要局域网访问），请显式传入 `--addr 0.0.0.0:8765`。
+
 ## [0.1.20] — 2026-06-09
 
 ### Login — QR 登录稳定性修复
