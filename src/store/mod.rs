@@ -201,6 +201,22 @@ impl Store {
     // ─── Clients ─────────────────────────────────────────────────────────────
 
     pub async fn upsert_client(&self, vtoken: &str, name: &str, label: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Update routing_state for any routes pointing to this client's old vtoken
+        // before inserting/updating the client's vtoken.
+        sqlx::query(
+            r#"
+            UPDATE routing_state
+            SET active_vtoken = $1
+            WHERE active_vtoken = (SELECT vtoken FROM clients WHERE name = $2)
+            "#,
+        )
+        .bind(vtoken)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
         // ON CONFLICT (name): update vtoken so a post-restart re-registration with a new
         // vtoken wins, keeping DB and in-memory registry consistent.
         sqlx::query(
@@ -216,8 +232,10 @@ impl Store {
         .bind(vtoken)
         .bind(name)
         .bind(label)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -432,14 +450,18 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Build placeholders: ($1,$2), ($3,$4), ...
-        let mut active_placeholders = Vec::with_capacity(pairs.len());
+        // Build clauses: (vctx = $1 AND vtoken = $2) OR ...
+        let mut active_clauses = Vec::with_capacity(pairs.len());
         for i in 0..pairs.len() {
-            active_placeholders.push(format!("(${}, ${})", i * 2 + 1, i * 2 + 2));
+            active_clauses.push(format!(
+                "(vctx = ${} AND vtoken = ${})",
+                i * 2 + 1,
+                i * 2 + 2
+            ));
         }
         let active_sql = format!(
-            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE (vctx, vtoken) IN ({})",
-            active_placeholders.join(", ")
+            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE {}",
+            active_clauses.join(" OR ")
         );
 
         let mut active_q = sqlx::query(&active_sql);
@@ -471,14 +493,19 @@ impl Store {
             })
             .collect();
 
-        let mut session_placeholders = Vec::with_capacity(resolved.len());
+        let mut session_clauses = Vec::with_capacity(resolved.len());
         for i in 0..resolved.len() {
-            session_placeholders.push(format!("(${}, ${}, ${})", i * 3 + 1, i * 3 + 2, i * 3 + 3));
+            session_clauses.push(format!(
+                "(vctx = ${} AND vtoken = ${} AND session_name = ${})",
+                i * 3 + 1,
+                i * 3 + 2,
+                i * 3 + 3
+            ));
         }
         let session_sql = format!(
             "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \
-             WHERE (vctx, vtoken, session_name) IN ({})",
-            session_placeholders.join(", ")
+             WHERE {}",
+            session_clauses.join(" OR ")
         );
 
         let mut session_q = sqlx::query(&session_sql);
@@ -604,24 +631,26 @@ impl Store {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut tx = self.pool.begin().await?;
-        for (vctx, real_ctx, peer_user_id) in entries {
-            sqlx::query(
-                r#"
-                INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (vctx) DO UPDATE SET
-                    real_ctx = excluded.real_ctx,
-                    peer_user_id = excluded.peer_user_id
-                "#,
-            )
-            .bind(vctx)
-            .bind(real_ctx)
-            .bind(peer_user_id)
-            .execute(&mut *tx)
-            .await?;
+        for chunk in entries.chunks(50) {
+            let mut tx = self.pool.begin().await?;
+            for (vctx, real_ctx, peer_user_id) in chunk {
+                sqlx::query(
+                    r#"
+                    INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (vctx) DO UPDATE SET
+                        real_ctx = excluded.real_ctx,
+                        peer_user_id = excluded.peer_user_id
+                    "#,
+                )
+                .bind(vctx)
+                .bind(real_ctx)
+                .bind(peer_user_id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            tx.commit().await?;
         }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -869,5 +898,159 @@ mod store_tests {
         for h in handles {
             h.await.expect("task join");
         }
+    }
+
+    #[tokio::test]
+    async fn test_sync_02_upsert_client_updates_routing_state() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+        // Register client "bridge-a" with "vtoken-1"
+        store
+            .upsert_client("vtoken-1", "bridge-a", None)
+            .await
+            .unwrap();
+
+        // Set route for user "alice" to "vtoken-1"
+        store.set_route("alice", "vtoken-1").await.unwrap();
+
+        // Verify route is set
+        let route = store.get_route("alice").await.unwrap();
+        assert_eq!(route, Some("vtoken-1".to_string()));
+
+        // Re-register client "bridge-a" with "vtoken-2"
+        store
+            .upsert_client("vtoken-2", "bridge-a", None)
+            .await
+            .unwrap();
+
+        // Verify route is updated to "vtoken-2"
+        let route = store.get_route("alice").await.unwrap();
+        assert_eq!(route, Some("vtoken-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_db_03_get_hub_ext_batch_query() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+        // Insert some session data
+        store
+            .set_active_session_name("vctx-1", "vtoken-1", "session-1")
+            .await
+            .unwrap();
+        store
+            .set_active_session_name("vctx-2", "vtoken-2", "session-2")
+            .await
+            .unwrap();
+
+        store
+            .set_backend_session("vctx-1", "vtoken-1", "session-1", "sid-1")
+            .await
+            .unwrap();
+        store
+            .set_backend_session("vctx-2", "vtoken-2", "session-2", "sid-2")
+            .await
+            .unwrap();
+
+        let pairs = vec![
+            ("vctx-1".to_string(), "vtoken-1".to_string()),
+            ("vctx-2".to_string(), "vtoken-2".to_string()),
+            ("vctx-3".to_string(), "vtoken-3".to_string()), // nonexistent
+        ];
+
+        let result = store.get_hub_ext_batch(&pairs).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            result.get(&("vctx-1".to_string(), "vtoken-1".to_string())),
+            Some(&("session-1".to_string(), Some("sid-1".to_string())))
+        );
+        assert_eq!(
+            result.get(&("vctx-2".to_string(), "vtoken-2".to_string())),
+            Some(&("session-2".to_string(), Some("sid-2".to_string())))
+        );
+        assert_eq!(
+            result.get(&("vctx-3".to_string(), "vtoken-3".to_string())),
+            Some(&("default".to_string(), None))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_02_persist_context_tokens_batch_large() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+        // Prepare 55 entries
+        let mut entries = Vec::new();
+        for i in 0..55 {
+            entries.push((
+                format!("vctx-{}", i),
+                format!("real-{}", i),
+                format!("peer-{}", i),
+            ));
+        }
+
+        store.persist_context_tokens_batch(&entries).await.unwrap();
+
+        // Check if entries are saved
+        let recent = store.list_recent_context_tokens(100).await.unwrap();
+        assert_eq!(recent.len(), 55);
+    }
+
+    #[tokio::test]
+    async fn test_sync_02_upsert_client_concurrent_adversarial() {
+        // Create a temporary database in target/ directory of the workspace
+        let temp_dir = tempfile::Builder::new()
+            .prefix("test_concurrent_db")
+            .tempdir_in("target")
+            .unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let db_url = format!("sqlite:{}", db_path.to_str().unwrap());
+
+        let store = Store::connect(&db_url).await.expect("connect");
+
+        // Initial setup: register client "bridge-concurrent" with "vtoken-initial"
+        store
+            .upsert_client("vtoken-initial", "bridge-concurrent", None)
+            .await
+            .unwrap();
+
+        // Set route for user "alice" to "vtoken-initial"
+        store.set_route("alice", "vtoken-initial").await.unwrap();
+
+        // Now run multiple concurrent upserts of client "bridge-concurrent"
+        let num_concurrency = 20;
+        let mut handles = vec![];
+
+        let store = std::sync::Arc::new(store);
+
+        for i in 0..num_concurrency {
+            let store_clone = store.clone();
+            let vtoken = format!("vtoken-{}", i);
+            let handle = tokio::spawn(async move {
+                store_clone
+                    .upsert_client(&vtoken, "bridge-concurrent", None)
+                    .await
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all tasks to complete
+        for h in handles {
+            h.await.unwrap().unwrap();
+        }
+
+        // Retrieve the final vtoken in the clients table
+        let clients = store.list_clients().await.unwrap();
+        let final_client_vtoken = clients
+            .iter()
+            .find(|c| c.name == "bridge-concurrent")
+            .map(|c| c.vtoken.clone())
+            .unwrap();
+
+        // Retrieve the route for "alice"
+        let final_route = store.get_route("alice").await.unwrap().unwrap();
+
+        // Under race conditions in the old implementation, final_route would be stale
+        // while final_client_vtoken would be the last committed vtoken.
+        // We assert that they must be identical.
+        assert_eq!(final_route, final_client_vtoken);
     }
 }

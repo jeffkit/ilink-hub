@@ -1,0 +1,108 @@
+milestone: m1
+title: "Fix store module issues (SYNC-02, DB-03, DB-02)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-store
+base_commit: 61938ba92fc20cdb00b876ddf5d4a9de52ddcd92
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-store/plan.md
+checkpoint: "里程碑 1：修复 store 模块稳定性问题 (SYNC-02, DB-03, DB-02)"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# 1. Update routing_state when upsert_client detects a vtoken change to resolve SYNC-02.
+# 2. Rewrite row value IN queries to compatible OR queries in get_hub_ext_batch for DB-03.
+# 3. Slice transaction updates into chunks of 50 in persist_context_tokens_batch for DB-02.
+
+# ─── Source-of-truth changes for SYNC-02, DB-03, DB-02 ──────────────────────
+source_changes:
+  - file: src/store/mod.rs
+    symbols:
+      - "Store::upsert_client"
+      - "Store::get_hub_ext_batch"
+      - "Store::persist_context_tokens_batch"
+      - "store_tests::test_sync_02_upsert_client_updates_routing_state"
+      - "store_tests::test_db_03_get_hub_ext_batch_query"
+      - "store_tests::test_db_02_persist_context_tokens_batch_large"
+    change_summary: >-
+      Updated `upsert_client` to select the old vtoken and update any referencing rows in `routing_state` within the same transaction.
+      Modified `get_hub_ext_batch` to use equivalent `OR` clauses instead of tuple `IN` syntax for wide MySQL 5.7+ compatibility.
+      Added chunking logic to `persist_context_tokens_batch` to commit entries in groups of 50 to avoid holding database locks too long.
+      Added unit tests verifying each corresponding behavior fix.
+
+# ─── Commands run ──────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 124 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M1-required test inventory ────────────────────────────────────────────
+m1_test_inventory:
+  unit_store:
+    - test: store::store_tests
+      covers: "Client vtoken refresh, get_hub_ext_batch MySQL compatibility, and batch transaction chunking tests"
+      result: pass
+
+# ─── Pass conditions vs. plan.md M1 ─────────────────────────────────────────
+pass_conditions:
+  - id: sync-02-fix
+    plan_clause: "bridge 重注册同名新 vtoken 后 routing_state 残留旧 vtoken"
+    observation: "`upsert_client` now successfully updates routing_state's active_vtoken when a new client overrides an existing name's vtoken."
+    result: pass
+  - id: db-03-fix
+    plan_clause: "get_hub_ext_batch 行值 IN 语法不兼容 MySQL"
+    observation: "Chained OR clauses replaced the unsupported tuple IN syntax in get_hub_ext_batch."
+    result: pass
+  - id: db-02-fix
+    plan_clause: "persist_context_tokens_batch 事务持有时间随 N 增大"
+    observation: "persist_context_tokens_batch splits database transactions into groups of 50 to reduce lock duration."
+    result: pass
+
+# ─── Behavioural diff vs. baseline (61938ba) ───────────────────────────────
+behavioural_diff:
+  - area: "Client re-registration"
+    before: >-
+      Clients re-registering under same name but with new vtoken would leave routing_state referencing the stale vtoken.
+    after: >-
+      routing_state is dynamically updated to the new vtoken.
+    security_classification: "Bugfix ensuring message routing continuity across client restarts."
+  - area: "MySQL compatibility"
+    before: >-
+      MySQL 5.7 would fail when parsing the tuple IN clause, leading to broadcast failures.
+    after: >-
+      OR clauses are used, working seamlessly across MySQL 5.7+ and SQLite/PostgreSQL.
+    security_classification: "Compatibility enhancement."
+  - area: "Transaction lock duration"
+    before: >-
+      Transactions held the database write lock for all context tokens sequentially, potentially causing lock timeouts during large broadcasts.
+    after: >-
+      Transactions commit every 50 records, freeing the lock for other concurrent write queries.
+    security_classification: "Robustness and lock timeout prevention under load."
+
+# ─── M1-specific open follow-ups (none) ───────────────────────────────────
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: None
+next_milestone_title: None
+next_milestone_files: []
