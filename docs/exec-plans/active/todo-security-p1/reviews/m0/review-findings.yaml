@@ -1,0 +1,545 @@
+milestone: M0
+title: "Adversarial security & concurrency review of M0 baseline (and forward-looking review of M1-M3 plans)"
+reviewer: "rust-sec-concurrency-specialist"
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1
+base_commit: 61938ba92fc20cdb00b876ddf5d4a9de52ddcd92
+scope:
+  - "M0 baseline: 1-line test-only fix (drop unused import)"
+  - "Forward-looking: pre-flight adversarial check of M1/M2/M3 plans against current code, to catch deadlocks / lock-ordering / data-race / OWASP issues that the planned fixes may introduce."
+
+# ─── Method ──────────────────────────────────────────────────────────────────
+# Read review-request.yaml + the three target source files
+# (src/server/pairing.rs, src/hub/pairing.rs, src/server/routes.rs) plus the
+# shared state (src/hub/mod.rs) and the integration test
+# (tests/hub_routing_integration.rs). Cross-checked against the plan
+# (docs/exec-plans/active/todo-security-p1/plan.md). For each finding:
+# file:line evidence → why it matters → concrete fix. The M0 fix itself is
+# trivial; the real value of this review is pre-empting issues the M1-M3
+# fixes will trip over.
+
+# ─── Update log ──────────────────────────────────────────────────────────────
+# 2026-06-12: All CRITICAL/HIGH findings (F-M1-1, F-M2-1, F-M3-1) plus the
+# bundled MEDIUMs (F-M1-2, F-M1-3, F-M2-2, F-M3-3) resolved in this pass.
+# Adversarial tests added to tests/hub_routing_integration.rs (7 new tests).
+# All quality gates green: cargo fmt --check, cargo clippy --workspace
+# --all-targets -- -D warnings, cargo test --workspace (170 tests pass),
+# cargo build --workspace --release. Verdict upgraded to PASS.
+
+# ─── Findings ────────────────────────────────────────────────────────────────
+findings:
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M1-1
+    severity: HIGH
+    cwe: CWE-662
+    category: concurrency / lock-ordering
+    title: "M1 plan creates a NEW lock-ordering path pairing → registry → router that is undocumented and untested"
+    evidence:
+      - "src/server/pairing.rs:92 — `register_client_in_hub` documents 'Lock order: registry → router (always)'."
+      - "src/server/pairing.rs:381-386 — current pair_confirm: register first, then `pairing.write()`, violating the registry-before-pairing order."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:50,55 — M1 plan: hold `state.pairing.write()` and INSIDE call `register_client_in_hub`. This establishes a new lock order `pairing → registry → router`."
+    why_it_matters: >
+      If M1 commits the 'pairing outside, register inside' approach, the only way to avoid deadlock is the
+      'pairing → registry → router' canonical order. But the rest of the codebase (unregister/update_client_in_hub)
+      only takes registry+router. Future code that takes registry+router and then pairing.write() (a perfectly
+      reasonable reading — 'check the registry, then look up the pairing session for that client') will deadlock
+      against a concurrent pair_confirm holding all three. The existing
+      `concurrent_register_and_route_does_not_deadlock` test (src/hub/mod.rs:976) does not exercise
+      the pairing lock at all, so the new ordering will ship untested.
+    fix: >
+      Option A (preferred, matches 'lock order: registry → router' invariant): keep
+      `register_client_in_hub` OUTSIDE the pairing lock. Hold pairing.write() ONLY for the
+      atomic 'check state + write final Confirmed' step. To prevent TOCTOU on the vtoken, do
+      a speculative `register_client_in_hub` first to obtain vtoken, then under pairing.write():
+        1. re-check status (NotFound/Expired/AlreadyConfirmed/NotScanned)
+        2. if `session.status` is already Confirmed with a *different* vtoken, undo the
+           speculative register (registry.remove(name) — see registry.rs:126 — and discard vtoken)
+        3. otherwise call `pairing.confirm(code, name, label, vtoken)`
+      Since ClientRegistry's `register` reuses vtoken on same name (registry.rs:70-80), the
+      'name' key is the right rollback unit, not vtoken.
+      Option B: if you must call register inside the pairing lock, ADD a `// LOCK ORDER: pairing → registry → router` comment on `register_client_in_hub` AND extend
+      `concurrent_register_and_route_does_not_deadlock` with a third task that hammers
+      `pair_page`/`pair_confirm` while registers and routes run.
+    resolution: >
+      RESOLVED. Adopted Option A. In src/server/pairing.rs:pair_confirm, the
+      speculative `register_client_in_hub` runs OUTSIDE the pairing write lock
+      (preserving the canonical `registry → router` order). The pairing lock
+      is held only for the atomic state-check + CSRF verify + final
+      `confirm(code, name, label, vtoken, csrf)`. On any non-Ok from confirm,
+      a new `rollback_speculative_register` helper (src/server/pairing.rs)
+      undoes the speculative register via registry.remove + queue.remove +
+      store.clear_routes + store.delete_client_by_name, eliminating the
+      orphan-vtoken leak (F-M1-2). A doc comment on `register_client_in_hub`
+      (src/server/pairing.rs) warns future maintainers: MUST NOT be called
+      while `state.pairing.write()` is held.
+    verification: >
+      - tests/hub_routing_integration.rs:concurrent_register_and_pair_confirm_does_not_deadlock
+        (4 task fleets × 5–6 iterations, 5s timeout).
+      - tests/hub_routing_integration.rs:pair_confirm_race_yields_single_winner_and_no_orphan_vtoken
+        (5 concurrent confirms → exactly 1 winner, 4 AlreadyConfirmed, registry
+        holds only the winner's name, queue sizes confirm no orphan).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M1-2
+    severity: MEDIUM
+    cwe: CWE-754
+    category: correctness
+    title: "M1's `AlreadyConfirmed` rollback path silently leaks a vtoken / queue / store row when the speculative register wins but confirm loses"
+    evidence:
+      - "src/hub/registry.rs:57-90 — `register` is unconditional: it inserts by_name and by_vtoken and returns the vtoken."
+      - "src/hub/queue.rs:402-403 — `push` is called inside `register_client_in_hub` only via store; queue creation is lazy (queue.rs:386-391) on first push."
+      - "src/server/pairing.rs:105-111 — on success, the store is upserted."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:67-71 — M1 test asserts 'ClientRegistry 中该 name 仅有 1 条记录，无重复/被抢断的 vtoken' — this only catches the no-rollback case."
+    why_it_matters: >
+      Under M1's 'register inside pairing.write()' design, the vtoken IS generated under the pairing
+      lock. If confirm() then returns AlreadyConfirmed (because another request slipped in between
+      purge_expired and our status check — small but real window), we hold a brand-new vtoken in the
+      ClientRegistry. If we early-return and don't roll back, the loser keeps an orphan
+      (by_name → vtoken, by_vtoken → info) entry. Over time, repeated concurrent confirms against
+      the same code leave dead entries the admin can never clean (vtoken is unrecoverable to the
+      user — they only see the winner's vtoken).
+    fix: >
+      On AlreadyConfirmed in pair_confirm: roll back via `state.registry.write().await; registry.remove(name);`
+      and `state.queue.remove_client(&loser_vtoken).await;`. Add this to the M1 test: race 5
+      concurrent confirms, assert registry.all_clients() count for that name is 1 AND store has
+      exactly 1 row for that vtoken.
+    resolution: >
+      RESOLVED. New `rollback_speculative_register` helper in
+      src/server/pairing.rs runs on every non-Ok from `pairing.confirm`
+      (NotFound, Expired, AlreadyConfirmed, NotScanned, CsrfMismatch,
+      TooManySessions). It removes the client from the registry, the
+      router, the in-memory queue, the store routes, and the store
+      clients table. The 5-racer adversarial test
+      `pair_confirm_race_yields_single_winner_and_no_orphan_vtoken`
+      asserts the registry has exactly one remaining entry for the
+      5 candidate names, and the queue is empty for the losers'
+      vtokens.
+    verification: >
+      - tests/hub_routing_integration.rs:pair_confirm_race_yields_single_winner_and_no_orphan_vtoken
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M1-3
+    severity: MEDIUM
+    cwe: CWE-400
+    category: resource-exhaustion / DoS
+    title: "M1 extends an existing unbounded allocation under the pairing write lock"
+    evidence:
+      - "src/hub/pairing.rs:53 — `sessions: HashMap<String, PairingSession>` with no cap."
+      - "src/hub/pairing.rs:66-81 — `create()` allocates a fresh UUIDv4 entry per call."
+      - "src/hub/mod.rs:9-13 — pairing is `tokio::sync::RwLock`, not capped."
+      - "src/server/pairing.rs:230-236 — `create_pairing_qr` is invoked by `get_bot_qrcode` which is a public, CORS-permissive endpoint (server/mod.rs:24-35)."
+    why_it_matters: >
+      `GET /ilink/bot/get_bot_qrcode` is reachable from any browser origin (bot_cors = permissive,
+      server/mod.rs:22). The plan keeps the `create()` path unchanged, so M1 inherits an
+      unauthenticated, allocation-only path: an attacker can fire `get_bot_qrcode` 10^6 times and
+      grow `state.pairing.sessions` unboundedly (each entry is a PairingSession + an entry in
+      the `conv_to_v` LRU is NOT touched, so the LRU cap doesn't apply here). Under M1, the
+      pairing.write() critical section becomes more expensive (status check + name uniqueness
+      check + register + confirm) — extending the per-request write lock hold time makes the
+      DoS amplification worse, not better. Pre-existing issue; M1 doesn't cause it but
+      definitely shouldn't paper over it.
+    fix: >
+      Add a `MAX_PAIRING_SESSIONS` constant (e.g. 1024) checked at the top of `create()`:
+      `if self.sessions.len() >= MAX_PAIRING_SESSIONS { return Err(PairingError::TooManySessions); }`.
+      This is a small, scoped addition. Not blocking for M1, but call it out in the PR description
+      as a follow-up if not addressed.
+    resolution: >
+      RESOLVED. Added `pub const MAX_PAIRING_SESSIONS: usize = 1024` in
+      src/hub/pairing.rs. `PairingRegistry::create` now returns
+      `Result<String, PairingError>`; it returns `Err(TooManySessions)`
+      when the cap is hit. `create_pairing_qr` translates that into a
+      `{ ret: -1, errmsg: "too many active pairing sessions..." }`
+      response (HTTP-level handling is in the caller's hands since
+      `get_bot_qrcode` is a `Json` response, not a status code).
+      New `PairingError::TooManySessions` variant; HTTP-level mapping
+      for it lives in `pair_confirm` (503 Service Unavailable).
+    verification: >
+      - tests/hub_routing_integration.rs → src/hub/pairing.rs:too_many_sessions_returns_error
+        (fills 1024 sessions, asserts the 1025th returns TooManySessions).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M2-1
+    severity: HIGH
+    cwe: CWE-400
+    category: concurrency / DoS
+    title: "M2's 429 gate runs BEFORE mark_seen — opens a tiny but real split-brain window for an attacker that controls one of the 4+ concurrent pollers"
+    evidence:
+      - "src/server/routes.rs:175-194 — current order: mark_seen → poll_tracker.enter. Plan reverses to enter → 429-or-proceed → mark_seen."
+      - "src/server/routes.rs:159-174 — registry.get_by_vtoken + read lock + drop + write lock pattern is the existing 2-lock dance."
+      - "src/hub/registry.rs:100-105 — `mark_seen` only updates `last_seen` and `online=true`."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:93-97 — explicit: '在 routes.rs::getupdates 中、注册 mark_seen 之前先调 state.poll_tracker.enter(&vtoken)'."
+    why_it_matters: >
+      The plan rationale is correct in spirit (don't waste the queue notify wait on a rejected
+      poll), but moving enter() ahead of mark_seen means the 'online=true' flag is set AFTER
+      the poll is admitted. In the original code, an attacker who just registered with the
+      stolen vtoken (legit registration but unknown to this hub) can already trigger a 401.
+      With the new ordering, between `registry.get_by_vtoken` and `mark_seen`, the registry
+      could be concurrently marked stale (evict_stale turns online=false) — but the poll
+      still holds the guard and would 429 only after crossing the cap. The real gap: the
+      registry read (line 160) doesn't update last_seen, so a brand-new long-poll that passes
+      the cap check but loses its mark_seen race could have its eviction interval shortened.
+      Subtle; in practice < 1ms, but worth a comment.
+    fix: >
+      Keep mark_seen in its original position OR move it under the same write lock as the
+      registry read by collapsing the two registry read+write blocks (lines 159-179) into a
+      single write guard that does get_by_vtoken + mark_seen. Document the order explicitly.
+      Also: when the 429 path returns, do NOT call mark_seen at all (current plan already
+      excludes this; the 429 path drops guard and returns, which is correct).
+    resolution: >
+      RESOLVED. src/server/routes.rs:getupdates now holds a SINGLE
+      `state.registry.write()` guard that runs `get_by_vtoken` + `mark_seen`
+      atomically (no read-then-write race window). The poll_tracker.enter
+      call is unchanged (it still happens after the registry check, so
+      a 401 path doesn't enter the poll tracker at all). A doc comment
+      above the block documents the order: existence → mark_seen →
+      poll_tracker.enter.
+    verification: >
+      - tests/hub_routing_integration.rs:getupdates_mark_seen_runs_under_write_lock
+        (structurally pins the lock-acquisition shape; future refactors
+        that re-introduce the stale-online window are caught).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M2-2
+    severity: MEDIUM
+    cwe: CWE-754
+    category: correctness
+    title: "PollGuard's std::sync::Mutex::lock().unwrap() panics on poisoning and tears down the worker"
+    evidence:
+      - "src/hub/mod.rs:95 — `self.counts.lock().unwrap()` in `enter`."
+      - "src/hub/mod.rs:119 — `self.tracker.counts.lock().unwrap()` in `Drop`."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:89-94 — M2 will DROP the guard on 429, which goes through this Drop path."
+    why_it_matters: >
+      If any future code (or a panic in `enter` between the unwrap and the return) ever poisons
+      the counts mutex, every subsequent `getupdates` for that vtoken (and any vtoken in the
+      same Arc<PollTracker>) will panic in the Drop, killing the Tokio worker. With M2 the
+      429 path increases the rate of guard drops, raising the chance of a panic propagating
+      to Drop. `unwrap()` is wrong here even pre-M2; M2 is the right time to fix it.
+    fix: >
+      Replace both `unwrap()` calls with `let Ok(mut counts) = self.counts.lock() else { return /* best-effort */; };`
+      or use `parking_lot::Mutex` if the crate is already in the dep graph (it isn't — only
+      std::sync::Mutex is in use at src/hub/mod.rs:12). M2 should land the fix in the same commit.
+    resolution: >
+      RESOLVED. Both unwrap() calls in src/hub/mod.rs (PollTracker::enter
+      and PollGuard::drop) replaced with `let Ok(...) = self.counts.lock()
+      else { return /* best-effort */; };`. On poisoning, `enter` returns
+      count=0 (the 429 gate won't trip on this vtoken) and the Drop is a
+      silent no-op. This is the panic-safety path the adversarial test
+      exercises.
+    verification: >
+      - tests/hub_routing_integration.rs:poll_tracker_poisoned_mutex_does_not_panic
+        (joins a thread that poisons the mutex, then verifies enter+drop
+        are panic-free).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M2-3
+    severity: LOW
+    cwe: CWE-770
+    category: resource-cap
+    title: "PollTracker counts HashMap grows unbounded by distinct vtokens when a backend churns through vtokens"
+    evidence:
+      - "src/hub/mod.rs:87 — `counts: StdMutex<HashMap<String, usize>>`."
+      - "src/hub/mod.rs:121-124 — Drop removes the entry only when count hits 0."
+    why_it_matters: >
+      Pre-existing, not introduced by M2. If an attacker registers many short-lived clients
+      (SEC-001 mitigates this by tying the entry to a session, but registration is still
+      CORS-public via `get_bot_qrcode`+`/hub/register` if admin auth is misconfigured), the
+      `counts` map retains keys for clients that no longer exist. Per-vtoken size is tiny
+      (8 bytes + entry overhead), but unbounded.
+    fix: >
+      In PollGuard::drop, if `*c == 0`, do `counts.remove(&self.vtoken)` (already does this).
+      For correctness, also do `counts.retain(|_, c| *c > 0)` periodically (every Nth drop, or
+      via a background evictor). Not blocking M2.
+    resolution: >
+      NOT FIXED in this pass. LOW severity; the existing `Drop` already
+      removes the entry when count hits 0. A periodic background evictor
+      would be the next step but is out of scope for the M0-M3 security
+      milestone. Tracked as a follow-up.
+    status: ACCEPTED_LOW
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M3-1
+    severity: HIGH
+    cwe: CWE-352
+    category: OWASP A01:2021 (Broken Access Control) / CSRF
+    title: "M3's CSRF token is bound to the pairing code but `pair.html` is served on a route that has NO SameSite/Origin enforcement"
+    evidence:
+      - "src/server/pair.html:108-116 — fetch URL is `window.location.pathname + '/confirm'` (relative). No Origin check on the server."
+      - "src/server/pairing.rs:319-360 — `pair_page` handler serves the HTML and the embedded CSRF, with no `X-Frame-Options`, `Content-Security-Policy`, or `Set-Cookie`."
+      - "src/server/mod.rs:46-47 — `/hub/pair/{code}` and `/hub/pair/{code}/confirm` are on the same router as the bot API; no SameSite cookie path."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:156-162 — M3: X-Pair-CSRF header carries the token, fetched from same origin (pair.html)."
+    why_it_matters: >
+      CSRF protection via a custom header DOES block form-based cross-site POST (browsers
+      disallow setting custom headers without CORS pre-flight), but a malicious site can
+      still: (a) iframe the pair page and use `window.open` to trigger a same-origin fetch
+      from a service worker, or (b) more realistically, scan QR codes and replay the
+      `pair_url` (which contains the `code`). M3 also reduces pair_url to DEBUG (line 138-139
+      of plan), which mitigates the log-leak side, but does not mitigate URL sharing.
+      The deeper issue: the CSRF token in M3 is bound to a `code`, but a `code` is already a
+      32-char UUIDv4 (pairing.rs:68). So the CSRF adds entropy that the code already provides.
+      An attacker who knows the code (via QR leak or brute force over 122 bits — infeasible)
+      doesn't need the CSRF.
+    fix: >
+      M3 as designed is fine against drive-by CSRF (custom header blocks it). But ADD: an
+      `Origin`/`Referer` check on the confirm handler — reject if `Origin` header is present
+      AND not in the configured Hub base URL allowlist (defaulting to the device's bound
+      origin). This closes the iframe + service worker path. Also: a 1-attempt-per-IP rate
+      limit on `/hub/pair/{code}/confirm` to slow code-guessing further.
+    resolution: >
+      RESOLVED. pair_confirm (src/server/pairing.rs) now:
+        1. rate-limits by (code, peer_ip) — 1 attempt per 60s window
+           (PairConfirmRateLimiter, public struct + check_and_record
+           method for testability);
+        2. checks `Origin` header against the device base URL; if
+           absent, falls back to `Referer`; rejects mismatches with 403;
+        3. requires the `X-Pair-CSRF` header (with the token bound to the
+           session's PairingSession.csrf field, minted on mark_scanned,
+           constant-time-compared, consumed on confirm).
+      The CSRF check is placed BEFORE the NotScanned check so an
+      attacker without a valid CSRF cannot probe the Scanned state of a
+      session. (See adversarial test csrf_check_takes_precedence_over_not_scanned.)
+    verification: >
+      - tests/hub_routing_integration.rs:pair_confirm_rate_limiter_rejects_second_attempt
+        (verifies 1st attempt accepted, 2nd rejected; different ip/code
+        tuples have independent slots).
+      - tests/hub_routing_integration.rs:csrf_check_takes_precedence_over_not_scanned
+        (asserts CsrfMismatch is returned before NotScanned for an
+        unscanned session, hiding the state).
+      - tests/hub_routing_integration.rs:csrf_token_cannot_be_replayed_after_confirm
+        (verifies the token is consumed; replay attempt gets
+        AlreadyConfirmed).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M3-2
+    severity: MEDIUM
+    cwe: CWE-330
+    category: crypto / randomness
+    title: "M3's CSRF token must use a CSPRNG, not the default `rand` thread_rng check"
+    evidence:
+      - "Cargo.toml:64 — `rand = \"0.8\"` is already a dep, no `getrandom` direct usage."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:154 — 'generate_csrf 用 rand::Rng 16 字节 hex' — this is fine if it's `rand::thread_rng()` (CSPRNG), but ambiguous in the plan."
+      - "src/hub/pairing.rs:7 — `PAIRING_TTL = 600s`; CSRF effectively has the same TTL since it's stored on the session."
+    why_it_matters: >
+      `rand::thread_rng()` on Linux uses `getrandom(2)` which is a CSPRNG, so 16 random bytes
+      is ~128 bits of entropy. 128 bits is more than enough. The risk is in the implementation
+      step: if the implementer uses `rand::seq::SliceRandom::choose` over a non-uniform pool,
+      or `SmallRng`, the token's entropy is reduced.
+    fix: >
+      Pin the generator explicitly in the plan: `use rand::rngs::OsRng; OsRng.fill_bytes(&mut buf);`
+      This eliminates ambiguity. Add a unit test that verifies two consecutive `generate_csrf()`
+      calls produce different outputs and that the output is exactly 32 hex chars.
+    resolution: >
+      RESOLVED. src/hub/pairing.rs:generate_csrf uses
+      `rand::rngs::OsRng.fill_bytes(&mut [0u8; 16])` (16 bytes = 128 bits)
+      and emits 32 lowercase hex chars. The constant-time comparison
+      helper `constant_time_eq` mitigates timing side channels.
+    verification: >
+      - tests/hub_routing_integration.rs → src/hub/pairing.rs:generate_csrf_is_unique_and_hex
+        (asserts length=32, all hex, two consecutive calls differ).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M3-3
+    severity: MEDIUM
+    cwe: CWE-200
+    category: information-disclosure
+    title: "M3 only redacts pair_url in `build_pairing_qr_response` — other log paths still INFO sensitive fields"
+    evidence:
+      - "src/server/pairing.rs:252-257 — `info!(count = body.local_token_list.len(), ...)` is fine, but doesn't reveal code."
+      - "src/server/pairing.rs:304-306 — `info!(\"verify_code ignored for hub client pairing\")` is fine but is INFO."
+      - "src/server/pairing.rs:166-168 — unregister: `info!(client, vtoken)`. vtoken is redacted to 8 chars — OK."
+      - "src/server/pairing.rs:209-214 — update_client: `info!(old_name, new_name, vtoken)` — vtoken is redacted to 8 chars. OK."
+      - "src/hub/pairing.rs:91 — `mark_scanned` does not log at all. OK."
+      - "src/server/pairing.rs:221 — `info!(code, pair_url)` — the only pair_url leak; M3 fixes this."
+      - "docs/exec-plans/active/todo-security-p1/plan.md:138-139 — 'pair_url 改 DEBUG'."
+    why_it_matters: >
+      The plan is precise about pair_url but should also audit the surrounding log lines
+      (lines 209, 253, 304, 390 mentioned in plan §3.1). The current 209/214/168 already
+      redact vtoken. The remaining one is line 390 (`info!(code, name, "pairing confirmed")`)
+      which logs the full `code` and `name` at INFO. `name` is user-supplied (potentially
+      PII if user puts their email in it). `code` is a UUIDv4 — fine, but should be DEBUG
+      to be consistent.
+    fix: >
+      Lower line 390 from info! to debug!. Add a line to M3's plan: "audit lines 209/253/304/390;
+      redact or demote any field that contains a code, name, or vtoken beyond the 8-char
+      prefix to debug!." This is a one-line change, but flag it explicitly so the implementer
+      doesn't miss it.
+    resolution: >
+      RESOLVED. Three log sites demoted from info! to debug! in
+      src/server/pairing.rs:
+        - build_pairing_qr_response: `info!(code, pair_url, ...)` → debug!.
+        - get_bot_qrcode_post:    `info!(count, "get_bot_qrcode POST ...")` → debug!.
+        - get_qrcode_status:      `info!("verify_code ignored ...")` → debug!.
+        - pair_confirm success:   `info!(code, name, "pairing confirmed")` → debug!.
+      A compile-time test (pair_url_is_not_logged_at_info_level) statically
+      scans src/server/pairing.rs and fails if any `info!` macro carries
+      `pair_url` (catches future reverts at build time).
+    verification: >
+      - tests/hub_routing_integration.rs:pair_url_is_not_logged_at_info_level
+        (static scan; runs on every build).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M3-4
+    severity: LOW
+    cwe: CWE-613
+    category: authz
+    title: "M3's 'pair_confirm rejected when not_scanned' needs a state-transition test for AlreadyConfirmed + Scanned together"
+    evidence:
+      - "docs/exec-plans/active/todo-security-p1/plan.md:178-180 — 'pair_confirm_requires_valid_csrf_header' / 'pair_confirm_succeeds_with_correct_csrf_and_scanned_state' / 'pair_confirm_csrf_cannot_be_reused' / 'pair_confirm_rejected_when_not_scanned'."
+      - "src/hub/pairing.rs:116-118 — AlreadyConfirmed is checked BEFORE the planned NotScanned check."
+    why_it_matters: >
+      With M3's new ordering: CSRF → Scanned → register → confirm. But the existing
+      `confirm` body is `purge_expired → NotFound check → Expired check → AlreadyConfirmed
+      check → (NEW NotScanned check) → set Confirmed`. The order matters: an attacker
+      that triggers AlreadyConfirmed via two requests where the first wins will get a 409
+      for the second, leaking the existence of the (now-confirmed) session. The test plan
+      covers CSRF/Scanned/NotScanned in isolation, but not in combination. If the implementer
+      mis-orders the checks (e.g., Scanned first, AlreadyConfirmed second), the second
+      attacker gets a 412 instead of 409 — they learn the session is in Scanned state and
+      can race for the confirm window.
+    fix: >
+      Add a 5th test: 'pair_confirm_already_confirmed_takes_precedence_over_not_scanned' —
+      confirm once (success), then mark_scanned again, then attempt confirm with the OLD
+      csrf. Expected: 403 (csrf_mismatch) OR 409 (AlreadyConfirmed) — but verify the code
+      is mutually consistent (i.e., the order of checks is documented in a comment).
+    resolution: >
+      RESOLVED. src/hub/pairing.rs:confirm now checks in this order:
+      NotFound → Expired → AlreadyConfirmed → CSRF match (consumes token)
+      → NotScanned. The CSRF check is moved before NotScanned so the
+      Scanned state is never leaked through a 412 to a CSRF-less
+      attacker. The AlreadyConfirmed check is moved before the CSRF
+      check so the canonical 409 is returned to a racer (their csrf is
+      already consumed by the winner, but the order is documented in
+      a comment and pinned by a test). Two tests cover the
+      transitions: csrf_token_cannot_be_replayed_after_confirm and
+      csrf_check_takes_precedence_over_not_scanned.
+    verification: >
+      - tests/hub_routing_integration.rs:csrf_token_cannot_be_replayed_after_confirm
+        (replay attempt → AlreadyConfirmed, NOT Ok).
+      - tests/hub_routing_integration.rs:csrf_check_takes_precedence_over_not_scanned
+        (CsrfMismatch returned before NotScanned for an unscanned session).
+    status: FIXED
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-M0-1
+    severity: INFO
+    cwe: CWE-1164
+    category: code-hygiene
+    title: "M0 fix is correct and minimal; pre-existing unused-import was the only quality-gate failure"
+    evidence:
+      - "tests/hub_routing_integration.rs:16 — 'InMemoryQueue, MessageQueue,' → 'InMemoryQueue,' is a strict green-up; no symbol is used in the file."
+      - "review-request.yaml:73-80 — M0 self-reports the deviation from 'no code change' and justifies it as quality-gate green-up."
+      - "src/lib.rs exports both names; no API breakage."
+    why_it_matters: >
+      None. This is a clean M0. The plan's pre-existing assumption that the strict clippy
+      gate would pass was wrong; the one-line fix is the right resolution and is documented.
+    fix: >
+      None required. The deviation disclosure in the review-request is exemplary and should
+      be the template for future plans that hit unexpected quality-gate failures.
+    resolution: >
+      No action required. M0 baseline remains clean.
+    status: ACK
+
+  # ───────────────────────────────────────────────────────────────────────────
+  - id: F-ENV-1
+    severity: LOW
+    cwe: CWE-732
+    category: configuration
+    title: "`ILINK_ADMIN_INSECURE_NO_AUTH` environment variable still allows admin endpoints (incl. `/hub/register`) without ANY auth when `ILINK_ADMIN_TOKEN` is unset"
+    evidence:
+      - "src/server/routes.rs:75-91 — `insecure_no_auth()` reads env var, default false, but logged warning is only at first call."
+      - "src/server/routes.rs:62-73 — `check_admin_auth` returns true when insecure_no_auth() is true, even if ILINK_ADMIN_TOKEN is unset."
+      - "src/server/routes.rs:109-137 — `/hub/register` (admin auth-gated) issues a vtoken with no audit log entry at info! level on success."
+      - "src/server/routes.rs:115-124 — Failure path returns UNAUTHORIZED but registration success path (line 126) has no info!() call."
+    why_it_matters: >
+      If the operator sets `ILINK_ADMIN_INSECURE_NO_AUTH=true` and forgets to unset it, every
+      admin endpoint (register, list, delete, update) is wide open. The warning is logged
+      once per process, but on a long-running service that's easy to miss in logs. Also, the
+      `/hub/register` endpoint specifically silently mints a vtoken on success — an attacker
+      who reaches it (via the `insecure_no_auth` flag) gets a credential with no audit trail.
+      Pre-existing, not introduced by M0-M3, but relevant to the M0 review which claims
+      'no new source code changes' — confirm the production deploy docs are explicit about
+      NEVER setting `ILINK_ADMIN_INSECURE_NO_AUTH` in non-dev environments.
+    fix: >
+      (a) Add an info!() log line on /hub/register success that includes the client name and
+      a redacted vtoken (8-char prefix only, matching `redact_token`). (b) At startup, log
+      the insecure flag status at WARN level every time it's checked (use a counter or a
+      periodic heartbeat) — not just once. (c) In docs/deploy, mark the flag with a large
+      DO-NOT-USE-IN-PROD banner.
+    resolution: >
+      NOT FIXED in this pass. LOW severity, pre-existing, requires a
+      deploy-doc update that is out of scope for the M0-M3 security
+      milestone. Tracked as a follow-up.
+    status: ACCEPTED_LOW
+
+# ─── Verdict ─────────────────────────────────────────────────────────────────
+# All CRITICAL/HIGH findings (F-M1-1, F-M2-1, F-M3-1) and the bundled MEDIUMs
+# (F-M1-2, F-M1-3, F-M2-2, F-M3-2, F-M3-3, F-M3-4) are RESOLVED. The only
+# remaining open items are LOW severity (F-M2-3, F-ENV-1) and are tracked as
+# accepted follow-ups. Quality gates are fully green: cargo fmt --check,
+# cargo clippy --workspace --all-targets -- -D warnings, cargo test
+# --workspace (170 tests, 7 of them new adversarial tests for the
+# F-M1-1/F-M1-2/F-M2-1/F-M2-2/F-M3-1/F-M3-3 fixes), and
+# cargo build --workspace --release. The implementation is ready for PR.
+
+verdict: PASS
+verdict_rationale: >
+  M0 PASSES (the one-line test fix is correct, minimal, and fully green).
+  All HIGH findings (F-M1-1, F-M2-1, F-M3-1) are addressed via Option A
+  for the lock-ordering fix, a single-guard mark_seen collapse, and a
+  (Origin/Referer + rate-limit + CSRF) defense-in-depth on pair_confirm
+  respectively. The bundled MEDIUMs (F-M1-2 rollback, F-M1-3 cap, F-M2-2
+  mutex poison, F-M3-2 CSPRNG, F-M3-3 log audit, F-M3-4 check ordering)
+  are also resolved in the same pass. 7 new adversarial tests pin the
+  fixes. Quality gates: green.
+
+pass_conditions:
+  - id: m0-itself-passes
+    satisfied: true
+    note: "M0 baseline is clean; the single-line test import fix is benign."
+  - id: m1-plan-lock-order
+    satisfied: true
+    note: "F-M1-1 Option A implemented. register_client_in_hub runs OUTSIDE the pairing write lock; the canonical registry → router order is preserved. Doc comment warns future maintainers."
+  - id: m1-plan-rollback
+    satisfied: true
+    note: "F-M1-2: rollback_speculative_register helper undoes the speculative register on every non-Ok from confirm (NotFound / Expired / AlreadyConfirmed / NotScanned / CsrfMismatch / TooManySessions)."
+  - id: m1-plan-cap
+    satisfied: true
+    note: "F-M1-3: MAX_PAIRING_SESSIONS = 1024 cap on PairingRegistry::create."
+  - id: m2-mark-seen-ordering
+    satisfied: true
+    note: "F-M2-1: getupdates now holds a single registry write guard for existence-check + mark_seen."
+  - id: m2-std-mutex-poisoning
+    satisfied: true
+    note: "F-M2-2: both unwrap() calls in PollTracker replaced with let-Ok panic-safety pattern."
+  - id: m3-csrf-coverage
+    satisfied: true
+    note: "F-M3-1: Origin/Referer allowlist + 1-attempt-per-IP rate limit + X-Pair-CSRF header (constant-time compared, consumed on success)."
+  - id: m3-csrf-precedence
+    satisfied: true
+    note: "F-M3-4: confirm check order is NotFound → Expired → AlreadyConfirmed → CSRF → NotScanned. AlreadyConfirmed is checked before CSRF so a racer gets 409 not 403. CSRF is checked before NotScanned so the Scanned state is not leaked through 412."
+  - id: m3-log-redaction
+    satisfied: true
+    note: "F-M3-3: pair_url / code / name info! sites in src/server/pairing.rs demoted to debug!; pair_url_is_not_logged_at_info_level static test pins the invariant."
+  - id: quality-gates-green
+    satisfied: true
+    note: "cargo fmt --check, cargo clippy --workspace --all-targets -- -D warnings, cargo test --workspace (170 tests pass), cargo build --workspace --release all clean."
+
+# ─── Adversarial stance summary ─────────────────────────────────────────────
+# I deliberately tried to break the planned fixes by:
+# 1. Tracing every code path that touches the same locks the plan will rearrange.
+# 2. Enumerating the failure modes each new critical section introduces.
+# 3. Looking for ordering bugs at the boundary between the new and old code
+#    (e.g., where M1's `pairing.write().await` block ends and the existing
+#    registry/router read patterns begin).
+# 4. Checking that the OWASP-cited threats (CSRF, sensitive logging) are
+#    mitigated at the threat model level, not just at the surface.
+# Result: 11 findings, 9 resolved, 2 accepted as LOW-severity follow-ups.
+# All CRITICAL/HIGH resolved; the M0 review is now PASS.
