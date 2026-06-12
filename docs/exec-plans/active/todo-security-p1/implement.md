@@ -300,4 +300,113 @@ Proceed to M4 (质量门禁收口 — release build, clippy --all-targets, fmt -
 
 ---
 
+## M4 — 质量门禁收口 `[Final Checkpoint ✅]`
+
+**Date**: 2026-06-12
+**Worktree**: `/Users/kongjie/projects/ilink-hub/.worktrees/todo-security-p1`
+**Verifying commit**: `a7e5ca9` (HEAD at M4 certification)
+**Base commit (M0)**: `61938ba92fc20cdb00b876ddf5d4a9de52ddcd92`
+
+### Scope note — verification-only milestone
+
+M4 carries **no source changes**. Per plan.md M4 it is a roll-up gate that verifies the combined M1+M2+M3 diff against the task-prompt quality gate (fmt / clippy / test / build) plus the plan.md release-mode command (`cargo build --workspace --release`). The cert log, behavioural roll-up, and final verdict are recorded in `reviews/m4/review-request.yaml`.
+
+### Plan §M4 commands
+
+| # | Command | Plan-required | Result |
+|---|---------|---------------|--------|
+| 1 | `cargo fmt --check` | yes (per task prompt) | no output, exit 0 |
+| 2 | `cargo clippy -- -D warnings` | yes (per task prompt) | no warnings, exit 0 |
+| 3 | `cargo test` | yes (per task prompt) | 174 passed / 0 failed / 1 ignored, exit 0 |
+| 4 | `cargo build` | yes (per task prompt) | Finished `dev` profile, exit 0 |
+| 5 | `cargo clippy --workspace --all-targets -- -D warnings` | yes (plan §M4 pass-condition) | no warnings, exit 0 |
+| 6 | `cargo test --workspace` | yes (plan §M4 pass-condition) | 174 passed; 0 failed; 1 ignored |
+| 7 | `cargo build --workspace --release` | yes (plan §M4 commands) | Finished `release` profile, exit 0 |
+| 8 | `git diff --stat` (61938ba..HEAD) | yes (plan §M4 commands) | 23 files changed, +5305 / -84 |
+
+### Plan §M4 pass conditions
+
+| # | Plan clause | Observation | Result |
+|---|-------------|-------------|--------|
+| 1 | SEC-001 修复已提交（commit 1） | commit `1961dc3` 携带 SEC-001 原子化修复（pairing write lock 内 register+confirm）；详见 `reviews/m1/review-request.yaml` | ✅ |
+| 2 | SEC-003 修复已提交（commit 2） | commit `8b3cc39` 携带 SEC-003 闸门（`MAX_CONCURRENT_POLLS_PER_VTOKEN=3` + 429）；详见 `reviews/m2/review-request.yaml` | ✅ |
+| 3 | SEC-013 修复已提交（commit 3，可拆多个小 commit 但同 PR） | commit `1961dc3` 携带 SEC-013 三件套（CSRF + Scanned 状态门 + 日志降级），commit `a7e5ca9` 携带 M3 cert 的 A-M3-1/A-M3-2 follow-ups；同 PR 内；详见 `reviews/m3/review-request.yaml` | ✅ |
+| 4 | `cargo clippy --workspace --all-targets -- -D warnings` 无新 warning | 0 warnings, exit 0 | ✅ |
+| 5 | `cargo test --workspace` 全绿 | 174 passed; 0 failed; 1 ignored（hub::pairing 8 个, server::pairing 3 个, breaking_changes 9 个, hub_routing_integration 24 个, queue_trait_tests 10 个, doc-tests 0/1 ignored） | ✅ |
+| 6 | `cargo fmt --check` 通过 | no output, exit 0 | ✅ |
+| 7 | PR 描述列出三处 CWE、修复机制、新增测试 | 7 个 CWE 在 `reviews/m4/review-request.yaml::behavioural_rollup` 中按 SEC-* 分组列出；修复机制在同段；新增测试在 `m{n}_test_inventory` 段（M1: 6 个, M2: 3 个, M3: 13 个 = 22 个 P1 相关测试） | ✅ |
+
+### Test inventory at M4
+
+| Suite | Passed | Failed | Ignored |
+|-------|--------|--------|---------|
+| `ilink_hub` (unit, `src/lib.rs`) | 131 | 0 | 0 |
+| `ilink-hub` (bin, `src/main.rs`) | 0 | 0 | 0 |
+| `ilink-hub-bridge` (bin) | 0 | 0 | 0 |
+| `ilink-relay` (bin) | 0 | 0 | 0 |
+| `breaking_changes` | 9 | 0 | 0 |
+| `hub_routing_integration` | 24 | 0 | 0 |
+| `queue_trait_tests` | 10 | 0 | 0 |
+| doc-tests | 0 | 0 | 1 |
+| **Total** | **174** | **0** | **1** |
+
+比 M3 (171) 多 3 个，对应 commit `a7e5ca9` 引入的 M3 follow-up 测试：
+- `pair_confirm_rate_limiter_allows_concurrent_distinct_keys` (A-M3-1)
+- `pair_confirm_rate_limiter_rejects_concurrent_attempts` (A-M3-1)
+- `pair_confirm_rate_limiter_bounds_memory_under_adversarial_load` (A-M3-2)
+
+### Diff stat (M0 baseline → HEAD)
+
+```
+ Cargo.lock                                         |   1 +
+ Cargo.toml                                         |   1 +
+ deploy/nginx-ilinkhub-relay.conf                   |  23 +
+ .../active/todo-security-p1/implement.md           | 303+
+ docs/exec-plans/active/todo-security-p1/plan.md    | 238+
+ docs/exec-plans/active/todo-security-p1/prompt.md  |  29 +
+ docs/exec-plans/active/todo-security-p1/reviews/{m0,m1,m2,m3}/*  | ~3500
+ src/hub/mod.rs                                     |  90 ++-
+ src/hub/pairing.rs                                 | 223 +++++-
+ src/hub/registry.rs                                |  30 +-
+ src/runtime/serve.rs                                |  19 +-
+ src/server/pair.html                               |   6 +-
+ src/server/pairing.rs                              | 497 ++++++++++-
+ src/server/routes.rs                                |  79 +-
+ tests/breaking_changes.rs                          |  73 ++
+ tests/hub_routing_integration.rs                   | 864 +++++++++++++++++++-
+ 23 files changed, 5305 insertions(+), 84 deletions(-)
+```
+
+### F-M4-* (none flagged)
+
+M4 自身没有独立的 review findings；它是验证里程碑。SEC-* 的 finding（F-M1-1/2/3, F-M2-1/2, F-M3-1/2/3/4, A-M3-1/2）已经在 M1/M2/M3 的 review-request.yaml 中被 cert。
+
+### Pass conditions
+
+- [x] `cargo fmt --check` exit 0
+- [x] `cargo clippy -- -D warnings` exit 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exit 0
+- [x] `cargo build` exit 0
+- [x] `cargo build --workspace --release` exit 0
+- [x] `cargo test` exit 0 (174 passed)
+- [x] `cargo test --workspace` exit 0 (174 passed)
+- [x] SEC-001 fix commit landed (`1961dc3`)
+- [x] SEC-003 fix commit landed (`8b3cc39`)
+- [x] SEC-013 fix commits landed (`1961dc3` + `a7e5ca9`)
+- [x] PR description checklist in `reviews/m4/review-request.yaml::behavioural_rollup`
+- [x] Review request written to `reviews/m4/review-request.yaml`
+
+### Artifacts
+
+- `docs/exec-plans/active/todo-security-p1/plan.md` — source of truth (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/prompt.md` — source prompt (pre-existing)
+- `docs/exec-plans/active/todo-security-p1/reviews/m4/review-request.yaml` — this milestone's checkpoint record
+- `docs/exec-plans/active/todo-security-p1/implement.md` — this file
+
+### Next
+
+P1 security fixes (SEC-001, SEC-003, SEC-013) are ready for PR review. The PR deliverable is the consolidated plan + commit series + four review-request YAMLs.
+
+---
+
 IMPL:DONE
