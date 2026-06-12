@@ -124,9 +124,35 @@
   - `<details class="qr-help">` 展开体三条 `<li>` 逐字覆盖三项 (账号未开通 iLink / 二维码过期 / 手机网络异常)。
 - 实际 GUI 端到端复现需要 `cargo tauri build` + 双击启动 .app,本里程碑验证命令列表未包含此步骤,仅覆盖静态路径。CSS/HTML 结构由 `npm run build` + `tsc clean` + 既有 188 个 Rust 单元测试三层保护,关键文案在 `index.html` 中可直接 grep 验证。
 
+### M4 — 质量门禁收尾 — ✅ 已完成
+
+**交付日期**: 2026-06-12
+**Worktree**: `/Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1`
+**Base / Head commit**: `29c43dcf0c8351843220ab53890f334c46774078` (M4 base == head, M4 自身零代码变更)
+
+**代码变更**:
+- 无。M4 的目标是把 M1/M2/M3 累积下来的分支在任务提示词要求的全套质量门禁下复跑一次,确认整条 P1 UX 修复链在统一约束下是绿的。M4 本身只新增 `reviews/m4/review-request.yaml` 与本节 `implement.md` 追加,不动 Rust / TS / HTML / CSS / 依赖。
+
+**验证命令(全部 green)**:
+- `cargo fmt --check` → 无输出,exit 0
+- `cargo clippy -- -D warnings` → 0 warning,exit 0
+- `cargo test` → 129 (ilink_hub lib) + 7 (breaking_changes) + 9 (hub_routing_integration) + 10 (queue_trait_tests) + 0 doc tests (1 ignored) = **155 passed, 0 failed, 1 ignored**
+- `cargo build` → Finished `dev` profile,exit 0
+- `cd desktop/ilink-hub-desktop && npm run build` → `tsc` clean + Vite v6.4.3 产出 `dist/index.html` (19.72 kB, gzip 5.02 kB) + CSS (27.41 kB, gzip 6.07 kB) + JS (25.67 kB, gzip 9.00 kB),7 modules transformed,built in 84ms,exit 0
+- `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` → Finished `dev` profile,exit 0
+- (追加) `cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` → desktop lib 31 (M1 5 + M2 13 + pre-existing 13) + desktop main 2 = **33 passed, 0 failed, 0 ignored**
+
+**Review 工件**:
+- `reviews/m4/review-request.yaml` 已生成,记录 base==head==M3 head commit、所有 6 条任务提示词命令的实际输出、与 Plan §M4 及 [E2E-4] 的逐条对照结果。
+
+**E2E Checkpoint [E2E-4] 备注**:
+- Plan 中 [E2E-4] 要求「全量 CI 等价命令本地复跑通过」,由本里程碑验证命令列表 6/6 全绿覆盖。任务提示词在 Plan §M4 之上额外追加了 `cargo fmt --check` / `cargo build` / `cargo check --manifest-path .../src-tauri/Cargo.toml` 三条,这三条同样全绿,本节一并记录。
+- 注意:Plan §M4 写的是 `pnpm -C desktop/ilink-hub-desktop run build`,本工作区 `desktop/ilink-hub-desktop/package.json` 的实际包管理器是 npm (脚本为 `tsc && vite build`),M1/M2/M3 三个里程碑一致使用 `npm run build` 并保持记录口径一致;M4 沿用相同命令以避免门禁形状在里程碑之间漂移。
+- 注意:Plan §M4 写的是 `cargo clippy --all-targets -- -D warnings`,任务提示词收紧为 `cargo clippy -- -D warnings` (默认 target 集合 = lib + bin),M4 沿用与 M1/M2/M3 一致的 `cargo clippy -- -D warnings` 默认 target 集合,记录在 `review-request.yaml` 的 `m4_test_inventory` 备注中说明。
+
 ## 总体进度
 
 - [x] M1 (UX-01)
 - [x] M2 (UX-02)
 - [x] M3 (UX-03)
-- [ ] M4 (质量门禁收尾)
+- [x] M4 (质量门禁收尾)

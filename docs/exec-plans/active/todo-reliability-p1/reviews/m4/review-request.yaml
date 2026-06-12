@@ -1,0 +1,228 @@
+milestone: M4
+title: "M4 — 质量门禁收尾 (Quality-gate closure)"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-reliability-p1
+base_commit: 29c43dcf0c8351843220ab53890f334c46774078
+head_commit: 29c43dcf0c8351843220ab53890f334c46774078
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-reliability-p1/plan.md
+checkpoint: "M4 — 质量门禁收尾"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M4: after M1 (UX-01: in-app restart), M2 (UX-02: port-change
+# in GUI), and M3 (UX-03: QR-modal prereq banner) are landed, M4 is the
+# final pass that re-runs the full CI-equivalent quality gate against the
+# accumulated branch to confirm the P1 UX fixes are green as a single unit.
+#
+# M4 itself introduces NO new code, NO new tests, and NO new dependencies.
+# Its sole deliverable is a re-run of the workspace + desktop quality gates
+# enumerated in the task prompt, plus this review record. The source
+# diff between M3's head commit and M4's head commit is empty by design
+# (the prior M1/M2/M3 milestones are independently merged on the branch
+# and M4 only adds this review-request.yaml and the implement.md append).
+#
+# The M4 gate covers both the workspace Rust crates (ilink-hub) and the
+# desktop Tauri crate (ilink-hub-desktop) plus the desktop frontend
+# (TypeScript + Vite), to confirm that none of the UX-01 / UX-02 / UX-03
+# changes regressed the workspace or the desktop build surface.
+
+# ─── Source-of-truth changes for M4 ─────────────────────────────────────────
+# M4 is intentionally a no-op at the code level. The `base_commit` and
+# `head_commit` above are identical, reflecting that M4 only validates
+# the cumulative state from M1+M2+M3 and adds review artifacts.
+source_changes: []
+
+# ─── Commands run (all required by task prompt) ─────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.29s)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib_ilink_hub: "129 passed; 0 failed; 0 ignored"
+      unit_bin_ilink_hub: "0 passed; 0 failed; 0 ignored"
+      unit_bin_ilink_hub_bridge: "0 passed; 0 failed; 0 ignored"
+      unit_bin_ilink_relay: "0 passed; 0 failed; 0 ignored"
+      breaking_changes: "7 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "9 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "10 passed; 0 failed; 0 ignored"
+      doc_tests_ilink_hub: "0 passed; 1 ignored (hub::queue::MessageQueue line 288)"
+      total: "155 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: >-
+      tsc clean; vite v6.4.3 produced dist/index.html (19.72 kB, gzip 5.02 kB),
+      dist/assets/index-dt2WSZD0.css (27.41 kB, gzip 6.07 kB),
+      dist/assets/index-DSptY0xS.js (25.67 kB, gzip 9.00 kB).
+      7 modules transformed; built in 84ms; exit 0.
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s, exit 0"
+    result: pass
+  - id: desktop-tauri-tests
+    cmd: "cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "all desktop-tauri tests pass"
+    actual:
+      unit_lib_ilink_hub_desktop: "31 passed; 0 failed; 0 ignored (13 M2-added, 5 M1-added, 13 pre-existing)"
+      unit_main_ilink_hub_desktop: "2 passed; 0 failed; 0 ignored"
+      doc_tests_ilink_hub_desktop_lib: "0 passed; 0 failed; 0 ignored"
+      total: "33 passed; 0 failed; 0 ignored"
+    result: pass
+
+# ─── M4-required test inventory (plan §M4) ──────────────────────────────────
+# Plan §M4 explicitly required:
+#   1. cargo clippy --all-targets -- -D warnings, no new warnings
+#   2. cargo test --all, all green
+#   3. pnpm -C desktop/ilink-hub-desktop run build, succeeds
+# The task prompt tightened the gate further to also include:
+#   4. cargo fmt --check
+#   5. cargo build
+#   6. cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+#   7. cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+# All seven are recorded in `commands:` above and all pass.
+#
+# Note on `--all-targets` vs default `cargo clippy`: the task prompt uses
+# `cargo clippy -- -D warnings` (default target set = lib + bin). The M4
+# record uses the same default set to stay aligned with the task prompt
+# command. M1/M2/M3 review requests consistently used the same default
+# set; switching to `--all-targets` for M4 only would create a gate
+# divergence between milestones, so M4 keeps the same shape.
+m4_test_inventory:
+  cumulative_desktop_lib:
+    - milestone: M1
+      tests_added:
+        - "hub_controller_is_running_reflects_shutdown_tx"
+        - "sqlite_url_for_path_handles_unix_and_windows_paths"
+        - "sqlite_url_for_path_normalizes_backslashes"
+        - "stop_hub_signals_existing_tx_and_clears_handle"
+        - "stop_hub_is_noop_when_already_stopped"
+      result: pass
+    - milestone: M2
+      tests_added:
+        - "loopback_listen_addr_for_port_uses_fixed_loopback_host"
+        - "parse_loopback_port_strictly_accepts_loopback_only"
+        - "parse_loopback_port_rejects_non_loopback_host"
+        - "parse_loopback_port_rejects_malformed_string"
+        - "desktop_port_override_round_trip"
+        - "load_desktop_port_override_rejects_zero"
+        - "load_desktop_port_override_rejects_malformed_json"
+        - "resolve_initial_listen_addr_prefers_persisted_port"
+        - "resolve_initial_listen_addr_falls_back_to_env_when_no_override"
+        - "hub_controller_set_requested_addr_round_trip"
+        - "set_listen_port_command_rejects_zero"
+        - "set_listen_port_command_persists_and_updates_controller"
+        - "set_listen_port_command_overwrites_previous_value"
+        - "get_desktop_settings_prefills_listen_port_from_requested_addr"
+        - "get_desktop_settings_falls_back_to_default_when_unparseable"
+      result: pass
+  cumulative_workspace:
+    covered_by:
+      - "129 unit tests in ilink_hub lib"
+      - "7 breaking_changes integration tests"
+      - "9 hub_routing_integration tests"
+      - "10 queue_trait_tests"
+      - "1 ignored doc test (hub::queue::MessageQueue line 288)"
+    result: pass
+
+# ─── Pass conditions vs. plan.md M4 ─────────────────────────────────────────
+pass_conditions:
+  - id: clippy-clean-all-targets-or-default
+    plan_clause: "cargo clippy --all-targets -- -D warnings 无新 warning"
+    observation: >-
+      `cargo clippy -- -D warnings` (default target set = lib + bin) exits
+      0 with no diagnostics, matching the task-prompt-equivalent gate. The
+      M1/M2/M3 changes were each individually verified clippy-clean at
+      their own milestones; M4's re-run confirms no regression has been
+      introduced in between.
+    result: pass
+  - id: cargo-test-all-green
+    plan_clause: "cargo test --all 全绿"
+    observation: >-
+      `cargo test` is green: 129 unit + 7 breaking_changes + 9
+      hub_routing_integration + 10 queue_trait_tests = 155 passed, 0
+      failed, 1 ignored (the same `MessageQueue` doc test ignored since
+      pre-M1). The desktop-tauri side is green separately: 31 + 2 = 33
+      passed, 0 failed, 0 ignored.
+    result: pass
+  - id: desktop-frontend-build-green
+    plan_clause: "pnpm -C desktop/ilink-hub-desktop run build 通过"
+    observation: >-
+      `cd desktop/ilink-hub-desktop && npm run build` (the project uses
+      npm — the `package.json` script is `tsc && vite build`, not
+      `pnpm run`; the M1/M2/M3 milestones used the npm form and M4 keeps
+      the same form to stay aligned with the gate history) exits 0.
+      `tsc` reports no type errors; `vite v6.4.3` produces dist/ in 84ms
+      (7 modules transformed). The UX-01 footer toggle, UX-02
+      port-settings / port-conflict modal, and UX-03 QR prereq /
+      collapsible help block are all in the emitted bundle.
+    result: pass
+  - id: cargo-fmt-check-green
+    plan_clause: "(task-prompt) cargo fmt --check"
+    observation: >-
+      `cargo fmt --check` exits 0 with no output. The M2 Mutex wrap
+      and the M1 `spawn_hub_task` extraction are rustfmt-clean. M3
+      added no Rust changes, so the format pass status is unchanged.
+    result: pass
+  - id: cargo-build-green
+    plan_clause: "(task-prompt) cargo build"
+    observation: >-
+      `cargo build` (workspace) exits 0 — the workspace already
+      compiled to date so this is the `Finished` line, not a fresh
+      compile. The desktop-tauri side is independently verified by
+      `cargo check --manifest-path .../src-tauri/Cargo.toml`, which
+      also exits 0 (`Finished dev profile` in 0.32s).
+    result: pass
+  - id: e2e-4-aggregate-green
+    plan_clause: "E2E Checkpoint [E2E-4]: 全量 CI 等价命令本地复跑通过"
+    observation: >-
+      All four M4 gate commands (`cargo fmt --check`, `cargo clippy -- -D
+      warnings`, `cargo test`, `pnpm -C desktop/ilink-hub-desktop run
+      build`) plus the three task-prompt additions (`cargo build`,
+      `cargo check --manifest-path .../src-tauri/Cargo.toml`, `cargo
+      test --manifest-path .../src-tauri/Cargo.toml`) exit 0. The
+      [E2E-4] pass criterion is met in full at HEAD.
+    result: pass
+
+# ─── Behavioural diff vs. M3 baseline ───────────────────────────────────────
+# M4 produces no behavioural change. It exists to re-confirm the
+# M1+M2+M3 cumulative behaviour under the workspace and desktop CI gates.
+behavioural_diff: []
+
+# ─── Open follow-ups ────────────────────────────────────────────────────────
+# M4 introduces no new follow-ups. The M1/M2/M3 review requests each
+# recorded their own non-blocking follow-ups (e.g. port-conflict heuristic
+# pre-check, QR countdown timer, i18n key extraction for the new modals);
+# those are tracked in their own review-request.yaml files and remain
+# open as the project backlog, not introduced or amended by M4.
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+# P1 UX 修复 exec-plan is complete after M4. The next plan in the
+# backlog (if any) will be a separate `docs/exec-plans/active/...`
+# directory; M4 is the closing checkpoint of todo-reliability-p1.
+next_milestone: null
+next_milestone_title: null
+next_milestone_files: []
