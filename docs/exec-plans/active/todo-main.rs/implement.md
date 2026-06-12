@@ -165,3 +165,30 @@
   - `/health` 请求：`curl -sf http://127.0.0.1:8765/health` 成功返回 `ok`。
   - `--addr 0.0.0.0:8765` 启动：`lsof -i :8765` 输出 `TCP *:ultraseek-http (LISTEN)`。
 - 在 `reviews/m2.3/review-request.yaml` 中提交了审核请求。
+
+---
+
+## M3 — 质量门
+
+### Decisions
+- 作为一个没有功能性代码变更的纯质量把关里程碑，重点在于对整个 Hub 和桌面端的前后端代码进行一致性、格式以及警告层面的全面核验。
+- 执行了完整的静态分析和构建任务，包括：
+  1. Rust 格式化检查 (`cargo fmt --check`)
+  2. Rust 静态分析 Clippy 无警告 (`cargo clippy -- -D warnings` / `--all-targets`)
+  3. 全部 154 个单元/集成测试通过 (`cargo test`)
+  4. Rust 主工程编译通过 (`cargo build`)
+  5. 桌面端前端构建通过 (`npm run build`)
+  6. 桌面端 Tauri Rust 部分检查通过 (`cargo check --manifest-path ...`)
+
+### Problems
+- 无。全部六项质量把关命令在此前解决完 M2.3 变更后，执行均无任何报错或警告，直接全绿通过。
+
+### Outcome
+- fmt: `cargo fmt --check` 成功通过。
+- clippy: `cargo clippy -- -D warnings` 通过，无任何 warnings。
+- test: `cargo test` 全绿通过（154 passed）。
+- build: `cargo build` 编译成功。
+- desktop-frontend: Vite 构建和 TypeScript 检查通过，成功输出 dist。
+- desktop-tauri: Tauri `src-tauri` 检查通过。
+- 在 `reviews/m3/review-request.yaml` 中提交了审核请求。
+
