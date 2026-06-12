@@ -102,6 +102,16 @@ impl DeviceIdentity {
             timestamp,
         ))
     }
+
+    /// Build an identity from already-known material. Used by tests so they do
+    /// not need to write to the user's real local data dir.
+    #[doc(hidden)]
+    pub fn for_testing(device_id: String, signing_key_b64: String) -> Self {
+        Self {
+            device_id,
+            signing_key_b64,
+        }
+    }
 }
 
 /// Backward-compatible helper for code that only needs the device id string.

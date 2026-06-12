@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
+use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
@@ -15,17 +16,51 @@ const RECONNECT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Spawn a background task that maintains a relay connection and forwards HTTP to local Hub.
-pub fn spawn_relay_client(identity: DeviceIdentity, hub_base: String, relay_ws_url: String) {
+///
+/// Returns when `shutdown` flips to `true`, performing a clean exit so the relay server
+/// observes a normal WebSocket close instead of an unexpected drop.
+pub fn spawn_relay_client(
+    identity: DeviceIdentity,
+    hub_base: String,
+    relay_ws_url: String,
+    shutdown: watch::Receiver<bool>,
+) {
+    tokio::spawn(run_relay_loop(identity, hub_base, relay_ws_url, shutdown));
+}
+
+/// Reconnect loop body, factored out so tests can `await` it directly.
+pub async fn run_relay_loop(
+    identity: DeviceIdentity,
+    hub_base: String,
+    relay_ws_url: String,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let device_id = identity.device_id().to_string();
-    tokio::spawn(async move {
-        loop {
-            match run_session(&identity, &device_id, &hub_base, &relay_ws_url).await {
-                Ok(()) => info!("relay session ended normally"),
-                Err(e) => warn!(error = %e, "relay session error"),
+    // If shutdown is already true at startup (e.g. shutdown raced with startup
+    // ordering), exit immediately rather than connecting once and dropping the
+    // socket on the way out.
+    if *shutdown.borrow() {
+        info!("relay client skipped (shutdown already signalled at spawn)");
+        return;
+    }
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("relay client shutting down");
+                    return;
+                }
             }
-            tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)).await;
+            res = run_session(&identity, &device_id, &hub_base, &relay_ws_url) => {
+                match res {
+                    Ok(()) => info!("relay session ended normally"),
+                    Err(e) => warn!(error = %e, "relay session error"),
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)) => {}
         }
-    });
+    }
 }
 
 async fn run_session(
@@ -177,4 +212,100 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+    use tokio::sync::watch;
+
+    fn test_identity() -> DeviceIdentity {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        DeviceIdentity::for_testing(
+            "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            B64.encode(signing_key.to_bytes()),
+        )
+    }
+
+    /// If `shutdown` is already true at spawn time, the loop must exit immediately
+    /// without ever calling `run_session` (and therefore without opening any WebSocket).
+    #[tokio::test]
+    async fn relay_loop_returns_immediately_when_shutdown_already_true() {
+        let (tx, rx) = watch::channel(false);
+        tx.send(true).expect("send shutdown");
+        let identity = test_identity();
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            run_relay_loop(
+                identity,
+                "http://127.0.0.1:1".to_string(),
+                "ws://127.0.0.1:1/ws/pairing".to_string(),
+                rx,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "run_relay_loop did not return within 200ms when shutdown was signalled at spawn"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "loop took {}ms to exit; expected near-instant",
+            start.elapsed().as_millis()
+        );
+    }
+
+    /// When `run_session` fails (e.g. unreachable relay URL) and the loop falls
+    /// into the `RECONNECT_SECS` sleep, sending `shutdown` must abort the sleep
+    /// and return promptly — well under the 5s reconnect interval.
+    #[tokio::test]
+    async fn relay_loop_exits_during_reconnect_sleep_when_shutdown_signalled() {
+        let (tx, rx) = watch::channel(false);
+        let identity = test_identity();
+        let loop_handle = tokio::spawn(run_relay_loop(
+            identity,
+            "http://127.0.0.1:1".to_string(),
+            // Unreachable WS URL — connect_async fails fast on 127.0.0.1:1.
+            "ws://127.0.0.1:1/ws/pairing".to_string(),
+            rx,
+        ));
+
+        // Give the loop time to attempt connect_async and fall into the
+        // 5s reconnect sleep.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        tx.send(true).expect("send shutdown");
+
+        // The sleep arm must abort via the select!'s `shutdown.changed()` arm.
+        // Allow a generous bound (RECONNECT_SECS is 5s, so anything <2s proves
+        // shutdown was honoured).
+        match tokio::time::timeout(Duration::from_secs(2), loop_handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("relay loop task panicked: {e}"),
+            Err(_) => panic!("relay loop did not exit within 2s of shutdown signal"),
+        }
+    }
+
+    /// `spawn_relay_client` must return synchronously (it just spawns a task) so the
+    /// caller's startup sequence is not blocked by relay connectivity.
+    #[tokio::test]
+    async fn spawn_relay_client_returns_without_blocking() {
+        let identity = test_identity();
+        let (_tx, rx) = watch::channel(false);
+        let start = std::time::Instant::now();
+        spawn_relay_client(
+            identity,
+            "http://127.0.0.1:1".to_string(),
+            "ws://127.0.0.1:1/ws/pairing".to_string(),
+            rx,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "spawn_relay_client blocked for {elapsed:?} (expected <50ms)"
+        );
+    }
 }
