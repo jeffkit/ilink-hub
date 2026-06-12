@@ -151,7 +151,7 @@ pub async fn unregister_client_in_hub(
     }
 
     if let Err(e) = state.queue.remove_client(&vtoken).await {
-        warn!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to remove client queue");
+        warn!(error = %e, vtoken = %crate::redact_token(&vtoken), "failed to remove client queue");
     }
 
     state
@@ -165,7 +165,7 @@ pub async fn unregister_client_in_hub(
         .await
         .map_err(UnregisterClientError::Store)?;
 
-    info!(client = %name, vtoken = %&vtoken[..vtoken.len().min(8)], "admin deleted offline client");
+    info!(client = %name, vtoken = %crate::redact_token(&vtoken), "admin deleted offline client");
     Ok(())
 }
 
@@ -209,7 +209,7 @@ pub async fn update_client_in_hub(
     info!(
         old_name = %old_name,
         new_name = %new_name,
-        vtoken = %&vtoken[..vtoken.len().min(8)],
+        vtoken = %crate::redact_token(&vtoken),
         "admin updated client"
     );
     Ok(vtoken)

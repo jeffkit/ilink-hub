@@ -418,7 +418,7 @@ async fn push_to_queue(state: &HubState, vtoken: &str, msg: WeixinMessage) {
                 .fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
-            error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push message to queue");
+            error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push message to queue");
             state
                 .metrics
                 .messages_dropped
@@ -562,7 +562,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                             .fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        error!(error = %e, vtoken = %&vtoken[..vtoken.len().min(8)], "failed to push hub broadcast message");
+                        error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push hub broadcast message");
                         state
                             .metrics
                             .messages_dropped
@@ -619,7 +619,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                                 } else {
                                     format!(
                                         "`{}`",
-                                        &s.backend_session_id[..s.backend_session_id.len().min(12)]
+                                        s.backend_session_id.chars().take(12).collect::<String>()
                                     )
                                 };
                                 lines.push(format!(

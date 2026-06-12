@@ -24,12 +24,7 @@ pub const UNKNOWN_VTOKEN_MSG: &str = "Unknown or revoked virtual token; register
 
 // ─── Auth helper ─────────────────────────────────────────────────────────────
 
-/// Redact a virtual token for logging: show only the first 8 characters followed by `…`.
-/// This lets operators correlate log lines without exposing the full credential.
-fn redact_token(t: &str) -> String {
-    let prefix: String = t.chars().take(8).collect();
-    format!("{prefix}…")
-}
+use crate::redact_token;
 
 fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
     headers

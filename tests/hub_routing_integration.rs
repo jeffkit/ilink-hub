@@ -13,7 +13,7 @@ use ilink_hub::{
     ilink::types::{MessageItem, SendMessageRequest, TextItem, WeixinMessage},
     ilink::UpstreamClient,
     store::Store,
-    InMemoryQueue, MessageQueue,
+    InMemoryQueue,
 };
 use tokio::sync::broadcast;
 

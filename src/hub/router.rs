@@ -158,7 +158,7 @@ impl Router {
         if let Some(vtoken) = self.get_route(from_user_id) {
             debug!(
                 from_user_id,
-                vtoken = %&vtoken[..vtoken.len().min(8)],
+                vtoken = %crate::redact_token(vtoken),
                 "routing message"
             );
             RoutingDecision::ForwardTo {
@@ -377,6 +377,6 @@ mod tests {
 
         let guard = logged_vtoken.lock().unwrap();
         let redacted = guard.as_ref().expect("expected vtoken to be logged");
-        assert_eq!(redacted, "very_lon");
+        assert_eq!(redacted, "very_lon…");
     }
 }
