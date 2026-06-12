@@ -59,7 +59,7 @@ pub fn public_key_b64(verifying_key: &VerifyingKey) -> String {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
+    use rand_core::OsRng;
 
     #[test]
     fn sign_and_verify_register() {

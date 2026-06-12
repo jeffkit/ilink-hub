@@ -11,8 +11,8 @@
   - [x] Make postgres/mysql optional
   - [x] Create `review-request.yaml` for milestone m2
 - **Milestone 3: Fix [D-02] Upgrade `rand` version to 0.9**
-  - [ ] Upgrade rand dependency
-  - [ ] Replace thread_rng usage
+  - [x] Upgrade rand dependency
+  - [x] Replace thread_rng usage
 
 ## Details for Milestone 1
 
@@ -27,12 +27,25 @@
 - Updated documentation: [README.md](file:///Users/kongjie/projects/ilink-hub/.worktrees/todo-misc/README.md), [docs/reference/configuration.md](file:///Users/kongjie/projects/ilink-hub/.worktrees/todo-misc/docs/reference/configuration.md), and [docs/guide/installation.md](file:///Users/kongjie/projects/ilink-hub/.worktrees/todo-misc/docs/guide/installation.md) to explain the new Cargo features requirement.
 - Created [review-request.yaml](file:///Users/kongjie/projects/ilink-hub/.worktrees/todo-misc/docs/exec-plans/active/todo-misc/reviews/m2/review-request.yaml) for Milestone 2.
 
+## Details for Milestone 3
+
+- Upgraded `rand` dependency to version `0.9` in `Cargo.toml`.
+- Replaced the deprecated `rand::thread_rng().gen::<u32>()` pattern with `rand::random::<u32>()` in `src/ilink/upstream.rs`.
+- Resolved `rand_core` trait compatibility issues with `ed25519-dalek` version 2 by:
+  - Adding `rand_core` version `0.6` with `getrandom` feature to `Cargo.toml`.
+  - Switching imports in `src/relay/auth.rs` and `src/relay/device.rs` to use `rand_core::OsRng` instead of `rand::rngs::OsRng`.
+- Created [review-request.yaml](file:///Users/kongjie/projects/ilink-hub/.worktrees/todo-misc/docs/exec-plans/active/todo-misc/reviews/m3/review-request.yaml) for Milestone 3.
+
 ## Validation Results
 
 - `cargo fmt --check`: Passed
 - `cargo clippy --all-targets --all-features -- -D warnings`: Passed
+- `cargo clippy --all-targets -- -D warnings`: Passed
 - `cargo test --all-features`: Passed
+- `cargo test`: Passed
 - `cargo build --all-features`: Passed
+- `cargo build`: Passed
 - `cargo check --no-default-features --features sqlite`: Passed
 - `cargo check --features postgres`: Passed
 - `cargo check --features mysql`: Passed
+- `cargo check --all-targets`: Passed

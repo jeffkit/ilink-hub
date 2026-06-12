@@ -1,0 +1,18 @@
+milestone: "m3"
+title: "Fix [D-02] Upgrade `rand` version to 0.9"
+description: >
+  Upgraded `rand` dependency from version 0.8 to 0.9 in `Cargo.toml`.
+  Replaced deprecated `rand::thread_rng().gen()` pattern with `rand::random::<u32>()` in `src/ilink/upstream.rs`.
+  Resolved compatibility issues with `ed25519-dalek` version 2 by introducing `rand_core` version 0.6 dependency and switching `SigningKey::generate` CSPRNG argument to use `rand_core::OsRng` in `src/relay/auth.rs` and `src/relay/device.rs`.
+files_changed:
+  - Cargo.toml
+  - src/ilink/upstream.rs
+  - src/relay/auth.rs
+  - src/relay/device.rs
+validation:
+  commands:
+    - cargo fmt --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test
+    - cargo build
+  status: "Passed"
