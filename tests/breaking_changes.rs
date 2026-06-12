@@ -245,18 +245,9 @@ fn queue_backend_memory_is_unchanged() {
 }
 
 // ─── F-M1-B: end-to-end test that the production pair_confirm handler ────────
-//     rejects requests with neither Origin nor Referer.
-//
-// The handler requires `ConnectInfo<SocketAddr>`. We rebuild a router
-// with `into_make_service_with_connect_info` semantics so the
-// extractor resolves in the test. (axum's `Router::oneshot_with_connect_info`
-// is the unit-test equivalent.)
 
 /// F-M1-B (handler-level): a bare-curl POST with no Origin and no
-/// Referer hits the production pair_confirm handler and is rejected
-/// with 403. Pre-fix the request would have passed through to the
-/// CSRF / state check (the if/else-if chain had no terminating
-/// `else`).
+/// Referer hits the production pair_confirm handler and is rejected with 403.
 #[tokio::test]
 async fn pair_confirm_handler_rejects_no_origin_no_referer() {
     use std::net::SocketAddr;
@@ -264,12 +255,9 @@ async fn pair_confirm_handler_rejects_no_origin_no_referer() {
     let app = ilink_hub::server::build_router(state);
     let mut req = Request::builder()
         .method("POST")
-        // Unique code per test so the (code, ip) rate limiter does
-        // not collide across tests in the same process.
         .uri("/hub/pair/pair_fm1b_no_origin/confirm")
         .header("Content-Type", "application/json")
         .header("X-Pair-CSRF", "deadbeef".repeat(4))
-        // No Origin, no Referer, on purpose.
         .body(Body::from(serde_json::json!({"name": "alice"}).to_string()))
         .unwrap();
     req.extensions_mut()
@@ -286,8 +274,7 @@ async fn pair_confirm_handler_rejects_no_origin_no_referer() {
     );
 }
 
-/// F-M1-B (handler-level): a POST with a foreign Origin (not the
-/// device's pair-public-url) is rejected with 403.
+/// F-M1-B (handler-level): a POST with a foreign Origin is rejected with 403.
 #[tokio::test]
 async fn pair_confirm_handler_rejects_foreign_origin() {
     use std::net::SocketAddr;
@@ -295,8 +282,6 @@ async fn pair_confirm_handler_rejects_foreign_origin() {
     let app = ilink_hub::server::build_router(state);
     let mut req = Request::builder()
         .method("POST")
-        // Unique code per test so the (code, ip) rate limiter does
-        // not collide across tests in the same process.
         .uri("/hub/pair/pair_fm1b_foreign_origin/confirm")
         .header("Content-Type", "application/json")
         .header("X-Pair-CSRF", "deadbeef".repeat(4))
@@ -315,4 +300,88 @@ async fn pair_confirm_handler_rejects_foreign_origin() {
         "F-M1-B: pair_confirm with foreign Origin must be rejected (got {})",
         resp.status()
     );
+}
+
+// ─── E-01: Sendtyping error propagation ──────────────────────────────────────
+
+#[tokio::test]
+async fn sendtyping_error_propagation_test() {
+    use axum::routing::post;
+    use axum::Router;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let should_fail = Arc::new(AtomicBool::new(false));
+    let should_fail_clone = should_fail.clone();
+
+    let mock_app = Router::new().route(
+        "/ilink/bot/sendtyping",
+        post(move || {
+            let sf = should_fail_clone.clone();
+            async move {
+                if sf.load(Ordering::Relaxed) {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock error")
+                } else {
+                    (axum::http::StatusCode::OK, "")
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let store = Store::connect("sqlite::memory:")
+        .await
+        .expect("in-memory store");
+    let upstream = Arc::new(UpstreamClient::new(
+        "sk-test:key".to_string(),
+        Some(base_url),
+    ));
+    let queue = Arc::new(InMemoryQueue::new());
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+
+    let vtoken =
+        ilink_hub::server::pairing::register_client_in_hub(&state, "test-client".to_string(), None)
+            .await;
+
+    let app = build_router(state);
+
+    // Case A: upstream succeeds
+    should_fail.store(false, Ordering::Relaxed);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ilink/bot/sendtyping")
+        .header("Authorization", format!("Bearer {vtoken}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"vctx":"vctx-123","typing":true}"#))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json["ret"], 0);
+
+    // Case B: upstream fails
+    should_fail.store(true, Ordering::Relaxed);
+    let req = Request::builder()
+        .method("POST")
+        .uri("/ilink/bot/sendtyping")
+        .header("Authorization", format!("Bearer {vtoken}"))
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"vctx":"vctx-123","typing":true}"#))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(json["ret"], 500);
+    assert!(json["errmsg"].as_str().unwrap().contains("upstream error"));
 }

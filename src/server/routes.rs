@@ -489,8 +489,13 @@ pub async fn sendtyping(
         }
     }
 
-    let _ = state.upstream.send_typing(req).await;
-    Json(serde_json::json!({"ret": 0}))
+    match state.upstream.send_typing(req).await {
+        Ok(_) => Json(serde_json::json!({"ret": 0})),
+        Err(e) => Json(serde_json::json!({
+            "ret": 500,
+            "errmsg": format!("upstream error: {e}")
+        })),
+    }
 }
 
 // ─── getconfig ───────────────────────────────────────────────────────────────

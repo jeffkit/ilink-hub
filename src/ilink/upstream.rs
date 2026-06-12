@@ -181,7 +181,8 @@ impl UpstreamClient {
             .headers(self.headers())
             .json(&req)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 
