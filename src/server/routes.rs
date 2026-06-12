@@ -469,7 +469,7 @@ pub async fn getconfig(
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
         let real_ctx = {
-            let ctx_map = state.ctx_map.read().await;
+            let mut ctx_map = state.ctx_map.write().await;
             ctx_map.resolve(vctx).map(str::to_string)
         };
         if let Some(real) = real_ctx {

@@ -199,7 +199,7 @@ impl BridgeApp {
     /// Parse YAML from a string (same as file body). Used by tests and for tooling.
     pub fn parse_yaml(raw: &str) -> Result<Self> {
         let file: BridgeFileRaw =
-            serde_yaml::from_str(raw).context("serde_yaml::from_str BridgeFileRaw")?;
+            serde_norway::from_str(raw).context("serde_norway::from_str BridgeFileRaw")?;
         match file {
             BridgeFileRaw::Single(c) => Self::from_single(c),
             BridgeFileRaw::Multi(m) => Self::from_multi(m),

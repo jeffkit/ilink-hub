@@ -4,7 +4,10 @@
 //! [`InMemoryQueue`] is the default implementation backed by a `tokio::sync::Mutex`.
 
 use async_trait::async_trait;
+use dashmap::DashMap;
+use lru::LruCache;
 use std::collections::{HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -17,6 +20,10 @@ use crate::ilink::types::WeixinMessage;
 /// Maximum number of messages buffered per client.
 const MAX_QUEUE_SIZE: usize = 200;
 
+/// Maximum number of virtual context token mappings held in memory.
+/// Oldest entries are evicted when the limit is reached (LRU policy).
+const MAX_CTX_MAP_ENTRIES: usize = 50_000;
+
 // ─── context_token mapping ────────────────────────────────────────────────────
 
 /// Maps virtual context tokens (issued to clients) to real context tokens
@@ -26,13 +33,15 @@ const MAX_QUEUE_SIZE: usize = 200;
 /// WeChat may issue a **new** `real_ctx` on every inbound message even in the same DM.
 /// `conv_to_v` keeps one stable virtual token per conversation so backend session IDs
 /// (e.g. Claude `--resume`) survive across messages.
-#[derive(Debug, Default)]
+///
+/// All four maps are capped at [`MAX_CTX_MAP_ENTRIES`] with LRU eviction to bound
+/// memory usage during long-running deployments.
 pub struct ContextTokenMap {
-    v_to_real: HashMap<String, String>,
-    real_to_v: HashMap<String, String>,
-    v_to_peer: HashMap<String, String>,
+    v_to_real: LruCache<String, String>,
+    real_to_v: LruCache<String, String>,
+    v_to_peer: LruCache<String, String>,
     /// Stable vctx per conversation (`peer:<id>` or `group:<id>`).
-    conv_to_v: HashMap<String, String>,
+    conv_to_v: LruCache<String, String>,
 }
 
 /// Conversation identity for session continuity (DM vs group).
@@ -46,9 +55,25 @@ pub fn conversation_key(peer_user_id: &str, group_id: Option<&str>) -> Option<St
     None
 }
 
+impl Default for ContextTokenMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ContextTokenMap {
+    pub fn new() -> Self {
+        let cap = NonZeroUsize::new(MAX_CTX_MAP_ENTRIES).unwrap();
+        Self {
+            v_to_real: LruCache::new(cap),
+            real_to_v: LruCache::new(cap),
+            v_to_peer: LruCache::new(cap),
+            conv_to_v: LruCache::new(cap),
+        }
+    }
+
     pub fn has_conversation(&self, conv_key: &str) -> bool {
-        self.conv_to_v.contains_key(conv_key)
+        self.conv_to_v.contains(conv_key)
     }
 
     /// Seed a known conversation → vctx mapping (e.g. after DB warm-up on hub restart).
@@ -59,7 +84,7 @@ impl ContextTokenMap {
         real_ctx: String,
         peer_user_id: String,
     ) {
-        self.conv_to_v.insert(conv_key, vctx.clone());
+        self.conv_to_v.put(conv_key, vctx.clone());
         self.seed_full(vctx, real_ctx, peer_user_id);
     }
 
@@ -87,12 +112,11 @@ impl ContextTokenMap {
         });
 
         if let Some(ref key) = conv_key {
-            if let Some(vtoken) = self.conv_to_v.get(key) {
-                let vtoken = vtoken.clone();
-                self.v_to_real.insert(vtoken.clone(), real_token.clone());
-                self.real_to_v.insert(real_token, vtoken.clone());
+            if let Some(vtoken) = self.conv_to_v.get(key).cloned() {
+                self.v_to_real.put(vtoken.clone(), real_token.clone());
+                self.real_to_v.put(real_token, vtoken.clone());
                 if !peer_user_id.is_empty() {
-                    self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+                    self.v_to_peer.put(vtoken.clone(), peer_user_id);
                 }
                 return vtoken;
             }
@@ -100,22 +124,22 @@ impl ContextTokenMap {
 
         // For unscoped calls, also check the real_to_v index.
         if client_scope.is_none() {
-            if let Some(vtoken) = self.real_to_v.get(&real_token) {
+            if let Some(vtoken) = self.real_to_v.get(&real_token).cloned() {
                 if !peer_user_id.is_empty() {
-                    self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+                    self.v_to_peer.put(vtoken.clone(), peer_user_id);
                 }
-                return vtoken.clone();
+                return vtoken;
             }
         }
 
         let vtoken = format!("vctx_{}", Uuid::new_v4().simple());
-        self.v_to_real.insert(vtoken.clone(), real_token.clone());
-        self.real_to_v.insert(real_token, vtoken.clone());
+        self.v_to_real.put(vtoken.clone(), real_token.clone());
+        self.real_to_v.put(real_token, vtoken.clone());
         if let Some(key) = conv_key {
-            self.conv_to_v.insert(key, vtoken.clone());
+            self.conv_to_v.put(key, vtoken.clone());
         }
         if !peer_user_id.is_empty() {
-            self.v_to_peer.insert(vtoken.clone(), peer_user_id);
+            self.v_to_peer.put(vtoken.clone(), peer_user_id);
         }
         vtoken
     }
@@ -125,35 +149,30 @@ impl ContextTokenMap {
         self.v_to_real.len()
     }
 
-    pub fn resolve(&self, vtoken: &str) -> Option<&str> {
+    pub fn resolve(&mut self, vtoken: &str) -> Option<&str> {
         self.v_to_real.get(vtoken).map(String::as_str)
     }
 
     /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
+    /// Uses `peek` (no LRU promotion) to allow `&self` and read-lock access.
     pub fn resolve_full(&self, vtoken: &str) -> Option<(&str, &str)> {
-        let real = self.v_to_real.get(vtoken)?.as_str();
-        let peer = self.v_to_peer.get(vtoken).map(String::as_str).unwrap_or("");
+        let real = self.v_to_real.peek(vtoken)?.as_str();
+        let peer = self.v_to_peer.peek(vtoken).map(String::as_str).unwrap_or("");
         Some((real, peer))
     }
 
     /// Seed a known mapping into the in-memory cache (without peer_user_id).
     pub fn seed(&mut self, vctx: String, real_ctx: String) {
-        self.v_to_real
-            .entry(vctx.clone())
-            .or_insert_with(|| real_ctx.clone());
-        self.real_to_v.entry(real_ctx).or_insert(vctx);
+        self.v_to_real.get_or_insert(vctx.clone(), || real_ctx.clone());
+        self.real_to_v.get_or_insert(real_ctx, || vctx);
     }
 
     /// Seed a known mapping including peer_user_id.
     pub fn seed_full(&mut self, vctx: String, real_ctx: String, peer_user_id: String) {
-        self.v_to_real
-            .entry(vctx.clone())
-            .or_insert_with(|| real_ctx.clone());
-        self.real_to_v
-            .entry(real_ctx)
-            .or_insert_with(|| vctx.clone());
+        self.v_to_real.get_or_insert(vctx.clone(), || real_ctx.clone());
+        self.real_to_v.get_or_insert(real_ctx, || vctx.clone());
         if !peer_user_id.is_empty() {
-            self.v_to_peer.entry(vctx).or_insert(peer_user_id);
+            self.v_to_peer.get_or_insert(vctx, || peer_user_id);
         }
     }
 }
@@ -296,15 +315,12 @@ pub trait MessageQueue: Send + Sync {
 
 // ─── InMemoryQueue ────────────────────────────────────────────────────────────
 //
-// Design: a two-level locking scheme so concurrent long-polls for different
-// clients never block each other.
+// Design: DashMap for lock-free per-client slot lookup, std::sync::Mutex per slot
+// for the message buffer. N concurrent long-polls for different clients never
+// block each other — only same-client operations briefly contend.
 //
-//  Outer map lock (short-held):  only used to look up / insert a PerClientSlot.
-//  Per-client lock (independent): protects the message buffer for one client.
-//
-// `wait_notify` grabs the outer lock just long enough to clone the Arc<Notify>,
-// then releases it before awaiting — so N simultaneous long-polls hold zero
-// shared locks while waiting.
+// `wait_notify` clones Arc<Notify> and releases all locks before awaiting, so
+// N simultaneous long-polls hold zero shared locks while waiting.
 
 struct PerClientSlot {
     messages: std::sync::Mutex<VecDeque<WeixinMessage>>,
@@ -343,19 +359,16 @@ impl PerClientSlot {
 }
 
 pub struct InMemoryQueue {
-    slots: tokio::sync::Mutex<HashMap<String, Arc<PerClientSlot>>>,
+    slots: DashMap<String, Arc<PerClientSlot>>,
 }
 
 impl InMemoryQueue {
     pub fn new() -> Self {
-        Self {
-            slots: tokio::sync::Mutex::new(HashMap::new()),
-        }
+        Self { slots: DashMap::new() }
     }
 
-    async fn get_or_create(&self, vtoken: &str) -> Arc<PerClientSlot> {
-        let mut slots = self.slots.lock().await;
-        slots
+    fn get_or_create(&self, vtoken: &str) -> Arc<PerClientSlot> {
+        self.slots
             .entry(vtoken.to_string())
             .or_insert_with(PerClientSlot::new)
             .clone()
@@ -371,34 +384,27 @@ impl Default for InMemoryQueue {
 #[async_trait]
 impl MessageQueue for InMemoryQueue {
     async fn push(&self, vtoken: &str, msg: WeixinMessage) -> Result<bool, HubError> {
-        let slot = self.get_or_create(vtoken).await;
-        Ok(slot.push(msg))
+        Ok(self.get_or_create(vtoken).push(msg))
     }
 
     async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
-        let slot = {
-            let slots = self.slots.lock().await;
-            slots.get(vtoken).cloned()
-        };
-        Ok(slot.map(|s| s.drain()).unwrap_or_default())
+        Ok(self.slots.get(vtoken).map(|s| s.drain()).unwrap_or_default())
     }
 
     async fn wait_notify(&self, vtoken: &str, timeout_secs: u64) -> Result<bool, HubError> {
-        // Grab notify handle and immediately release the outer lock so other clients
-        // can push/drain/wait concurrently without contention.
-        let notify = self.get_or_create(vtoken).await.notify.clone();
+        // Clone Arc<Notify> and release the DashMap shard lock before awaiting.
+        let notify = self.get_or_create(vtoken).notify.clone();
         let result =
             tokio::time::timeout(Duration::from_secs(timeout_secs), notify.notified()).await;
         Ok(result.is_ok())
     }
 
     async fn remove_client(&self, vtoken: &str) -> Result<(), HubError> {
-        self.slots.lock().await.remove(vtoken);
+        self.slots.remove(vtoken);
         Ok(())
     }
 
     async fn queue_sizes(&self) -> Result<HashMap<String, usize>, HubError> {
-        let slots = self.slots.lock().await;
-        Ok(slots.iter().map(|(k, s)| (k.clone(), s.len())).collect())
+        Ok(self.slots.iter().map(|e| (e.key().clone(), e.value().len())).collect())
     }
 }

@@ -131,12 +131,15 @@ async fn two_clients_both_receive_broadcast_message() {
     assert_eq!(msgs_a.len(), 1, "client A should receive the message");
     assert_eq!(msgs_b.len(), 1, "client B should receive the message");
 
-    // Each client receives a different virtual context token (scoped per-backend).
+    // Both clients receive the same stable virtual context token (conversation-scoped,
+    // not per-backend). This enables session continuity: a conversation started via
+    // Broadcast and later routed via /use shares the same vctx so Claude --resume works.
+    // Sessions are isolated by (vctx, vtoken), so each backend's session is still independent.
     let vctx_a = msgs_a[0].context_token.as_deref().unwrap_or("");
     let vctx_b = msgs_b[0].context_token.as_deref().unwrap_or("");
     assert!(vctx_a.starts_with("vctx_"), "context_token should be a vctx");
     assert!(vctx_b.starts_with("vctx_"), "context_token should be a vctx");
-    assert_ne!(vctx_a, vctx_b, "each backend gets its own virtual context token");
+    assert_eq!(vctx_a, vctx_b, "broadcast uses one shared vctx per conversation for session continuity");
 }
 
 /// With a default client configured, a message is forwarded only to that
@@ -220,7 +223,7 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
     let real_ctx = {
-        let ctx_map = state.ctx_map.read().await;
+        let mut ctx_map = state.ctx_map.write().await;
         ctx_map.resolve(&vctx).map(str::to_string)
     };
     if let Some(real) = real_ctx {

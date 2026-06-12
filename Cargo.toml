@@ -63,6 +63,8 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.8"
 base64 = "0.22"
+dashmap = "6"
+lru = "0.12"
 
 # Storage — sqlx supports SQLite, PostgreSQL, MySQL via DATABASE_URL
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgres", "mysql", "chrono", "uuid", "migrate"] }
@@ -70,7 +72,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "postgre
 # Config
 config = "0.14"
 dirs = "5"
-serde_yaml = "0.9"
 
 # QR code display in terminal
 qrcode = { version = "0.14", features = ["svg"] }
@@ -79,6 +80,7 @@ qrcode = { version = "0.14", features = ["svg"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+serde_norway = "0.9.42"
 
 [dev-dependencies]
 tokio-test = "0.4"
