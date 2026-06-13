@@ -79,6 +79,7 @@ impl PairingSession {
 #[derive(Debug, Default)]
 pub struct PairingRegistry {
     sessions: HashMap<String, PairingSession>,
+    confirmed_sessions: HashMap<String, (PairingSession, Instant)>,
 }
 
 impl PairingRegistry {
@@ -91,6 +92,8 @@ impl PairingRegistry {
         // is_expired (which preserves the live-set status semantics for
         // get()/public_status()).
         self.sessions.retain(|_, s| !s.should_evict());
+        self.confirmed_sessions
+            .retain(|_, (_, confirmed_at)| confirmed_at.elapsed() < CONFIRMED_TTL);
     }
 
     pub fn create(&mut self) -> Result<String, PairingError> {
@@ -115,7 +118,13 @@ impl PairingRegistry {
     }
 
     pub fn get(&self, code: &str) -> Option<PairingSession> {
-        self.sessions.get(code).cloned()
+        if let Some(session) = self.sessions.get(code) {
+            return Some(session.clone());
+        }
+        if let Some((session, _)) = self.confirmed_sessions.get(code) {
+            return Some(session.clone());
+        }
+        None
     }
 
     pub fn mark_scanned(&mut self, code: &str) -> bool {
@@ -127,6 +136,7 @@ impl PairingRegistry {
             }
             if session.status == PairingStatus::Wait {
                 session.status = PairingStatus::Scanned;
+                session.created_at = Instant::now(); // Reset TTL/created_at to 60s
             }
             // Mint a CSRF token the first time a session is scanned. Subsequent
             // re-scans (page reloads, re-renders) are no-ops on the token so a
@@ -152,10 +162,14 @@ impl PairingRegistry {
         csrf_header: &str,
     ) -> Result<(), PairingError> {
         self.purge_expired();
-        let session = self.sessions.get_mut(code).ok_or(PairingError::NotFound)?;
+
+        if self.confirmed_sessions.contains_key(code) {
+            return Err(PairingError::AlreadyConfirmed);
+        }
+
+        let mut session = self.sessions.remove(code).ok_or(PairingError::NotFound)?;
 
         if session.is_expired() {
-            session.status = PairingStatus::Expired;
             return Err(PairingError::Expired);
         }
         // AlreadyConfirmed is checked BEFORE NotScanned so the second of two racing
@@ -180,6 +194,9 @@ impl PairingRegistry {
         session.vtoken = Some(vtoken);
         session.client_name = Some(client_name);
         session.client_label = client_label;
+
+        self.confirmed_sessions
+            .insert(code.to_string(), (session, Instant::now()));
         Ok(())
     }
 }
@@ -347,16 +364,16 @@ mod tests {
         let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
         reg.confirm(&code, "client".into(), None, "vhub_x".into(), &csrf)
             .unwrap();
-        // Session is now Confirmed and visible.
-        assert_eq!(reg.sessions.len(), 1);
+        // Session moved to confirmed_sessions on confirm; sessions is now empty.
+        assert_eq!(reg.sessions.len(), 0);
         assert_eq!(
             reg.get(&code).unwrap().status_str(),
             "confirmed",
-            "freshly confirmed session must be visible"
+            "freshly confirmed session must be visible via confirmed_sessions"
         );
 
-        // Backdate created_at past CONFIRMED_TTL and force a purge.
-        reg.sessions.get_mut(&code).unwrap().created_at =
+        // Backdate confirmed_at past CONFIRMED_TTL and force a purge.
+        reg.confirmed_sessions.get_mut(&code).unwrap().1 =
             Instant::now() - Duration::from_secs(86_400 + 60);
         reg.purge_expired();
 
