@@ -117,6 +117,9 @@ struct ManagedBridge {
 
 enum ManagedBridgeState {
     Running,
+    Probing {
+        task: JoinHandle<String>,
+    },
     Restarting {
         restart_at: Instant,
         last_error: String,
@@ -237,7 +240,7 @@ impl BridgeManager {
             specs.into_iter().map(|s| (s.id.clone(), s)).collect();
 
         self.stop_removed_or_changed(&desired).await;
-        self.mark_exited_children();
+        self.mark_exited_children().await;
         self.restart_ready_children().await;
         self.start_new_children(desired);
         self.publish_status("running", None);
@@ -283,7 +286,7 @@ impl BridgeManager {
         }
     }
 
-    fn mark_exited_children(&mut self) {
+    async fn mark_exited_children(&mut self) {
         let now = Instant::now();
         for (id, managed) in self.children.iter_mut() {
             if !matches!(managed.state, ManagedBridgeState::Running) {
@@ -294,29 +297,44 @@ impl BridgeManager {
             };
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let error = format!("bridge child exited: {status}");
                     warn!(profile = %id, %status, "bridge child exited");
+                    let config_path = managed.spec.config_path.clone();
+                    let init_error = format!("bridge child exited: {status}");
+                    let task =
+                        tokio::spawn(async move { do_probing(config_path, init_error).await });
                     managed.child = None;
-                    managed.restart_attempts = next_restart_attempts(
-                        managed.restart_attempts,
-                        now.duration_since(managed.last_start),
-                        self.opts.max_restart_backoff.saturating_mul(3),
-                    );
-                    let delay = restart_delay(
-                        self.opts.restart_backoff,
-                        self.opts.max_restart_backoff,
-                        managed.restart_attempts,
-                    );
-                    managed.state = ManagedBridgeState::Restarting {
-                        restart_at: now + delay,
-                        last_error: error,
-                    };
+                    managed.state = ManagedBridgeState::Probing { task };
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    let error = format!("failed to inspect bridge child: {e}");
                     warn!(profile = %id, error = %e, "failed to inspect bridge child");
+                    let config_path = managed.spec.config_path.clone();
+                    let init_error = format!("failed to inspect bridge child: {e}");
+                    let task =
+                        tokio::spawn(async move { do_probing(config_path, init_error).await });
                     managed.child = None;
+                    managed.state = ManagedBridgeState::Probing { task };
+                }
+            }
+        }
+
+        let mut finished_probes = Vec::new();
+        for (id, managed) in self.children.iter_mut() {
+            if let ManagedBridgeState::Probing { task } = &managed.state {
+                if task.is_finished() {
+                    finished_probes.push(id.clone());
+                }
+            }
+        }
+
+        for id in finished_probes {
+            if let Some(managed) = self.children.get_mut(&id) {
+                let old_state = std::mem::replace(&mut managed.state, ManagedBridgeState::Running);
+                if let ManagedBridgeState::Probing { task } = old_state {
+                    let error = match task.await {
+                        Ok(err) => err,
+                        Err(join_err) => format!("probing task panicked: {join_err}"),
+                    };
                     managed.restart_attempts = next_restart_attempts(
                         managed.restart_attempts,
                         now.duration_since(managed.last_start),
@@ -335,7 +353,27 @@ impl BridgeManager {
             }
         }
     }
+}
 
+async fn do_probing(config_path: PathBuf, mut error: String) -> String {
+    if let Ok(app) = BridgeApp::load(&config_path) {
+        if let Some(profile) = app.profile(app.default_profile_name()) {
+            match crate::bridge::probe_profile_light(profile) {
+                Err(e) => {
+                    error = e.to_string();
+                }
+                Ok(()) => {
+                    if let Err(e) = crate::bridge::dry_run_profile(profile, "ping").await {
+                        error = e.to_string();
+                    }
+                }
+            }
+        }
+    }
+    error
+}
+
+impl BridgeManager {
     async fn restart_ready_children(&mut self) {
         let now = Instant::now();
         let ready_ids: Vec<String> = self
@@ -386,6 +424,36 @@ impl BridgeManager {
             if self.children.contains_key(&id) {
                 continue;
             }
+
+            let mut probe_error = None;
+            if let Ok(app) = BridgeApp::load(&spec.config_path) {
+                if let Some(profile) = app.profile(app.default_profile_name()) {
+                    if let Err(e) = crate::bridge::probe_profile_light(profile) {
+                        probe_error = Some(e.to_string());
+                    }
+                }
+            }
+
+            if let Some(err) = probe_error {
+                error!(profile = %id, error = %err, "failed to start bridge child: probe failed");
+                let delay =
+                    restart_delay(self.opts.restart_backoff, self.opts.max_restart_backoff, 1);
+                self.children.insert(
+                    id.clone(),
+                    ManagedBridge {
+                        spec,
+                        child: None,
+                        last_start: Instant::now(),
+                        restart_attempts: 1,
+                        state: ManagedBridgeState::Restarting {
+                            restart_at: Instant::now() + delay,
+                            last_error: err,
+                        },
+                    },
+                );
+                continue;
+            }
+
             match spawn_bridge_child(&self.opts, &spec) {
                 Ok(child) => {
                     info!(
@@ -453,6 +521,9 @@ impl BridgeManager {
                         managed.child.as_ref().and_then(|child| child.id()),
                         Some(now.duration_since(managed.last_start).as_secs()),
                     ),
+                    ManagedBridgeState::Probing { .. } => {
+                        ("probing".to_string(), None, None, None, None)
+                    }
                     ManagedBridgeState::Restarting {
                         restart_at,
                         last_error,
@@ -499,6 +570,9 @@ async fn stop_managed_child(managed: &mut ManagedBridge) {
         stop_child(child).await;
     }
     managed.child = None;
+    if let ManagedBridgeState::Probing { task } = &managed.state {
+        task.abort();
+    }
 }
 
 fn restart_delay(base: Duration, max: Duration, attempts: u32) -> Duration {
@@ -954,5 +1028,101 @@ stdin: none
             .expect("manager task should stop when sender is dropped")
             .expect("manager task join");
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mark_exited_children_does_not_block_and_probes() {
+        let temp_dir = temp_dir("probing-test");
+        let profile_path = temp_dir.join("test-profile.yaml");
+        fs::write(
+            &profile_path,
+            r#"
+command: sleep
+args: ["1"]
+"#,
+        )
+        .unwrap();
+
+        let spec = BridgeProcessSpec {
+            id: "test-profile".into(),
+            config_path: profile_path,
+            cred_path: temp_dir.join("test-profile.json"),
+            register_name: "test-profile".into(),
+            fingerprint: FileFingerprint {
+                len: 0,
+                modified: None,
+            },
+        };
+
+        let mut manager = BridgeManager::new(
+            BridgeManagerOptions::new(
+                "http://127.0.0.1:8765".into(),
+                temp_dir.clone(),
+                temp_dir.clone(),
+            ),
+            Arc::new(Mutex::new(BridgeManagerStatus::default())),
+        );
+
+        // Spawn a child process that exits immediately
+        let mut cmd = tokio::process::Command::new("true");
+        let mut child = cmd.spawn().unwrap();
+
+        // Wait until the child process has actually exited
+        while child.try_wait().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        manager.children.insert(
+            "test-profile".into(),
+            ManagedBridge {
+                spec,
+                child: Some(child),
+                last_start: Instant::now(),
+                restart_attempts: 0,
+                state: ManagedBridgeState::Running,
+            },
+        );
+
+        // Call mark_exited_children. It should transition the child to Probing immediately without blocking.
+        let start = Instant::now();
+        manager.mark_exited_children().await;
+        let elapsed = start.elapsed();
+
+        // Assert that it took less than 500ms (probing sleep 1 in background shouldn't block us)
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "mark_exited_children blocked the scheduler!"
+        );
+
+        // The state should now be Probing
+        let managed = manager.children.get("test-profile").unwrap();
+        assert!(matches!(managed.state, ManagedBridgeState::Probing { .. }));
+
+        // Wait for the background probing task to finish
+        let mut attempts = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            manager.mark_exited_children().await;
+            let managed = manager.children.get("test-profile").unwrap();
+            if matches!(managed.state, ManagedBridgeState::Restarting { .. }) {
+                break;
+            }
+            attempts += 1;
+            if attempts > 40 {
+                panic!("Task did not transition to Restarting after probing");
+            }
+        }
+
+        // Verify that the state is now Restarting
+        let managed = manager.children.get("test-profile").unwrap();
+        if let ManagedBridgeState::Restarting { last_error, .. } = &managed.state {
+            assert!(
+                last_error.contains("exited") || last_error.is_empty(),
+                "unexpected error: {}",
+                last_error
+            );
+        } else {
+            panic!("expected Restarting state");
+        }
     }
 }
