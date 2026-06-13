@@ -40,7 +40,7 @@ const PAIR_RATE_WINDOW_SECS: u64 = 60;
 #[derive(Clone)]
 pub struct RelayState {
     hubs: Arc<RwLock<HashMap<String, HubHandle>>>,
-    pending: Arc<RwLock<HashMap<String, oneshot::Sender<RelayMessage>>>>,
+    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>>,
     device_keys: Arc<RwLock<HashMap<String, [u8; 32]>>>,
     ws_rate_limiter: Arc<RateLimiter>,
     pair_rate_limiter: Arc<RateLimiter>,
@@ -54,7 +54,7 @@ struct HubHandle {
 pub fn build_relay_router() -> Router {
     let state = RelayState {
         hubs: Arc::new(RwLock::new(HashMap::new())),
-        pending: Arc::new(RwLock::new(HashMap::new())),
+        pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
         device_keys: Arc::new(RwLock::new(HashMap::new())),
         ws_rate_limiter: Arc::new(RateLimiter::new(WS_RATE_MAX, WS_RATE_WINDOW_SECS)),
         pair_rate_limiter: Arc::new(RateLimiter::new(PAIR_RATE_MAX, PAIR_RATE_WINDOW_SECS)),
@@ -167,7 +167,7 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
                         }
                     }
                     RelayMessage::Response { id, status, headers, body } => {
-                        let tx = state.pending.write().await.remove(&id);
+                        let tx = state.pending.lock().unwrap().remove(&id);
                         if let Some(tx) = tx {
                             let _ = tx.send(RelayMessage::Response { id, status, headers, body });
                         }
@@ -191,6 +191,19 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
     }
 }
 
+struct PendingRequestGuard {
+    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>>,
+    request_id: String,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&self.request_id);
+        }
+    }
+}
+
 async fn forward_to_hub(
     state: &RelayState,
     device_id: &str,
@@ -209,7 +222,12 @@ async fn forward_to_hub(
     let request_id = Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel();
 
-    state.pending.write().await.insert(request_id.clone(), tx);
+    state.pending.lock().unwrap().insert(request_id.clone(), tx);
+
+    let _guard = PendingRequestGuard {
+        pending: state.pending.clone(),
+        request_id: request_id.clone(),
+    };
 
     let mut hdr_map = HashMap::new();
     for (k, v) in headers.iter() {
@@ -227,16 +245,12 @@ async fn forward_to_hub(
     };
 
     if hub.tx.send(req).is_err() {
-        state.pending.write().await.remove(&request_id);
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
         Ok(Ok(resp)) => Ok(resp),
-        _ => {
-            state.pending.write().await.remove(&request_id);
-            Err(StatusCode::GATEWAY_TIMEOUT)
-        }
+        _ => Err(StatusCode::GATEWAY_TIMEOUT),
     }
 }
 
@@ -348,4 +362,77 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_secs() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_relay_pending_request_no_leak_on_cancel() {
+        let state = RelayState {
+            hubs: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            device_keys: Arc::new(RwLock::new(HashMap::new())),
+            ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+        };
+
+        let device_id = "test-device".to_string();
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+        state
+            .hubs
+            .write()
+            .await
+            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+
+        let state_clone = state.clone();
+        let handle = tokio::spawn(async move {
+            let _ = forward_to_hub(
+                &state_clone,
+                "test-device",
+                "GET",
+                "/test-path",
+                HeaderMap::new(),
+                None,
+            )
+            .await;
+        });
+
+        // Let the task run up to the await point inside forward_to_hub
+        let msg = tokio::time::timeout(Duration::from_millis(500), ws_rx.recv())
+            .await
+            .expect("should receive request on ws channel")
+            .expect("msg is some");
+
+        let request_id = match msg {
+            RelayMessage::Request { id, .. } => id,
+            _ => panic!("expected RelayMessage::Request"),
+        };
+
+        // Assert that the request is currently registered in the pending map
+        {
+            let pending = state.pending.lock().unwrap();
+            assert!(
+                pending.contains_key(&request_id),
+                "request must be in pending map"
+            );
+        }
+
+        // Abort the spawned task (simulating client cancel/disconnect)
+        handle.abort();
+        let _ = handle.await; // wait for it to be fully dropped
+
+        // Wait a tiny bit for the drop/cleanup to complete
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Assert that the request_id is cleaned up and no longer exists in the pending map
+        {
+            let pending = state.pending.lock().unwrap();
+            assert!(
+                !pending.contains_key(&request_id),
+                "pending request must be cleaned up on cancel!"
+            );
+        }
+    }
 }

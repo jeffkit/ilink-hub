@@ -131,7 +131,28 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     }
 
     let router = build_router(state);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                let is_from_env = std::env::var("WEIXIN_BASE_URL")
+                    .ok()
+                    .and_then(|val| extract_host_port(&val))
+                    .map(|parsed| parsed == addr)
+                    .unwrap_or(false);
+                if is_from_env {
+                    eprintln!(
+                        "❌ Failed to bind to address '{}' (EADDRNOTAVAIL).\n\
+                         This listen address was derived from WEIXIN_BASE_URL which contains a domain/external URL.\n\
+                         To fix this, please specify a local address to listen on, for example:\n\
+                         --addr 127.0.0.1:8765 or --addr 0.0.0.0:8765",
+                        addr
+                    );
+                }
+            }
+            return Err(e.into());
+        }
+    };
     let local_display = listener
         .local_addr()
         .map(|a| a.to_string())
@@ -638,4 +659,18 @@ mod tests {
 
         env::remove_var("ILINK_MAX_QUEUE_SIZE");
     }
+}
+
+fn extract_host_port(s: &str) -> Option<String> {
+    let s = s.trim();
+    if let Ok(url) = reqwest::Url::parse(s) {
+        if let Some(host) = url.host_str() {
+            let port = url.port().unwrap_or(8765);
+            return Some(format!("{}:{}", host, port));
+        }
+    }
+    if s.contains(':') {
+        return Some(s.to_string());
+    }
+    None
 }

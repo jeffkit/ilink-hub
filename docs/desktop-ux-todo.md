@@ -79,7 +79,7 @@
 
 ### UX-04 · Bridge 模板保存后不探活 CLI，失败仅显示「重启 N」
 
-- **状态**：open
+- **状态**：done
 - **文件**：`desktop/ilink-hub-desktop/src-tauri/src/lib.rs:694-790`（模板生成 `claude` / `cursor`(=`agent`) / `codex` / `gemini`），`desktop/ilink-hub-desktop/src/main.ts:524-543`（子进程状态仅渲染 `pid … · 重启 N`）
 - **问题**：小白在 Bridge 页选「Claude Code / Cursor / Codex / Gemini」模板、填项目目录、保存后，manager 立即拉起子进程。但若本机**没装对应 CLI 或没登录认证**，UI 只会显示「pid — · 重启 N」并不断退避重启，没有「未找到 `claude` 命令，请先安装并登录」这类可读提示，小白完全无法判断为什么不工作；也没有「测试一下」按钮先验证 CLI 能否产出 stdout。
 - **修复方向**：
@@ -93,21 +93,21 @@
 
 ### DOC-01 · 「后端」与「Bridge」两个 Tab 关系未解释
 
-- **状态**：open
+- **状态**：done
 - **文件**：`desktop/ilink-hub-desktop/index.html:24-28`（三个 Tab 并列），`docs/bridge/README.md:14`（Hub 侧并不区分调用方是不是 bridge）
 - **问题**：首页有「后端」「Bridge」两个并列 Tab，但 Bridge 本质上**也是一种后端**（只是本机 CLI 桥接）。小白看不出二者关系，也不知道「我要接 Claude Code 到底该去哪个 Tab」。
 - **修复方向**：在两个 Tab 顶部各加一句定位说明（如「后端：任意通过 Token 接入的客户端」「Bridge：把本机 CLI 一键接入，免手填 Token」），或在帮助折叠区画一张「Bridge 也是后端之一」的关系图。
 
 ### DOC-02 · Bridge 页黑话多
 
-- **状态**：open
+- **状态**：done
 - **文件**：`desktop/ilink-hub-desktop/index.html:168-169,196-245`（"workspace 名"、"等待 manager 扫描"等），`desktop/ilink-hub-desktop/src/main.ts:520,528,532`（"等待 manager 扫描"、`pid … · 重启 N`）
 - **问题**：Bridge 页大量出现 `workspace` / `profile` / `manager` / `pid` / 「等待 manager 扫描」等技术黑话，对小白几乎不可读。
 - **修复方向**：用更口语化的中文替换面向用户的标签（如 workspace→「接入名」、profile→「配置」、「等待扫描」→「准备中…」），`pid/重启` 等调试信息收进「详情/高级」折叠区。
 
 ### DOC-03 · 首页指标用词偏技术
 
-- **状态**：open
+- **状态**：done
 - **文件**：`desktop/ilink-hub-desktop/index.html:54-74`（"用户上行次数 = 从微信侧进入 Hub 的消息条数"、"对话次数 = 已转发至后端的消息条数"）
 - **问题**：「用户上行次数」「上行」属网络/后端黑话，小白不易理解。
 - **修复方向**：改为更直观的措辞，如「收到用户消息」「转发给 AI」，并保留一行小字解释。

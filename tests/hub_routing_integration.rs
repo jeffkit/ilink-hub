@@ -1190,3 +1190,31 @@ fn register_returns_is_new_flag() {
     assert_eq!(v1, v2, "vtoken is reused for the same name");
     assert!(!is_new2, "second register of the same name is_new=false");
 }
+#[tokio::test]
+async fn test_pair_confirm_auth_bypass_lockout_adversarial() {
+    use axum::extract::{ConnectInfo, Json, Path, State};
+    use axum::http::HeaderMap;
+    use ilink_hub::server::pairing::{pair_confirm, PairConfirmRequest};
+    use std::net::SocketAddr;
+
+    let state = make_state().await;
+    let legitimate_vtoken = register(&state, "mac-home").await;
+
+    let peer: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+    let (status, _body) = pair_confirm(
+        State(Arc::clone(&state)),
+        Path("invalid_code_xyz".to_string()),
+        HeaderMap::new(),
+        ConnectInfo(peer),
+        Json(PairConfirmRequest { name: "mac-home".to_string(), label: None }),
+    )
+    .await;
+
+    assert_ne!(status, axum::http::StatusCode::OK,
+        "confirm with invalid code must not return 200");
+
+    let registry = state.clients.registry.read().await;
+    let client = registry.get_by_name("mac-home").expect("mac-home must still exist");
+    assert_eq!(client.vtoken, legitimate_vtoken, "vtoken must not be overwritten");
+}

@@ -525,3 +525,92 @@ fn test_bridge_hub_url_env_fallback() {
         stdout
     );
 }
+
+#[test]
+fn test_cli_deprecation_warnings() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub")
+        .unwrap_or_else(|_| "./target/release/ilink-hub".to_string());
+
+    // Case 1: Only ILINK_HUB_URL is set, warning should be present.
+    let output = std::process::Command::new(&bin_path)
+        .arg("register")
+        .arg("--help")
+        .env("RUST_LOG", "debug")
+        .env_remove("WEIXIN_BASE_URL")
+        .env("ILINK_HUB_URL", "http://127.0.0.1:9002")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        combined.contains("are deprecated") && combined.contains("ILINK_HUB_URL"),
+        "Should print deprecation warning for ILINK_HUB_URL, got: {}",
+        combined
+    );
+
+    // Case 2: Both ILINK_HUB_URL and WEIXIN_BASE_URL are set, warning should NOT be present.
+    let output = std::process::Command::new(&bin_path)
+        .arg("register")
+        .arg("--help")
+        .env("RUST_LOG", "debug")
+        .env("WEIXIN_BASE_URL", "http://127.0.0.1:9001")
+        .env("ILINK_HUB_URL", "http://127.0.0.1:9002")
+        .env_remove("ILINK_HUB_ADDR")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        !combined.contains("are deprecated"),
+        "Should NOT print deprecation warning if WEIXIN_BASE_URL is set, got: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_bridge_deprecation_warnings() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub-bridge")
+        .unwrap_or_else(|_| "./target/release/ilink-hub-bridge".to_string());
+
+    // Case 1: Only ILINK_HUB_ADDR is set, warning should be present.
+    let output = std::process::Command::new(&bin_path)
+        .arg("--help")
+        .env("RUST_LOG", "info")
+        .env_remove("WEIXIN_BASE_URL")
+        .env_remove("ILINK_HUB_URL")
+        .env("ILINK_HUB_ADDR", "127.0.0.1:9003")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let combined = format!("{}\n{}", stdout, stderr);
+    assert!(
+        combined.contains("are deprecated") && combined.contains("ILINK_HUB_ADDR"),
+        "Bridge should print deprecation warning for ILINK_HUB_ADDR, got: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_bind_failure_friendly_message() {
+    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub")
+        .unwrap_or_else(|_| "./target/release/ilink-hub".to_string());
+
+    // Run serve with a public/unassignable IP address set via WEIXIN_BASE_URL.
+    // EADDRNOTAVAIL (AddrNotAvailable) should be triggered.
+    let output = std::process::Command::new(&bin_path)
+        .arg("serve")
+        .env("RUST_LOG", "info")
+        .env("WEIXIN_BASE_URL", "http://254.254.254.254:8765")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Failed to bind to address") && stderr.contains("WEIXIN_BASE_URL"),
+        "Should output a friendly suggestion when EADDRNOTAVAIL occurs, got: {}",
+        stderr
+    );
+}

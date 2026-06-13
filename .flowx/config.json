@@ -22,6 +22,16 @@
       "name": "build",
       "cmd": "cargo build",
       "onFail": "rollback"
+    },
+    {
+      "name": "desktop-frontend",
+      "cmd": "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build",
+      "onFail": "resume-fix"
+    },
+    {
+      "name": "desktop-tauri",
+      "cmd": "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml",
+      "onFail": "resume-fix"
     }
   ],
 
@@ -31,6 +41,7 @@
     "default": [
       { "cli": "claude", "provider": "anthropic-minimax", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] },
       { "cli": "agy", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] },
+      { "cli": "agy", "timeout": 3600000, "extraArgs": ["--dangerously-skip-permissions"] },
       { "cli": "claude", "provider": "anthropic-deepseek", "timeout": 1800000, "extraArgs": ["--dangerously-skip-permissions"] }
     ],
     "reviewer": [
