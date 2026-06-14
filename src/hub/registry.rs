@@ -1,7 +1,7 @@
 //! Client registry — tracks registered backend clients and their virtual tokens.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,8 @@ pub struct ClientInfo {
     pub vtoken: String,
     /// Human-readable label shown in `/list`
     pub label: Option<String>,
-    pub registered_at: Instant,
+    /// Wall-clock registration time; survives display across restarts.
+    pub registered_at: SystemTime,
     pub last_seen: Option<Instant>,
     pub online: bool,
 }
@@ -23,7 +24,7 @@ impl ClientInfo {
             name,
             vtoken: format!("vhub_{}", Uuid::new_v4().simple()),
             label,
-            registered_at: Instant::now(),
+            registered_at: SystemTime::now(),
             last_seen: None,
             online: false,
         }

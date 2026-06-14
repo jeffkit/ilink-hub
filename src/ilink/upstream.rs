@@ -2,9 +2,10 @@
 //! and fans received messages out to the Hub's internal message bus.
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use reqwest::Client;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc::UnboundedSender};
 use tracing::{debug, error, info, warn};
@@ -36,7 +37,7 @@ pub struct SessionRenewal {
 pub struct UpstreamClient {
     client: Client,
     base_url: String,
-    token: RwLock<String>,
+    token: ArcSwap<String>,
     pub polls_ok: AtomicU64,
     pub polls_err: AtomicU64,
     pub relogin_attempts: AtomicU64,
@@ -51,7 +52,7 @@ impl UpstreamClient {
         Self {
             client,
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
-            token: RwLock::new(token),
+            token: ArcSwap::new(Arc::new(token)),
             polls_ok: AtomicU64::new(0),
             polls_err: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
@@ -64,12 +65,12 @@ impl UpstreamClient {
     }
 
     pub fn set_token(&self, token: String) {
-        *self.token.write().expect("upstream token lock poisoned") = token;
+        self.token.store(Arc::new(token));
     }
 
     /// Extracts the bot ID from the token (`botid@im.bot:secretkey` → `botid@im.bot`).
     pub fn bot_id(&self) -> String {
-        let token = self.token.read().expect("upstream token lock poisoned");
+        let token = self.token.load();
         token.split(':').next().unwrap_or("").to_string()
     }
 
@@ -102,10 +103,10 @@ impl UpstreamClient {
             "AuthorizationType",
             HeaderValue::from_static("ilink_bot_token"),
         );
-        let token = self.token.read().expect("upstream token lock poisoned");
+        let token = self.token.load();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", *token)).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", token.as_str())).unwrap(),
         );
         headers.insert(
             "X-WECHAT-UIN",

@@ -398,21 +398,25 @@ pub async fn sendmessage(
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string());
 
+        // Pre-fetch active session once; reused for both cli_session_id persistence and
+        // the outbound-origin footer, avoiding two identical DB queries per message.
+        let active_session: Option<String> = match replied_session_name.clone() {
+            Some(n) => Some(n),
+            None => state
+                .store
+                .get_active_session_name(&vctx, &vtoken)
+                .await
+                .ok(),
+        };
+
         // Read cli_session_id from hub_ext and persist it to the correct session.
         if let Some(ext) = msg.ilink_hub_ext.as_mut() {
             if let Some(cli_sid) = ext.cli_session_id.take() {
                 let t = cli_sid.trim().to_string();
                 if !t.is_empty() {
-                    // Prefer the session name echoed by the bridge; only fall back to the
-                    // current active session when the bridge didn't provide one (older clients).
-                    let session_name = match replied_session_name.clone() {
-                        Some(n) => n,
-                        None => state
-                            .store
-                            .get_active_session_name(&vctx, &vtoken)
-                            .await
-                            .unwrap_or_else(|_| "default".to_string()),
-                    };
+                    let session_name = active_session
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string());
                     if let Err(e) = state
                         .store
                         .set_backend_session(&vctx, &vtoken, &session_name, &t)
@@ -444,16 +448,7 @@ pub async fn sendmessage(
             )
         };
 
-        // Use the session name from the bridge reply when available; fall back to current
-        // active session only for older bridge clients that don't echo it back.
-        let active_session = match replied_session_name.clone() {
-            Some(n) => Some(n),
-            None => state
-                .store
-                .get_active_session_name(&vctx, &vtoken)
-                .await
-                .ok(),
-        };
+        // active_session already resolved above — no second DB query needed.
 
         let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
         if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {

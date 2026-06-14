@@ -50,24 +50,24 @@ pub struct ContextTokenMap {
 
 struct ContextTokenMapInner {
     v_to_record: LruCache<String, ContextRecord>,
-    real_to_v: HashMap<String, String>,
-    conv_to_v: HashMap<String, String>,
+    real_to_v: LruCache<String, String>,
+    conv_to_v: LruCache<String, String>,
 }
 
 impl ContextTokenMapInner {
     /// Remove secondary-map entries for a (vtoken, record) pair, guarding against
     /// overwrites (only remove if the index still points at this vtoken).
     fn remove_secondary(&mut self, vtoken: &str, record: &ContextRecord) {
-        if let Some(mapped) = self.real_to_v.get(&record.real_token) {
-            if mapped == vtoken {
-                self.real_to_v.remove(&record.real_token);
-            }
+        if self
+            .real_to_v
+            .peek(&record.real_token)
+            .map_or(false, |v| v == vtoken)
+        {
+            self.real_to_v.pop(&record.real_token);
         }
         if let Some(ref k) = record.conv_key {
-            if let Some(mapped) = self.conv_to_v.get(k) {
-                if mapped == vtoken {
-                    self.conv_to_v.remove(k);
-                }
+            if self.conv_to_v.peek(k).map_or(false, |v| v == vtoken) {
+                self.conv_to_v.pop(k);
             }
         }
     }
@@ -87,9 +87,9 @@ impl ContextTokenMapInner {
 
         // Insert new indices.
         self.real_to_v
-            .insert(record.real_token.clone(), vtoken.clone());
+            .put(record.real_token.clone(), vtoken.clone());
         if let Some(ref k) = record.conv_key {
-            self.conv_to_v.insert(k.clone(), vtoken);
+            self.conv_to_v.put(k.clone(), vtoken);
         }
     }
 
@@ -119,24 +119,28 @@ impl ContextTokenMapInner {
             }
 
             if real_changed {
-                if let Some(mapped_vtoken) = self.real_to_v.get(&old_real) {
-                    if mapped_vtoken == &vtoken {
-                        self.real_to_v.remove(&old_real);
-                    }
+                if self
+                    .real_to_v
+                    .peek(&old_real)
+                    .map_or(false, |v| v == &vtoken)
+                {
+                    self.real_to_v.pop(&old_real);
                 }
-                self.real_to_v.insert(real_token.clone(), vtoken.clone());
+                self.real_to_v.put(real_token.clone(), vtoken.clone());
             }
 
             if conv_changed {
                 if let Some(ref old_k) = old_conv {
-                    if let Some(mapped_vtoken) = self.conv_to_v.get(old_k) {
-                        if mapped_vtoken == &vtoken {
-                            self.conv_to_v.remove(old_k);
-                        }
+                    if self
+                        .conv_to_v
+                        .peek(old_k)
+                        .map_or(false, |v| v == &vtoken)
+                    {
+                        self.conv_to_v.pop(old_k);
                     }
                 }
                 if let Some(ref k) = conv_key {
-                    self.conv_to_v.insert(k.clone(), vtoken.clone());
+                    self.conv_to_v.put(k.clone(), vtoken.clone());
                 }
             }
 
@@ -187,15 +191,15 @@ impl ContextTokenMap {
         Self {
             inner: std::sync::Mutex::new(ContextTokenMapInner {
                 v_to_record: LruCache::new(cap),
-                real_to_v: HashMap::new(),
-                conv_to_v: HashMap::new(),
+                real_to_v: LruCache::new(cap),
+                conv_to_v: LruCache::new(cap),
             }),
         }
     }
 
     pub fn has_conversation(&self, conv_key: &str) -> bool {
         let inner = self.inner.lock().unwrap();
-        inner.conv_to_v.contains_key(conv_key)
+        inner.conv_to_v.contains(conv_key)
     }
 
     /// Seed a known conversation → vctx mapping (e.g. after DB warm-up on hub restart).
@@ -230,7 +234,7 @@ impl ContextTokenMap {
         });
 
         if let Some(ref key) = conv_key {
-            if let Some(vtoken) = inner.conv_to_v.get(key).cloned() {
+            if let Some(vtoken) = inner.conv_to_v.peek(key).cloned() {
                 let old_record = inner.v_to_record.peek(&vtoken).cloned();
                 if let Some(record) = old_record {
                     let mut real_changed = false;
@@ -241,12 +245,14 @@ impl ContextTokenMap {
                     }
 
                     if real_changed {
-                        if let Some(mapped_vtoken) = inner.real_to_v.get(&old_real) {
-                            if mapped_vtoken == &vtoken {
-                                inner.real_to_v.remove(&old_real);
-                            }
+                        if inner
+                            .real_to_v
+                            .peek(&old_real)
+                            .map_or(false, |v| v == &vtoken)
+                        {
+                            inner.real_to_v.pop(&old_real);
                         }
-                        inner.real_to_v.insert(real_token.clone(), vtoken.clone());
+                        inner.real_to_v.put(real_token.clone(), vtoken.clone());
                     }
 
                     if let Some(r) = inner.v_to_record.get_mut(&vtoken) {
@@ -264,7 +270,7 @@ impl ContextTokenMap {
 
         // For unscoped calls, also check the real_to_v index.
         if client_scope.is_none() {
-            if let Some(vtoken) = inner.real_to_v.get(&real_token).cloned() {
+            if let Some(vtoken) = inner.real_to_v.peek(&real_token).cloned() {
                 if let Some(record) = inner.v_to_record.get_mut(&vtoken) {
                     if !peer_user_id.is_empty() {
                         record.peer_user_id = peer_user_id;

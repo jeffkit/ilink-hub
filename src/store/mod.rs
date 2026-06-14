@@ -166,27 +166,36 @@ impl Store {
         .await?;
 
         // ── v3: real_ctx unique index (race-free upsert) ──────────────────────
-        let _ = self
+        if let Err(e) = self
             .ddl(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
                  ON context_token_map (real_ctx)",
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "v3 migration: CREATE UNIQUE INDEX failed (may already exist)");
+        }
 
         // ── v4: created_at column + index for portable ORDER BY ───────────────
-        let _ = self
+        if let Err(e) = self
             .ddl(
                 "ALTER TABLE context_token_map \
                  ADD COLUMN created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)",
             )
-            .await;
+            .await
+        {
+            tracing::debug!(error = %e, "v4 migration: ALTER TABLE skipped (column likely already exists)");
+        }
 
-        let _ = self
+        if let Err(e) = self
             .ddl(
                 "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
                  ON context_token_map (created_at DESC)",
             )
-            .await;
+            .await
+        {
+            tracing::warn!(error = %e, "v4 migration: CREATE INDEX failed (may already exist)");
+        }
 
         Ok(())
     }
@@ -450,6 +459,9 @@ impl Store {
     ///
     /// Returns a map of `(vctx, vtoken) → (session_name, Option<backend_session_id>)`.
     /// Used by the Broadcast path to avoid N×2 individual DB round-trips.
+    ///
+    /// Uses `QueryBuilder` so placeholder style (`$N` vs `?`) is chosen automatically
+    /// by the runtime driver — compatible with SQLite, PostgreSQL, and MySQL.
     pub async fn get_hub_ext_batch(
         &self,
         pairs: &[(String, String)], // (vctx, vtoken)
@@ -458,21 +470,21 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Build clauses with $N positional placeholders (required for PG; SQLite also accepts them).
-        let mut active_clauses = Vec::with_capacity(pairs.len());
-        for i in 0..pairs.len() {
-            active_clauses.push(format!("(vctx = ${} AND vtoken = ${})", i * 2 + 1, i * 2 + 2));
-        }
-        let active_sql = format!(
-            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE {}",
-            active_clauses.join(" OR "),
+        // Query 1: resolve active session names for each (vctx, vtoken) pair.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE ",
         );
-
-        let mut active_q = sqlx::query(&active_sql);
-        for (vctx, vtoken) in pairs {
-            active_q = active_q.bind(vctx).bind(vtoken);
+        for (i, (vctx, vtoken)) in pairs.iter().enumerate() {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("(vctx = ");
+            qb.push_bind(vctx.as_str());
+            qb.push(" AND vtoken = ");
+            qb.push_bind(vtoken.as_str());
+            qb.push(")");
         }
-        let active_rows = active_q.fetch_all(&self.pool).await?;
+        let active_rows = qb.build().fetch_all(&self.pool).await?;
 
         // Build map: (vctx, vtoken) → session_name
         let mut session_map: std::collections::HashMap<(String, String), String> =
@@ -497,26 +509,23 @@ impl Store {
             })
             .collect();
 
-        let mut session_clauses = Vec::with_capacity(resolved.len());
-        for i in 0..resolved.len() {
-            session_clauses.push(format!(
-                "(vctx = ${} AND vtoken = ${} AND session_name = ${})",
-                i * 3 + 1,
-                i * 3 + 2,
-                i * 3 + 3,
-            ));
-        }
-        let session_sql = format!(
-            "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \
-             WHERE {}",
-            session_clauses.join(" OR ")
+        // Query 2: fetch backend session IDs for the resolved (vctx, vtoken, session_name) triples.
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 WHERE ",
         );
-
-        let mut session_q = sqlx::query(&session_sql);
-        for (vctx, vtoken, name) in &resolved {
-            session_q = session_q.bind(vctx).bind(vtoken).bind(name);
+        for (i, (vctx, vtoken, name)) in resolved.iter().enumerate() {
+            if i > 0 {
+                qb2.push(" OR ");
+            }
+            qb2.push("(vctx = ");
+            qb2.push_bind(vctx.as_str());
+            qb2.push(" AND vtoken = ");
+            qb2.push_bind(vtoken.as_str());
+            qb2.push(" AND session_name = ");
+            qb2.push_bind(name.as_str());
+            qb2.push(")");
         }
-        let session_rows = session_q.fetch_all(&self.pool).await?;
+        let session_rows = qb2.build().fetch_all(&self.pool).await?;
 
         let mut sid_map: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();

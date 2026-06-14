@@ -18,6 +18,7 @@ use axum::{
     routing::get,
     Router,
 };
+use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{oneshot, RwLock};
 use tracing::{info, warn};
@@ -40,7 +41,7 @@ const PAIR_RATE_WINDOW_SECS: u64 = 60;
 #[derive(Clone)]
 pub struct RelayState {
     hubs: Arc<RwLock<HashMap<String, HubHandle>>>,
-    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>>,
+    pending: Arc<DashMap<String, oneshot::Sender<RelayMessage>>>,
     device_keys: Arc<RwLock<HashMap<String, [u8; 32]>>>,
     ws_rate_limiter: Arc<RateLimiter>,
     pair_rate_limiter: Arc<RateLimiter>,
@@ -54,7 +55,7 @@ struct HubHandle {
 pub fn build_relay_router() -> Router {
     let state = RelayState {
         hubs: Arc::new(RwLock::new(HashMap::new())),
-        pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        pending: Arc::new(DashMap::new()),
         device_keys: Arc::new(RwLock::new(HashMap::new())),
         ws_rate_limiter: Arc::new(RateLimiter::new(WS_RATE_MAX, WS_RATE_WINDOW_SECS)),
         pair_rate_limiter: Arc::new(RateLimiter::new(PAIR_RATE_MAX, PAIR_RATE_WINDOW_SECS)),
@@ -167,7 +168,7 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
                         }
                     }
                     RelayMessage::Response { id, status, headers, body } => {
-                        let tx = state.pending.lock().unwrap().remove(&id);
+                        let tx = state.pending.remove(&id).map(|(_, tx)| tx);
                         if let Some(tx) = tx {
                             let _ = tx.send(RelayMessage::Response { id, status, headers, body });
                         }
@@ -192,15 +193,13 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
 }
 
 struct PendingRequestGuard {
-    pending: Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>>,
+    pending: Arc<DashMap<String, oneshot::Sender<RelayMessage>>>,
     request_id: String,
 }
 
 impl Drop for PendingRequestGuard {
     fn drop(&mut self) {
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(&self.request_id);
-        }
+        self.pending.remove(&self.request_id);
     }
 }
 
@@ -222,7 +221,7 @@ async fn forward_to_hub(
     let request_id = Uuid::new_v4().to_string();
     let (tx, rx) = oneshot::channel();
 
-    state.pending.lock().unwrap().insert(request_id.clone(), tx);
+    state.pending.insert(request_id.clone(), tx);
 
     let _guard = PendingRequestGuard {
         pending: state.pending.clone(),
@@ -359,8 +358,33 @@ pub async fn serve(addr: &str) -> Result<()> {
         listener,
         router.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn unix_now() -> i64 {
@@ -378,7 +402,7 @@ mod tests {
     async fn test_relay_pending_request_no_leak_on_cancel() {
         let state = RelayState {
             hubs: Arc::new(RwLock::new(HashMap::new())),
-            pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
             device_keys: Arc::new(RwLock::new(HashMap::new())),
             ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
             pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
@@ -418,9 +442,8 @@ mod tests {
 
         // Assert that the request is currently registered in the pending map
         {
-            let pending = state.pending.lock().unwrap();
             assert!(
-                pending.contains_key(&request_id),
+                state.pending.contains_key(&request_id),
                 "request must be in pending map"
             );
         }
@@ -434,9 +457,8 @@ mod tests {
 
         // Assert that the request_id is cleaned up and no longer exists in the pending map
         {
-            let pending = state.pending.lock().unwrap();
             assert!(
-                !pending.contains_key(&request_id),
+                !state.pending.contains_key(&request_id),
                 "pending request must be cleaned up on cancel!"
             );
         }

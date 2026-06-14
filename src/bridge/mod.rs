@@ -160,7 +160,7 @@ fn session_dispatch_key(msg: &WeixinMessage) -> String {
 /// never race against each other.
 async fn run_session_worker(
     key: String,
-    mut rx: mpsc::UnboundedReceiver<WeixinMessage>,
+    mut rx: mpsc::Receiver<WeixinMessage>,
     client: HubClient,
     app: Arc<BridgeApp>,
 ) {
@@ -174,11 +174,13 @@ async fn run_session_worker(
 
 /// Routes inbound messages to per-session serial workers.
 ///
-/// Each unique dispatch key owns an `UnboundedSender`; a new Tokio task is spawned lazily
+/// Each unique dispatch key owns a bounded `Sender`; a new Tokio task is spawned lazily
 /// on first use. If a worker task exits unexpectedly (channel closed), the next `dispatch`
-/// call for that key transparently creates a fresh worker.
+/// call for that key transparently creates a fresh worker. Messages are dropped with a
+/// warning when the per-session queue is full (backpressure).
+const DEFAULT_SESSION_QUEUE_SIZE: usize = 200;
 struct SessionDispatcher {
-    senders: tokio::sync::Mutex<HashMap<String, mpsc::UnboundedSender<WeixinMessage>>>,
+    senders: tokio::sync::Mutex<HashMap<String, mpsc::Sender<WeixinMessage>>>,
     client: HubClient,
     app: Arc<BridgeApp>,
 }
@@ -204,18 +206,27 @@ impl SessionDispatcher {
 
         // Try the existing sender; if the channel is dead, fall through to spawn a new worker.
         let needs_new = match senders.get(&key) {
-            Some(tx) => tx.send(msg.clone()).is_err(),
+            Some(tx) => tx.is_closed(),
             None => true,
         };
 
         if needs_new {
-            let (tx, rx) = mpsc::unbounded_channel();
-            // Cannot fail: receiver is alive and we hold the lock.
-            let _ = tx.send(msg);
-            senders.insert(key.clone(), tx);
+            let (tx, rx) = mpsc::channel(DEFAULT_SESSION_QUEUE_SIZE);
+            senders.insert(key.clone(), tx.clone());
             let client = self.client.clone();
             let app = Arc::clone(&self.app);
-            tokio::spawn(run_session_worker(key, rx, client, app));
+            tokio::spawn(run_session_worker(key.clone(), rx, client, app));
+        }
+
+        // Send to the (possibly freshly created) worker; drop on backpressure.
+        if let Some(tx) = senders.get(&key) {
+            match tx.try_send(msg) {
+                Ok(_) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(session_key = %key, "session queue full, dropping message");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
     }
 
