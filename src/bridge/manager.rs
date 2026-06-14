@@ -92,10 +92,12 @@ impl BridgeManagerHandle {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FileFingerprint {
     len: u64,
     modified: Option<SystemTime>,
+    /// mtime of handler script files referenced by the profile (script/args), if any.
+    handler_modified: Vec<Option<SystemTime>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,6 +696,7 @@ fn spec_from_profile_file(
 ) -> BridgeProcessSpec {
     let id = profile_id_from_path(&config_path);
     let cred_path = credentials_dir.join(format!("{id}.json"));
+    let handler_modified = handler_mtimes(&config_path);
     BridgeProcessSpec {
         id: id.clone(),
         config_path,
@@ -702,8 +705,48 @@ fn spec_from_profile_file(
         fingerprint: FileFingerprint {
             len: metadata.len(),
             modified: metadata.modified().ok(),
+            handler_modified,
         },
     }
+}
+
+/// Collect mtimes of local handler files referenced by the profile YAML.
+///
+/// Looks at `script` and the first element of `args` for each profile, resolving
+/// relative paths against the yaml file's directory. Non-existent or non-local
+/// paths are silently skipped.
+fn handler_mtimes(config_path: &Path) -> Vec<Option<SystemTime>> {
+    let Ok(app) = crate::bridge::BridgeApp::load(config_path) else {
+        return vec![];
+    };
+    let base = config_path.parent().unwrap_or(Path::new("."));
+    let mut mtimes = Vec::new();
+    for name in app.profile_names() {
+        let Some(profile) = app.profile(name) else {
+            continue;
+        };
+        // Candidates: the script path (before expansion) or args[0] (the handler file).
+        let candidates: Vec<&str> = profile
+            .args
+            .first()
+            .map(|s| s.as_str())
+            .into_iter()
+            .collect();
+        for candidate in candidates {
+            let path = Path::new(candidate);
+            let resolved = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                base.join(path)
+            };
+            match std::fs::metadata(&resolved) {
+                Ok(m) if m.is_file() => mtimes.push(m.modified().ok()),
+                _ => {}
+            }
+        }
+    }
+    mtimes.sort_by_key(|t| t.map(|st| st.duration_since(SystemTime::UNIX_EPOCH).ok()));
+    mtimes
 }
 
 fn is_yaml_file(path: &Path) -> bool {
@@ -857,6 +900,7 @@ stdin: none
         let fingerprint = FileFingerprint {
             len: 0,
             modified: None,
+            handler_modified: vec![],
         };
         let spec = BridgeProcessSpec {
             id: "old-profile".into(),
@@ -939,6 +983,7 @@ stdin: none
             fingerprint: FileFingerprint {
                 len: 1,
                 modified: None,
+                handler_modified: vec![],
             },
         };
 
@@ -1051,6 +1096,7 @@ args: ["1"]
             fingerprint: FileFingerprint {
                 len: 0,
                 modified: None,
+                handler_modified: vec![],
             },
         };
 

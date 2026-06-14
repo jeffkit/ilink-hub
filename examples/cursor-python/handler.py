@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sys
+import os
 
 from ilink_bridge import ProfileContext, ProfileResult, create_profile
 
@@ -32,18 +32,14 @@ TIMEOUT_SECS = 300
 
 
 async def call_cursor_agent(message: str, session_id: str) -> tuple[str, str]:
-    """
-    调用 Cursor Agent CLI（agent --print --output-format json），
-    返回 (回复文本, 新 session_id)。
+    """调用 Cursor Agent CLI，返回 (回复文本, 新 session_id)。"""
+    cmd = ["agent", "--print", "--trust", "--yolo", "--output-format", "json"]
 
-    参数：
-        message    用户消息
-        session_id Hub 存储的 Cursor session UUID（空字符串 = 新会话）
+    # 支持通过环境变量指定模型（在 profiles.yaml 的 env 段设置 CURSOR_MODEL）
+    model = os.environ.get("CURSOR_MODEL")
+    if model:
+        cmd += ["--model", model]
 
-    返回：
-        (response, new_session_id)
-    """
-    cmd = ["agent", "--print", "--trust", "--output-format", "json"]
     if session_id:
         cmd += ["--resume", session_id]
 

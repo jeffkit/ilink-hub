@@ -23,9 +23,8 @@ profiles:
     cwd: /path/to/your/project  # ← 改为你的项目目录（claude 会在此目录下运行）
     timeout_secs: 600
     max_reply_chars: 8000
-    # 可选：通过 CLAUDE_MODEL 指定模型（不设则使用 claude 的默认配置）
-    # env:
-    #   CLAUDE_MODEL: sonnet   # 或 haiku、opus 等
+    env:
+      CLAUDE_MODEL: claude-sonnet-4-6  # 可选：不设则使用 claude 的默认配置
 
   claude-new:                 # /new 前缀强制开新会话
     script: ./handler.js
@@ -34,7 +33,7 @@ profiles:
     max_reply_chars: 8000
     env:
       ILINK_SESSION_ID: ""    # 覆盖自动注入，强制新会话
-      # CLAUDE_MODEL: sonnet  # 可选：同上
+      CLAUDE_MODEL: claude-sonnet-4-6  # 可选：同上
 
 routing:
   strategy: prefix

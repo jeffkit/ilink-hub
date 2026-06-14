@@ -9,8 +9,8 @@
 - Cursor Agent CLI 已安装并登录（[安装文档](https://cursor.com/docs/cli/overview)）
 
 ```bash
-agent --version       # 验证已安装
-agent login           # 或 export CURSOR_API_KEY=key-...
+agent --version   # 验证已安装
+agent login       # 或 export CURSOR_API_KEY=key-...
 ```
 
 ## 安装
@@ -46,8 +46,9 @@ ILINK_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 ## 接入 Bridge
 
 1. 修改 `profiles.yaml` 中的 `cwd` 为你的项目目录
-2. 如使用虚拟环境，取消注释 `command` / `args` 字段并注释掉 `script` 字段
-3. 启动 bridge：
+2. 可选：修改 `env.CURSOR_MODEL` 指定模型（如 `claude-4.6-sonnet-medium`），运行 `agent --list-models` 查看全部可用模型
+3. 如使用虚拟环境，取消注释 `command` / `args` 字段并注释掉 `script` 字段
+4. 启动 bridge：
 
 ```bash
 ilink-hub-bridge --config profiles.yaml
@@ -68,4 +69,6 @@ ilink-hub-bridge --config profiles.yaml
                               │         <回复文本>
 ```
 
-`handler.py` 通过 `asyncio.create_subprocess_exec` 调用 `agent --print --output-format json`，从 JSON 输出中提取回复和新 session_id，通过 `ilink-bridge-profile` SDK 按 P0 协议写回 stdout。
+`handler.py` 通过 `asyncio.create_subprocess_exec` 调用 `agent --print --trust --yolo --output-format json`，从 JSON 输出中提取回复和新 session_id，通过 `ilink-bridge-profile` SDK 按 P0 协议写回 stdout。
+
+> **注意**：`--yolo` 允许 agent 执行 shell 命令无需逐条确认；`--trust` 信任工作目录；`cli_session_first_line_prefix` 必须在 profiles.yaml 里配置，否则 session id 会被当作正文发送给用户。
