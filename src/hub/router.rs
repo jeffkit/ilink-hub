@@ -95,6 +95,29 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     None
 }
 
+/// Parse an `@<backend> <message>` mention (a temporary shortcut, analogous to a quote-reply).
+///
+/// The backend **name** is everything between the leading `@` and the first whitespace;
+/// the **message** is the remainder (trimmed). A name with internal spaces is therefore not
+/// matchable — the first space always terminates the name (per product decision). The name is
+/// the same identifier used by `/use <name>` (resolved via the client registry by the caller).
+///
+/// Returns `None` when the text does not start with `@` or the name is empty. This parser does
+/// **not** validate that the name is a registered backend — that check happens in the dispatcher
+/// where the registry is available; an unknown name falls back to a normal message.
+pub fn parse_at_mention(text: &str) -> Option<(String, String)> {
+    let rest = text.trim_start().strip_prefix('@')?;
+    let (name, message) = match rest.split_once(char::is_whitespace) {
+        Some((n, m)) => (n, m),
+        None => (rest, ""),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), message.trim().to_string()))
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -188,6 +211,47 @@ mod tests {
             parse_hub_command("/use mac-workspace"),
             Some(HubCommand::UseClient("mac-workspace".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_at_mention_basic() {
+        assert_eq!(
+            parse_at_mention("@mac-workspace 帮我看下日志"),
+            Some(("mac-workspace".to_string(), "帮我看下日志".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_at_mention_name_only_no_message() {
+        assert_eq!(
+            parse_at_mention("@claude"),
+            Some(("claude".to_string(), "".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_at_mention_first_space_terminates_name() {
+        // The name is everything before the first space; the rest is the message,
+        // even when the message itself contains spaces.
+        assert_eq!(
+            parse_at_mention("@后端 这条 消息 有 空格"),
+            Some(("后端".to_string(), "这条 消息 有 空格".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_at_mention_trims_leading_whitespace() {
+        assert_eq!(
+            parse_at_mention("   @bot hi"),
+            Some(("bot".to_string(), "hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_at_mention_rejects_non_at_and_empty_name() {
+        assert_eq!(parse_at_mention("hello @bot"), None);
+        assert_eq!(parse_at_mention("@ no name"), None);
+        assert_eq!(parse_at_mention("@"), None);
     }
 
     #[test]

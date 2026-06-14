@@ -193,6 +193,108 @@ async fn single_default_client_receives_forward_to_message() {
     );
 }
 
+/// `@<backend> <message>` forwards to the named backend on a brand-new session, strips the
+/// `@name` prefix, and does NOT change the user's current `/use` route or active session.
+#[tokio::test]
+async fn at_mention_routes_to_named_backend_on_new_session() {
+    let state = make_state().await;
+    let vtoken_claude = register(&state, "claude").await;
+    let vtoken_codex = register(&state, "codex").await;
+
+    {
+        let mut registry = state.clients.registry.write().await;
+        registry.mark_seen(&vtoken_claude);
+        registry.mark_seen(&vtoken_codex);
+    }
+
+    // The user's current backend is codex (via /use). The @claude mention must NOT change this.
+    {
+        let mut router = state.routing.router.lock().await;
+        router.set_route("user@wx", vtoken_codex.clone());
+    }
+
+    let (tx, rx) = broadcast::channel(16);
+    spawn_dispatcher(Arc::clone(&state), rx);
+
+    tx.send(make_user_msg("user@wx", "real-ctx-at", "@claude 看下日志 有 空格"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let msgs_claude = state.clients.queue.drain(&vtoken_claude).await.unwrap();
+    let msgs_codex = state.clients.queue.drain(&vtoken_codex).await.unwrap();
+
+    assert_eq!(
+        msgs_claude.len(),
+        1,
+        "the @-mentioned backend (claude) should receive the message"
+    );
+    assert_eq!(
+        msgs_codex.len(),
+        0,
+        "the current /use backend (codex) should NOT receive an @-mention to another backend"
+    );
+
+    // The `@name` prefix is stripped; everything after the first space is the message body.
+    assert_eq!(msgs_claude[0].text(), Some("看下日志 有 空格"));
+
+    // A fresh `at-…` session is attached.
+    let ext = msgs_claude[0].ilink_hub_ext.as_ref().expect("hub_ext");
+    let session_name = ext.session_name.as_deref().unwrap_or("");
+    assert!(
+        session_name.starts_with("at-"),
+        "expected a fresh at- session, got: {session_name}"
+    );
+
+    // The user's active route is unchanged — still codex.
+    {
+        let router = state.routing.router.lock().await;
+        assert_eq!(router.get_route("user@wx"), Some(vtoken_codex.as_str()));
+    }
+
+    // The @-mention session must NOT have become claude's active session.
+    let vctx = msgs_claude[0].context_token.clone().unwrap();
+    let active = state
+        .store
+        .get_active_session_name(&vctx, &vtoken_claude)
+        .await
+        .unwrap();
+    assert_eq!(
+        active, "default",
+        "@-mention must not change the backend's active session"
+    );
+}
+
+/// `@<unknown> …` (name not a registered backend) is treated as a normal message and routed
+/// to the current backend with the text left intact (no prefix stripping).
+#[tokio::test]
+async fn at_mention_unknown_backend_falls_through_to_normal_routing() {
+    let state = make_state().await;
+    let vtoken = register(&state, "claude").await;
+    {
+        let mut registry = state.clients.registry.write().await;
+        registry.mark_seen(&vtoken);
+    }
+    {
+        let mut router = state.routing.router.lock().await;
+        router.set_route("user@wx", vtoken.clone());
+    }
+
+    let (tx, rx) = broadcast::channel(16);
+    spawn_dispatcher(Arc::clone(&state), rx);
+
+    tx.send(make_user_msg("user@wx", "real-ctx-at-unknown", "@nobody hello"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
+    assert_eq!(msgs.len(), 1, "current backend should receive the message");
+    assert_eq!(
+        msgs[0].text(),
+        Some("@nobody hello"),
+        "unknown @name is not stripped; treated as plain text"
+    );
+}
+
 /// Messages from the same user always receive the same virtual context token
 /// so that backend sessions stay stable across multiple messages.
 #[tokio::test]

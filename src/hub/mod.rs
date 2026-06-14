@@ -395,6 +395,23 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         .upstream_user_messages
         .fetch_add(1, Ordering::Relaxed);
 
+    // `@<backend> <message>` shortcut — highest priority, ahead of quote-reply and the
+    // current `/use` route. It is a *temporary* operation (like a quote): it forwards this
+    // one message to the named backend on a **fresh session**, without changing the user's
+    // active backend or active session. An unknown name falls through to normal routing.
+    if let Some(text) = msg.text() {
+        if let Some((backend_name, payload)) = router::parse_at_mention(text) {
+            let vtoken = {
+                let registry = state.clients.registry.read().await;
+                registry.get_by_name(&backend_name).map(|c| c.vtoken.clone())
+            };
+            if let Some(vtoken) = vtoken {
+                handle_at_mention(state, msg, backend_name, vtoken, payload).await;
+                return;
+            }
+        }
+    }
+
     let routing = {
         let router = state.routing.router.lock().await;
         router.route(&msg)
@@ -572,6 +589,100 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 msg_clone.ilink_hub_ext = hub_ext;
                 push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg_clone).await;
             }
+        }
+    }
+}
+
+/// Handle an `@<backend> <message>` shortcut: forward `payload` to `vtoken` on a brand-new,
+/// uniquely-named session, without touching the user's active backend (`/use`) or active
+/// session. Each `@` creates a fresh session (product decision); to continue the conversation
+/// the user quote-replies to the backend's answer, which the quote index routes back to this
+/// session (the echoed `session_name` is registered on the outbound reply).
+async fn handle_at_mention(
+    state: Arc<HubState>,
+    mut msg: WeixinMessage,
+    backend_name: String,
+    vtoken: String,
+    payload: String,
+) {
+    let real_ctx = match msg.context_token.clone() {
+        Some(ctx) if !ctx.is_empty() => ctx,
+        _ => {
+            warn!("@mention message has no context_token, skipping dispatch");
+            return;
+        }
+    };
+    let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+    let group_id = msg.group_id.clone();
+
+    let vctx =
+        resolve_vctx_for_message(&state, &real_ctx, &peer_user_id, group_id.as_deref(), None).await;
+
+    // Always a new session. Millisecond precision keeps names unique even for rapid @-mentions.
+    let session_name = format!("at-{}", chrono::Local::now().format("%Y%m%d-%H%M%S%3f"));
+
+    // Pre-create the (empty-UUID) session slot so it shows up in `/session list` immediately and
+    // is a real, resumable session once the backend replies with its cli_session_id. We do NOT
+    // mark it active — that would change the user's current session, defeating the "temporary"
+    // semantics.
+    if let Err(e) = state
+        .store
+        .set_backend_session(&vctx, &vtoken, &session_name, "")
+        .await
+    {
+        warn!(error = %e, vctx = %vctx, session = %session_name, "failed to pre-create @mention session slot");
+    }
+
+    debug!(
+        backend = %backend_name,
+        vtoken = %crate::redact_token(&vtoken),
+        session = %session_name,
+        "routing @mention to new session"
+    );
+
+    // Persist the context_token mapping (fire-and-forget), mirroring the ForwardTo path.
+    {
+        let store = state.store.clone();
+        let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
+        let metrics = state.metrics.clone();
+        let sem = state.persist_sem.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = sem.try_acquire() else {
+                warn!("persist semaphore full, dropping context_token persist (@mention)");
+                metrics
+                    .persist_fire_and_forget_failures_forward
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
+                warn!(error = %e, "failed to persist context_token mapping (@mention)");
+                metrics
+                    .persist_fire_and_forget_failures_forward
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    let hub_ext =
+        build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, Some(session_name.clone())).await;
+
+    // Strip the `@name` prefix so the backend receives only the message body.
+    set_first_text_item(&mut msg, payload);
+    msg.context_token = Some(vctx);
+    msg.ilink_hub_ext = hub_ext;
+    push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg).await;
+}
+
+/// Replace the text of the first text-bearing item in `msg` (used to strip the `@name` prefix
+/// before forwarding). If no text item exists, the message is left unchanged.
+fn set_first_text_item(msg: &mut WeixinMessage, text: String) {
+    let Some(items) = msg.item_list.as_mut() else {
+        return;
+    };
+    let items_mut = std::sync::Arc::make_mut(items);
+    if let Some(item) = items_mut.iter_mut().find(|i| i.text_item.is_some()) {
+        if let Some(ti) = item.text_item.as_mut() {
+            ti.text = Some(text);
         }
     }
 }
@@ -1094,6 +1205,7 @@ fn build_help_text() -> String {
      /session new <名称> [UUID] — 创建新 session（可选初始 UUID）\n\
      /session use <名称> — 切换到指定 session\n\
      /session delete <名称> — 删除指定 session\n\n\
+     快捷 @ 后端：发送 `@<名称> <消息>` 可临时在该后端上**新建一个会话**并发送此消息，不会改变你当前 /use 的后端和活跃 session（与引用回复类似的临时操作）。名称与 /use 使用的名称一致（可用 /list 查看）；名称取第一个空格之前的部分，其余为消息内容。需要继续这个临时会话时，引用它的回复即可。\n\n\
      引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
      多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅**同时在线**的后端多于一个时默认追加；历史注册但离线的客户端不计入）。可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
      关于 iLink Hub：\n\
