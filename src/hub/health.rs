@@ -24,8 +24,14 @@ pub fn spawn_health_checker(state: Arc<HubState>) {
                 }
                 _ = tokio::time::sleep(Duration::from_secs(CHECK_INTERVAL_SECS)) => {
                     let timeout = Duration::from_secs(OFFLINE_THRESHOLD_SECS);
-                    let mut registry = state.clients.registry.write().await;
-                    registry.evict_stale(timeout);
+                    // Hold write lock only for the O(N) eviction scan, then drop it
+                    // so getupdates/sendmessage read-lock acquisitions are not blocked
+                    // for the subsequent len() calls.
+                    {
+                        let mut registry = state.clients.registry.write().await;
+                        registry.evict_stale(timeout);
+                    }
+                    let registry = state.clients.registry.read().await;
                     let online = registry.online_clients().len();
                     let total = registry.all_clients().len();
                     info!(online, total, "health check: client status");

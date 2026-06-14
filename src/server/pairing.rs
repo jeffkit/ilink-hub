@@ -712,10 +712,19 @@ pub async fn pair_confirm(
         }
     }
 
-    // Resolve the effective client IP: when the request arrives from loopback
-    // (relay client connecting back to hub), trust X-Forwarded-For to get the
-    // phone's real IP. Direct connections use ConnectInfo as-is.
-    let effective_ip = if peer_ip.0.ip().is_loopback() {
+    // Resolve the effective client IP. When the request arrives from loopback AND
+    // carries the per-process relay secret (proving it came from the in-process relay
+    // client rather than any other local process), trust X-Forwarded-For as the real
+    // phone IP. Without a matching secret, loopback connections use their actual address.
+    let relay_secret_ok = headers
+        .get("x-ilink-relay-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            use subtle::ConstantTimeEq;
+            v.as_bytes().ct_eq(state.relay_secret.as_bytes()).unwrap_u8() == 1
+        })
+        .unwrap_or(false);
+    let effective_ip = if peer_ip.0.ip().is_loopback() && relay_secret_ok {
         headers
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())

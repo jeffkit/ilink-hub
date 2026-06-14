@@ -418,11 +418,16 @@ async fn renew_expired_session(
         renewal.qr_login_ui.clone().or_else(|| {
             renewal.qr_tx.as_ref().map(|tx| {
                 // Return the cached sender if still open; create once otherwise.
+                // Drop the cached sender first so the old bridging task exits cleanly
+                // (its receiver closes → recv() returns None → task exits) before the
+                // new QR cycle begins. This prevents the old task from writing a stale
+                // Done/Expired event that wipes the new cycle's Ready cache entry.
                 if let Some(ref existing) = renewal.cached_ui_tx {
                     if !existing.is_closed() {
                         return existing.clone();
                     }
                 }
+                renewal.cached_ui_tx = None; // drop old sender → old task exits
                 let (unbounded_tx, mut unbounded_rx) = tokio::sync::mpsc::unbounded_channel();
                 let broadcast_tx = tx.clone();
                 let last_ready = renewal.qr_last_ready.clone();

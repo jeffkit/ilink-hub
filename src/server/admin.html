@@ -461,7 +461,7 @@
 
 <script>
 const HUB_URL = window.location.origin;
-let adminToken = localStorage.getItem('ilink_admin_token') || '';
+let adminToken = sessionStorage.getItem('ilink_admin_token') || '';
 let lastRegEnv = '';
 let editingClient = null;
 
@@ -613,7 +613,7 @@ async function registerClient() {
 
   if (tokenInput) {
     adminToken = tokenInput;
-    localStorage.setItem('ilink_admin_token', adminToken);
+    sessionStorage.setItem('ilink_admin_token', adminToken);
   }
 
   try {
@@ -657,7 +657,7 @@ function showToast(msg) {
 }
 
 function esc(s) {
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
 document.getElementById('clients-grid').addEventListener('click', (e) => {
@@ -833,7 +833,7 @@ async function doLogin() {
     }
     // Token works
     adminToken = token;
-    localStorage.setItem('ilink_admin_token', adminToken);
+    sessionStorage.setItem('ilink_admin_token', adminToken);
     document.getElementById('login-error').style.display = 'none';
     hideLoginOverlay();
     loadClients();
@@ -849,7 +849,7 @@ async function doLogin() {
 
 function doLogout() {
   adminToken = '';
-  localStorage.removeItem('ilink_admin_token');
+  sessionStorage.removeItem('ilink_admin_token');
   showLoginOverlay();
 }
 
@@ -884,7 +884,7 @@ async function init() {
   if (r && (r.status === 401 || r.status === 403)) {
     // Stored token is invalid, clear and show login
     adminToken = '';
-    localStorage.removeItem('ilink_admin_token');
+    sessionStorage.removeItem('ilink_admin_token');
     showLoginOverlay();
     return;
   }

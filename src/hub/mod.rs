@@ -296,6 +296,11 @@ pub struct HubState {
     pub metrics: Arc<Metrics>,
     /// Backpressure semaphore for fire-and-forget context-token persist tasks.
     pub persist_sem: Arc<tokio::sync::Semaphore>,
+    /// Per-process random secret shared with the in-process relay client so the Hub
+    /// can distinguish trusted relay-forwarded XFF headers from local-process spoofing.
+    /// The relay client injects `X-Ilink-Relay-Secret: <secret>` on every forwarded
+    /// request; Hub's pair_confirm trusts X-Forwarded-For only when this matches.
+    pub relay_secret: String,
 }
 
 impl HubState {
@@ -305,6 +310,13 @@ impl HubState {
         queue: Arc<dyn MessageQueue>,
         shutdown: watch::Receiver<bool>,
     ) -> Arc<Self> {
+        use rand::distributions::Alphanumeric;
+        use rand::Rng;
+        let relay_secret: String = rand::thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
         Arc::new(Self {
             ilink: IlinkConnState::new(upstream, shutdown),
             routing: RoutingState::new(),
@@ -312,6 +324,7 @@ impl HubState {
             store,
             metrics: Arc::new(Metrics::new()),
             persist_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PERSIST_TASKS)),
+            relay_secret,
         })
     }
 }

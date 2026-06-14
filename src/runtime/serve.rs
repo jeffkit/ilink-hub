@@ -134,7 +134,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
             relay = %relay_ws,
             "pairing relay enabled (zero-config)"
         );
-        crate::relay::client::spawn_relay_client(identity, hub_base, relay_ws, shutdown_rx.clone());
+        crate::relay::client::spawn_relay_client(identity, hub_base, relay_ws, state.relay_secret.clone(), shutdown_rx.clone());
     } else {
         info!("pairing relay disabled (set HUB_PAIR_URL or ILINKHUB_RELAY=0)");
     }

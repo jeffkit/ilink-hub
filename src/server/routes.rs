@@ -359,7 +359,13 @@ pub async fn sendmessage(
         .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
-        match state.store.resolve_context_token_full(&vctx).await {
+        let db_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.store.resolve_context_token_full(&vctx),
+        )
+        .await
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("context_token DB lookup timed out")));
+        match db_result {
             Ok(Some((r, p))) => {
                 state.routing.ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
@@ -628,8 +634,9 @@ pub async fn admin_clients(
         .map(|c| {
             // Redact vtoken: expose only the first 8 chars so the list is usable
             // for identification while preventing full-token leakage via logs/dashboards.
-            let redacted = if c.vtoken.len() > 8 {
-                format!("{}…", &c.vtoken[..8])
+            let prefix: String = c.vtoken.chars().take(8).collect();
+            let redacted = if c.vtoken.chars().count() > 8 {
+                format!("{prefix}…")
             } else {
                 "…".to_string()
             };
@@ -872,12 +879,15 @@ pub async fn admin_ilink_qr_stream(
     Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
     StatusCode,
 > {
-    // EventSource can't set headers — accept token via query param as fallback.
-    // When a token is configured, also accept it as `?token=` query param.
-    // When no token is configured, apply the same insecure-flag gate as other admin routes.
+    // EventSource can't set custom headers — accept token via ?token= query param as fallback.
+    // Trade-off: the full URL (including the token) appears in reverse-proxy access logs and
+    // browser history. Operators should configure their proxy to redact or omit the ?token=
+    // query parameter from access logs for this endpoint.
     let authed = check_admin_auth(&headers)
         || admin_token().map_or(insecure_no_auth(), |required| {
-            params.get("token").map(String::as_str).unwrap_or("") == required
+            use subtle::ConstantTimeEq;
+            let provided = params.get("token").map(String::as_str).unwrap_or("");
+            provided.as_bytes().ct_eq(required.as_bytes()).unwrap_u8() == 1
         });
     if !authed {
         return Err(StatusCode::UNAUTHORIZED);

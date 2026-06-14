@@ -29,15 +29,19 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
 
 /// Spawn a background task that maintains a relay connection and forwards HTTP to local Hub.
 ///
+/// `relay_secret` is injected as `X-Ilink-Relay-Secret` on every forwarded request so the
+/// Hub can distinguish trusted relay-forwarded XFF headers from local-process spoofing.
+///
 /// Returns when `shutdown` flips to `true`, performing a clean exit so the relay server
 /// observes a normal WebSocket close instead of an unexpected drop.
 pub fn spawn_relay_client(
     identity: DeviceIdentity,
     hub_base: String,
     relay_ws_url: String,
+    relay_secret: String,
     shutdown: watch::Receiver<bool>,
 ) {
-    tokio::spawn(run_relay_loop(identity, hub_base, relay_ws_url, shutdown));
+    tokio::spawn(run_relay_loop(identity, hub_base, relay_ws_url, relay_secret, shutdown));
 }
 
 /// Reconnect loop body, factored out so tests can `await` it directly.
@@ -45,6 +49,7 @@ pub async fn run_relay_loop(
     identity: DeviceIdentity,
     hub_base: String,
     relay_ws_url: String,
+    relay_secret: String,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let device_id = identity.device_id().to_string();
@@ -76,6 +81,7 @@ pub async fn run_relay_loop(
                 &device_id,
                 &hub_base,
                 &relay_ws_url,
+                &relay_secret,
                 session_shutdown,
             ) => {
                 match res {
@@ -106,6 +112,7 @@ async fn run_session(
     device_id: &str,
     hub_base: &str,
     relay_ws_url: &str,
+    relay_secret: &str,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<SessionExit> {
     info!(url = %relay_ws_url, device_id = %device_id, "connecting to pairing relay");
@@ -196,7 +203,7 @@ async fn run_session(
                     }
                 } else {
                     let forward_fut =
-                        forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref());
+                        forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref(), relay_secret);
                     let res = tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
@@ -260,6 +267,7 @@ async fn forward_to_hub(
     path: &str,
     headers: &HashMap<String, String>,
     body: Option<&str>,
+    relay_secret: &str,
 ) -> Result<(u16, HashMap<String, String>, Option<String>)> {
     let url = format!("{hub_base}{path}");
     let mut req = match method.to_uppercase().as_str() {
@@ -278,6 +286,10 @@ async fn forward_to_hub(
         }
         req = req.header(k, v);
     }
+    // Prove to the Hub that this forwarded request came from the in-process relay
+    // client (not an arbitrary local process). The Hub trusts X-Forwarded-For only
+    // when this secret matches.
+    req = req.header("x-ilink-relay-secret", relay_secret);
 
     if let Some(b) = body {
         req = req.body(b.to_string());
@@ -358,7 +370,8 @@ mod tests {
                 identity,
                 "http://127.0.0.1:1".to_string(),
                 "ws://127.0.0.1:1/ws/pairing".to_string(),
-                rx,
+                String::new(),
+            rx,
             ),
         )
         .await;
@@ -385,6 +398,7 @@ mod tests {
             identity,
             format!("http://{unreachable}"),
             format!("ws://{unreachable}/ws/pairing"),
+            String::new(),
             rx,
         ));
 
@@ -414,6 +428,7 @@ mod tests {
             identity,
             "http://127.0.0.1:1".to_string(),
             "ws://127.0.0.1:1/ws/pairing".to_string(),
+            String::new(),
             rx,
         );
         let elapsed = start.elapsed();
@@ -459,6 +474,7 @@ mod tests {
             identity,
             format!("http://{addr}"),
             format!("ws://{addr}/ws/pairing"),
+            String::new(),
             rx,
         ));
 
@@ -566,6 +582,7 @@ mod tests {
             identity,
             format!("http://{hub_addr}"),
             format!("ws://{ws_addr}/ws/pairing"),
+            String::new(),
             rx,
         ));
 
