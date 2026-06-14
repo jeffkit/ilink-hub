@@ -13,16 +13,9 @@
 //! group id) so a quote-reply in one conversation can never resolve to a message the Hub
 //! sent into a *different* conversation.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::time::{Duration, Instant};
-
-fn calculate_hash<T: Hash>(t: &T) -> u64 {
-    let mut s = DefaultHasher::new();
-    t.hash(&mut s);
-    s.finish()
-}
 
 use super::router::{HubCommand, RoutingDecision};
 
@@ -78,12 +71,24 @@ struct ContentEntry {
 }
 
 /// In-memory index with TTL eviction (no persistence yet).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct QuoteRouteIndex {
     /// Content signature hash → outbound origins (scoped per conversation).
     by_content: HashMap<u64, Vec<ContentEntry>>,
     /// Monotonically increasing counter to assign unique logical sequence numbers.
     next_seq: u64,
+    /// Per-instance random seed so content hashes are not predictable externally.
+    hasher: std::collections::hash_map::RandomState,
+}
+
+impl Default for QuoteRouteIndex {
+    fn default() -> Self {
+        Self {
+            by_content: HashMap::new(),
+            next_seq: 0,
+            hasher: std::collections::hash_map::RandomState::new(),
+        }
+    }
 }
 
 const INDEX_TTL: Duration = Duration::from_secs(86400 * 7);
@@ -95,6 +100,10 @@ const CONTENT_PREFIX_CHARS: usize = 48;
 const MAX_BY_CONTENT_KEYS: usize = 10_000;
 
 impl QuoteRouteIndex {
+    fn hash_key<T: Hash>(&self, t: &T) -> u64 {
+        self.hasher.hash_one(t)
+    }
+
     /// Index an outbound message by its exact rendered text so a later quote-reply in the
     /// same conversation routes back to its origin.
     ///
@@ -109,7 +118,7 @@ impl QuoteRouteIndex {
         self.evict_expired();
 
         for key_str in content_keys(text) {
-            let key = calculate_hash(&key_str);
+            let key = self.hash_key(&key_str);
             if !self.by_content.contains_key(&key) && self.by_content.len() >= MAX_BY_CONTENT_KEYS {
                 // Find the oldest key to evict.
                 let mut oldest_key: Option<u64> = None;
@@ -157,7 +166,7 @@ impl QuoteRouteIndex {
     ) -> Option<QuoteOrigin> {
         let now = Instant::now();
         for key_str in content_keys(text) {
-            let key = calculate_hash(&key_str);
+            let key = self.hash_key(&key_str);
             let Some(bucket) = self.by_content.get(&key) else {
                 continue;
             };
@@ -432,7 +441,7 @@ mod tests {
         let mut idx = QuoteRouteIndex::default();
         let text = "完成了";
         idx.by_content.insert(
-            calculate_hash(&format!("full:{text}")),
+            idx.hash_key(&format!("full:{text}")),
             vec![
                 ContentEntry {
                     scope: SCOPE.into(),

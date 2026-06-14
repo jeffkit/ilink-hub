@@ -31,7 +31,7 @@ pub use outbound_label::{
     should_append_outbound_origin_label,
 };
 pub use pairing::PairingRegistry;
-pub use queue::{conversation_key, ClientQueue, ContextTokenMap, InMemoryQueue, MessageQueue};
+pub use queue::{conversation_key, ContextTokenMap, InMemoryQueue, MessageQueue};
 pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
@@ -222,7 +222,10 @@ impl IlinkConnState {
 /// mapping, and quote-reply tracking. Pure in-memory; no I/O.
 pub struct RoutingState {
     pub router: Mutex<Router>,
-    pub ctx_map: RwLock<ContextTokenMap>,
+    /// ContextTokenMap is internally protected by a std::sync::Mutex; no outer
+    /// async lock is needed and wrapping it in RwLock just adds a redundant layer
+    /// that causes priority inversion under broadcast load (HIGH-3).
+    pub ctx_map: ContextTokenMap,
     /// Quote-reply → backend / hub command (see [`quote_route`]).
     pub quote_index: Mutex<QuoteRouteIndex>,
 }
@@ -231,7 +234,7 @@ impl RoutingState {
     fn new() -> Self {
         Self {
             router: Mutex::new(Router::new(None)),
-            ctx_map: RwLock::new(ContextTokenMap::default()),
+            ctx_map: ContextTokenMap::default(),
             quote_index: Mutex::new(QuoteRouteIndex::default()),
         }
     }
@@ -259,6 +262,13 @@ impl ClientState {
     }
 }
 
+/// Maximum number of concurrent fire-and-forget persist tasks. Applying this limit
+/// bounds the number of SQLite pool-acquire waiters during message bursts and
+/// prevents them from growing without bound. Tasks that cannot acquire a permit
+/// drop their work and increment the relevant failure counter — the same observable
+/// behaviour as before, but now with natural backpressure.
+const MAX_CONCURRENT_PERSIST_TASKS: usize = 32;
+
 /// Top-level hub state. Groups related state into cohesive sub-states so that
 /// internal helpers (dispatcher, hub-command handler, etc.) take the smallest
 /// slice they need instead of the entire blob.
@@ -280,6 +290,8 @@ pub struct HubState {
     pub store: Arc<Store>,
     /// Observability counters. Cross-cutting; not part of any sub-state.
     pub metrics: Arc<Metrics>,
+    /// Backpressure semaphore for fire-and-forget context-token persist tasks.
+    pub persist_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl HubState {
@@ -295,6 +307,7 @@ impl HubState {
             clients: ClientState::new(queue),
             store,
             metrics: Arc::new(Metrics::new()),
+            persist_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PERSIST_TASKS)),
         })
     }
 }
@@ -407,7 +420,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let store = state.store.clone();
             let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
             let metrics = state.metrics.clone();
+            let sem = state.persist_sem.clone();
             tokio::spawn(async move {
+                let Ok(_permit) = sem.try_acquire() else {
+                    warn!("persist semaphore full, dropping context_token persist (forward)");
+                    metrics
+                        .persist_fire_and_forget_failures_forward
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
                 if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
                     warn!(error = %e, "failed to persist context_token mapping");
                     metrics
@@ -492,7 +513,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     .collect();
                 let store = state.store.clone();
                 let metrics = state.metrics.clone();
+                let sem = state.persist_sem.clone();
                 tokio::spawn(async move {
+                    let Ok(_permit) = sem.try_acquire() else {
+                        warn!("persist semaphore full, dropping context_token batch-persist (broadcast)");
+                        metrics
+                            .persist_fire_and_forget_failures_broadcast
+                            .fetch_add(1, Ordering::Relaxed);
+                        return;
+                    };
                     if let Err(e) = store.persist_context_tokens_batch(&entries).await {
                         warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
                         metrics
@@ -931,7 +960,7 @@ async fn resolve_vctx_for_message(
     // atomically so no other task can race in between.
     let db_vctx = if client_scope.is_none() {
         let needs_seed = if let Some(ref key) = conv_key {
-            !state.routing.ctx_map.read().await.has_conversation(key)
+            !state.routing.ctx_map.has_conversation(key)
         } else {
             false
         };
@@ -954,11 +983,10 @@ async fn resolve_vctx_for_message(
         None
     };
 
-    let ctx_map = state.routing.ctx_map.write().await;
     if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
-        // Only seed if nothing else raced in while we held the lock released.
-        if !ctx_map.has_conversation(key) {
-            ctx_map.seed_conversation(
+        // Only seed if nothing else raced in while we did the DB lookup.
+        if !state.routing.ctx_map.has_conversation(key) {
+            state.routing.ctx_map.seed_conversation(
                 key.clone(),
                 vctx,
                 real_ctx.to_string(),
@@ -966,7 +994,7 @@ async fn resolve_vctx_for_message(
             );
         }
     }
-    ctx_map.map_scoped(
+    state.routing.ctx_map.map_scoped(
         real_ctx.to_string(),
         peer_user_id.to_string(),
         group_id,
@@ -1387,7 +1415,7 @@ mod tests {
 
         // RoutingState is empty but functional.
         assert!(
-            state.routing.ctx_map.read().await.is_empty(),
+            state.routing.ctx_map.is_empty(),
             "fresh RoutingState has no conversations"
         );
         assert!(

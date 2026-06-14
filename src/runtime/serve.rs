@@ -282,7 +282,6 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
         Ok(routes) => {
             let count = routes.len();
             let mut router = state.routing.router.lock().await;
-            let mut router = state.routing.router.lock().await;
             let registry = state.clients.registry.read().await;
             for (from_user, vtoken) in routes {
                 if registry.get_by_vtoken(&vtoken).is_some() {
@@ -301,9 +300,8 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_recent_context_tokens(500).await {
         Ok(entries) => {
             let count = entries.len();
-            let ctx_map = state.routing.ctx_map.write().await;
             for (vctx, real_ctx, peer_user_id) in entries {
-                ctx_map.seed_full(vctx, real_ctx, peer_user_id);
+                state.routing.ctx_map.seed_full(vctx, real_ctx, peer_user_id);
             }
             info!(count, "warmed context_token cache from database");
         }

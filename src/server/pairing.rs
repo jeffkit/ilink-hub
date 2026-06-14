@@ -668,6 +668,7 @@ pub async fn pair_confirm(
     peer_ip: axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<PairConfirmRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    const MAX_NAME_LEN: usize = 64;
     let name = req.name.trim().to_string();
     if name.is_empty() {
         return (
@@ -675,10 +676,24 @@ pub async fn pair_confirm(
             Json(serde_json::json!({ "error": "name is required" })),
         );
     }
+    if name.len() > MAX_NAME_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": format!("name must be at most {MAX_NAME_LEN} characters") })),
+        );
+    }
     let label = req
         .label
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty());
+    if let Some(ref l) = label {
+        if l.len() > MAX_NAME_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("label must be at most {MAX_NAME_LEN} characters") })),
+            );
+        }
+    }
 
     // F-M3-1: rate-limit by (code, peer_ip) to slow code-guessing and
     // iframe/service-worker replay attacks.

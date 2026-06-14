@@ -102,6 +102,8 @@ pub struct RegisterResponse {
     pub errmsg: Option<String>,
 }
 
+const MAX_CLIENT_NAME_LEN: usize = 64;
+
 pub async fn register(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
@@ -117,6 +119,36 @@ pub async fn register(
                 errmsg: Some("Unauthorized".to_string()),
             }),
         );
+    }
+
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > MAX_CLIENT_NAME_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(RegisterResponse {
+                ret: 400,
+                vtoken: String::new(),
+                base_url: String::new(),
+                errmsg: Some(format!(
+                    "name must be 1–{MAX_CLIENT_NAME_LEN} characters"
+                )),
+            }),
+        );
+    }
+    if let Some(label) = &req.label {
+        if label.len() > MAX_CLIENT_NAME_LEN {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(RegisterResponse {
+                    ret: 400,
+                    vtoken: String::new(),
+                    base_url: String::new(),
+                    errmsg: Some(format!(
+                        "label must be at most {MAX_CLIENT_NAME_LEN} characters"
+                    )),
+                }),
+            );
+        }
     }
 
     let (vtoken, _is_new) =
@@ -224,21 +256,6 @@ pub async fn getupdates(
         registry.mark_seen(&vtoken);
     }
 
-    // Detect split-brain: more than one concurrent long-poll for the same vtoken means two
-    // bridge processes share one credential/token and will compete for this vtoken's queue
-    // (drain is a destructive read), so inbound messages get stolen non-deterministically.
-    // The guard is held for the whole handler so the count reflects truly-concurrent polls.
-    let (concurrent_polls, _poll_guard) = state.clients.poll_tracker.enter(&vtoken);
-    if concurrent_polls > 1 {
-        warn!(
-            vtoken = %redact_token(&vtoken),
-            concurrent = concurrent_polls,
-            "multiple bridges are long-polling the same vtoken — they share one credential/token \
-             and will steal each other's messages. Give each backend its own registration \
-             instead of reusing a token."
-        );
-    }
-
     // Use timeout from legacy field if provided, otherwise 30s
     let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
     let mut shutdown_rx = state.ilink.shutdown.clone();
@@ -335,17 +352,16 @@ pub async fn sendmessage(
     tracing::Span::current().record("vctx", &vctx);
 
     // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
-    let (real_ctx, peer_user_id) = {
-        let ctx_map = state.routing.ctx_map.read().await;
-        ctx_map.resolve_full(&vctx)
-    }
-    .unwrap_or_else(|| ("".to_string(), "".to_string()));
+    let (real_ctx, peer_user_id) = state
+        .routing
+        .ctx_map
+        .resolve_full(&vctx)
+        .unwrap_or_else(|| ("".to_string(), "".to_string()));
 
     let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
         match state.store.resolve_context_token_full(&vctx).await {
             Ok(Some((r, p))) => {
-                let ctx_map = state.routing.ctx_map.write().await;
-                ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
+                state.routing.ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
             Ok(None) => {
@@ -532,10 +548,7 @@ pub async fn getconfig(
 
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
-        let real_ctx = {
-            let ctx_map = state.routing.ctx_map.read().await;
-            ctx_map.resolve(vctx)
-        };
+        let real_ctx = state.routing.ctx_map.resolve(vctx);
         if let Some(real) = real_ctx {
             req.context_token = Some(real);
         }
@@ -932,13 +945,8 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
         .persist_fire_and_forget_failures_broadcast
         .load(Ordering::Relaxed);
     let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let ctx_map_size = state.routing.ctx_map.read().await.len();
+    let ctx_map_size = state.routing.ctx_map.len();
     let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
-    let upstream_polls_ok = state.ilink.upstream.polls_ok.load(Ordering::Relaxed);
-    let upstream_polls_err = state.ilink.upstream.polls_err.load(Ordering::Relaxed);
-    let relogin_attempts = state.ilink.upstream.relogin_attempts.load(Ordering::Relaxed);
-    let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let ctx_map_size = state.routing.ctx_map.read().await.len();
 
     let mut out = String::with_capacity(1024);
 

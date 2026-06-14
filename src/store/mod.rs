@@ -103,7 +103,7 @@ impl Store {
                 vtoken      TEXT PRIMARY KEY,
                 name        TEXT NOT NULL UNIQUE,
                 label       TEXT,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 last_seen   TEXT
             )",
         )
@@ -113,7 +113,7 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS routing_state (
                 from_user     TEXT PRIMARY KEY,
                 active_vtoken TEXT NOT NULL,
-                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             )",
         )
         .await?;
@@ -133,7 +133,7 @@ impl Store {
                 id         INTEGER PRIMARY KEY,
                 token      TEXT NOT NULL,
                 base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
             )",
         )
         .await?;
@@ -145,7 +145,7 @@ impl Store {
                 vtoken             TEXT NOT NULL,
                 session_name       TEXT NOT NULL,
                 backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 PRIMARY KEY (vctx, vtoken, session_name)
             )",
         )
@@ -156,7 +156,7 @@ impl Store {
                 vctx         TEXT NOT NULL,
                 vtoken       TEXT NOT NULL,
                 session_name TEXT NOT NULL DEFAULT 'default',
-                updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
                 PRIMARY KEY (vctx, vtoken)
             )",
         )
@@ -174,7 +174,7 @@ impl Store {
         let _ = self
             .ddl(
                 "ALTER TABLE context_token_map \
-                 ADD COLUMN created_at TEXT NOT NULL DEFAULT (datetime('now'))",
+                 ADD COLUMN created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)",
             )
             .await;
 
@@ -455,18 +455,14 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Build clauses: (vctx = $1 AND vtoken = $2) OR ...
+        // Build clauses using ? placeholders (ANSI SQL, works on SQLite/PG/MySQL).
         let mut active_clauses = Vec::with_capacity(pairs.len());
-        for i in 0..pairs.len() {
-            active_clauses.push(format!(
-                "(vctx = ${} AND vtoken = ${})",
-                i * 2 + 1,
-                i * 2 + 2
-            ));
+        for _ in 0..pairs.len() {
+            active_clauses.push("(vctx = ? AND vtoken = ?)");
         }
         let active_sql = format!(
             "SELECT vctx, vtoken, session_name FROM active_sessions WHERE {}",
-            active_clauses.join(" OR ")
+            active_clauses.join(" OR "),
         );
 
         let mut active_q = sqlx::query(&active_sql);
@@ -499,13 +495,8 @@ impl Store {
             .collect();
 
         let mut session_clauses = Vec::with_capacity(resolved.len());
-        for i in 0..resolved.len() {
-            session_clauses.push(format!(
-                "(vctx = ${} AND vtoken = ${} AND session_name = ${})",
-                i * 3 + 1,
-                i * 3 + 2,
-                i * 3 + 3
-            ));
+        for _ in 0..resolved.len() {
+            session_clauses.push("(vctx = ? AND vtoken = ? AND session_name = ?)");
         }
         let session_sql = format!(
             "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \

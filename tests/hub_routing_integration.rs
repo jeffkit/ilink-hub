@@ -246,10 +246,7 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
         SendMessageRequest::reply_text(vctx.clone(), "reply".to_string(), "user@wx", None);
 
     // Resolve vctx → real_ctx via the in-memory map (same logic as the handler).
-    let real_ctx = {
-        let mut ctx_map = state.routing.ctx_map.write().await;
-        ctx_map.resolve(&vctx).map(|s| s.to_string())
-    };
+    let real_ctx = state.routing.ctx_map.resolve(&vctx).map(|s| s.to_string());
     if let Some(real) = real_ctx {
         if let Some(msg) = send_req.msg.as_mut() {
             msg.context_token = Some(real.clone());

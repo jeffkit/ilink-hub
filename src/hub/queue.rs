@@ -55,39 +55,34 @@ struct ContextTokenMapInner {
 }
 
 impl ContextTokenMapInner {
+    /// Remove secondary-map entries for a (vtoken, record) pair, guarding against
+    /// overwrites (only remove if the index still points at this vtoken).
+    fn remove_secondary(&mut self, vtoken: &str, record: &ContextRecord) {
+        if let Some(mapped) = self.real_to_v.get(&record.real_token) {
+            if mapped == vtoken {
+                self.real_to_v.remove(&record.real_token);
+            }
+        }
+        if let Some(ref k) = record.conv_key {
+            if let Some(mapped) = self.conv_to_v.get(k) {
+                if mapped == vtoken {
+                    self.conv_to_v.remove(k);
+                }
+            }
+        }
+    }
+
     fn insert_record(&mut self, vtoken: String, record: ContextRecord) {
         // If the key already exists, pop it to clean up the secondary maps.
         if let Some(old_record) = self.v_to_record.pop(&vtoken) {
-            if let Some(mapped_vtoken) = self.real_to_v.get(&old_record.real_token) {
-                if mapped_vtoken == &vtoken {
-                    self.real_to_v.remove(&old_record.real_token);
-                }
-            }
-            if let Some(ref k) = old_record.conv_key {
-                if let Some(mapped_vtoken) = self.conv_to_v.get(k) {
-                    if mapped_vtoken == &vtoken {
-                        self.conv_to_v.remove(k);
-                    }
-                }
-            }
+            self.remove_secondary(&vtoken, &old_record);
         }
 
         // Push the new record and handle LRU eviction if we exceed capacity.
         if let Some((evicted_vtoken, evicted_record)) =
             self.v_to_record.push(vtoken.clone(), record.clone())
         {
-            if let Some(mapped_vtoken) = self.real_to_v.get(&evicted_record.real_token) {
-                if mapped_vtoken == &evicted_vtoken {
-                    self.real_to_v.remove(&evicted_record.real_token);
-                }
-            }
-            if let Some(ref k) = evicted_record.conv_key {
-                if let Some(mapped_vtoken) = self.conv_to_v.get(k) {
-                    if mapped_vtoken == &evicted_vtoken {
-                        self.conv_to_v.remove(k);
-                    }
-                }
-            }
+            self.remove_secondary(&evicted_vtoken, &evicted_record);
         }
 
         // Insert new indices.
@@ -452,20 +447,21 @@ mod context_map_tests {
 // ─── Client queue ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
-pub struct ClientQueue {
-    pub pending: VecDeque<WeixinMessage>,
-    pub notify: Arc<Notify>,
+#[allow(dead_code)]
+pub(crate) struct ClientQueue {
+    pub(crate) pending: VecDeque<WeixinMessage>,
+    pub(crate) notify: Arc<Notify>,
 }
 
 impl ClientQueue {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending: VecDeque::new(),
             notify: Arc::new(Notify::new()),
         }
     }
 
-    pub fn push(&mut self, msg: WeixinMessage) -> bool {
+    pub(crate) fn push(&mut self, msg: WeixinMessage) -> bool {
         let dropped = if self.pending.len() >= MAX_QUEUE_SIZE {
             self.pending.pop_front();
             warn!(
@@ -481,7 +477,7 @@ impl ClientQueue {
         dropped
     }
 
-    pub fn drain(&mut self) -> Vec<WeixinMessage> {
+    pub(crate) fn drain(&mut self) -> Vec<WeixinMessage> {
         self.pending.drain(..).collect()
     }
 }
