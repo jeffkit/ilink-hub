@@ -169,7 +169,10 @@ impl UpstreamClient {
                 }
                 Ok(resp)
             }
-            Err(_) => Ok(SendMessageResponse::ok()), // treat unparseable as success
+            Err(e) => {
+                warn!(error = %e, body = %text, "iLink sendmessage returned unparseable body, treating as success");
+                Ok(SendMessageResponse::ok())
+            }
         }
     }
 

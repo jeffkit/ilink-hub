@@ -530,7 +530,13 @@ pub async fn get_qrcode_status(
         if terminal || Instant::now() >= deadline {
             return Json(resp);
         }
-        tokio::time::sleep(QR_STATUS_POLL_INTERVAL).await;
+        // Wait for a pairing state change (scan or confirm) rather than sleeping 1s.
+        // Falls back to a timeout so the loop exits at the deadline even if no event fires.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::select! {
+            _ = state.clients.pairing_notify.notified() => {}
+            _ = tokio::time::sleep(remaining) => {}
+        }
     }
 }
 
@@ -541,8 +547,12 @@ pub async fn pair_page(
 ) -> impl IntoResponse {
     let session = {
         let mut pairing = state.clients.pairing.write().await;
-        if pairing.get(&code).is_some() {
+        let changed = pairing.get(&code).is_some() && {
             pairing.mark_scanned(&code);
+            true
+        };
+        if changed {
+            state.clients.pairing_notify.notify_waiters();
         }
         pairing.get(&code)
     };
@@ -764,6 +774,9 @@ pub async fn pair_confirm(
         let mut pairing = state.clients.pairing.write().await;
         pairing.confirm(&code, name.clone(), label, vtoken.clone(), &csrf_header)
     };
+    if confirm_result.is_ok() {
+        state.clients.pairing_notify.notify_waiters();
+    }
 
     match confirm_result {
         Ok(()) => {

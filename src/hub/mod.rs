@@ -245,6 +245,9 @@ impl RoutingState {
 pub struct ClientState {
     pub registry: RwLock<ClientRegistry>,
     pub pairing: RwLock<PairingRegistry>,
+    /// Notified whenever a pairing session transitions state (scanned/confirmed).
+    /// `get_qrcode_status` waits on this instead of sleep-polling every 1s.
+    pub pairing_notify: Arc<tokio::sync::Notify>,
     pub queue: Arc<dyn MessageQueue>,
     /// Tracks concurrent `getupdates` long-polls per vtoken to detect bridges that share one
     /// credential/token (queue split-brain).
@@ -256,6 +259,7 @@ impl ClientState {
         Self {
             registry: RwLock::new(ClientRegistry::new()),
             pairing: RwLock::new(PairingRegistry::new()),
+            pairing_notify: Arc::new(tokio::sync::Notify::new()),
             queue,
             poll_tracker: Arc::new(PollTracker::default()),
         }

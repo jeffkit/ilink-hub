@@ -87,7 +87,15 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(1024);
+    // Dispatcher broadcast channel: capacity bounds how many messages can be buffered
+    // between the upstream polling loop and the dispatcher task. A burst exceeding
+    // this limit causes a Lagged error and drops the oldest messages silently.
+    // Tune via ILINK_DISPATCH_CHANNEL_SIZE (default 1024).
+    let dispatch_channel_size: usize = std::env::var("ILINK_DISPATCH_CHANNEL_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
+    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
