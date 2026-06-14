@@ -66,7 +66,7 @@ pub fn append_outbound_origin_footer_to_first_text_item(
     let Some(t) = ti.text.as_ref() else {
         return;
     };
-    ti.text = Some(format!("{t}\n\n— {line}"));
+    ti.text = Some(format!("{t}\n\n---\n{line}"));
 }
 
 #[cfg(test)]
@@ -137,7 +137,7 @@ mod tests {
             ..Default::default()
         };
         append_outbound_origin_footer_to_first_text_item(&mut msg, "w", Some("lbl"), None);
-        assert_eq!(msg.text(), Some("body\n\n— w · lbl"));
+        assert_eq!(msg.text(), Some("body\n\n---\nw · lbl"));
     }
 
     #[test]
