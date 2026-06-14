@@ -319,11 +319,17 @@ async fn pair_confirm(
     State(state): State<RelayState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path((device_id, code)): Path<(String, String)>,
-    headers: HeaderMap,
+    mut headers: HeaderMap,
     body: String,
 ) -> Response {
     if let Err(status) = check_pair_rate(&state, &addr) {
         return (status, "too many pairing requests").into_response();
+    }
+
+    // Inject the real phone IP so the Hub rate-limiter keys on the phone,
+    // not the relay's loopback address. The Hub only trusts this from loopback.
+    if let Ok(v) = addr.ip().to_string().parse() {
+        headers.insert("x-forwarded-for", v);
     }
 
     match forward_to_hub(

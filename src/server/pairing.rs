@@ -60,7 +60,6 @@ pub struct BotQrcodeBody {
 
 /// Hold long-poll requests briefly so clients (OpenClaw) can wait on one HTTP call.
 const QR_STATUS_LONG_POLL: Duration = Duration::from_secs(25);
-const QR_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a (code, ip) entry remains "occupied" once recorded. F-M3-1
 /// hardening against iframe/service-worker replay; one attempt per IP per
@@ -524,17 +523,25 @@ pub async fn get_qrcode_status(
     }
 
     let deadline = Instant::now() + QR_STATUS_LONG_POLL;
+    // Pin the Notify future outside the loop to avoid lost-wakeup: recreating
+    // notified() each iteration discards any notification that fired between
+    // the previous select! arm returning and this call. With a pinned future,
+    // the notification is captured once and survives across loop iterations
+    // until it is actually delivered.
+    let mut notified = std::pin::pin!(state.clients.pairing_notify.notified());
     loop {
         let resp = qrcode_status_json(state.as_ref(), &query.qrcode).await;
         let terminal = resp.status.as_deref() != Some("wait");
         if terminal || Instant::now() >= deadline {
             return Json(resp);
         }
-        // Wait for a pairing state change (scan or confirm) rather than sleeping 1s.
-        // Falls back to a timeout so the loop exits at the deadline even if no event fires.
         let remaining = deadline.saturating_duration_since(Instant::now());
         tokio::select! {
-            _ = state.clients.pairing_notify.notified() => {}
+            _ = &mut notified => {
+                // Re-arm for the next iteration in case this was a spurious
+                // wake from a different code's transition.
+                notified.set(state.clients.pairing_notify.notified());
+            }
             _ = tokio::time::sleep(remaining) => {}
         }
     }
@@ -705,9 +712,25 @@ pub async fn pair_confirm(
         }
     }
 
+    // Resolve the effective client IP: when the request arrives from loopback
+    // (relay client connecting back to hub), trust X-Forwarded-For to get the
+    // phone's real IP. Direct connections use ConnectInfo as-is.
+    let effective_ip = if peer_ip.0.ip().is_loopback() {
+        headers
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| peer_ip.0.ip().to_string())
+    } else {
+        peer_ip.0.ip().to_string()
+    };
+
     // F-M3-1: rate-limit by (code, peer_ip) to slow code-guessing and
     // iframe/service-worker replay attacks.
-    if !pair_confirm_rate_limiter().check_and_record(&code, &peer_ip.0.ip().to_string()) {
+    if !pair_confirm_rate_limiter().check_and_record(&code, &effective_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({ "error": "too many confirm attempts for this pairing code" })),

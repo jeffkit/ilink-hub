@@ -28,6 +28,9 @@ pub struct SessionRenewal {
     pub ilink_status: Option<Arc<AtomicU8>>,
     /// Receives manual re-login triggers from the admin API.
     pub relogin_rx: Option<broadcast::Receiver<()>>,
+    /// Cached bridge sender: created once on the first relogin and reused for subsequent
+    /// renewals so we don't spawn a new unbounded_channel + task on every -14 cycle.
+    pub cached_ui_tx: Option<UnboundedSender<QrLoginUiEvent>>,
 }
 
 pub struct UpstreamClient {
@@ -243,7 +246,7 @@ impl UpstreamClient {
                 let code = resp.errcode.or(resp.ret).unwrap_or(0);
                 if code == -14 {
                     warn!("startup session probe returned -14, triggering immediate re-login");
-                    if let Some(ref renewal_ctx) = renewal {
+                    if let Some(ref mut renewal_ctx) = renewal {
                         set_status(renewal_ctx, crate::hub::ilink_status::NEEDS_LOGIN);
                         match renew_expired_session(self.clone(), renewal_ctx).await {
                             Ok(()) => {
@@ -256,7 +259,7 @@ impl UpstreamClient {
                         }
                     }
                 } else {
-                    if let Some(ref renewal_ctx) = renewal {
+                    if let Some(ref mut renewal_ctx) = renewal {
                         set_status(renewal_ctx, crate::hub::ilink_status::CONNECTED);
                     }
                     if let Some(buf) = resp.get_updates_buf {
@@ -291,7 +294,7 @@ impl UpstreamClient {
             if manual_relogin {
                 info!("manual re-login triggered from admin UI");
                 self.relogin_attempts.fetch_add(1, Ordering::Relaxed);
-                if let Some(ref renewal_ctx) = renewal {
+                if let Some(ref mut renewal_ctx) = renewal {
                     set_status(renewal_ctx, crate::hub::ilink_status::LOGGING_IN);
                     match renew_expired_session(self.clone(), renewal_ctx).await {
                         Ok(()) => {
@@ -313,7 +316,7 @@ impl UpstreamClient {
                 Ok(resp) if resp.ret == Some(0) || resp.errcode.is_none() => {
                     self.polls_ok.fetch_add(1, Ordering::Relaxed);
                     backoff_secs = 1;
-                    if let Some(ref renewal_ctx) = renewal {
+                    if let Some(ref mut renewal_ctx) = renewal {
                         set_status(renewal_ctx, crate::hub::ilink_status::CONNECTED);
                     }
                     if let Some(new_buf) = resp.get_updates_buf {
@@ -343,7 +346,7 @@ impl UpstreamClient {
                         "iLink upstream returned error"
                     );
                     if code == -14 {
-                        if let Some(ref renewal_ctx) = renewal {
+                        if let Some(ref mut renewal_ctx) = renewal {
                             set_status(renewal_ctx, crate::hub::ilink_status::NEEDS_LOGIN);
                             if renewing
                                 .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -394,7 +397,7 @@ fn set_status(renewal: &SessionRenewal, status: u8) {
 
 async fn renew_expired_session(
     upstream: Arc<UpstreamClient>,
-    renewal: &SessionRenewal,
+    renewal: &mut SessionRenewal,
 ) -> Result<()> {
     let quiet_ui = renewal.qr_login_ui.is_some() || renewal.qr_tx.is_some();
     if !quiet_ui {
@@ -409,9 +412,17 @@ async fn renew_expired_session(
     }
 
     // Build a combined QR UI sender: prefer desktop channel, fall back to SSE broadcast.
+    // Reuse a cached bridge task/sender across renewals to avoid spawning a new
+    // unbounded_channel + task on every -14 re-login cycle.
     let ui_tx: Option<UnboundedSender<QrLoginUiEvent>> =
         renewal.qr_login_ui.clone().or_else(|| {
             renewal.qr_tx.as_ref().map(|tx| {
+                // Return the cached sender if still open; create once otherwise.
+                if let Some(ref existing) = renewal.cached_ui_tx {
+                    if !existing.is_closed() {
+                        return existing.clone();
+                    }
+                }
                 let (unbounded_tx, mut unbounded_rx) = tokio::sync::mpsc::unbounded_channel();
                 let broadcast_tx = tx.clone();
                 let last_ready = renewal.qr_last_ready.clone();
@@ -430,6 +441,7 @@ async fn renew_expired_session(
                         let _ = broadcast_tx.send(evt);
                     }
                 });
+                renewal.cached_ui_tx = Some(unbounded_tx.clone());
                 unbounded_tx
             })
         });

@@ -114,6 +114,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
             qr_last_ready: Some(state.ilink.qr_last_ready.clone()),
             ilink_status: Some(state.ilink.ilink_status.clone()),
             relogin_rx: Some(state.ilink.relogin_tx.subscribe()),
+            cached_ui_tx: None,
         });
         tokio::spawn(async move {
             upstream_clone

@@ -24,7 +24,10 @@ impl Store {
         // before connecting, because sqlx's AnyPool does not set
         // `create_if_missing` by default and will return SQLITE_CANTOPEN (14).
         if url.starts_with("sqlite:") {
-            Self::ensure_sqlite_file(url)?;
+            let url_owned = url.to_string();
+            tokio::task::spawn_blocking(move || Self::ensure_sqlite_file(&url_owned))
+                .await
+                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
         }
 
         // For SQLite :memory: databases each new physical connection gets its own
@@ -455,10 +458,10 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Build clauses using ? placeholders (ANSI SQL, works on SQLite/PG/MySQL).
+        // Build clauses with $N positional placeholders (required for PG; SQLite also accepts them).
         let mut active_clauses = Vec::with_capacity(pairs.len());
-        for _ in 0..pairs.len() {
-            active_clauses.push("(vctx = ? AND vtoken = ?)");
+        for i in 0..pairs.len() {
+            active_clauses.push(format!("(vctx = ${} AND vtoken = ${})", i * 2 + 1, i * 2 + 2));
         }
         let active_sql = format!(
             "SELECT vctx, vtoken, session_name FROM active_sessions WHERE {}",
@@ -495,8 +498,13 @@ impl Store {
             .collect();
 
         let mut session_clauses = Vec::with_capacity(resolved.len());
-        for _ in 0..resolved.len() {
-            session_clauses.push("(vctx = ? AND vtoken = ? AND session_name = ?)");
+        for i in 0..resolved.len() {
+            session_clauses.push(format!(
+                "(vctx = ${} AND vtoken = ${} AND session_name = ${})",
+                i * 3 + 1,
+                i * 3 + 2,
+                i * 3 + 3,
+            ));
         }
         let session_sql = format!(
             "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 \
@@ -620,6 +628,10 @@ impl Store {
 
     /// Persist multiple vctx→real_ctx mappings in a single transaction.
     /// Used by the Broadcast dispatch path to avoid N separate round-trips.
+    ///
+    /// All entries are written in one transaction so a partial DB failure does not
+    /// leave some rows committed while others are dropped — that would generate
+    /// duplicate vctx tokens for the same conversation on the next broadcast.
     pub async fn persist_context_tokens_batch(
         &self,
         entries: &[(String, String, String)], // (vctx, real_ctx, peer_user_id)
@@ -627,26 +639,24 @@ impl Store {
         if entries.is_empty() {
             return Ok(());
         }
-        for chunk in entries.chunks(50) {
-            let mut tx = self.pool.begin().await?;
-            for (vctx, real_ctx, peer_user_id) in chunk {
-                sqlx::query(
-                    r#"
-                    INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
-                    VALUES ($1, $2, $3)
-                    ON CONFLICT (vctx) DO UPDATE SET
-                        real_ctx = excluded.real_ctx,
-                        peer_user_id = excluded.peer_user_id
-                    "#,
-                )
-                .bind(vctx)
-                .bind(real_ctx)
-                .bind(peer_user_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-            tx.commit().await?;
+        let mut tx = self.pool.begin().await?;
+        for (vctx, real_ctx, peer_user_id) in entries {
+            sqlx::query(
+                r#"
+                INSERT INTO context_token_map (vctx, real_ctx, peer_user_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (vctx) DO UPDATE SET
+                    real_ctx = excluded.real_ctx,
+                    peer_user_id = excluded.peer_user_id
+                "#,
+            )
+            .bind(vctx)
+            .bind(real_ctx)
+            .bind(peer_user_id)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

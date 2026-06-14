@@ -626,11 +626,18 @@ pub async fn admin_clients(
         .all_clients()
         .iter()
         .map(|c| {
+            // Redact vtoken: expose only the first 8 chars so the list is usable
+            // for identification while preventing full-token leakage via logs/dashboards.
+            let redacted = if c.vtoken.len() > 8 {
+                format!("{}…", &c.vtoken[..8])
+            } else {
+                "…".to_string()
+            };
             serde_json::json!({
                 "name": c.name,
                 "label": c.label,
                 "online": c.online,
-                "vtoken": c.vtoken,
+                "vtoken": redacted,
             })
         })
         .collect();

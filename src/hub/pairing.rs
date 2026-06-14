@@ -98,7 +98,7 @@ impl PairingRegistry {
 
     pub fn create(&mut self) -> Result<String, PairingError> {
         self.purge_expired();
-        if self.sessions.len() >= MAX_PAIRING_SESSIONS {
+        if self.sessions.len() + self.confirmed_sessions.len() >= MAX_PAIRING_SESSIONS {
             return Err(PairingError::TooManySessions);
         }
         let code = format!("pair_{}", Uuid::new_v4().simple());

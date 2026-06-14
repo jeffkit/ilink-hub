@@ -68,6 +68,13 @@ impl DeviceIdentity {
         }
         fs::write(&path, serde_json::to_string_pretty(self)?)
             .with_context(|| format!("write {}", path.display()))?;
+        // Restrict to owner-read/write only — the file contains the Ed25519 signing key.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        }
         Ok(())
     }
 

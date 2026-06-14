@@ -2,18 +2,18 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 #[derive(Debug)]
 pub struct RateLimiter {
     inner: Mutex<Inner>,
     max_events: usize,
-    window_ms: i64,
+    window_ms: u64,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
-    buckets: HashMap<String, Vec<i64>>,
+    buckets: HashMap<String, Vec<Instant>>,
 }
 
 impl RateLimiter {
@@ -21,32 +21,31 @@ impl RateLimiter {
         Self {
             inner: Mutex::new(Inner::default()),
             max_events,
-            window_ms: window_secs as i64 * 1000,
+            window_ms: window_secs * 1000,
         }
     }
 
     pub fn allow(&self, key: &str) -> bool {
-        let now = now_ms();
+        let now = Instant::now();
+        let window = std::time::Duration::from_millis(self.window_ms);
         let mut inner = self.inner.lock().expect("rate limiter lock");
         let bucket = inner.buckets.entry(key.to_string()).or_default();
-        bucket.retain(|t| now - *t < self.window_ms);
+        bucket.retain(|t| now.duration_since(*t) < window);
         if bucket.len() >= self.max_events {
             return false;
         }
         bucket.push(now);
-        // Evict keys that have had no events in the last window to bound memory.
+        // Evict stale keys to bound memory growth. Apply the window filter to
+        // all buckets so entries with only expired timestamps are removed, not
+        // just buckets that are currently empty.
         if inner.buckets.len() > 10_000 {
-            inner.buckets.retain(|_, v| !v.is_empty());
+            inner.buckets.retain(|_, v| {
+                v.retain(|t| now.duration_since(*t) < window);
+                !v.is_empty()
+            });
         }
         true
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_millis() as i64
 }
 
 #[cfg(test)]
