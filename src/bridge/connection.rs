@@ -318,13 +318,14 @@ pub async fn resolve_hub_connection(
 
     match local_credential_state(&path).await? {
         LocalCredState::Valid(creds) => {
-            let base = creds.base_url.trim().trim_end_matches('/').to_string();
-            let hub_for_token = if base.is_empty() {
-                hub.clone()
-            } else {
-                base.clone()
-            };
-            if let Err(e) = validate_hub_token(&hub_for_token, &creds.token).await {
+            // Always validate against the explicitly-provided hub URL, not the
+            // URL stored in the credential file.  The stored base_url can be
+            // stale when the hub moved to a new port: both the old and new
+            // hub instances share the same SQLite database, so the same vtoken
+            // remains valid — but the old URL would silently redirect the
+            // bridge to the wrong hub instance and leave the new hub with an
+            // empty client list.
+            if let Err(e) = validate_hub_token(&hub, &creds.token).await {
                 warn!(
                     error = %e,
                     path = %path.display(),
@@ -341,11 +342,15 @@ pub async fn resolve_hub_connection(
                 )
                 .await;
             }
-            if base.is_empty() {
-                Ok((hub, creds.token))
-            } else {
-                Ok((base, creds.token))
+            // Token is valid for this hub.  If the stored base_url differs
+            // (e.g. hub moved ports), silently rewrite the credential so
+            // subsequent restarts use the current URL without another round-trip.
+            let stored_base = creds.base_url.trim().trim_end_matches('/');
+            if stored_base != hub.trim_end_matches('/') {
+                let name = creds.client_name.as_deref().unwrap_or("");
+                let _ = write_credentials(&path, &hub, &creds.token, name).await;
             }
+            Ok((hub, creds.token))
         }
         LocalCredState::Missing => {
             auto_register_and_save(&path, &hub, register_client_name, None, config_path).await

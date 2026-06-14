@@ -152,6 +152,12 @@ let bridgeCredentialsDir = "";
 let bridgeProfiles: BridgeProfileFile[] = [];
 let selectedBridgeProfileId: string | null = null;
 let bridgeAutoStartAttempted = false;
+/** Set to true by applyBridgeStatus whenever bridge is running/starting.
+ * Captured in the hub-stopped handler so that when hub comes back on a
+ * new port we know whether to restart the bridge manager (bridge_restart)
+ * rather than just doing the first-run auto-start check. */
+let lastBridgeRunning = false;
+let bridgeNeedsRestartOnHubRecovery = false;
 let editingClient: EditingClient | null = null;
 let confirmResolver: ((ok: boolean) => void) | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | null = null;
@@ -494,22 +500,16 @@ async function applyListenPortChange(newPort: number): Promise<boolean> {
     setPortMsg(`已保存为 ${res.listenPort}，正在重启 Hub…`, false);
 
     // Restart the hub so the new port actually takes effect.
-    if (hubBaseUrl) {
-      // Service is up: stop + start (restart_hub drains run_serve first).
-      try {
-        await invoke("restart_hub");
-      } catch (err) {
-        setPortMsg(`重启失败：${String(err)}`);
-        return false;
-      }
-    } else {
-      // Service not running yet: just start it.
-      try {
-        await invoke("start_hub");
-      } catch (err) {
-        setPortMsg(`启动失败：${String(err)}`);
-        return false;
-      }
+    // Always use restart_hub regardless of whether the hub is currently
+    // listening: restart_hub handles both cases (slot occupied → stop then
+    // start; slot empty → start directly) and avoids the "hub already
+    // running" error that start_hub returns when a previous bind failure
+    // left a stale sender in the slot.
+    try {
+      await invoke("restart_hub");
+    } catch (err) {
+      setPortMsg(`重启失败：${String(err)}`);
+      return false;
     }
     setHubState("starting", "正在重新启动 Hub…");
     void refreshHubInfo();
@@ -654,6 +654,7 @@ function bridgeStateLabel(state: BridgeStatusPayload["state"]): string {
 }
 
 function applyBridgeStatus(s: BridgeStatusPayload) {
+  lastBridgeRunning = s.running || s.state === "starting";
   bridgeConfigPath = s.path || bridgeConfigPath;
   const stateEl = $<HTMLElement>("#bridge-state");
   const pathEl = $<HTMLElement>("#bridge-config-path");
@@ -1025,7 +1026,15 @@ function applyHubInfo(info: HubInfo) {
     startBridgePolling();
     void refreshStats();
     void refreshBridgeConfig();
-    void autoStartBridgeIfReady();
+
+    if (bridgeNeedsRestartOnHubRecovery) {
+      // Hub came back (possibly on a new port) while bridge was running.
+      // Restart the bridge manager so it reconnects to the new hub URL.
+      bridgeNeedsRestartOnHubRecovery = false;
+      void invoke("bridge_restart").catch(() => {});
+    } else {
+      void autoStartBridgeIfReady();
+    }
   } else {
     hubBaseUrl = "";
     if (hubUrlEl) hubUrlEl.textContent = "—";
@@ -1407,6 +1416,11 @@ window.addEventListener("DOMContentLoaded", () => {
     clearStatsUi();
     void refreshBridgeStatus();
     renderClientsEmpty("服务已停止。");
+    // Reset so autoStartBridgeIfReady can fire again when hub comes back.
+    bridgeAutoStartAttempted = false;
+    // If bridge was running, schedule a bridge_restart when hub recovers so
+    // the manager reconnects to the (potentially new) hub URL.
+    bridgeNeedsRestartOnHubRecovery = lastBridgeRunning;
   });
 
   void listen<string>("hub-listening", () => {

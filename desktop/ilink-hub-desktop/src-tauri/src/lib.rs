@@ -2416,32 +2416,42 @@ fn spawn_hub_task(
     let listening_for_clear = listening_addr.clone();
 
     let run_serve = tauri::async_runtime::spawn(async move {
-        match ilink_hub::run_serve(opts, shutdown_rx).await {
+        let result = ilink_hub::run_serve(opts, shutdown_rx).await;
+
+        // Common teardown for both success and error paths.
+        {
+            let mut g = hub_state_for_shutdown
+                .lock()
+                .expect("HubController mutex poisoned — please restart the app");
+            *g = None;
+        }
+        {
+            let mut g = listening_for_clear
+                .lock()
+                .expect("HubController mutex poisoned — please restart the app");
+            *g = None;
+        }
+
+        // Clear the shutdown_tx slot so a subsequent start_hub (or the port-
+        // change "save & restart" flow) can succeed after a bind failure.
+        //
+        // On the normal restart_hub path, restart_hub already takes this slot
+        // before awaiting this task, so the slot is None here and .take() is a
+        // harmless no-op.
+        if let Some(ctrl) = app_handle.try_state::<HubController>() {
+            let _ = ctrl
+                .shutdown_tx
+                .lock()
+                .expect("HubController mutex poisoned — please restart the app")
+                .take();
+        }
+
+        match result {
             Ok(()) => {
-                let mut g = hub_state_for_shutdown
-                    .lock()
-                    .expect("HubController mutex poisoned — please restart the app");
-                *g = None;
-                drop(g);
-                let mut g = listening_for_clear
-                    .lock()
-                    .expect("HubController mutex poisoned — please restart the app");
-                *g = None;
-                drop(g);
                 let _ = app_handle.emit("hub-stopped", ());
             }
             Err(e) => {
                 tracing::error!(error = %e, "hub exited with error");
-                let mut g = hub_state_for_shutdown
-                    .lock()
-                    .expect("HubController mutex poisoned — please restart the app");
-                *g = None;
-                drop(g);
-                let mut g = listening_for_clear
-                    .lock()
-                    .expect("HubController mutex poisoned — please restart the app");
-                *g = None;
-                drop(g);
                 let _ = app_handle.emit("hub-error", e.to_string());
             }
         }
@@ -2504,16 +2514,27 @@ async fn start_hub(app: tauri::AppHandle) -> Result<(), String> {
         .try_state::<HubController>()
         .ok_or_else(|| "hub not initialized".to_string())?;
 
-    // Atomically claim the slot before spawning. If the slot is already taken,
-    // refuse the request without touching the helper — this closes the
-    // double-spawn race where two concurrent start_hub calls both passed
-    // is_running() and both spawned run_serve tasks.
-    let guard = ctrl
-        .shutdown_tx
-        .lock()
-        .expect("HubController mutex poisoned — please restart the app");
-    if guard.is_some() {
-        return Err("hub already running".into());
+    // Atomically claim the slot before spawning. If the slot is already taken
+    // AND the channel is still open (run_serve is alive), refuse the request —
+    // this closes the double-spawn race where two concurrent start_hub calls
+    // both passed the is_running() check and both spawned run_serve tasks.
+    //
+    // If the slot is Some but the channel is closed, run_serve has already
+    // exited without clearing the slot (e.g. the task finished before setup()
+    // installed the sender). Treat this as "not running" and clear the stale
+    // sender so we can start fresh.
+    {
+        let mut guard = ctrl
+            .shutdown_tx
+            .lock()
+            .expect("HubController mutex poisoned — please restart the app");
+        if let Some(tx) = guard.as_ref() {
+            if !tx.is_closed() {
+                return Err("hub already running".into());
+            }
+            // Stale sender — run_serve has already exited; clear it.
+            *guard = None;
+        }
     }
     let addr = ctrl.requested_addr();
     let db_path = ctrl.database_path.clone();
@@ -2521,7 +2542,6 @@ async fn start_hub(app: tauri::AppHandle) -> Result<(), String> {
     let hub_state = ctrl.hub_state.clone();
     let env_token = ctrl.env_token.clone();
     let env_base_url = ctrl.env_base_url.clone();
-    drop(guard);
 
     let (tx, mut handles) = spawn_hub_task(
         &app,
@@ -2534,15 +2554,21 @@ async fn start_hub(app: tauri::AppHandle) -> Result<(), String> {
     );
 
     // Install the sender. If we lose the race here (a concurrent start
-    // installed between our drop(guard) and this acquire), abort the
-    // orphaned tasks we just spawned and surface the error.
+    // installed between our earlier drop(guard) and this acquire), abort
+    // the orphaned tasks we just spawned and surface the error.
+    // Apply the same is_closed() check as above so a stale sender from a
+    // fast-exiting run_serve never blocks a valid restart.
     let mut guard = ctrl
         .shutdown_tx
         .lock()
         .expect("HubController mutex poisoned — please restart the app");
-    if guard.is_some() {
-        handles.abort_all();
-        return Err("hub already running".into());
+    if let Some(tx) = guard.as_ref() {
+        if !tx.is_closed() {
+            handles.abort_all();
+            return Err("hub already running".into());
+        }
+        // Stale sender — clear before installing the new one.
+        *guard = None;
     }
     *guard = Some(tx);
     let mut task_handles = ctrl
@@ -2613,6 +2639,73 @@ async fn restart_hub(app: tauri::AppHandle) -> Result<(), String> {
     start_hub(app).await
 }
 
+/// One-time migration: copy bridge profiles and credentials from the legacy
+/// shared CLI directory (`~/.ilink-hub-bridge/`) to the desktop-specific
+/// directory (`~/.ilink-hub/desktop-bridge/`) the first time the app runs
+/// with the new layout.
+///
+/// Migration is skipped when the new profiles directory already exists,
+/// so re-running is a no-op. Errors are logged and ignored — a failed
+/// migration is not fatal; the user will simply start with an empty
+/// profile list and need to re-register.
+fn migrate_bridge_dir_once() {
+    let new_profiles = ilink_hub::paths::desktop_bridge_profiles_dir();
+    let new_creds = ilink_hub::paths::desktop_bridge_credentials_dir();
+    let old_profiles = ilink_hub::paths::default_bridge_profiles_dir();
+    let old_creds = ilink_hub::paths::default_bridge_manager_credentials_dir();
+
+    // Only run when the new directory has never been created.
+    if new_profiles.exists() {
+        return;
+    }
+
+    fn copy_dir_ext(src: &std::path::Path, dst: &std::path::Path, ext: &str) {
+        if !src.exists() {
+            return;
+        }
+        if let Err(e) = std::fs::create_dir_all(dst) {
+            tracing::warn!(error = %e, dst = %dst.display(), "bridge migration: failed to create dir");
+            return;
+        }
+        let entries = match std::fs::read_dir(src) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, src = %src.display(), "bridge migration: failed to read dir");
+                return;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) == Some(ext) {
+                let dest = dst.join(entry.file_name());
+                if let Err(e) = std::fs::copy(&path, &dest) {
+                    tracing::warn!(
+                        error = %e,
+                        src = %path.display(),
+                        dst = %dest.display(),
+                        "bridge migration: failed to copy file"
+                    );
+                } else {
+                    tracing::info!(
+                        src = %path.display(),
+                        dst = %dest.display(),
+                        "bridge migration: copied"
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(
+        old = %old_profiles.display(),
+        new = %new_profiles.display(),
+        "migrating desktop bridge profiles to new location"
+    );
+    copy_dir_ext(&old_profiles, &new_profiles, "yaml");
+    copy_dir_ext(&old_profiles, &new_profiles, "yml");
+    copy_dir_ext(&old_creds, &new_creds, "json");
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2624,6 +2717,10 @@ pub fn run() {
                         .add_directive("tauri=info".parse().unwrap()),
                 )
                 .try_init();
+
+            // Migrate bridge profiles/credentials from the legacy shared CLI
+            // directory to the desktop-specific directory on first launch.
+            migrate_bridge_dir_once();
 
             let data_dir = ilink_hub::paths::data_dir();
             std::fs::create_dir_all(&data_dir).context("create data dir")?;
@@ -2693,9 +2790,12 @@ pub fn run() {
                     state: "stopped".into(),
                     error: None,
                 })),
+                // Use desktop-specific directories so the desktop bridge
+                // manager does not collide with a simultaneously-running CLI
+                // bridge manager under ~/.ilink-hub-bridge/.
                 config_path: ilink_hub::paths::default_bridge_config_path(),
-                profiles_dir: ilink_hub::paths::default_bridge_profiles_dir(),
-                credentials_dir: ilink_hub::paths::default_bridge_manager_credentials_dir(),
+                profiles_dir: ilink_hub::paths::desktop_bridge_profiles_dir(),
+                credentials_dir: ilink_hub::paths::desktop_bridge_credentials_dir(),
             });
 
             Ok(())

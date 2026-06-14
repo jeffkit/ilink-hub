@@ -45,6 +45,25 @@ pub fn default_bridge_manager_credentials_dir() -> PathBuf {
     bridge_manager_dir().join("credentials")
 }
 
+/// Root for the desktop app's own bridge data: `~/.ilink-hub/desktop-bridge`.
+///
+/// Kept under `~/.ilink-hub/` (alongside `desktop-port.json` and the hub DB)
+/// so all desktop-app state lives in one place and does not collide with a
+/// simultaneously-running CLI bridge manager under `~/.ilink-hub-bridge/`.
+pub fn desktop_bridge_dir() -> PathBuf {
+    data_dir().join("desktop-bridge")
+}
+
+/// Desktop bridge manager profiles directory: `~/.ilink-hub/desktop-bridge/profiles`.
+pub fn desktop_bridge_profiles_dir() -> PathBuf {
+    desktop_bridge_dir().join("profiles")
+}
+
+/// Desktop bridge manager credentials directory: `~/.ilink-hub/desktop-bridge/credentials`.
+pub fn desktop_bridge_credentials_dir() -> PathBuf {
+    desktop_bridge_dir().join("credentials")
+}
+
 /// Expand a leading `~` or `$HOME` in a config path (YAML `cwd`, `script`, etc.).
 /// Returns the input unchanged when home is unavailable or no expansion applies.
 pub fn expand_user_path(path: &str) -> String {
@@ -104,6 +123,20 @@ mod tests {
         assert_eq!(
             default_bridge_manager_credentials_dir(),
             base.join("credentials")
+        );
+    }
+
+    #[test]
+    fn desktop_bridge_paths_live_under_data_dir() {
+        let base = data_dir();
+        assert_eq!(desktop_bridge_dir(), base.join("desktop-bridge"));
+        assert_eq!(
+            desktop_bridge_profiles_dir(),
+            base.join("desktop-bridge").join("profiles")
+        );
+        assert_eq!(
+            desktop_bridge_credentials_dir(),
+            base.join("desktop-bridge").join("credentials")
         );
     }
 
