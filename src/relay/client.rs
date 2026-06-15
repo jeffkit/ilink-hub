@@ -68,32 +68,41 @@ pub async fn run_relay_loop(
             return;
         }
         let session_shutdown = shutdown.clone();
+        // Run the session to completion. `run_session` already races every
+        // in-flight I/O against `shutdown` and returns `SessionExit::Shutdown`
+        // when it fires, so it must NOT be raced against the reconnect timer
+        // here: doing so cancels a *healthy* long-lived session every
+        // `RECONNECT_SECS`, producing a register/disconnect flap on the relay
+        // (and the resulting reconnect storm trips the relay's rate limiter).
+        match run_session(
+            &identity,
+            &device_id,
+            &hub_base,
+            &relay_ws_url,
+            &relay_secret,
+            session_shutdown,
+        )
+        .await
+        {
+            Ok(SessionExit::Shutdown) => {
+                info!("relay session observed shutdown");
+                return;
+            }
+            Ok(SessionExit::EndedNormally) => info!("relay session ended normally"),
+            Err(e) => warn!(error = %e, "relay session error"),
+        }
+
+        // Backoff before reconnecting. Interruptible by shutdown so a SIGTERM
+        // during the wait exits promptly instead of stalling for the full
+        // reconnect interval.
         tokio::select! {
             biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
-                    info!("relay client shutting down");
-                    return;
-                }
-            }
-            res = run_session(
-                &identity,
-                &device_id,
-                &hub_base,
-                &relay_ws_url,
-                &relay_secret,
-                session_shutdown,
-            ) => {
-                match res {
-                    Ok(SessionExit::Shutdown) => {
-                        info!("relay session observed shutdown");
-                        return;
-                    }
-                    Ok(SessionExit::EndedNormally) => info!("relay session ended normally"),
-                    Err(e) => warn!(error = %e, "relay session error"),
-                }
-            }
+            _ = wait_for_shutdown(&mut shutdown) => {}
             _ = tokio::time::sleep(Duration::from_secs(RECONNECT_SECS)) => {}
+        }
+        if *shutdown.borrow() {
+            info!("relay client shutting down (during reconnect backoff)");
+            return;
         }
     }
 }
