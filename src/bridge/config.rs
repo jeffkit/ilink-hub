@@ -500,8 +500,26 @@ fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
             }
             Ok(p)
         }
+        "codex" => {
+            p.command = "ilink-hub-bridge".to_string();
+            p.args = vec!["profile".to_string(), "codex".to_string()];
+            p.stdin = StdinMode::Message;
+            if p.cli_session_first_line_prefix.is_none() {
+                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+            }
+            Ok(p)
+        }
+        "agy" => {
+            p.command = "ilink-hub-bridge".to_string();
+            p.args = vec!["profile".to_string(), "agy".to_string()];
+            p.stdin = StdinMode::Message;
+            if p.cli_session_first_line_prefix.is_none() {
+                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+            }
+            Ok(p)
+        }
         other => anyhow::bail!(
-            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code, cursor"
+            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code, cursor, codex, agy"
         ),
     }
 }
