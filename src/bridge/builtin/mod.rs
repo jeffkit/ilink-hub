@@ -7,6 +7,7 @@
 //! All built-ins follow the same P0 exec protocol as external scripts/SDKs.
 
 mod claude_code;
+mod cursor;
 
 /// Dispatch to a built-in profile handler by type name.
 ///
@@ -14,6 +15,9 @@ mod claude_code;
 pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
     match profile_type {
         "claude-code" => claude_code::run().await,
-        other => anyhow::bail!("unknown built-in profile type `{other}`; supported: claude-code"),
+        "cursor" => cursor::run().await,
+        other => anyhow::bail!(
+            "unknown built-in profile type `{other}`; supported: claude-code, cursor"
+        ),
     }
 }

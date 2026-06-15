@@ -469,6 +469,8 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
 /// Recognised shorthands:
 /// - `"claude-code"` → `command: ilink-hub-bridge  args: [profile, claude-code]`
 ///   with `cli_session_first_line_prefix: "ILINK_SESSION:"` auto-set.
+/// - `"cursor"` → `command: ilink-hub-bridge  args: [profile, cursor]`
+///   with `cli_session_first_line_prefix: "ILINK_SESSION:"` auto-set.
 ///
 /// If `profile_type` is `None` or the command is already set, returns the profile unchanged.
 fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
@@ -489,8 +491,17 @@ fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
             }
             Ok(p)
         }
+        "cursor" => {
+            p.command = "ilink-hub-bridge".to_string();
+            p.args = vec!["profile".to_string(), "cursor".to_string()];
+            p.stdin = StdinMode::Message;
+            if p.cli_session_first_line_prefix.is_none() {
+                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+            }
+            Ok(p)
+        }
         other => anyhow::bail!(
-            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code"
+            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code, cursor"
         ),
     }
 }
