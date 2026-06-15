@@ -66,13 +66,43 @@ class ProfileContext:
     context_token: str
     """Hub context token (ILINK_CONTEXT_TOKEN)."""
 
+    async def send_partial(self, text: str) -> None:
+        """Send a partial response chunk to the WeChat user immediately.
+
+        Writes an ``ILINK_PARTIAL:<json>`` line to stdout and flushes the buffer.
+        The bridge reads this line in real-time and forwards the decoded text to
+        the Hub without waiting for the profile process to exit.
+
+        The profile itself has no knowledge of iLink or Hub URLs — the bridge
+        handles all protocol details.  This method is intentionally thin: it only
+        writes to stdout and flushes.
+
+        Example::
+
+            async def handler(ctx):
+                async for chunk in stream_ai(ctx.message):
+                    await ctx.send_partial(chunk)
+                return ProfileResult(session_id=new_session_id)
+        """
+        sys.stdout.write(f"ILINK_PARTIAL:{json.dumps(text)}\n")
+        sys.stdout.flush()
+
 
 @dataclass
 class ProfileResult:
-    """Return value from a profile handler."""
+    """Return value from a profile handler.
 
-    response: str
-    """Reply text to send back to the WeChat user."""
+    When all content has been sent incrementally via :meth:`ProfileContext.send_partial`,
+    set ``response`` to an empty string so the bridge does not send an additional
+    (empty) final message.
+    """
+
+    response: str = ""
+    """Reply text to send back to the WeChat user.
+
+    Set to an empty string when all content was already sent via
+    :meth:`ProfileContext.send_partial`.
+    """
 
     session_id: Optional[str] = None
     """New backend session ID to persist (optional)."""

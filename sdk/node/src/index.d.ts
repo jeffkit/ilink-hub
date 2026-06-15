@@ -9,6 +9,12 @@ export interface ProfileContext {
   fromUser: string;
   /** Hub context token (ILINK_CONTEXT_TOKEN) */
   contextToken: string;
+  /**
+   * Send a partial response chunk to the WeChat user immediately.
+   * Writes `ILINK_PARTIAL:<json>` to stdout and flushes.
+   * The bridge forwards the text in real-time without waiting for the process to exit.
+   */
+  sendPartial(text: string): void;
 }
 
 export interface ProfileResult {

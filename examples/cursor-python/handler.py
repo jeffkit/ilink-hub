@@ -2,7 +2,7 @@
 Cursor Agent Bridge Profile (Python SDK)
 
 通过 ilink-bridge-profile SDK 接入 Cursor Agent CLI（agent 命令），
-支持多轮对话（--resume）。
+支持多轮对话（--resume）和流式输出（--output-format stream-json）。
 
 依赖：
     pip install -r requirements.txt
@@ -24,18 +24,108 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from typing import AsyncIterator
 
 from ilink_bridge import ProfileContext, ProfileResult, create_profile
 
 # agent CLI 单次调用的最大等待时间（秒）
-TIMEOUT_SECS = 300
+TIMEOUT_SECS = 1800
+
+
+async def stream_cursor_agent(
+    message: str, session_id: str
+) -> AsyncIterator[tuple[str, str]]:
+    """流式调用 Cursor Agent CLI（--output-format stream-json）。
+
+    在 agent 工作期间，逐行解析 stream-json 事件：
+    - ``type == "assistant"`` 的文本内容作为阶段性进展 yield（供 send_partial 使用）
+    - ``type == "result"`` 作为最终结果 yield（result 字段 + session_id）
+
+    Yields:
+        (text, session_id, is_final) — is_final=True 表示这是最终结果消息。
+    """
+    cmd = ["agent", "--print", "--trust", "--yolo", "--output-format", "stream-json"]
+
+    model = os.environ.get("CURSOR_MODEL")
+    if model:
+        cmd += ["--model", model]
+
+    if session_id:
+        cmd += ["--resume", session_id]
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    assert proc.stdin is not None
+    proc.stdin.write(message.encode())
+    await proc.stdin.drain()
+    proc.stdin.close()
+
+    assert proc.stdout is not None
+    deadline = asyncio.get_event_loop().time() + TIMEOUT_SECS
+
+    while True:
+        remaining = deadline - asyncio.get_event_loop().time()
+        if remaining <= 0:
+            proc.kill()
+            raise RuntimeError(f"Cursor Agent timed out after {TIMEOUT_SECS}s")
+
+        try:
+            line_bytes = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise RuntimeError(f"Cursor Agent timed out after {TIMEOUT_SECS}s") from None
+
+        if not line_bytes:
+            break  # EOF
+
+        line = line_bytes.decode(errors="replace").strip()
+        if not line:
+            continue
+
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        event_type = event.get("type")
+
+        if event_type == "assistant":
+            # Intermediate progress text from the agent during its work process.
+            # Sent as send_partial so the user sees real-time progress.
+            content = event.get("message", {}).get("content", [])
+            text = "".join(
+                block.get("text", "")
+                for block in content
+                if block.get("type") == "text"
+            )
+            if text:
+                yield text, "", False  # (text, session_id, is_final)
+
+        elif event_type == "result":
+            new_session_id = event.get("session_id", "")
+            result_text = event.get("result", "")
+            # The result event carries the FINAL answer, distinct from intermediate progress.
+            yield result_text, new_session_id, True
+
+    await proc.wait()
+    if proc.returncode is not None and proc.returncode != 0:
+        assert proc.stderr is not None
+        stderr_text = (await proc.stderr.read()).decode(errors="replace").strip()
+        raise RuntimeError(f"agent exited with code {proc.returncode}: {stderr_text}")
 
 
 async def call_cursor_agent(message: str, session_id: str) -> tuple[str, str]:
-    """调用 Cursor Agent CLI，返回 (回复文本, 新 session_id)。"""
+    """非流式调用 Cursor Agent CLI，返回 (回复文本, 新 session_id)。
+
+    保留作备用路径，在 agent 不支持 stream-json 时使用。
+    """
     cmd = ["agent", "--print", "--trust", "--yolo", "--output-format", "json"]
 
-    # 支持通过环境变量指定模型（在 profiles.yaml 的 env 段设置 CURSOR_MODEL）
     model = os.environ.get("CURSOR_MODEL")
     if model:
         cmd += ["--model", model]
@@ -69,15 +159,32 @@ async def call_cursor_agent(message: str, session_id: str) -> tuple[str, str]:
             f"failed to parse agent JSON output: {e}\nraw output: {raw[:500]}"
         ) from e
 
-    result = data.get("result", "")
-    new_session_id = data.get("session_id", "")
-    return result, new_session_id
+    return data.get("result", ""), data.get("session_id", "")
 
 
 async def handler(ctx: ProfileContext) -> ProfileResult:
-    response, new_session_id = await call_cursor_agent(ctx.message, ctx.session_id)
+    new_session_id = ctx.session_id
+    try:
+        # Stream agent events via ILINK_PARTIAL so the user sees output immediately.
+        # Only assistant events carry new text; empirically the result event's text equals
+        # the last assistant event and is already streamed — so we skip re-sending it and
+        # only capture the session_id from the result event.
+        # When all content is sent via ILINK_PARTIAL, response="" skips the duplicate final send.
+        async for text, chunk_session_id, is_final in stream_cursor_agent(
+            ctx.message, ctx.session_id
+        ):
+            if chunk_session_id:
+                new_session_id = chunk_session_id
+            if not is_final and text:
+                await ctx.send_partial(text)
+    except Exception:
+        # Fallback: non-streaming call when agent doesn't support stream-json.
+        fallback_text, new_session_id = await call_cursor_agent(ctx.message, ctx.session_id)
+        if fallback_text:
+            await ctx.send_partial(fallback_text)
+
     return ProfileResult(
-        response=response,
+        response="",
         session_id=new_session_id or ctx.session_id or None,
     )
 

@@ -3,17 +3,15 @@
 # Codex Bridge Profile（Shell 版）
 #
 # 通过 Codex CLI 的 JSONL 输出模式（--json）接收用户消息，
-# 支持多轮对话（exec resume <session_id>）。
+# 支持多轮对话（exec resume <session_id>）和流式输出（ILINK_PARTIAL）。
 #
 # ─── 依赖 ──────────────────────────────────────────────────────────────────
 #   必需：  codex CLI（已安装并认证：codex login）
-#           jq（JSON 解析：brew install jq  或  sudo apt install jq）
-#   可选：  python3（jq 不存在时的备用解析器）
+#           jq（JSON 解析与 ILINK_PARTIAL 编码：brew install jq）
 #
 # ─── 本地测试（不启动 bridge）──────────────────────────────────────────────
 #   ILINK_MESSAGE="你好，介绍一下自己" \
 #   ILINK_SESSION_ID="" \
-#   ILINK_CWD="/path/to/your/project" \
 #   bash handler.sh
 #
 # ─── 接入 bridge ────────────────────────────────────────────────────────────
@@ -32,6 +30,11 @@ if [[ -n "${ILINK_CWD:-}" && -d "$ILINK_CWD" ]]; then
     cd "$ILINK_CWD"
 fi
 
+if ! command -v jq &>/dev/null; then
+    >&2 echo "[codex-bridge] 错误：未找到 jq，请先安装（brew install jq 或 sudo apt install jq）"
+    exit 1
+fi
+
 # 构造 codex 命令：有 session_id 时用 exec resume（多轮对话），否则新建会话
 if [[ -n "$SESSION_ID" ]]; then
     CODEX_ARGS=(exec resume "$SESSION_ID" "$MESSAGE")
@@ -39,57 +42,41 @@ else
     CODEX_ARGS=(exec "$MESSAGE")
 fi
 
-# 执行 codex，关闭 stdin（echo ""），输出 JSONL 事件流
-JSON_OUTPUT=$(echo "" | codex "${CODEX_ARGS[@]}" $CODEX_BYPASS --json 2>/dev/null)
-
-# ── 解析 JSONL 输出 ──────────────────────────────────────────────────────────
+# ── 流式处理 JSONL 输出 ──────────────────────────────────────────────────────
+# codex --json 逐行输出事件，边输出边解析，将 agent_message 通过 ILINK_PARTIAL 实时推送给用户。
+#
+# 事件类型说明：
+#   thread.started          → session_id（保存，进程结束后输出 ILINK_SESSION:）
+#   item.completed (agent_message) → 回复文本（立即输出 ILINK_PARTIAL:）
+#
+# ILINK_PARTIAL: 格式要求文本必须 JSON 编码（换行等特殊字符转义），用 jq -cn 完成。
+#
 NEW_SESSION_ID=""
-RESPONSE=""
 
-if command -v jq &>/dev/null; then
-    # jq 路径：直接过滤 JSONL
-    NEW_SESSION_ID=$(printf '%s\n' "$JSON_OUTPUT" \
-        | jq -r 'select(.type=="thread.started") | .thread_id // empty' 2>/dev/null \
-        | head -1)
-    RESPONSE=$(printf '%s\n' "$JSON_OUTPUT" \
-        | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty' 2>/dev/null \
-        | tr -d '\000')
-elif command -v python3 &>/dev/null; then
-    # Python3 备用路径
-    PARSED=$(printf '%s\n' "$JSON_OUTPUT" | python3 - <<'PYEOF'
-import json, sys
-session_id = ""
-parts = []
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    try:
-        d = json.loads(line)
-        if d.get("type") == "thread.started" and not session_id:
-            session_id = d.get("thread_id", "")
-        elif d.get("type") == "item.completed":
-            item = d.get("item", {})
-            if item.get("type") == "agent_message":
-                parts.append(item.get("text", ""))
-    except json.JSONDecodeError:
-        pass
-print(session_id, end="\x01")
-print("\n".join(parts), end="")
-PYEOF
-)
-    NEW_SESSION_ID="${PARSED%%$'\x01'*}"
-    RESPONSE="${PARSED#*$'\x01'}"
-else
-    >&2 echo "[codex-bridge] 警告：未找到 jq 或 python3，无法解析 JSON，直接输出原始内容"
-    printf '%s' "$JSON_OUTPUT"
-    exit 0
-fi
+while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
 
-# ── P0 协议输出（bridge 读取）────────────────────────────────────────────────
-# 第 1 行：ILINK_SESSION:<uuid>（bridge 存入 Hub，下次调用时回注 ILINK_SESSION_ID）
-# 其余行：Codex 的回复正文
+    type=$(printf '%s' "$line" | jq -r '.type // empty' 2>/dev/null) || continue
+
+    case "$type" in
+        thread.started)
+            NEW_SESSION_ID=$(printf '%s' "$line" | jq -r '.thread_id // empty' 2>/dev/null) || true
+            ;;
+        item.completed)
+            item_type=$(printf '%s' "$line" | jq -r '.item.type // empty' 2>/dev/null) || continue
+            if [[ "$item_type" == "agent_message" ]]; then
+                text=$(printf '%s' "$line" | jq -r '.item.text // empty' 2>/dev/null) || continue
+                if [[ -n "$text" ]]; then
+                    # JSON-encode text so newlines and special chars are safely escaped on one line.
+                    encoded=$(printf '%s' "$text" | jq -Rs '.')
+                    printf 'ILINK_PARTIAL:%s\n' "$encoded"
+                fi
+            fi
+            ;;
+    esac
+done < <(echo "" | codex "${CODEX_ARGS[@]}" $CODEX_BYPASS --json 2>/dev/null)
+
+# ── P0 协议输出：ILINK_SESSION（仅在有 session_id 时输出）───────────────────
 if [[ -n "$NEW_SESSION_ID" ]]; then
-    echo "ILINK_SESSION:$NEW_SESSION_ID"
+    printf 'ILINK_SESSION:%s\n' "$NEW_SESSION_ID"
 fi
-printf '%s' "$RESPONSE"

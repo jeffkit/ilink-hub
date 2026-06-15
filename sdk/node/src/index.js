@@ -130,6 +130,18 @@ function createProfile(handler) {
     sessionName: process.env.ILINK_SESSION_NAME || 'default',
     fromUser: process.env.ILINK_FROM_USER || '',
     contextToken: process.env.ILINK_CONTEXT_TOKEN || '',
+    /**
+     * Send a partial response chunk to the WeChat user immediately.
+     *
+     * Writes an `ILINK_PARTIAL:<json>` line to stdout and flushes.
+     * The bridge reads this in real-time and forwards the text to the Hub
+     * without waiting for the process to exit.
+     *
+     * @param {string} text
+     */
+    sendPartial(text) {
+      process.stdout.write(`ILINK_PARTIAL:${JSON.stringify(text)}\n`);
+    },
   };
 
   Promise.resolve()

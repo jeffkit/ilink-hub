@@ -3,7 +3,8 @@
  * Claude Code Bridge Profile (Node.js)
  *
  * 通过 ilink-bridge-profile SDK 接入 Claude Code CLI，
- * 支持多轮对话（--resume）和自动降级（session 失效时新建会话）。
+ * 支持多轮对话（--resume）、流式输出（--output-format stream-json）
+ * 和自动降级（session 失效时新建会话）。
  *
  * 依赖：
  *   npm install
@@ -22,48 +23,76 @@
 
 const { createProfile } = require('ilink-bridge-profile');
 const { spawn } = require('child_process');
+const readline = require('readline');
 
 /** claude CLI 单次调用的最大等待时间（毫秒） */
 const TIMEOUT_MS = 300_000;
 
 /**
- * 执行 claude CLI，stdin 立即关闭（避免 claude 等待管道输入）。
- * 返回 stdout 字符串。
+ * 流式调用 claude CLI（--output-format stream-json），逐行解析事件并通过回调推送。
  *
- * 注：claude 在 API 错误（如模型不可用）时也会以非零退出码退出，
- * 但仍然会在 stdout 输出 JSON（其中包含错误信息），所以不以退出码判定成败，
- * 而是由调用方解析 JSON 内容来判断。
- * 仅当 stdout 为空（表示 spawn 本身失败）时才以 stderr 内容抛出。
+ * - `type == "assistant"` 事件中的 text block → onChunk(text)（ILINK_PARTIAL）
+ * - `type == "result"` 事件 → 返回 { result, sessionId }
  *
- * @param {string[]} args
- * @returns {Promise<string>}
+ * 若 sessionId 非空则认为调用成功；若进程以非零退出且未收到 result 事件则抛出错误。
+ *
+ * @param {string[]}  args      传给 claude 的参数（不含 --output-format）
+ * @param {(text: string) => void} onChunk  每收到一段文本立即回调
+ * @returns {Promise<{ result: string, sessionId: string }>}
  */
-function spawnClaude(args) {
+function streamClaude(args, onChunk) {
   return new Promise((resolve, reject) => {
-    const child = spawn('claude', args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    const stdoutChunks = [];
+    const allArgs = ['--output-format', 'stream-json', '--dangerously-skip-permissions', ...args];
+    const child = spawn('claude', allArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+
     const stderrChunks = [];
-
-    child.stdout.on('data', (d) => stdoutChunks.push(d));
     child.stderr.on('data', (d) => stderrChunks.push(d));
+    child.stdin.end(); // claude reads prompt from -p arg, not stdin
 
-    // 关闭 stdin，避免 claude 等待管道输入
-    child.stdin.end();
+    let resultData = null;
+    let timedOut = false;
 
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill('SIGTERM');
       reject(new Error(`claude timed out after ${TIMEOUT_MS / 1000}s`));
     }, TIMEOUT_MS);
 
-    child.on('close', () => {
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+
+    rl.on('line', (line) => {
+      if (!line.trim()) return;
+      let event;
+      try {
+        event = JSON.parse(line);
+      } catch {
+        return;
+      }
+
+      if (event.type === 'assistant') {
+        // Stream each text content block immediately via onChunk → ILINK_PARTIAL.
+        const blocks = event.message?.content ?? [];
+        const text = blocks
+          .filter((b) => b.type === 'text')
+          .map((b) => b.text ?? '')
+          .join('');
+        if (text) onChunk(text);
+      } else if (event.type === 'result') {
+        // Only capture session_id; the response text is already streamed above.
+        resultData = { result: event.result ?? '', sessionId: event.session_id ?? '' };
+      }
+    });
+
+    child.on('close', (code) => {
       clearTimeout(timer);
-      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
-      const stderr = Buffer.concat(stderrChunks).toString('utf8');
-      if (!stdout.trim()) {
-        // 空 stdout 说明 claude 根本没有启动或立即崩溃
-        reject(new Error(`claude produced no output\nstderr: ${stderr}`));
+      if (timedOut) return;
+      rl.close();
+
+      if (resultData) {
+        resolve(resultData);
       } else {
-        resolve(stdout);
+        const stderr = Buffer.concat(stderrChunks).toString('utf8').trim();
+        reject(new Error(`claude exited with code ${code}, no result event\nstderr: ${stderr}`));
       }
     });
 
@@ -74,62 +103,36 @@ function spawnClaude(args) {
   });
 }
 
-/**
- * 调用 Claude Code CLI（--print --output-format json），
- * 返回回复文本和新 session_id。
- *
- * @param {string} message   用户消息
- * @param {string} sessionId Hub 存储的 Claude session UUID（空字符串 = 新会话）
- * @returns {Promise<{ result: string, sessionId: string }>}
- */
-async function callClaude(message, sessionId) {
-  const args = ['--print', '--output-format', 'json'];
-
-  // 支持通过环境变量指定模型（在 profiles.yaml 的 env 段设置 CLAUDE_MODEL）
+createProfile(async (ctx) => {
+  const { message, sessionId, sendPartial } = ctx;
   const model = process.env.CLAUDE_MODEL;
-  if (model) {
-    args.push('--model', model);
-  }
+  const baseArgs = ['--print'];
+  if (model) baseArgs.push('--model', model);
+  baseArgs.push('-p', message);
 
-  if (sessionId) {
-    args.push('--resume', sessionId);
-  }
-  args.push(message);
+  let newSessionId = '';
 
-  let stdout;
+  const tryStream = async (sid) => {
+    const args = [...baseArgs];
+    if (sid) args.push('--resume', sid);
+    const data = await streamClaude(args, (chunk) => sendPartial(chunk));
+    newSessionId = data.sessionId;
+  };
+
   try {
-    stdout = await spawnClaude(args);
+    await tryStream(sessionId);
   } catch (err) {
     if (sessionId) {
       // session 失效（如 --resume 的 UUID 过期），降级为新会话
       process.stderr.write(
         `[claude-code] session ${sessionId} resume failed (${err.message}), retrying as new session\n`,
       );
-      const freshArgs = ['--print', '--output-format', 'json'];
-      if (model) freshArgs.push('--model', model);
-      freshArgs.push(message);
-      stdout = await spawnClaude(freshArgs);
+      await tryStream('');
     } else {
       throw err;
     }
   }
 
-  // Claude 输出 JSON 数组；最后一个 type=result 的事件包含回复正文和新 session_id
-  const events = JSON.parse(stdout.trim());
-  const resultEvent = [...events].reverse().find((e) => e.type === 'result');
-  if (!resultEvent) {
-    throw new Error(`no result event in claude output: ${stdout.slice(0, 500)}`);
-  }
-
-  // is_error=true 通常表示 API 错误（如模型不可用），直接返回错误信息作为回复
-  const resultText = resultEvent.result || '';
-  return {
-    result: resultText,
-    sessionId: resultEvent.is_error ? '' : (resultEvent.session_id || ''),
-  };
-}
-
-createProfile(async ({ message, sessionId }) => {
-  const { result, sessionId: newSessionId } = await callClaude(message, sessionId);
-  return { response: result, sessionId: newSessionId || undefined };
+  // All text was already sent via ILINK_PARTIAL; response="" skips the duplicate final send.
+  return { response: '', sessionId: newSessionId || undefined };
 });

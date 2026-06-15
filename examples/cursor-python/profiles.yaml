@@ -22,7 +22,7 @@ profiles:
   cursor:
     script: ./handler.py      # bridge 自动用 python3 运行
     cwd: /path/to/your/project  # ← 改为你的项目目录（agent 会在此目录下运行）
-    timeout_secs: 600
+    timeout_secs: 1800
     max_reply_chars: 8000
     cli_session_first_line_prefix: "ILINK_SESSION:"  # 必须，否则 session id 会出现在正文里
     env:
