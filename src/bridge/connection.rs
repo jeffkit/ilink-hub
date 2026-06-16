@@ -256,8 +256,8 @@ async fn auto_register_and_save(
 ) -> Result<(String, String)> {
     let hub = hub.trim().trim_end_matches('/').to_string();
     let name = auto_client_name(register_client_name, saved_client_name, config_path);
-    let label = "auto-registered downstream";
-    let vtoken = register_via_hub_http(&hub, &name, label).await.with_context(|| {
+    let label = local_hostname();
+    let vtoken = register_via_hub_http(&hub, &name, &label).await.with_context(|| {
         "自动调用 /hub/register 失败。若返回体为业务错误：检查 `ILINK_ADMIN_TOKEN` 是否与 Hub 一致；\
          或改用 `WEIXIN_TOKEN` / `--pair`。"
     })?;
