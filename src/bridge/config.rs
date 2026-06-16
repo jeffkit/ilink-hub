@@ -475,14 +475,18 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
 
 /// Expand a `type: <shorthand>` profile into a full exec-mode profile.
 ///
-/// Recognised shorthands:
-/// - `"claude-code"` → `command: ilink-hub-bridge  args: [profile, claude-code]`
-///   with `cli_session_first_line_prefix: "ILINK_SESSION:"` auto-set.
-/// - `"cursor"` → `command: ilink-hub-bridge  args: [profile, cursor]`
-///   with `cli_session_first_line_prefix: "ILINK_SESSION:"` auto-set.
+/// All built-in types delegate to `ilink-hub-bridge profile <type>` so that
+/// the handler runs in the same binary with minimal external dependencies.
+///
+/// | `type:`       | CLI required  | Session resume | Extra env vars accepted              |
+/// |---------------|---------------|----------------|--------------------------------------|
+/// | `claude-code` | `claude`      | ✓              | `ILINK_CLAUDE_MODEL`                 |
+/// | `codex`       | `codex`       | ✗              | `ILINK_CODEX_MODEL`                  |
+/// | `cursor`      | `cursor`      | ✓ (optional)   | `ILINK_CURSOR_MODEL`, `ILINK_CURSOR_WORKSPACE`, `ILINK_CURSOR_EXTRA_ARGS` |
+/// | `agy`         | `agy`         | ✓              | `ILINK_AGY_MODEL`, `ILINK_AGY_ADD_DIR`, `ILINK_AGY_SANDBOX`, `ILINK_AGY_EXTRA_ARGS` |
 ///
 /// If `profile_type` is `None` or the command is already set, returns the profile unchanged.
-fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
+fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
     let Some(ref pt) = p.profile_type.clone() else {
         return Ok(p);
     };
@@ -490,45 +494,28 @@ fn expand_profile_type(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
         // Explicit command wins; type is informational only.
         return Ok(p);
     }
+
+    /// Build the standard ilink-hub-bridge self-invocation for built-in profile types.
+    /// All built-ins use `stdin: message` so the bridge writes the user text to the
+    /// child's stdin pipe (unused by env-var readers, but harmless and kept for symmetry).
+    fn make_builtin(mut p: BridgeProfile, type_name: &str, with_session: bool) -> BridgeProfile {
+        p.command = "ilink-hub-bridge".to_string();
+        p.args = vec!["profile".to_string(), type_name.to_string()];
+        p.stdin = StdinMode::Message;
+        if with_session && p.cli_session_first_line_prefix.is_none() {
+            p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+        }
+        p
+    }
+
     match pt.as_str() {
-        "claude-code" => {
-            p.command = "ilink-hub-bridge".to_string();
-            p.args = vec!["profile".to_string(), "claude-code".to_string()];
-            p.stdin = StdinMode::Message;
-            if p.cli_session_first_line_prefix.is_none() {
-                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
-            }
-            Ok(p)
-        }
-        "cursor" => {
-            p.command = "ilink-hub-bridge".to_string();
-            p.args = vec!["profile".to_string(), "cursor".to_string()];
-            p.stdin = StdinMode::Message;
-            if p.cli_session_first_line_prefix.is_none() {
-                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
-            }
-            Ok(p)
-        }
-        "codex" => {
-            p.command = "ilink-hub-bridge".to_string();
-            p.args = vec!["profile".to_string(), "codex".to_string()];
-            p.stdin = StdinMode::Message;
-            if p.cli_session_first_line_prefix.is_none() {
-                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
-            }
-            Ok(p)
-        }
-        "agy" => {
-            p.command = "ilink-hub-bridge".to_string();
-            p.args = vec!["profile".to_string(), "agy".to_string()];
-            p.stdin = StdinMode::Message;
-            if p.cli_session_first_line_prefix.is_none() {
-                p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
-            }
-            Ok(p)
-        }
+        "claude-code" => Ok(make_builtin(p, "claude-code", true)),
+        "codex" => Ok(make_builtin(p, "codex", false)),
+        "cursor" => Ok(make_builtin(p, "cursor", true)),
+        "agy" => Ok(make_builtin(p, "agy", true)),
         other => anyhow::bail!(
-            "profile `{name}`: unknown `type: {other}`; supported built-in types: claude-code, cursor, codex, agy"
+            "profile `{name}`: unknown `type: {other}`; \
+             supported built-in types: claude-code, codex, cursor, agy"
         ),
     }
 }

@@ -891,12 +891,23 @@ pub fn probe_profile_light(profile: &BridgeProfile) -> Result<(), ProbeError> {
         }
     }
 
-    let command_to_check =
-        if profile.profile_type.as_deref() == Some("claude-code") || profile.command == "claude" {
-            "claude"
-        } else {
-            &profile.command
-        };
+    // Map built-in profile types to the underlying CLI binary they require.
+    let command_to_check: &str = match profile.profile_type.as_deref() {
+        Some("claude-code") => "claude",
+        Some("codex") => "codex",
+        Some("cursor") => "cursor",
+        Some("agy") => "agy",
+        _ => {
+            // For external commands, also map known wrapper names to real binaries.
+            match profile.command.as_str() {
+                "claude" => "claude",
+                "codex" => "codex",
+                "cursor" => "cursor",
+                "agy" => "agy",
+                other => other,
+            }
+        }
+    };
 
     if !check_command_exists(command_to_check) {
         return Err(ProbeError::NotFound(command_to_check.to_string()));
@@ -918,11 +929,17 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
         }
     }
 
+    // When the profile self-invokes `ilink-hub-bridge profile <type>`, resolve the
+    // underlying CLI binary so the dry-run actually exercises that tool.
+    // If the profile already specifies a concrete command (e.g. in tests using `echo`),
+    // use it as-is so mock tests continue to work.
     let command = if profile.command == "ilink-hub-bridge" {
-        if profile.profile_type.as_deref() == Some("claude-code") {
-            "claude".to_string()
-        } else {
-            profile.command.clone()
+        match profile.profile_type.as_deref() {
+            Some("claude-code") => "claude".to_string(),
+            Some("codex") => "codex".to_string(),
+            Some("cursor") => "cursor".to_string(),
+            Some("agy") => "agy".to_string(),
+            _ => profile.command.clone(),
         }
     } else {
         profile.command.clone()
@@ -932,25 +949,45 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
         return Err(ProbeError::NotFound(command));
     }
 
-    let resolved_command =
-        if command == "claude" || command == "agent" || command == "codex" || command == "gemini" {
-            find_in_path_robust(&command)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or(command)
-        } else {
-            command
-        };
+    // Resolve to absolute path for well-known coding-agent CLIs.
+    const KNOWN_AGENT_CLIS: &[&str] = &["claude", "agent", "codex", "cursor", "agy"];
+    let resolved_command = if KNOWN_AGENT_CLIS.contains(&command.as_str()) {
+        find_in_path_robust(&command)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or(command)
+    } else {
+        command
+    };
 
-    let args: Vec<String> = if profile.profile_type.as_deref() == Some("claude-code") {
-        vec![
+    // Build the dry-run arg list that mirrors each built-in's actual invocation.
+    // This is keyed on `profile_type` so that test mocks (which use `echo` as the
+    // command) still produce the expected output with the real CLI's args.
+    let args: Vec<String> = match profile.profile_type.as_deref() {
+        Some("claude-code") => vec![
             "--output-format".into(),
             "json".into(),
             "--dangerously-skip-permissions".into(),
             "-p".into(),
             message.to_string(),
-        ]
-    } else {
-        profile
+        ],
+        Some("codex") => vec![
+            "--approval-mode".into(),
+            "full-auto".into(),
+            "-q".into(),
+            message.to_string(),
+        ],
+        Some("cursor") => vec![
+            "agent".into(),
+            "run".into(),
+            "--prompt".into(),
+            message.to_string(),
+        ],
+        Some("agy") => vec![
+            "--dangerously-skip-permissions".into(),
+            "-p".into(),
+            message.to_string(),
+        ],
+        _ => profile
             .args
             .iter()
             .map(|a| {
@@ -958,7 +995,7 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
                     .replace("{{SESSION_ID}}", "")
                     .replace("{{SESSION_NAME}}", "default")
             })
-            .collect()
+            .collect(),
     };
 
     let mut cmd = tokio::process::Command::new(&resolved_command);

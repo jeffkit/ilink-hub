@@ -5,6 +5,15 @@
 //!   - Remaining lines: reply text for the WeChat user
 //!
 //! All built-ins follow the same P0 exec protocol as external scripts/SDKs.
+//!
+//! ## Supported built-in types
+//!
+//! | `type:` value  | CLI tool   | Session resume | Notes                                     |
+//! |----------------|------------|----------------|-------------------------------------------|
+//! | `claude-code`  | `claude`   | ✓ (`--resume`) | Anthropic Claude Code CLI                 |
+//! | `codex`        | `codex`    | ✗              | OpenAI Codex CLI (`@openai/codex`)        |
+//! | `cursor`       | `cursor`   | ✓ (optional)   | Cursor background agent CLI               |
+//! | `agy`          | `agy`      | ✓ (`--conversation`) | Google Antigravity CLI             |
 
 mod agy;
 mod claude_code;
@@ -17,11 +26,12 @@ mod cursor;
 pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
     match profile_type {
         "claude-code" => claude_code::run().await,
-        "cursor" => cursor::run().await,
         "codex" => codex::run().await,
+        "cursor" => cursor::run().await,
         "agy" => agy::run().await,
         other => anyhow::bail!(
-            "unknown built-in profile type `{other}`; supported: claude-code, cursor, codex, agy"
+            "unknown built-in profile type `{other}`; \
+             supported: claude-code, codex, cursor, agy"
         ),
     }
 }

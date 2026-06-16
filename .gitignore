@@ -37,3 +37,6 @@ package-lock.json
 .flowx/runs/
 .flowx/prompt-*.md
 .worktrees/
+
+# agy (Google Antigravity CLI) local session state
+.antigravitycli/
