@@ -25,9 +25,13 @@ examples/**/.wechatbot-hub-credentials.json
 
 # SDK build artifacts
 sdk/python/dist/
+sdk/python/build/
 sdk/python/**/__pycache__/
 sdk/python/**/*.pyc
 sdk/python/**/*.egg-info/
+
+# Node
+package-lock.json
 
 # flowx orchestration: keep config.json tracked, ignore run state and worktrees
 .flowx/runs/

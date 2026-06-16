@@ -254,9 +254,27 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
 
     let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
 
-    // Parse `--output-format json` result: a single JSON object with `result` and `session_id`.
-    let event: ClaudeStreamEvent = serde_json::from_str(stdout_str.trim())
-        .with_context(|| format!("parse claude json output: {stdout_str}"))?;
+    // Parse `--output-format json` result.
+    // Claude CLI ≥ 2.1.153 emits a JSON array of all events (system, assistant,
+    // rate_limit_event, result, …) instead of a single result object.
+    // Older versions output a single JSON object with `result` and `session_id`.
+    // Handle both formats so a CLI upgrade doesn't silently break one-shot mode.
+    let event: ClaudeStreamEvent = {
+        let trimmed = stdout_str.trim();
+        if trimmed.starts_with('[') {
+            let events: Vec<ClaudeStreamEvent> = serde_json::from_str(trimmed)
+                .with_context(|| format!("parse claude json output: {stdout_str}"))?;
+            events
+                .into_iter()
+                .find(|e| e.event_type.as_deref() == Some("result"))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("no result event in claude json output: {stdout_str}")
+                })?
+        } else {
+            serde_json::from_str(trimmed)
+                .with_context(|| format!("parse claude json output: {stdout_str}"))?
+        }
+    };
 
     if !output.status.success() && event.session_id.is_none() {
         let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
@@ -314,5 +332,30 @@ mod tests {
         assert_eq!(event.event_type.as_deref(), Some("system"));
         assert!(event.result.is_none());
         assert!(event.message.is_none());
+    }
+
+    /// Claude CLI ≥ 2.1.153 changed `--output-format json` to emit a JSON array of all
+    /// events (system, assistant, rate_limit_event, result) instead of a single result
+    /// object.  The oneshot parser must extract the result event from the array.
+    #[test]
+    fn oneshot_parses_json_array_format() {
+        let json = r#"[
+            {"type":"system","subtype":"init","session_id":"sess-xyz"},
+            {"type":"assistant","message":{"content":[{"type":"text","text":"Hi"}]}},
+            {"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}},
+            {"type":"result","subtype":"success","result":"Final answer","session_id":"sess-xyz"}
+        ]"#;
+
+        let trimmed = json.trim();
+        assert!(trimmed.starts_with('['), "test input must be an array");
+
+        let events: Vec<ClaudeStreamEvent> = serde_json::from_str(trimmed).unwrap();
+        let result_event = events
+            .into_iter()
+            .find(|e| e.event_type.as_deref() == Some("result"))
+            .expect("result event must be found");
+
+        assert_eq!(result_event.result.as_deref(), Some("Final answer"));
+        assert_eq!(result_event.session_id.as_deref(), Some("sess-xyz"));
     }
 }

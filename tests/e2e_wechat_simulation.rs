@@ -117,6 +117,10 @@ struct Harness {
     state: Arc<HubState>,
     mock: Arc<MockUpstream>,
     _dispatch_tx: broadcast::Sender<WeixinMessage>,
+    /// Held so the watch::channel is never closed for the lifetime of the
+    /// harness. Closing the sender would let `wait_shutdown_signal` resolve
+    /// immediately and short-circuit every long-poll before its timer fires.
+    _shutdown_tx: tokio::sync::watch::Sender<bool>,
 }
 
 async fn boot() -> Harness {
@@ -128,7 +132,7 @@ async fn boot() -> Harness {
     );
     let mock = Arc::new(MockUpstream::default());
     let queue: Arc<dyn ilink_hub::hub::MessageQueue> = Arc::new(InMemoryQueue::new());
-    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = HubState::new(mock.clone() as Arc<dyn UpstreamSink>, store, queue, shutdown_rx);
 
     let router = server::build_router(state.clone());
@@ -153,6 +157,7 @@ async fn boot() -> Harness {
         state,
         mock,
         _dispatch_tx: tx,
+        _shutdown_tx: shutdown_tx,
     }
 }
 
@@ -169,7 +174,7 @@ async fn boot_without_default() -> Harness {
     );
     let mock = Arc::new(MockUpstream::default());
     let queue: Arc<dyn ilink_hub::hub::MessageQueue> = Arc::new(InMemoryQueue::new());
-    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = HubState::new(mock.clone() as Arc<dyn UpstreamSink>, store, queue, shutdown_rx);
 
     // Override the default route to None — HubState::new starts with None,
@@ -198,6 +203,7 @@ async fn boot_without_default() -> Harness {
         state,
         mock,
         _dispatch_tx: tx,
+        _shutdown_tx: shutdown_tx,
     }
 }
 
@@ -566,69 +572,71 @@ async fn quote_reply_routes_back_to_originating_backend() {
     let user = "alice@wechat";
     let real_ctx = "real-ctx-quote-001";
 
-    // No default route → messages broadcast; claude is the first registered
-    // client so its registration made it the Hub-internal default. We want
-    // explicit `/use` semantics instead: have the user pin to codex.
-    let _ = bridge_send_with_session(
-        &h.base_url,
-        &va,
-        "warmup",
-        user,
-        "warmup",
-        None,
-        None,
-    )
-    .await; // best-effort, will fail (no vctx) — ignored
+    // Both clients must be `online=true` for broadcast to fan out. `register`
+    // doesn't mark them online; only a real `getupdates` call does (mark_seen).
+    // We short-poll both with timeout=0 to flip them online without consuming
+    // the messages we'll want later.
+    let _ = poll_for_messages(&h.base_url, &va, 0).await;
+    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+
+    // Drop the Hub-internal default that `register` set on the first client.
+    // Now both clients are reachable only via broadcast (no per-user route).
     h.state.routing.router.lock().await.unset_default();
 
-    // `/use codex` to make codex the user's default backend.
+    // ── Turn 1: broadcast a question; claude (and codex) both receive it.
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "/use codex"))
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    // Hub command reply goes upstream via mock (we don't assert on it here).
-
-    // ── Turn 1: claude answers via broadcast, then we /use codex so codex is now active
-    // Actually the previous /use command already picked codex. Now broadcast a real question.
-    h._dispatch_tx
-        .send(user_text_msg(user, "real-ctx-quote-002", "what is foo?"))
+        .send(user_text_msg(user, real_ctx, "what is foo?"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
     let codex_msgs = poll_for_messages(&h.base_url, &vb, 1).await;
-    // Broadcast fan-out — both backends receive a copy of the user's question.
-    assert_eq!(claude_msgs.len(), 1);
-    assert_eq!(codex_msgs.len(), 1);
+    assert_eq!(claude_msgs.len(), 1, "broadcast must reach claude");
+    assert_eq!(codex_msgs.len(), 1, "broadcast must reach codex");
     let claude_vctx = claude_msgs[0].context_token.as_deref().unwrap().to_string();
 
-    // Claude replies with a unique answer that we'll quote-reply to later.
-    let claude_answer = "the meaning of foo is 42";
+    // Drain the codex copy so it doesn't bleed into the next assertion. Claude's
+    // copy is also drained via poll_for_messages above.
+    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+
+    // ── Claude replies via `sendmessage`. The Hub registers the outbound body
+    // (including the origin footer it appends) into the QuoteRouteIndex. The
+    // footer is `"\n\n---\nclaude"` because `should_append_outbound_origin_label`
+    // returns true with 2+ online clients and no env override.
+    let claude_body = "the meaning of foo is 42";
     let _ = bridge_send_with_session(
         &h.base_url,
         &va,
         &claude_vctx,
         user,
-        claude_answer,
+        claude_body,
         Some("default"),
         None,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // ── Turn 2: user quote-replies claude's answer. Current /use is codex,
-    // but the quote override must route back to claude.
-    let quote_text = "but what about bar?"; // this is what the user types
+    // Pin the user's default to codex so we can prove the quote override wins
+    // against a non-broadcast base decision (ForwardTo{codex} rather than Broadcast).
+    h._dispatch_tx
+        .send(user_text_msg(user, real_ctx, "/use codex"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Discard the /use ack that landed on the mock upstream.
+    let _ = h.mock.sent_messages().await;
+
+    // ── Turn 2: user quote-replies claude's answer. The ref_msg must carry
+    // exactly the text the Hub indexed — body + appended footer — otherwise
+    // content-based matching misses and the message falls through to /use.
+    let quoted_registered_text = format!("{claude_body}\n\n---\nclaude");
+    let quote_text = "but what about bar?";
     let mut msg = user_text_msg(user, real_ctx, quote_text);
-    // Inject a ref_msg pointing at claude's answer. The Hub indexes outbound
-    // messages by their rendered text (see `quote_route.rs`), so quoting
-    // exactly the same string is what makes the index match.
     let items = std::sync::Arc::make_mut(msg.item_list.as_mut().unwrap());
     items[0].extra = json!({
         "ref_msg": {
             "message_item": {
                 "type": 1,
-                "text_item": { "text": claude_answer },
+                "text_item": { "text": quoted_registered_text },
                 "create_time_ms": chrono_millis_now(),
             }
         }
@@ -785,11 +793,35 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
 
 /// Hold MAX+1 concurrent polls on the same vtoken: the first MAX return
 /// normally (no messages), the (MAX+1)th gets 429.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn over_cap_concurrent_polls_get_429() {
     use ilink_hub::hub::MAX_CONCURRENT_POLLS_PER_VTOKEN;
     let h = boot().await;
     let vtoken = register_client(&h.base_url, "claude").await;
+
+    // Sanity: the PollTracker is wired up and 4 concurrent enters return
+    // monotonically increasing counts 1..=4. We exercise this in a real OS
+    // thread (not a spawned tokio task) so the std::sync::Mutex inside
+    // PollTracker is hit the same way it would be by hyper's worker threads
+    // in production — the cross-process behavior we want to validate.
+    let tracker = h.state.clients.poll_tracker.clone();
+    let vtoken_for_inproc = vtoken.clone();
+    let inproc = std::thread::spawn(move || {
+        let c1 = tracker.enter(&vtoken_for_inproc).0;
+        let g1 = tracker.enter(&vtoken_for_inproc).1;
+        let c2 = tracker.enter(&vtoken_for_inproc).0;
+        let g2 = tracker.enter(&vtoken_for_inproc).1;
+        let c3 = tracker.enter(&vtoken_for_inproc).0;
+        let g3 = tracker.enter(&vtoken_for_inproc).1;
+        let c4 = tracker.enter(&vtoken_for_inproc).0;
+        drop(g3);
+        drop(g2);
+        drop(g1);
+        (c1, c2, c3, c4)
+    });
+    let (c1, c2, c3, c4) = inproc.join().unwrap();
+    eprintln!("DEBUG: inproc counts = {c1} {c2} {c3} {c4}");
+    assert_eq!((c1, c2, c3, c4), (1, 2, 3, 4));
 
     let client = reqwest::Client::new();
     let url = format!("{}/ilink/bot/getupdates", h.base_url);
@@ -818,10 +850,7 @@ async fn over_cap_concurrent_polls_get_429() {
 
     let mut statuses = Vec::with_capacity(total);
     for h in handles {
-        let resp = h.await.expect("join").error_for_status().unwrap_or_else(|e| {
-            // 429 has an error status; we still want the status code.
-            panic!("getupdates returned non-2xx: {e}")
-        });
+        let resp = h.await.expect("join");
         statuses.push(resp.status());
     }
 

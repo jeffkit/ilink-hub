@@ -196,6 +196,12 @@ impl QuoteRouteIndex {
         self.resolve_by_content(scope, &text, ref_ms)
     }
 
+    /// Extract the quoted text and timestamp from a user message's ref_msg.
+    /// Public so DB-backed fallback resolvers can reuse the same extraction logic.
+    pub fn collect_quoted(msg: &crate::ilink::types::WeixinMessage) -> Option<(String, Option<i64>)> {
+        collect_quoted_content(msg)
+    }
+
     /// Extract `(backend_name, session_name)` from the footer embedded in the quoted message
     /// text. Used as a fallback when the in-memory index is cold (e.g. after a Hub restart).
     pub fn footer_from_user_quote(

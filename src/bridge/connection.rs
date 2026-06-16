@@ -214,10 +214,30 @@ fn local_hostname() -> String {
             return h.to_string();
         }
     }
-    // Read hostname from the kernel's proc interface — no fork, no child process.
-    // Fallback chain: /proc/sys/kernel/hostname → /etc/hostname → "host".
+    // gethostname(2) works on both Linux and macOS.
     #[cfg(unix)]
     {
+        use std::ffi::CStr;
+        extern "C" {
+            fn gethostname(name: *mut libc_types::c_char, namelen: libc_types::size_t) -> libc_types::c_int;
+        }
+        mod libc_types {
+            pub type c_char = i8;
+            pub type size_t = usize;
+            pub type c_int = i32;
+        }
+        let mut buf = [0i8; 256];
+        let ret = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };
+        if ret == 0 {
+            let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
+            if let Ok(s) = cstr.to_str() {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        // Fallback: read from proc/etc files (Linux only).
         for path in &["/proc/sys/kernel/hostname", "/etc/hostname"] {
             if let Ok(contents) = std::fs::read_to_string(path) {
                 let h = contents.trim();

@@ -430,9 +430,14 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         if from_index.is_some() {
             from_index
         } else {
-            // Cold index (e.g. after a Hub restart): fall back to parsing the origin footer
-            // embedded in the quoted message text so quote-replies still route correctly.
-            resolve_quote_from_footer(&state, &msg).await
+            // Cold index (e.g. after a Hub restart): first try DB lookup, then fall back to
+            // footer text parsing as last resort.
+            let from_db = resolve_quote_from_db(&state, &msg).await;
+            if from_db.is_some() {
+                from_db
+            } else {
+                resolve_quote_from_footer(&state, &msg).await
+            }
         }
     };
     let routing = merge_routing_with_quote(routing, quoted);
@@ -486,6 +491,29 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
             let hub_ext =
                 build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
+
+            // Fire-and-forget: record user message to history.
+            if let Some(content) = msg.text().map(str::to_string) {
+                let session_name = hub_ext
+                    .as_ref()
+                    .and_then(|e| e.session_name.as_deref())
+                    .unwrap_or("default")
+                    .to_string();
+                let store = state.store.clone();
+                let (vctx3, vtoken3, peer3) =
+                    (vctx.clone(), vtoken.clone(), peer_user_id.clone());
+                let sem = state.persist_sem.clone();
+                tokio::spawn(async move {
+                    let Ok(_permit) = sem.try_acquire() else { return };
+                    if let Err(e) = store
+                        .save_message(&vctx3, Some(&vtoken3), &session_name, &peer3, "user", &content)
+                        .await
+                    {
+                        warn!(error = %e, "failed to save user message to history");
+                    }
+                });
+            }
+
             msg.context_token = Some(vctx);
             msg.ilink_hub_ext = hub_ext;
             push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg).await;
@@ -602,6 +630,47 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 msg_clone.ilink_hub_ext = hub_ext;
                 push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg_clone).await;
             }
+        }
+    }
+}
+
+/// DB-backed quote resolver: query the messages table by peer_user_id + content prefix.
+/// Runs when the in-memory QuoteRouteIndex is cold. Returns the vtoken + session_name
+/// recorded when the assistant message was originally sent, independent of footer format.
+async fn resolve_quote_from_db(
+    state: &Arc<HubState>,
+    msg: &crate::ilink::types::WeixinMessage,
+) -> Option<QuoteOrigin> {
+    let (quoted_text, _) = quote_route::QuoteRouteIndex::collect_quoted(msg)?;
+    let peer_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+    if peer_user_id.is_empty() {
+        return None;
+    }
+    // Use the first 48 chars as prefix (same constant as CONTENT_PREFIX_CHARS in quote_route).
+    let prefix: String = quoted_text.trim().chars().take(48).collect();
+    if prefix.is_empty() {
+        return None;
+    }
+    match state.store.find_assistant_message_by_content(peer_user_id, &prefix).await {
+        Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
+            let (name, label) = {
+                let registry = state.clients.registry.read().await;
+                registry.get_by_vtoken(&vtoken)
+                    .map(|c| (c.name.clone(), c.label.clone()))
+                    .unwrap_or_else(|| (vtoken.clone(), None))
+            };
+            debug!(
+                peer = %peer_user_id,
+                vtoken = %crate::redact_token(&vtoken),
+                session = ?session_name,
+                "quote index miss — resolved via DB message history"
+            );
+            Some(QuoteOrigin::Client { vtoken, name, label, session_name })
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!(error = %e, "DB quote lookup failed, falling back to footer");
+            None
         }
     }
 }
