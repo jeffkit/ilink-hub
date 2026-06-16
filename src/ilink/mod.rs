@@ -4,4 +4,4 @@ pub mod upstream;
 
 pub use login::{LoginClient, QrLoginUiEvent};
 pub use types::*;
-pub use upstream::{SessionRenewal, UpstreamClient};
+pub use upstream::{SessionRenewal, UpstreamClient, UpstreamSink};

@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use reqwest::Client;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -14,6 +15,31 @@ use crate::store::Store;
 
 use super::login::{LoginClient, QrLoginUiEvent};
 use super::types::*;
+
+/// Abstraction over the iLink upstream HTTP surface, used by the Hub to send
+/// messages back to WeChat users and to issue long-polls. Production wires
+/// [`UpstreamClient`]; tests can substitute a recording mock to assert what the
+/// Hub actually emits on the wire without a real iLink backend.
+///
+/// The Hub only ever needs the send path (`send_message`, plus the
+/// bot-id/token helpers used for observability). `get_updates` lives on
+/// `UpstreamClient` directly because the polling loop constructs it before
+/// the Hub state exists; tests don't need to drive long-polls, they inject
+/// messages straight into the dispatch channel.
+#[async_trait]
+pub trait UpstreamSink: Send + Sync {
+    async fn notify_start(&self) -> Result<()>;
+    async fn send_message(&self, req: SendMessageRequest) -> Result<SendMessageResponse>;
+    async fn send_typing(&self, req: SendTypingRequest) -> Result<()>;
+    async fn get_config(&self, req: GetConfigRequest) -> Result<GetConfigResponse>;
+    async fn get_upload_url(&self, req: GetUploadUrlRequest) -> Result<GetUploadUrlResponse>;
+    /// Polling-loop success counter (mirrors the production `UpstreamClient` field).
+    fn polls_ok(&self) -> u64;
+    /// Polling-loop failure counter.
+    fn polls_err(&self) -> u64;
+    /// QR re-login attempts counter.
+    fn relogin_attempts(&self) -> u64;
+}
 
 /// Context for renewing an expired iLink session from the upstream polling loop.
 pub struct SessionRenewal {
@@ -483,5 +509,33 @@ mod tests {
         ));
         assert!(!UpstreamClient::is_well_formed_bot_token(""));
         assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
+    }
+}
+
+#[async_trait]
+impl UpstreamSink for UpstreamClient {
+    async fn notify_start(&self) -> Result<()> {
+        UpstreamClient::notify_start(self).await
+    }
+    async fn send_message(&self, req: SendMessageRequest) -> Result<SendMessageResponse> {
+        UpstreamClient::send_message(self, req).await
+    }
+    async fn send_typing(&self, req: SendTypingRequest) -> Result<()> {
+        UpstreamClient::send_typing(self, req).await
+    }
+    async fn get_config(&self, req: GetConfigRequest) -> Result<GetConfigResponse> {
+        UpstreamClient::get_config(self, req).await
+    }
+    async fn get_upload_url(&self, req: GetUploadUrlRequest) -> Result<GetUploadUrlResponse> {
+        UpstreamClient::get_upload_url(self, req).await
+    }
+    fn polls_ok(&self) -> u64 {
+        self.polls_ok.load(Ordering::Relaxed)
+    }
+    fn polls_err(&self) -> u64 {
+        self.polls_err.load(Ordering::Relaxed)
+    }
+    fn relogin_attempts(&self) -> u64 {
+        self.relogin_attempts.load(Ordering::Relaxed)
     }
 }

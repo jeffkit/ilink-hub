@@ -79,7 +79,12 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend()?;
-    let state = HubState::new(upstream.clone(), store.clone(), queue, shutdown_rx.clone());
+    let state = HubState::new(
+        upstream.clone() as Arc<dyn crate::ilink::UpstreamSink>,
+        store.clone(),
+        queue,
+        shutdown_rx.clone(),
+    );
 
     if let Some(tx) = on_hub_state {
         let _ = tx.send(state.clone());
