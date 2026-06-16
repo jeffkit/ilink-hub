@@ -14,7 +14,7 @@ use tokio::sync::{broadcast, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
-use crate::ilink::{QrLoginUiEvent, UpstreamClient};
+use crate::ilink::{QrLoginUiEvent, UpstreamSink};
 use crate::store::Store;
 
 /// iLink upstream connection status codes stored in `HubState::ilink_status`.
@@ -32,7 +32,7 @@ pub use outbound_label::{
 };
 pub use pairing::PairingRegistry;
 pub use queue::{conversation_key, ContextTokenMap, InMemoryQueue, MessageQueue};
-pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex};
+pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex, QuoteOrigin};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 
@@ -189,8 +189,14 @@ impl Drop for PollGuard {
 /// event lives here. Callers that need to send a message upstream, observe a QR
 /// login, or trigger a re-login take a reference to this sub-state rather than
 /// touching the whole `HubState`.
+///
+/// `upstream` is held as a trait object so end-to-end tests can inject a
+/// recording mock in place of [`UpstreamClient`]. The polling loop owns the
+/// concrete `UpstreamClient` separately and does not go through this field.
+/// The observability counters on the polling loop are exposed through the
+/// `UpstreamSink::polls_ok` / `polls_err` / `relogin_attempts` accessors.
 pub struct IlinkConnState {
-    pub upstream: Arc<UpstreamClient>,
+    pub upstream: Arc<dyn UpstreamSink>,
     /// Shared with Axum graceful shutdown; long-poll handlers exit early when this becomes `true`.
     pub shutdown: watch::Receiver<bool>,
     /// Current iLink upstream status (see [`ilink_status`] constants).
@@ -204,7 +210,7 @@ pub struct IlinkConnState {
 }
 
 impl IlinkConnState {
-    fn new(upstream: Arc<UpstreamClient>, shutdown: watch::Receiver<bool>) -> Self {
+    fn new(upstream: Arc<dyn UpstreamSink>, shutdown: watch::Receiver<bool>) -> Self {
         let (qr_tx, _) = broadcast::channel(16);
         let (relogin_tx, _) = broadcast::channel(4);
         Self {
@@ -305,7 +311,7 @@ pub struct HubState {
 
 impl HubState {
     pub fn new(
-        upstream: Arc<UpstreamClient>,
+        upstream: Arc<dyn UpstreamSink>,
         store: Arc<Store>,
         queue: Arc<dyn MessageQueue>,
         shutdown: watch::Receiver<bool>,
@@ -420,7 +426,14 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     let quoted = {
         let scope = msg.from_user_id.as_deref().unwrap_or_default();
         let mut q = state.routing.quote_index.lock().await;
-        q.resolve_user_quote(scope, &msg)
+        let from_index = q.resolve_user_quote(scope, &msg);
+        if from_index.is_some() {
+            from_index
+        } else {
+            // Cold index (e.g. after a Hub restart): fall back to parsing the origin footer
+            // embedded in the quoted message text so quote-replies still route correctly.
+            resolve_quote_from_footer(&state, &msg).await
+        }
     };
     let routing = merge_routing_with_quote(routing, quoted);
 
@@ -591,6 +604,29 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             }
         }
     }
+}
+
+/// Fallback quote resolver: parse the origin footer from the quoted message text and look up
+/// the backend by name in the client registry. Used when the in-memory quote index is cold
+/// (e.g. after a Hub restart).
+async fn resolve_quote_from_footer(
+    state: &Arc<HubState>,
+    msg: &crate::ilink::types::WeixinMessage,
+) -> Option<QuoteOrigin> {
+    let (name, session_name) = quote_route::QuoteRouteIndex::footer_from_user_quote(msg)?;
+    let registry = state.clients.registry.read().await;
+    let client = registry.get_by_name(&name)?;
+    debug!(
+        backend = %name,
+        session = ?session_name,
+        "quote index miss — resolved via footer fallback"
+    );
+    Some(QuoteOrigin::Client {
+        vtoken: client.vtoken.clone(),
+        name: client.name.clone(),
+        label: client.label.clone(),
+        session_name,
+    })
 }
 
 /// Handle an `@<backend> <message>` shortcut: forward `payload` to `vtoken` on a brand-new,
@@ -773,7 +809,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
                     None => lines.push("\n当前未选中（广播模式）".to_string()),
                 }
-                lines.push("用 `/use <名称>` 切换后端。".to_string());
+                lines.push("用 `/use <名称>`（或 `/u <名称>`）切换后端，或发送 `@<名称> <消息>` 直接发起临时会话。".to_string());
                 lines.join("\n")
             }
         }
@@ -794,7 +830,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 
                 format!("✅ 已切换到 `{}`", name)
             } else {
-                format!("❌ 未找到名为 `{}` 的后端。用 `/list` 查看可用后端。", name)
+                format!("❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。", name)
             }
         }
         HubCommand::Broadcast(ref text) => {
@@ -1195,16 +1231,16 @@ async fn build_hub_ext_for_vctx(
 
 fn build_help_text() -> String {
     "iLink Hub 帮助\n\n\
-     可用指令：\n\
-     /status — 查看当前 Hub 状态\n\
-     /list — 列出所有已注册的 AI 后端\n\
-     /use <名称> — 切换到指定的 AI 后端\n\
-     /help — 显示此帮助\n\n\
+     可用指令（括号内为缩写）：\n\
+     /status（/s）— 查看当前 Hub 状态\n\
+     /list（/ls）— 列出所有已注册的 AI 后端\n\
+     /use <名称>（/u <名称>）— 切换到指定的 AI 后端\n\
+     /help（/h）— 显示此帮助\n\n\
      Session 管理（同一后端下的多会话）：\n\
-     /session list — 列出当前对话的所有 sessions\n\
-     /session new <名称> [UUID] — 创建新 session（可选初始 UUID）\n\
-     /session use <名称> — 切换到指定 session\n\
-     /session delete <名称> — 删除指定 session\n\n\
+     /session list（/sl）— 列出当前对话的所有 sessions\n\
+     /session new <名称> [UUID]（/sn <名称>）— 创建新 session（可选初始 UUID）\n\
+     /session use <名称>（/su <名称>）— 切换到指定 session\n\
+     /session delete <名称>（/sd <名称>）— 删除指定 session\n\n\
      快捷 @ 后端：发送 `@<名称> <消息>` 可临时在该后端上**新建一个会话**并发送此消息，不会改变你当前 /use 的后端和活跃 session（与引用回复类似的临时操作）。名称与 /use 使用的名称一致（可用 /list 查看）；名称取第一个空格之前的部分，其余为消息内容。需要继续这个临时会话时，引用它的回复即可。\n\n\
      引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
      多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅**同时在线**的后端多于一个时默认追加；历史注册但离线的客户端不计入）。可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
@@ -1578,7 +1614,7 @@ mod tests {
         // IlinkConnState: poll counters are reachable through the sub-state.
         // (We don't actually issue an HTTP request — the production base URL
         // would attempt a real network call, which is out of scope here.)
-        assert_eq!(state.ilink.upstream.polls_ok.load(Ordering::Relaxed), 0);
+        assert_eq!(state.ilink.upstream.polls_ok(), 0);
 
         // RoutingState: setting a route and reading it back round-trips.
         let vtoken = "vt-abc".to_string();

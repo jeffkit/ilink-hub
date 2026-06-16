@@ -196,6 +196,15 @@ impl QuoteRouteIndex {
         self.resolve_by_content(scope, &text, ref_ms)
     }
 
+    /// Extract `(backend_name, session_name)` from the footer embedded in the quoted message
+    /// text. Used as a fallback when the in-memory index is cold (e.g. after a Hub restart).
+    pub fn footer_from_user_quote(
+        msg: &crate::ilink::types::WeixinMessage,
+    ) -> Option<(String, Option<String>)> {
+        let (text, _) = collect_quoted_content(msg)?;
+        parse_footer_from_quoted_text(&text)
+    }
+
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
         for bucket in self.by_content.values_mut() {
@@ -233,6 +242,53 @@ fn content_keys(text: &str) -> Vec<String> {
         keys.push(format!("pre:{prefix}"));
     }
     keys
+}
+
+/// Fallback when the in-memory quote index is cold (e.g. after a Hub restart): parse the
+/// outbound origin footer embedded in the quoted message text and return `(backend_name,
+/// session_name)`.
+///
+/// Handles two historical footer formats:
+/// * New (current): `…\n\n---\n{name} [· label] [· session]`
+/// * Old (pre-footer-hr): `…\n\n— {name} [· session]`
+///
+/// Returns `None` when no recognisable footer is found.
+pub fn parse_footer_from_quoted_text(text: &str) -> Option<(String, Option<String>)> {
+    // Try new format: last line after `---` separator.
+    let footer_line = if let Some(pos) = text.rfind("\n---\n") {
+        text[pos + 5..].trim()
+    } else if let Some(pos) = text.rfind("\n— ") {
+        // Old format: line starting with em-dash.
+        text[pos + 4..].trim()
+    } else if let Some(stripped) = text.trim().strip_prefix("— ") {
+        // Edge case: the whole quoted text is just a footer line.
+        stripped.trim()
+    } else {
+        return None;
+    };
+
+    if footer_line.is_empty() {
+        return None;
+    }
+
+    // Split by ` · ` — parts are [name, label?, session?]
+    let parts: Vec<&str> = footer_line.split(" · ").collect();
+    let name = parts[0].trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    // The last part that looks like a session name (`at-YYYYMMDD-*` or `session-YYYYMMDD-*`).
+    let session = parts.iter().rev().find_map(|p| {
+        let p = p.trim();
+        if p.starts_with("at-") || p.starts_with("session-") {
+            Some(p.to_string())
+        } else {
+            None
+        }
+    });
+
+    Some((name.to_string(), session))
 }
 
 /// Pull the quoted text and its (second-granularity) `create_time_ms` from a user message's
@@ -630,5 +686,51 @@ mod tests {
         let user = quote_reply("reply", text, Some(i64::MAX));
         let origin = idx.resolve_user_quote(SCOPE, &user);
         assert!(origin.is_some());
+    }
+
+    #[test]
+    fn parse_footer_new_format_name_and_session() {
+        let text = "你好！有什么我可以帮你的吗？\n\n---\nilink-claude · session-20260611-125634";
+        let (name, session) = parse_footer_from_quoted_text(text).unwrap();
+        assert_eq!(name, "ilink-claude");
+        assert_eq!(session.as_deref(), Some("session-20260611-125634"));
+    }
+
+    #[test]
+    fn parse_footer_new_format_with_label() {
+        let text = "body\n\n---\nilink-claude · office · session-20260611-194813";
+        let (name, session) = parse_footer_from_quoted_text(text).unwrap();
+        assert_eq!(name, "ilink-claude");
+        assert_eq!(session.as_deref(), Some("session-20260611-194813"));
+    }
+
+    #[test]
+    fn parse_footer_old_format_em_dash() {
+        // The historical "— backend · session" format produced by older Hub versions.
+        let text = "你好！有什么我可以帮你的吗？\n\n— ilink-claude · session-20260611-125634";
+        let (name, session) = parse_footer_from_quoted_text(text).unwrap();
+        assert_eq!(name, "ilink-claude");
+        assert_eq!(session.as_deref(), Some("session-20260611-125634"));
+    }
+
+    #[test]
+    fn parse_footer_at_mention_session() {
+        let text = "完成了\n\n---\nilink-claude · at-20260615-114019020";
+        let (name, session) = parse_footer_from_quoted_text(text).unwrap();
+        assert_eq!(name, "ilink-claude");
+        assert_eq!(session.as_deref(), Some("at-20260615-114019020"));
+    }
+
+    #[test]
+    fn parse_footer_name_only_no_session() {
+        let text = "hello\n\n---\nilink-claude";
+        let (name, session) = parse_footer_from_quoted_text(text).unwrap();
+        assert_eq!(name, "ilink-claude");
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn parse_footer_no_footer_returns_none() {
+        assert!(parse_footer_from_quoted_text("plain message without footer").is_none());
     }
 }

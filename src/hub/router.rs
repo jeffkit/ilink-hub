@@ -32,14 +32,15 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     if text.eq_ignore_ascii_case("/list") || text.eq_ignore_ascii_case("/ls") {
         return Some(HubCommand::List);
     }
-    if text.eq_ignore_ascii_case("/status") {
+    if text.eq_ignore_ascii_case("/status") || text.eq_ignore_ascii_case("/s") {
         return Some(HubCommand::Status);
     }
-    if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") {
+    if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") || text.eq_ignore_ascii_case("/h") {
         return Some(HubCommand::Help);
     }
     if let Some(rest) = text
         .strip_prefix("/use ")
+        .or_else(|| text.strip_prefix("/u "))
         .or_else(|| text.strip_prefix("/switch "))
     {
         return Some(HubCommand::UseClient(rest.trim().to_string()));
@@ -51,17 +52,24 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
         return Some(HubCommand::Broadcast(rest.trim().to_string()));
     }
 
-    // /session subcommands
-    if text.eq_ignore_ascii_case("/session list") || text.eq_ignore_ascii_case("/session ls") {
+    // /session subcommands — full forms and short aliases (/sl /sn /su /sd)
+    if text.eq_ignore_ascii_case("/session list")
+        || text.eq_ignore_ascii_case("/session ls")
+        || text.eq_ignore_ascii_case("/sl")
+    {
         return Some(HubCommand::SessionList);
     }
-    if let Some(rest) = text.strip_prefix("/session new ").or_else(|| {
-        if text.eq_ignore_ascii_case("/session new") {
-            Some("")
-        } else {
-            None
-        }
-    }) {
+    if let Some(rest) = text
+        .strip_prefix("/session new ")
+        .or_else(|| text.strip_prefix("/sn "))
+        .or_else(|| {
+            if text.eq_ignore_ascii_case("/session new") || text.eq_ignore_ascii_case("/sn") {
+                Some("")
+            } else {
+                None
+            }
+        })
+    {
         let rest = rest.trim();
         let mut parts = rest.splitn(2, ' ');
         let name = parts.next().unwrap_or("").trim().to_string();
@@ -75,7 +83,10 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
         };
         return Some(HubCommand::SessionNew(name, uuid));
     }
-    if let Some(rest) = text.strip_prefix("/session use ") {
+    if let Some(rest) = text
+        .strip_prefix("/session use ")
+        .or_else(|| text.strip_prefix("/su "))
+    {
         let name = rest.trim().to_string();
         if !name.is_empty() {
             return Some(HubCommand::SessionUse(name));
@@ -85,6 +96,7 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
         .strip_prefix("/session delete ")
         .or_else(|| text.strip_prefix("/session rm "))
         .or_else(|| text.strip_prefix("/session del "))
+        .or_else(|| text.strip_prefix("/sd "))
     {
         let name = rest.trim().to_string();
         if !name.is_empty() {
@@ -97,19 +109,39 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
 
 /// Parse an `@<backend> <message>` mention (a temporary shortcut, analogous to a quote-reply).
 ///
-/// The backend **name** is everything between the leading `@` and the first whitespace;
-/// the **message** is the remainder (trimmed). A name with internal spaces is therefore not
-/// matchable — the first space always terminates the name (per product decision). The name is
-/// the same identifier used by `/use <name>` (resolved via the client registry by the caller).
+/// The backend **name** is everything between the leading `@` and the first whitespace or the
+/// first non-ASCII character; the **message** is the remainder (trimmed). Backend names are
+/// ASCII-only (letters, digits, hyphens, underscores), so a non-ASCII character (e.g. Chinese)
+/// immediately following the name is treated as the start of the message — this allows users to
+/// write `@claude你好` without an explicit space between the name and the message body. The name
+/// is the same identifier used by `/use <name>` (resolved via the client registry by the caller).
 ///
 /// Returns `None` when the text does not start with `@` or the name is empty. This parser does
 /// **not** validate that the name is a registered backend — that check happens in the dispatcher
 /// where the registry is available; an unknown name falls back to a normal message.
 pub fn parse_at_mention(text: &str) -> Option<(String, String)> {
     let rest = text.trim_start().strip_prefix('@')?;
-    let (name, message) = match rest.split_once(char::is_whitespace) {
-        Some((n, m)) => (n, m),
-        None => (rest, ""),
+    // Collect ASCII word characters (letters, digits, hyphens, underscores) as the name.
+    // The name ends at the first whitespace or the first non-ASCII character, whichever comes
+    // first — this lets users omit the space between an ASCII backend name and a non-ASCII
+    // message body (e.g. `@claude你好` is equivalent to `@claude 你好`).
+    // When the text starts with a non-ASCII character (e.g. `@后端 消息`), we fall back to
+    // splitting on whitespace so purely non-ASCII backend names still work.
+    let starts_with_ascii = rest.chars().next().map(|c| c.is_ascii()).unwrap_or(false);
+    let (name, message) = if starts_with_ascii {
+        let split_at = rest
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() || !c.is_ascii())
+            .map(|(i, _)| i);
+        match split_at {
+            Some(i) => (&rest[..i], rest[i..].trim_start()),
+            None => (rest, ""),
+        }
+    } else {
+        match rest.split_once(char::is_whitespace) {
+            Some((n, m)) => (n, m),
+            None => (rest, ""),
+        }
     };
     let name = name.trim();
     if name.is_empty() {
@@ -147,6 +179,13 @@ impl Router {
 
     pub fn set_default(&mut self, vtoken: String) {
         self.default_client = Some(vtoken);
+    }
+
+    /// Clear the default route so subsequent messages fall through to
+    /// broadcast (used by tests that want to exercise the fan-out path
+    /// without first deleting the default client).
+    pub fn unset_default(&mut self) {
+        self.default_client = None;
     }
 
     pub fn set_route(&mut self, from_user_id: &str, vtoken: String) {
@@ -236,6 +275,20 @@ mod tests {
         assert_eq!(
             parse_at_mention("@后端 这条 消息 有 空格"),
             Some(("后端".to_string(), "这条 消息 有 空格".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_at_mention_no_space_before_non_ascii_message() {
+        // Non-ASCII character immediately following the name acts as a split point.
+        // Users can type @claude你好 without an explicit space.
+        assert_eq!(
+            parse_at_mention("@claude你好"),
+            Some(("claude".to_string(), "你好".to_string()))
+        );
+        assert_eq!(
+            parse_at_mention("@backend-name消息内容"),
+            Some(("backend-name".to_string(), "消息内容".to_string()))
         );
     }
 
