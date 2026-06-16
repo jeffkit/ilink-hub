@@ -104,6 +104,11 @@ pub struct BridgeProfile {
     /// 会随 `sendmessage` 写入 Hub；其余行作为发给微信的正文。
     #[serde(default)]
     pub cli_session_first_line_prefix: Option<String>,
+    /// 是否启用流式部分回复（`ILINK_PARTIAL:`）。默认 `true`。
+    /// 设为 `false` 时，子进程仍可输出 `ILINK_PARTIAL:` 行，但 bridge 不转发，
+    /// 只等程序退出后将完整 stdout 作为最终回复一次性发送。
+    #[serde(default = "default_true")]
+    pub streaming: bool,
 }
 
 impl Default for BridgeProfile {
@@ -121,6 +126,7 @@ impl Default for BridgeProfile {
             truncation_suffix: default_truncation_suffix(),
             include_stderr_in_reply: false,
             cli_session_first_line_prefix: None,
+            streaming: true,
         }
     }
 }
@@ -169,6 +175,8 @@ pub struct BridgeConfig {
     pub include_stderr_in_reply: bool,
     #[serde(default)]
     pub cli_session_first_line_prefix: Option<String>,
+    #[serde(default = "default_true")]
+    pub streaming: bool,
 }
 
 impl BridgeConfig {
@@ -240,6 +248,7 @@ impl BridgeApp {
             truncation_suffix: c.truncation_suffix.clone(),
             include_stderr_in_reply: c.include_stderr_in_reply,
             cli_session_first_line_prefix: c.cli_session_first_line_prefix.clone(),
+            streaming: c.streaming,
         };
         warn_shell_injection_risk(&profile, "default");
         let mut profiles = HashMap::new();

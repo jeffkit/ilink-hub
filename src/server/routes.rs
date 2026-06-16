@@ -481,6 +481,15 @@ pub async fn sendmessage(
                 .register_outbound_content(&conv_scope, &text, origin);
         }
     }
+    // When the bridge sends a session-persist-only message (empty body, cli_session_id already
+    // consumed above), skip forwarding to iLink — an empty text message would be rejected or
+    // would confuse the user. The only side-effect we needed (session UUID persistence) already
+    // happened via set_backend_session above.
+    let msg_text_empty = req.msg.as_ref().map(|m| m.text().unwrap_or("").trim().is_empty()).unwrap_or(true);
+    if msg_text_empty {
+        return Json(SendMessageResponse::default());
+    }
+
     if req.base_info.is_none() {
         req.base_info = Some(BaseInfo::default());
     }
@@ -941,13 +950,9 @@ pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String)
     let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
     let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
     let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
-    let upstream_polls_ok = state.ilink.upstream.polls_ok.load(Ordering::Relaxed);
-    let upstream_polls_err = state.ilink.upstream.polls_err.load(Ordering::Relaxed);
-    let relogin_attempts = state
-        .ilink
-        .upstream
-        .relogin_attempts
-        .load(Ordering::Relaxed);
+    let upstream_polls_ok = state.ilink.upstream.polls_ok();
+    let upstream_polls_err = state.ilink.upstream.polls_err();
+    let relogin_attempts = state.ilink.upstream.relogin_attempts();
     let persist_faf_failures_forward = state
         .metrics
         .persist_fire_and_forget_failures_forward

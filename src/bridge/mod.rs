@@ -369,7 +369,32 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
     tracing::Span::current().record("profile", profile_name);
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
-    match run_cli(
+    // Channel for streaming partial replies emitted by the profile via `ILINK_PARTIAL:` stdout lines.
+    // Each chunk is forwarded to Hub immediately so users see incremental output.
+    let (partial_tx, mut partial_rx) = mpsc::unbounded_channel::<String>();
+
+    // Spawn a forwarding task that sends each partial chunk to Hub as it arrives.
+    // This task exits naturally when `partial_tx` is dropped (i.e. when run_cli returns).
+    let fwd_client = client.clone();
+    let fwd_ctx = ctx.clone();
+    let fwd_from_user = from_user.clone();
+    let fwd_session_name = session_name_for_cli.clone();
+    let forward_handle = tokio::spawn(async move {
+        while let Some(chunk) = partial_rx.recv().await {
+            let mut req =
+                SendMessageRequest::reply_text(fwd_ctx.clone(), chunk, &fwd_from_user, None);
+            if let Some(ref mut msg) = req.msg {
+                use crate::ilink::types::HubExt;
+                let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                ext.session_name = Some(fwd_session_name.clone());
+            }
+            if let Err(e) = fwd_client.sendmessage(req).await {
+                warn!(error = %e, "failed to send partial reply");
+            }
+        }
+    });
+
+    let cli_result = run_cli(
         profile,
         profile_name,
         &payload,
@@ -377,15 +402,40 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
         &session_name_for_cli,
         &from_user,
         &ctx,
+        partial_tx, // consumed here; drop signals forwarding task to finish
     )
-    .await
-    {
+    .await;
+
+    // Wait for all in-flight partial sends to complete before processing the final result.
+    let _ = forward_handle.await;
+
+    match cli_result {
         Ok((raw_body, cli_session)) => {
             let body = truncate_chars(
                 &raw_body,
                 profile.max_reply_chars,
                 &profile.truncation_suffix,
             );
+            // When body is empty (all content sent via ILINK_PARTIAL) but a new cli_session_id
+            // was returned, we still need to notify Hub so it can persist the session UUID.
+            // Without this, the session slot stays empty and subsequent quote-replies cannot
+            // resume the Claude session (they start a fresh conversation instead).
+            if body.trim().is_empty() {
+                if let Some(sid) = cli_session {
+                    if !sid.trim().is_empty() {
+                        let mut req = SendMessageRequest::reply_text(ctx, String::new(), &from_user, Some(sid));
+                        if let Some(ref mut msg) = req.msg {
+                            use crate::ilink::types::HubExt;
+                            let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                            hub_ext.session_name = Some(session_name_for_cli.clone());
+                        }
+                        if let Err(e) = client.sendmessage(req).await {
+                            warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply");
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let mut req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
             // Echo back session_name so the Hub uses the correct session for footer labeling
             // even when the user switched sessions between sending the message and the AI reply
@@ -463,6 +513,7 @@ async fn run_cli(
     session_name: &str,
     from_user: &str,
     context_token: &str,
+    partial_tx: mpsc::UnboundedSender<String>,
 ) -> Result<(String, Option<String>)> {
     let args: Vec<String> = cfg
         .args
@@ -489,6 +540,7 @@ async fn run_cli(
     cmd.env("ILINK_SESSION_NAME", session_name);
     cmd.env("ILINK_FROM_USER", from_user);
     cmd.env("ILINK_CONTEXT_TOKEN", context_token);
+    cmd.env("ILINK_STREAMING", if cfg.streaming { "1" } else { "0" });
 
     for (k, v) in &cfg.env {
         let v = apply_placeholders(v, message, session_id, session_name);
@@ -519,35 +571,106 @@ async fn run_cli(
 
     let dur = Duration::from_secs(cfg.timeout_secs.max(1));
 
-    if matches!(cfg.stdin, StdinMode::Message) {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("stdin pipe missing for stdin: message")?;
+    // Take stdout/stderr handles before any awaits so they are not moved into futures below.
+    let child_stdout = child.stdout.take().context("stdout pipe missing")?;
+    let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
-        let write_fut = async {
-            stdin
-                .write_all(message.as_bytes())
-                .await
-                .context("write stdin")?;
-            stdin.shutdown().await.context("shutdown stdin")?;
-            Ok::<(), anyhow::Error>(())
+    // Drain stderr in a background task to prevent the stderr pipe buffer from filling up and
+    // blocking the subprocess (which could also stall stdout writes).
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        tokio::io::BufReader::new(child_stderr)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // Write stdin concurrently with reading stdout to avoid pipe deadlock when both pipes are full.
+    let stdin_task: Option<tokio::task::JoinHandle<Result<()>>> =
+        if matches!(cfg.stdin, StdinMode::Message) {
+            let mut stdin = child
+                .stdin
+                .take()
+                .context("stdin pipe missing for stdin: message")?;
+            let message_owned = message.to_string();
+            Some(tokio::spawn(async move {
+                stdin
+                    .write_all(message_owned.as_bytes())
+                    .await
+                    .context("write stdin")?;
+                stdin.shutdown().await.context("shutdown stdin")?;
+                Ok(())
+            }))
+        } else {
+            None
         };
 
-        tokio::time::timeout(dur, write_fut).await.map_err(|_| {
-            anyhow::anyhow!("CLI stdin write timed out after {}s", cfg.timeout_secs)
-        })??;
+    // Stream stdout line by line.  Lines prefixed with `ILINK_PARTIAL:` carry a JSON-encoded
+    // text chunk that should be forwarded to the WeChat user immediately; all other lines
+    // accumulate as the final reply body (existing P0 semantics).
+    // When `cfg.streaming` is false, ILINK_PARTIAL lines are NOT forwarded — instead the
+    // decoded text is appended to final_lines so the complete response is sent at the end.
+    let streaming = cfg.streaming;
+    let stream_result: Result<Vec<String>> =
+        tokio::time::timeout(dur, async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(child_stdout);
+            let mut final_lines: Vec<String> = Vec::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await.context("read stdout")?;
+                if n == 0 {
+                    break; // EOF — subprocess exited
+                }
+                let trimmed = line.trim_end_matches(['\n', '\r']);
+                if let Some(json_part) = trimmed.strip_prefix("ILINK_PARTIAL:") {
+                    if streaming {
+                        match serde_json::from_str::<String>(json_part) {
+                            Ok(chunk) => {
+                                let _ = partial_tx.send(chunk);
+                            }
+                            Err(e) => {
+                                warn!(error = %e, raw = %json_part, "failed to decode ILINK_PARTIAL chunk; skipping");
+                            }
+                        }
+                    }
+                    // When streaming is disabled, discard ILINK_PARTIAL lines entirely.
+                    // The built-in profile (claude_code.rs) will emit the full text via
+                    // a non-ILINK_PARTIAL line (stdout) when ILINK_STREAMING=0.
+                } else {
+                    final_lines.push(line.clone());
+                }
+            }
+            // Drop partial_tx here so the forwarding task observes channel close after
+            // all chunks have been sent (or immediately when streaming is disabled).
+            drop(partial_tx);
+            Ok(final_lines)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?;
+
+    let final_lines = stream_result?;
+
+    // Wait for subprocess exit (it should already have exited since we got EOF on stdout).
+    let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .map_err(|_| anyhow::anyhow!("CLI failed to exit after stdout EOF"))?
+        .context("wait for CLI process")?;
+
+    // Collect stdin write result (non-fatal).
+    if let Some(task) = stdin_task {
+        match task.await {
+            Ok(Err(e)) => warn!(error = %e, "stdin write error (non-fatal)"),
+            Err(e) => warn!(error = %e, "stdin task panicked"),
+            Ok(Ok(())) => {}
+        }
     }
 
-    let output = tokio::time::timeout(dur, child.wait_with_output())
-        .await
-        .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?
-        .context("wait_with_output")?;
-
-    let status = output.status;
-    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
+    // Collect stderr.
+    let stderr = stderr_task.await.unwrap_or_default();
     if !stderr.is_empty() {
         tracing::debug!(stderr = %stderr, "CLI stderr");
     }
@@ -557,10 +680,13 @@ async fn run_cli(
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
+        let stdout_str: String = final_lines.concat();
         anyhow::bail!(
-            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}"
+            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout_str}"
         );
     }
+
+    let mut stdout = final_lines.concat();
 
     if cfg.include_stderr_in_reply && !stderr.is_empty() {
         stdout.push_str("\n--- stderr ---\n");
@@ -727,13 +853,14 @@ pub fn find_in_path_robust(name: &str) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
-        // Also check npm global bin
+        // Also check common user-local bin directories
         if let Ok(home) = std::env::var("HOME") {
-            let npm_bin = std::path::Path::new(&home)
-                .join(".npm-global/bin")
-                .join(name);
-            if npm_bin.is_file() {
-                return Some(npm_bin);
+            let home_path = std::path::Path::new(&home);
+            for rel in &[".local/bin", ".npm-global/bin", ".cargo/bin"] {
+                let candidate = home_path.join(rel).join(name);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
             }
         }
     }
@@ -1027,6 +1154,7 @@ mod tests {
         let large_msg = "A".repeat(128 * 1024);
 
         let start = std::time::Instant::now();
+        let (partial_tx, _partial_rx) = mpsc::unbounded_channel::<String>();
         let res = run_cli(
             profile,
             "test_profile",
@@ -1035,6 +1163,7 @@ mod tests {
             "session-name",
             "user-123",
             "ctx-123",
+            partial_tx,
         )
         .await;
 
