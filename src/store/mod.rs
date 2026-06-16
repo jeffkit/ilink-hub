@@ -197,6 +197,41 @@ impl Store {
             tracing::warn!(error = %e, "v4 migration: CREATE INDEX failed (may already exist)");
         }
 
+        // ── v5: chat message history ──────────────────────────────────────────
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                created_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await?;
+
+        if let Err(e) = self
+            .ddl(
+                "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
+                 ON messages (vctx, created_at DESC)",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "v5 migration: CREATE INDEX failed (may already exist)");
+        }
+
+        if let Err(e) = self
+            .ddl(
+                "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
+                 ON messages (peer_user_id, role, created_at DESC)",
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "v5 migration: CREATE INDEX (peer) failed (may already exist)");
+        }
+
         Ok(())
     }
 
@@ -785,6 +820,102 @@ pub struct ClientRow {
 pub struct BackendSessionRow {
     pub session_name: String,
     pub backend_session_id: String,
+}
+
+// ─── Message history ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub id: i64,
+    pub vctx: String,
+    pub vtoken: Option<String>,
+    pub session_name: String,
+    pub peer_user_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+impl Store {
+    pub async fn save_message(
+        &self,
+        vctx: &str,
+        vtoken: Option<&str>,
+        session_name: &str,
+        peer_user_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO messages (vctx, vtoken, session_name, peer_user_id, role, content) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(peer_user_id)
+        .bind(role)
+        .bind(content)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Find the most recent assistant message in a conversation whose content starts with
+    /// `content_prefix`. Used as DB-backed fallback for quote-reply routing when the
+    /// in-memory QuoteRouteIndex is cold (e.g. after a Hub restart).
+    pub async fn find_assistant_message_by_content(
+        &self,
+        peer_user_id: &str,
+        content_prefix: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        // LIKE pattern: escape '%' and '_' in the prefix to avoid wildcard interpretation.
+        let escaped = content_prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let row = sqlx::query(
+            "SELECT vtoken, session_name FROM messages \
+             WHERE peer_user_id = $1 AND role = 'assistant' AND content LIKE $2 ESCAPE '\\' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(peer_user_id)
+        .bind(&pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            let vtoken: Option<String> = r.get("vtoken");
+            let session_name: String = r.get("session_name");
+            (vtoken.unwrap_or_default(), Some(session_name))
+        }))
+    }
+
+    pub async fn list_messages(
+        &self,
+        vctx: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let rows = sqlx::query(
+            "SELECT id, vctx, vtoken, session_name, peer_user_id, role, content, created_at \
+             FROM messages WHERE vctx = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(vctx)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| MessageRow {
+                id: r.get("id"),
+                vctx: r.get("vctx"),
+                vtoken: r.get("vtoken"),
+                session_name: r.get("session_name"),
+                peer_user_id: r.get("peer_user_id"),
+                role: r.get("role"),
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]

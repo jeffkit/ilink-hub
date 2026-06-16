@@ -386,6 +386,7 @@ pub async fn sendmessage(
         (real_ctx, peer_user_id)
     };
 
+    let mut active_session: Option<String> = None;
     if let Some(msg) = &mut req.msg {
         // Extract the session name echoed back by the bridge (set since the race-condition fix).
         // This tells us which session was active when the *original message was dispatched*,
@@ -400,7 +401,7 @@ pub async fn sendmessage(
 
         // Pre-fetch active session once; reused for both cli_session_id persistence and
         // the outbound-origin footer, avoiding two identical DB queries per message.
-        let active_session: Option<String> = match replied_session_name.clone() {
+        active_session = match replied_session_name.clone() {
             Some(n) => Some(n),
             None => state
                 .store
@@ -435,9 +436,17 @@ pub async fn sendmessage(
         // Replace virtual context_token with real one and inject to_user_id if missing
         msg.context_token = Some(real_ctx);
         if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
-            msg.to_user_id = Some(peer_user_id);
+            msg.to_user_id = Some(peer_user_id.clone());
         }
         msg.ensure_outbound();
+
+        // Session-persist-only messages (empty body, cli_session_id already persisted above):
+        // return early BEFORE appending the footer. Without this early check, the footer text
+        // itself would make the message appear non-empty, bypassing the guard below and causing
+        // an empty-looking message (containing only the footer) to be forwarded to iLink.
+        if msg.text().map(|t| t.trim().is_empty()).unwrap_or(true) {
+            return Json(SendMessageResponse::default());
+        }
 
         let (client_meta, registered_count) = {
             let reg = state.clients.registry.read().await;
@@ -471,7 +480,7 @@ pub async fn sendmessage(
                 vtoken: vtoken.clone(),
                 name,
                 label,
-                session_name: active_session,
+                session_name: active_session.clone(),
             };
             state
                 .routing
@@ -488,6 +497,32 @@ pub async fn sendmessage(
     let msg_text_empty = req.msg.as_ref().map(|m| m.text().unwrap_or("").trim().is_empty()).unwrap_or(true);
     if msg_text_empty {
         return Json(SendMessageResponse::default());
+    }
+
+    // Fire-and-forget: record assistant reply to history (only non-empty, non-partial messages).
+    let is_partial = req.msg.as_ref()
+        .and_then(|m| m.message_state)
+        .map(|s| s != crate::ilink::types::message_state::FINISH)
+        .unwrap_or(false);
+    if !is_partial {
+        if let Some(content) = req.msg.as_ref().and_then(|m| m.text()).map(str::to_string) {
+            let session_name = active_session
+                .as_deref()
+                .unwrap_or("default")
+                .to_string();
+            let store = state.store.clone();
+            let (vctx4, vtoken4, peer4) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
+            let sem = state.persist_sem.clone();
+            tokio::spawn(async move {
+                let Ok(_permit) = sem.try_acquire() else { return };
+                if let Err(e) = store
+                    .save_message(&vctx4, Some(&vtoken4), &session_name, &peer4, "assistant", &content)
+                    .await
+                {
+                    warn!(error = %e, "failed to save assistant message to history");
+                }
+            });
+        }
     }
 
     if req.base_info.is_none() {
