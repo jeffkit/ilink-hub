@@ -1,6 +1,6 @@
 # Bridge Profile 规范（P0 Exec Protocol）
 
-> 最后更新：2026-06-08
+> 最后更新：2026-06-16
 
 iLink Hub Bridge 的 **profile** 就是一个可执行的脚本或程序：收到消息 → 做处理 → 把回复写到 stdout。
 
@@ -19,6 +19,7 @@ P0 仅依赖环境变量 + stdout，**完全跨平台**（macOS / Linux / Window
 | `ILINK_SESSION_NAME` | session 可读名称（默认 `default`） |
 | `ILINK_FROM_USER` | 发送消息的用户 ID |
 | `ILINK_CONTEXT_TOKEN` | Hub context token |
+| `ILINK_STREAMING` | `1`（默认）= 流式模式，`0` = 一次性回复模式（见下文） |
 
 > 当 YAML 设置了 `stdin: message` 时，`ILINK_MESSAGE` 同时也会写入 stdin。
 
@@ -27,6 +28,52 @@ P0 仅依赖环境变量 + stdout，**完全跨平台**（macOS / Linux / Window
 ```
 [可选] ILINK_SESSION:<uuid>     ← 如需 session 追踪，首行输出这个
 <回复给微信用户的文本>
+```
+
+Bridge 从进程启动开始**实时读取** stdout——profile 一旦写入并刷新缓冲区，bridge 立即处理。
+
+### 流式输出（ILINK_PARTIAL）
+
+当 profile 需要把 AI 生成的文本**逐段发给用户**时，可在终端输出中夹杂 `ILINK_PARTIAL:` 行：
+
+```
+ILINK_PARTIAL:<JSON 编码的字符串>
+```
+
+- bridge 读到该行后**立即**将解码后的文本通过 sendmessage 发给微信用户，无需等进程退出。
+- `<JSON 编码的字符串>` 是对分块文本调用 `json.dumps(text)` / `JSON.stringify(text)` 的结果，换行等特殊字符会被 JSON 转义，整个标记**只占 stdout 的一行**。
+- profile 内部**无需感知 iLink 协议**——`ILINK_PARTIAL:` 只是 profile 与 bridge 之间的约定，bridge 负责向 Hub 发消息的全部细节。
+- 进程**退出 = EOF**，bridge 结束读取，若剩余 stdout 非空则作为最终消息发送；若全部内容已通过 `ILINK_PARTIAL:` 发出，最终 body 为空时 bridge 会自动跳过最终 sendmessage。
+
+#### 关闭流式（`streaming: false`）
+
+如果遇到流式 bug 或需要调试，可以在 YAML profile 里将 `streaming` 设为 `false`：
+
+```yaml
+profiles:
+  claude:
+    type: claude-code
+    cwd: /path/to/your/project
+    streaming: false     # 关闭流式，等 AI 完全响应后一次性发送
+```
+
+关闭后：
+- bridge 忽略所有 `ILINK_PARTIAL:` 行，**不实时转发**给用户
+- 同时向子进程注入 `ILINK_STREAMING=0`，内置 profile（如 `claude-code`）会自动切换为一次性输出模式
+- 进程退出后，完整 stdout 作为最终回复**一次性**发送
+
+默认值为 `true`（流式开启）。
+
+**Bash 示例：**
+
+```bash
+#!/usr/bin/env bash
+# 流式调用示例：用于测试，每秒发一段
+echo 'ILINK_PARTIAL:"第一段，1 秒前发出"'
+sleep 1
+echo 'ILINK_PARTIAL:"第二段，2 秒前发出"'
+sleep 1
+# 进程退出 → bridge 读到 EOF → 完成
 ```
 
 ### 退出码
@@ -94,6 +141,24 @@ async def handler(ctx):
 
 create_profile(handler)
 ```
+
+**流式输出（`ctx.send_partial`）：**
+
+```python
+from ilink_bridge import create_profile, ProfileResult
+
+async def handler(ctx):
+    new_sid = ctx.session_id
+    # AI 每产生一段文本，立即发给用户，无需等到全部完成
+    async for chunk, new_sid in stream_ai(ctx.message, ctx.session_id):
+        await ctx.send_partial(chunk)   # 写 ILINK_PARTIAL: + flush
+    # 全部已流式发出，response 置空即可
+    return ProfileResult(response="", session_id=new_sid)
+
+create_profile(handler)
+```
+
+`send_partial` 的实现只有两行：写 `ILINK_PARTIAL:{json.dumps(text)}\n` 并立即 `flush()`。Bridge 在实时读 stdout 时检测到该前缀，就立即向 Hub 发消息——**profile 完全不感知 iLink 协议**。
 
 YAML 配置：
 

@@ -50,6 +50,8 @@ profiles:
   claude:
     type: claude-code       # 内置：自动管理 --resume
     cwd: /path/to/your/project  # ← 改为你的项目目录
+    # streaming: true       # 默认 true，启用流式部分回复（ILINK_PARTIAL）
+                            # 设为 false 则等 Claude 完全响应后一次性发送，适合调试或遇到流式 bug 时使用
     # 若需指定模型或注入 API Key，可添加 env：
     # env:
     #   ILINK_CLAUDE_MODEL: sonnet
