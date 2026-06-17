@@ -985,10 +985,44 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
             format!("📡 Broadcast to {} client(s)", online.len())
         }
         HubCommand::Status => {
-            let registry = state.clients.registry.read().await;
-            let online = registry.online_clients().len();
-            let total = registry.all_clients().len();
-            messages::hub_status(online, total)
+            let (online, total, online_clients) = {
+                let registry = state.clients.registry.read().await;
+                let all = registry.all_clients();
+                let online = registry.online_clients().len();
+                let total = all.len();
+                // Only online clients are shown in the overview.
+                let online_clients: Vec<(String, String)> = all
+                    .iter()
+                    .filter(|c| c.online)
+                    .map(|c| (c.name.clone(), c.vtoken.clone()))
+                    .collect();
+                (online, total, online_clients)
+            };
+            let vtokens: Vec<String> =
+                online_clients.iter().map(|(_, vt)| vt.clone()).collect();
+            let all_sessions_map = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                state.store.get_all_session_entries_per_vtoken(&vtokens),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                warn!("get_all_session_entries_per_vtoken timed out in /status");
+                Ok(std::collections::HashMap::new())
+            })
+            .unwrap_or_default();
+            // Build per-client session list: (client_name, Vec<SessionStatusEntry>)
+            let client_sessions: Vec<(String, Vec<crate::store::SessionStatusEntry>)> =
+                online_clients
+                    .into_iter()
+                    .map(|(name, vtoken)| {
+                        let sessions = all_sessions_map
+                            .get(&vtoken)
+                            .cloned()
+                            .unwrap_or_default();
+                        (name, sessions)
+                    })
+                    .collect();
+            messages::hub_status(online, total, &client_sessions)
         }
         HubCommand::Help => build_help_text(),
 

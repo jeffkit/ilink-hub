@@ -1539,6 +1539,253 @@ impl Store {
             })
             .collect())
     }
+
+    /// For each vtoken in the list, return a summary of the most recent conversation turn:
+    /// `(session_name, last_user_content, waiting_for_reply)`.
+    ///
+    /// `waiting_for_reply` is `true` when the last stored message for that vtoken has
+    /// `role = 'user'` — meaning the user sent a message but the assistant has not yet
+    /// written a reply back to the messages table.
+    ///
+    /// Uses `MAX(id)` (autoincrement, strictly monotone) as the "latest row" selector,
+    /// which is stable even when two rows share the same `created_at` second — portable
+    /// across SQLite, PostgreSQL, and MySQL.
+    pub async fn get_session_status_per_vtoken(
+        &self,
+        vtokens: &[String],
+    ) -> Result<std::collections::HashMap<String, SessionStatusEntry>> {
+        if vtokens.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 1: find MAX(id) per vtoken across all roles — id is autoincrement so
+        // MAX(id) always picks the row that was inserted last, even within the same second.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+        );
+        {
+            let mut sep = qb.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb.push(") GROUP BY vtoken");
+        let max_rows = qb.build().fetch_all(&self.pool).await?;
+
+        if max_rows.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 2: fetch the actual latest row by id to determine role.
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
+        );
+        {
+            let mut sep = qb2.separated(", ");
+            for row in &max_rows {
+                let max_id: i64 = row.get("max_id");
+                sep.push_bind(max_id);
+            }
+        }
+        qb2.push(")");
+        let latest_rows = qb2.build().fetch_all(&self.pool).await?;
+
+        // Step 3: find MAX(id) of user-role messages per vtoken (for the display snippet).
+        // We always want to show the user's question, not the assistant's reply.
+        // Also fetch created_at to compute elapsed processing time when waiting_for_reply.
+        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, MAX(id) AS max_id FROM messages \
+             WHERE role = 'user' AND vtoken IN (",
+        );
+        {
+            let mut sep = qb3.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb3.push(") GROUP BY vtoken");
+        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+
+        // (vtoken → (content, created_at))
+        let mut user_content_map: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        if !user_max_rows.is_empty() {
+            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
+                "SELECT vtoken, content, created_at FROM messages WHERE id IN (",
+            );
+            {
+                let mut sep = qb4.separated(", ");
+                for row in &user_max_rows {
+                    let max_id: i64 = row.get("max_id");
+                    sep.push_bind(max_id);
+                }
+            }
+            qb4.push(")");
+            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            for row in user_rows {
+                let vtoken: String = row.get("vtoken");
+                let content: String = row.get("content");
+                let created_at: String = row.get("created_at");
+                user_content_map.entry(vtoken).or_insert((content, created_at));
+            }
+        }
+
+        let mut map = std::collections::HashMap::new();
+        for row in latest_rows {
+            let vtoken: String = row.get("vtoken");
+            let session: String = row.get("session_name");
+            let role: String = row.get("role");
+            let waiting = role == "user";
+            let (last_user_msg, user_msg_created_at) = user_content_map
+                .get(&vtoken)
+                .map(|(c, t)| (Some(c.clone()), Some(t.clone())))
+                .unwrap_or((None, None));
+            map.entry(vtoken).or_insert(SessionStatusEntry {
+                session_name: session,
+                last_user_content: last_user_msg,
+                waiting_for_reply: waiting,
+                user_msg_created_at,
+            });
+        }
+        Ok(map)
+    }
+
+    /// Return all active sessions (grouped by session_name) for the given vtokens.
+    ///
+    /// For each (vtoken, session_name) pair that has at least one message, returns a
+    /// `SessionStatusEntry` with the latest user message and whether the AI has replied.
+    /// Results are ordered by the timestamp of the most recent message in that session
+    /// (most recent first within each vtoken).
+    pub async fn get_all_session_entries_per_vtoken(
+        &self,
+        vtokens: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<SessionStatusEntry>>> {
+        if vtokens.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 1: for each (vtoken, session_name) find MAX(id) — determines the latest role.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+        );
+        {
+            let mut sep = qb.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb.push(") GROUP BY vtoken, session_name ORDER BY max_id DESC");
+        let session_rows = qb.build().fetch_all(&self.pool).await?;
+
+        if session_rows.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Collect (vtoken, session_name, max_id, role) by fetching the latest row per session.
+        let max_ids: Vec<i64> = session_rows
+            .iter()
+            .map(|r| r.get::<i64, _>("max_id"))
+            .collect();
+
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
+        );
+        {
+            let mut sep = qb2.separated(", ");
+            for id in &max_ids {
+                sep.push_bind(*id);
+            }
+        }
+        qb2.push(")");
+        let role_rows = qb2.build().fetch_all(&self.pool).await?;
+        // (vtoken, session_name) → role of the latest message
+        let mut role_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &role_rows {
+            let vt: String = row.get("vtoken");
+            let sn: String = row.get("session_name");
+            let role: String = row.get("role");
+            role_map.insert((vt, sn), role);
+        }
+
+        // Step 2: for each (vtoken, session_name), find the latest user message.
+        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages \
+             WHERE role = 'user' AND vtoken IN (",
+        );
+        {
+            let mut sep = qb3.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb3.push(") GROUP BY vtoken, session_name");
+        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+
+        let user_max_ids: Vec<i64> = user_max_rows
+            .iter()
+            .map(|r| r.get::<i64, _>("max_id"))
+            .collect();
+
+        // (vtoken, session_name) → (content, created_at)
+        let mut user_content_map: std::collections::HashMap<(String, String), (String, String)> =
+            std::collections::HashMap::new();
+        if !user_max_ids.is_empty() {
+            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
+                "SELECT vtoken, session_name, content, created_at FROM messages WHERE id IN (",
+            );
+            {
+                let mut sep = qb4.separated(", ");
+                for id in &user_max_ids {
+                    sep.push_bind(*id);
+                }
+            }
+            qb4.push(")");
+            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            for row in user_rows {
+                let vt: String = row.get("vtoken");
+                let sn: String = row.get("session_name");
+                let content: String = row.get("content");
+                let created_at: String = row.get("created_at");
+                user_content_map.insert((vt, sn), (content, created_at));
+            }
+        }
+
+        // Assemble result — preserve order from session_rows (most recent first).
+        let mut map: std::collections::HashMap<String, Vec<SessionStatusEntry>> =
+            std::collections::HashMap::new();
+        for row in &session_rows {
+            let vt: String = row.get("vtoken");
+            let sn: String = row.get("session_name");
+            let role = role_map
+                .get(&(vt.clone(), sn.clone()))
+                .map(String::as_str)
+                .unwrap_or("assistant");
+            let waiting = role == "user";
+            let (last_user_content, user_msg_created_at) = user_content_map
+                .get(&(vt.clone(), sn.clone()))
+                .map(|(c, t)| (Some(c.clone()), Some(t.clone())))
+                .unwrap_or((None, None));
+            map.entry(vt).or_default().push(SessionStatusEntry {
+                session_name: sn,
+                last_user_content,
+                waiting_for_reply: waiting,
+                user_msg_created_at,
+            });
+        }
+        Ok(map)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStatusEntry {
+    pub session_name: String,
+    pub last_user_content: Option<String>,
+    /// `true` when the last stored message is from the user (AI has not replied yet).
+    pub waiting_for_reply: bool,
+    /// ISO-8601 timestamp of the last user message — used to compute elapsed time
+    /// when `waiting_for_reply` is true. `None` when there are no user messages.
+    pub user_msg_created_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -3045,5 +3292,129 @@ mod store_tests {
                 "table {t} declared in migrations/*.sql but missing from catalog"
             );
         }
+    }
+
+    // ─── get_session_status_per_vtoken ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_status_empty_vtokens_returns_empty_map() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let result = store
+            .get_session_status_per_vtoken(&[])
+            .await
+            .expect("query");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_status_no_messages_returns_empty_map() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let vtokens = vec!["vt-unknown".to_string()];
+        let result = store
+            .get_session_status_per_vtoken(&vtokens)
+            .await
+            .expect("query");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_status_waiting_when_last_message_is_user() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        store
+            .save_message("vctx1", Some("vt1"), "default", "user1", "user", "帮我看看这个问题")
+            .await
+            .expect("save user");
+
+        let result = store
+            .get_session_status_per_vtoken(&["vt1".to_string()])
+            .await
+            .expect("query");
+
+        let entry = result.get("vt1").expect("entry for vt1");
+        assert!(entry.waiting_for_reply, "last role is user → should be waiting");
+        assert_eq!(entry.session_name, "default");
+        assert_eq!(
+            entry.last_user_content.as_deref(),
+            Some("帮我看看这个问题")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_status_not_waiting_when_last_message_is_assistant() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        store
+            .save_message("vctx2", Some("vt2"), "work", "user2", "user", "请解释一下 Rust 的生命周期")
+            .await
+            .expect("save user");
+        store
+            .save_message("vctx2", Some("vt2"), "work", "user2", "assistant", "生命周期是…")
+            .await
+            .expect("save assistant");
+
+        let result = store
+            .get_session_status_per_vtoken(&["vt2".to_string()])
+            .await
+            .expect("query");
+
+        let entry = result.get("vt2").expect("entry for vt2");
+        assert!(!entry.waiting_for_reply, "last role is assistant → not waiting");
+        assert_eq!(entry.session_name, "work");
+        assert_eq!(
+            entry.last_user_content.as_deref(),
+            Some("请解释一下 Rust 的生命周期")
+        );
+    }
+
+    #[tokio::test]
+    async fn session_status_multiple_vtokens_independent() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        // vt-a: user sent, AI hasn't replied
+        store
+            .save_message("ctx-a", Some("vt-a"), "default", "pa", "user", "问题A")
+            .await
+            .expect("save");
+        // vt-b: full round trip
+        store
+            .save_message("ctx-b", Some("vt-b"), "session-x", "pb", "user", "问题B")
+            .await
+            .expect("save");
+        store
+            .save_message("ctx-b", Some("vt-b"), "session-x", "pb", "assistant", "回答B")
+            .await
+            .expect("save");
+
+        let result = store
+            .get_session_status_per_vtoken(&["vt-a".to_string(), "vt-b".to_string()])
+            .await
+            .expect("query");
+
+        let a = result.get("vt-a").expect("vt-a");
+        assert!(a.waiting_for_reply);
+        assert_eq!(a.last_user_content.as_deref(), Some("问题A"));
+
+        let b = result.get("vt-b").expect("vt-b");
+        assert!(!b.waiting_for_reply);
+        assert_eq!(b.last_user_content.as_deref(), Some("问题B"));
+        assert_eq!(b.session_name, "session-x");
+    }
+
+    #[tokio::test]
+    async fn session_status_unknown_vtoken_not_in_result() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        store
+            .save_message("ctx", Some("vt-known"), "default", "p", "user", "hi")
+            .await
+            .expect("save");
+
+        let result = store
+            .get_session_status_per_vtoken(&[
+                "vt-known".to_string(),
+                "vt-missing".to_string(),
+            ])
+            .await
+            .expect("query");
+
+        assert!(result.contains_key("vt-known"));
+        assert!(!result.contains_key("vt-missing"), "unknown vtoken must not appear");
     }
 }
