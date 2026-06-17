@@ -319,17 +319,22 @@ pub enum UnregisterClientError {
 }
 
 /// Remove a registered backend client from memory, DB, routing, and its message queue.
-/// Only offline clients can be deleted.
+///
+/// When `force` is `false` the call is rejected with [`UnregisterClientError::StillOnline`]
+/// if the client is currently marked online.  Set `force = true` to skip that check — useful
+/// when the bridge manager has just killed the child process and knows the client will stop
+/// polling within seconds.
 pub async fn unregister_client_in_hub(
     state: &HubState,
     name: &str,
+    force: bool,
 ) -> Result<(), UnregisterClientError> {
     let vtoken = {
         let registry = state.clients.registry.read().await;
         let Some(client) = registry.get_by_name(name) else {
             return Err(UnregisterClientError::NotFound);
         };
-        if client.online {
+        if client.online && !force {
             return Err(UnregisterClientError::StillOnline);
         }
         client.vtoken.clone()

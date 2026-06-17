@@ -732,10 +732,20 @@ pub struct AdminClientMutationResponse {
 
 pub type AdminDeleteClientResponse = AdminClientMutationResponse;
 
+#[derive(Debug, Deserialize, Default)]
+pub struct AdminDeleteClientQuery {
+    /// When `true`, skip the "still online" guard and force-remove the client.
+    /// Intended for the bridge manager, which has just killed the child process and
+    /// knows the client will stop polling momentarily.
+    #[serde(default)]
+    pub force: bool,
+}
+
 pub async fn admin_delete_client(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<AdminDeleteClientQuery>,
 ) -> (StatusCode, Json<AdminDeleteClientResponse>) {
     if !check_admin_auth(&headers) {
         return (
@@ -760,7 +770,7 @@ pub async fn admin_delete_client(
         );
     }
 
-    match crate::server::pairing::unregister_client_in_hub(state.as_ref(), name).await {
+    match crate::server::pairing::unregister_client_in_hub(state.as_ref(), name, query.force).await {
         Ok(()) => (
             StatusCode::OK,
             Json(AdminDeleteClientResponse {

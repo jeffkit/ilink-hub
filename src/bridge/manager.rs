@@ -283,6 +283,24 @@ impl BridgeManager {
                             "removed orphaned credentials for deleted profile"
                         );
                     }
+
+                    // Auto-deregister the client from Hub so it disappears from /list
+                    // immediately instead of lingering as an offline ghost entry.
+                    // We use force=true because the child was just killed — it will stop
+                    // polling within seconds regardless, and the caller already made the
+                    // intent clear by deleting the profile YAML.  Best-effort: if Hub is
+                    // unreachable the operator can always clean up manually.
+                    let hub_url = self.opts.hub_url.clone();
+                    let register_name = managed.spec.register_name.clone();
+                    let admin_token = std::env::var("ILINK_ADMIN_TOKEN")
+                        .ok()
+                        .filter(|t| !t.trim().is_empty());
+                    tokio::spawn(async move {
+                        match deregister_from_hub(&hub_url, &register_name, admin_token.as_deref()).await {
+                            Ok(()) => info!(profile = %register_name, "auto-deregistered deleted profile from Hub"),
+                            Err(e) => warn!(profile = %register_name, error = %e, "failed to auto-deregister deleted profile from Hub"),
+                        }
+                    });
                 }
             }
         }
@@ -826,6 +844,41 @@ fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> 
     cmd.kill_on_drop(true);
 
     cmd.spawn().context("spawn bridge child")
+}
+
+/// Call `DELETE /hub/clients/{name}?force=true` on the Hub to remove an offline bridge.
+///
+/// Uses `force=true` so the request succeeds even when the Hub has not yet had time to
+/// run its health-check and flip the client to `online=false` after the child was killed.
+///
+/// Returns `Ok(())` when the client was deleted or was already absent (404).
+async fn deregister_from_hub(
+    hub_url: &str,
+    name: &str,
+    admin_token: Option<&str>,
+) -> anyhow::Result<()> {
+    let url = format!(
+        "{}/hub/clients/{}?force=true",
+        hub_url.trim_end_matches('/'),
+        name
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .context("build reqwest client")?;
+    let mut req = client.delete(&url);
+    if let Some(token) = admin_token {
+        req = req.header("Authorization", format!("Bearer {}", token.trim()));
+    }
+    let resp = req.send().await.context("DELETE /hub/clients")?;
+    match resp.status() {
+        s if s.is_success() => Ok(()),
+        reqwest::StatusCode::NOT_FOUND => Ok(()), // already gone
+        s => {
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Hub returned {s}: {body}");
+        }
+    }
 }
 
 #[cfg(test)]
