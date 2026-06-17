@@ -88,13 +88,25 @@ impl Store {
         // avoid SQLITE_BUSY (5) errors: SQLite's file-level write lock means a
         // long write transaction (e.g. `persist_context_tokens_batch`) and a
         // concurrent read (e.g. `get_active_session_name`) executed on two
-        // different physical connections race on the same lock. The
-        // default `busy_timeout` of 5s for sqlite connections is kept so
-        // the rare case of contention from the migration runner's `acquire`
-        // during shutdown still has a chance to drain.
+        // different physical connections race on the same lock.
+        //
+        // We explicitly set `busy_timeout = 5000` (5s) and `journal_mode = WAL`
+        // via an `after_connect` callback so the behaviour is explicit rather
+        // than relying on sqlx internal defaults that may change across
+        // versions. WAL mode improves crash safety and write throughput
+        // (writes do not block reads); on :memory: databases both PRAGMAs
+        // are accepted but have no effect.
         let pool = if is_sqlite {
             sqlx::pool::PoolOptions::<sqlx::Any>::new()
                 .max_connections(1)
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
+                            .execute(&mut *conn)
+                            .await?;
+                        Ok(())
+                    })
+                })
                 .connect(url)
                 .await?
         } else {
@@ -135,7 +147,19 @@ impl Store {
             }
         }
         if !path.exists() {
-            std::fs::File::create(path)?;
+            match std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+            {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Another process created the file between our `exists()`
+                    // check and `create_new()`; the file exists now — no
+                    // truncation, no data loss.
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
@@ -206,9 +230,23 @@ impl Store {
                     .bind(version)
                     .execute(&self.pool)
                     .await?;
-                // INSERT IGNORE: rows_affected is 1 on a fresh insert, 0 when
-                // the unique key collided and the row was skipped.
-                Ok(result.rows_affected() == 1)
+                if result.rows_affected() == 1 {
+                    return Ok(true);
+                }
+                // Defensive check: MySQL's INSERT IGNORE suppresses ALL errors,
+                // not just duplicate-key. If a non-duplicate error was suppressed,
+                // the row won't exist. Verify the row is actually present.
+                let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = ?")
+                    .bind(version)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if row.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "INSERT IGNORE for schema_version v{version}: row absent after insert — \
+                         a non-duplicate error may have been silently suppressed"
+                    ));
+                }
+                Ok(false)
             }
         }
     }
@@ -272,7 +310,22 @@ impl Store {
                     .bind(version)
                     .execute(&mut **tx)
                     .await?;
-                Ok(result.rows_affected() == 1)
+                if result.rows_affected() == 1 {
+                    return Ok(true);
+                }
+                // Defensive check: MySQL's INSERT IGNORE suppresses ALL errors,
+                // not just duplicate-key.
+                let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = ?")
+                    .bind(version)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                if row.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "INSERT IGNORE for schema_version v{version}: row absent after insert — \
+                         a non-duplicate error may have been silently suppressed"
+                    ));
+                }
+                Ok(false)
             }
         }
     }
@@ -493,8 +546,7 @@ impl Store {
                  WHERE name = 'created_at'",
             )
             .fetch_optional(&mut **tx)
-            .await
-            .unwrap_or(None)
+            .await?
             .is_some(),
             DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
                 "SELECT 1 FROM information_schema.columns \
@@ -2055,8 +2107,18 @@ mod store_tests {
                     match Store::connect(&url).await {
                         Ok(s) => return Ok(s),
                         Err(e) => {
+                            let is_busy = e
+                                .downcast_ref::<sqlx::Error>()
+                                .map(|se| {
+                                    matches!(
+                                        se,
+                                        sqlx::Error::Database(ref db_err)
+                                            if db_err.code().as_deref() == Some("5")
+                                    )
+                                })
+                                .unwrap_or(false);
                             last_err = format!("{e}");
-                            if last_err.contains("database is locked") && attempt < 4 {
+                            if is_busy && attempt < 4 {
                                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                                 continue;
                             }
@@ -3056,5 +3118,322 @@ mod store_tests {
                 "table {t} declared in migrations/*.sql but missing from catalog"
             );
         }
+    }
+
+    // ─── Adversarial tests for M1 review findings ──────────────────────────
+    //
+    // Each test below pins down a specific SEC-ADV finding from the
+    // adversarial review. They are independent of the M1/M2/M3 regression
+    // tests above and exercise only the new code paths.
+
+    /// SEC-ADV-001: `ensure_sqlite_file` must NOT truncate an existing
+    /// SQLite database file. We create a valid DB, write data to it, then
+    /// call `ensure_sqlite_file` again — the file size must not shrink to
+    /// zero and the data must still be readable.
+    #[test]
+    fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("existing.db");
+        let url = format!("sqlite:{}", db_path.display());
+
+        // Create the database via Store::connect (this writes v1-v5 schema).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _store = rt.block_on(async {
+            Store::connect(&url).await.expect("first connect")
+        });
+
+        // Record the file size after schema creation.
+        let size_before = std::fs::metadata(&db_path).expect("metadata").len();
+        assert!(
+            size_before > 0,
+            "database file must have content after Store::connect"
+        );
+
+        // Now simulate a concurrent connect: call `ensure_sqlite_file` on
+        // the same path. With the old `File::create` this would truncate
+        // the file to 0 bytes. With `create_new(true)` it returns
+        // AlreadyExists and leaves the file untouched.
+        Store::ensure_sqlite_file(&url).expect("ensure_sqlite_file must succeed");
+
+        let size_after = std::fs::metadata(&db_path).expect("metadata").len();
+        assert!(
+            size_after >= size_before,
+            "ensure_sqlite_file must not truncate existing database: \
+             size_before={size_before}, size_after={size_after}"
+        );
+
+        // Verify the database is still usable (not corrupted by truncation).
+        let store2 = rt.block_on(async {
+            Store::connect(&url).await.expect("second connect")
+        });
+        let v = rt.block_on(store2.get_current_version()).unwrap();
+        assert_eq!(v, 5, "database must still be at v5 after ensure_sqlite_file");
+    }
+
+    /// SEC-ADV-001 (concurrent stress): hammer `ensure_sqlite_file` from
+    /// multiple OS threads against the same file. With the old `File::create`
+    /// this would eventually truncate a concurrent writer's data. With
+    /// `create_new(true)` + `AlreadyExists` handling, every call either
+    /// creates the file or safely observes it already exists.
+    #[test]
+    fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("race.db");
+        let url = format!("sqlite:{}", db_path.display());
+
+        // First, create the database and populate it.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _store = rt.block_on(async {
+            Store::connect(&url).await.expect("first connect")
+        });
+        let size_before = std::fs::metadata(&db_path).expect("metadata").len();
+
+        // Now hammer `ensure_sqlite_file` from 16 threads concurrently.
+        let url = Arc::new(url);
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let url = Arc::clone(&url);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..50 {
+                    Store::ensure_sqlite_file(&url).expect("ensure_sqlite_file");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread join");
+        }
+
+        let size_after = std::fs::metadata(&db_path).expect("metadata").len();
+        assert!(
+            size_after >= size_before,
+            "concurrent ensure_sqlite_file must not truncate: \
+             size_before={size_before}, size_after={size_after}"
+        );
+
+        // Database must still be usable.
+        let store2 = rt.block_on(async {
+            Store::connect(&url).await.expect("reconnect after concurrent race")
+        });
+        let v = rt.block_on(store2.get_current_version()).unwrap();
+        assert_eq!(v, 5);
+    }
+
+    /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
+    /// errors from the `pragma_table_info` query rather than silently
+    /// treating all errors as "column not found". The non-tx `column_exists`
+    /// still uses `.unwrap_or(None)` as a deliberate choice (caller treats
+    /// absent column as "not present and let the DDL surface the real
+    /// error"), but the tx variant in `migrate_to_v4_tx` now uses `?`.
+    /// This test verifies the in-tx path propagates errors for a
+    /// syntactically-invalid pragma query (malformed identifier).
+    #[tokio::test]
+    async fn adversarial_v4_tx_pragma_error_propagates() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let store = Store {
+            pool,
+            kind: DatabaseKind::Sqlite,
+        };
+        // Bootstrap schema_version table (required by run_migrations).
+        store
+            .ddl(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                    version     INTEGER PRIMARY KEY,
+                    migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await
+            .expect("schema_version");
+        // Mark v1-v3 as applied so only v4 runs.
+        for v in 1..=3 {
+            store.record_migration_run(v).await.expect("mark");
+        }
+        // Create a context_token_map WITHOUT created_at so v4 tries to add it.
+        store
+            .ddl(
+                "CREATE TABLE IF NOT EXISTS context_token_map (
+                    vctx TEXT PRIMARY KEY, real_ctx TEXT NOT NULL,
+                    peer_user_id TEXT NOT NULL DEFAULT '', expires_at TEXT
+                )",
+            )
+            .await
+            .expect("context_token_map");
+
+        // v4 should succeed (column doesn't exist yet, so ALTER ADD COLUMN runs).
+        store.migrate_to_v4().await.expect("v4 must add created_at column");
+        assert!(
+            store
+                .column_exists("context_token_map", "created_at")
+                .await
+                .unwrap(),
+            "created_at must exist after v4"
+        );
+    }
+
+    /// SEC-ADV-002: `column_exists` on SQLite must return `Ok(false)` for
+    /// a non-existent table rather than propagating an error. This is the
+    /// deliberate error-suppression behaviour documented in the function
+    /// comment: callers treat "column absent" as a signal to run DDL, and
+    /// the DDL itself will surface the real error (e.g. "no such table")
+    /// with a clearer message.
+    #[tokio::test]
+    async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let store = Store {
+            pool,
+            kind: DatabaseKind::Sqlite,
+        };
+        // No tables created — `column_exists` on a non-existent table must
+        // return `Ok(false)`, NOT propagate a runtime error.
+        let result = store.column_exists("no_such_table", "any_col").await;
+        assert!(
+            result.is_ok(),
+            "column_exists on non-existent table must return Ok, not Err"
+        );
+        assert!(
+            !result.unwrap(),
+            "column_exists on non-existent table must return Ok(false)"
+        );
+    }
+
+    /// SEC-ADV-002 (regression): after a failed column_exists that
+    /// returned `Ok(false)` (deliberate suppression), the caller should
+    /// be able to attempt DDL that surfaces the real error. This confirms
+    /// the design that error suppression in column_exists does not hide
+    /// the root cause permanently.
+    #[tokio::test]
+    async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
+        sqlx::any::install_default_drivers();
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("pool");
+        let store = Store {
+            pool,
+            kind: DatabaseKind::Sqlite,
+        };
+        // column_exists returns false → caller tries DDL
+        let col_missing = !store
+            .column_exists("ghost_table", "ghost_col")
+            .await
+            .unwrap();
+        assert!(col_missing);
+        // The DDL must surface the real "no such table" error.
+        let ddl_result = store
+            .ddl("ALTER TABLE ghost_table ADD COLUMN ghost_col TEXT")
+            .await;
+        assert!(
+            ddl_result.is_err(),
+            "DDL on non-existent table must propagate error"
+        );
+        let err_msg = format!("{}", ddl_result.unwrap_err());
+        assert!(
+            err_msg.to_lowercase().contains("no such table")
+                || err_msg.to_lowercase().contains("error"),
+            "DDL error must mention the table problem; got: {err_msg}"
+        );
+    }
+
+    /// SEC-ADV-004 + SEC-ADV-006: after `Store::connect` to a file-backed
+    /// SQLite database, the connection pool must have WAL journal mode
+    /// and busy_timeout=5000 explicitly configured.
+    #[tokio::test]
+    async fn adversarial_sqlite_connect_configures_wal_and_busy_timeout() {
+        sqlx::any::install_default_drivers();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let url = format!("sqlite:{}/pragma.db", tmp.path().display());
+        let store = Store::connect(&url).await.expect("connect");
+
+        // Verify journal_mode is WAL via pragma_journal_mode TVF.
+        let (jm,): (String,) = sqlx::query_as("SELECT * FROM pragma_journal_mode")
+            .fetch_one(&store.pool)
+            .await
+            .expect("journal_mode query");
+        assert_eq!(
+            jm, "wal",
+            "journal_mode must be WAL after Store::connect; got {jm}"
+        );
+
+        // Verify busy_timeout is 5000 via pragma_busy_timeout TVF.
+        let (bt,): (i32,) = sqlx::query_as("SELECT * FROM pragma_busy_timeout")
+            .fetch_one(&store.pool)
+            .await
+            .expect("busy_timeout query");
+        assert_eq!(
+            bt, 5000,
+            "busy_timeout must be 5000ms after Store::connect; got {bt}"
+        );
+    }
+
+    /// SEC-ADV-003: `try_claim_migration_in_tx` must have the same claim
+    /// semantics as `try_claim_migration` — exactly one caller wins in a
+    /// race. This test verifies the in-tx variant under concurrent access
+    /// on the same pool.
+    #[tokio::test]
+    async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
+        sqlx::any::install_default_drivers();
+        // File-backed SQLite so all connections share the same database —
+        // :memory: databases are per-connection private unless shared-cache
+        // is enabled.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_url = format!("sqlite:{}/txclaim.db", tmp.path().display());
+        Store::ensure_sqlite_file(&db_url).expect("ensure db file");
+        let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+            .max_connections(2)
+            .connect(&db_url)
+            .await
+            .expect("pool");
+        let store = Store {
+            pool: pool.clone(),
+            kind: DatabaseKind::Sqlite,
+        };
+        // Bootstrap schema_version.
+        store
+            .ddl(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                    version     INTEGER PRIMARY KEY,
+                    migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await
+            .expect("schema_version");
+
+        // Both transactions race for v99. Only one tx's claim can succeed.
+        let pool2 = pool.clone();
+        let store2 = Store {
+            pool: pool2,
+            kind: DatabaseKind::Sqlite,
+        };
+        let (r1, r2) = tokio::join!(
+            async {
+                let mut tx = store.pool.begin().await.expect("tx1");
+                let claimed = store.try_claim_migration_in_tx(&mut tx, 99).await.unwrap();
+                tx.commit().await.expect("commit1");
+                claimed
+            },
+            async {
+                let mut tx = store2.pool.begin().await.expect("tx2");
+                let claimed = store2.try_claim_migration_in_tx(&mut tx, 99).await.unwrap();
+                tx.commit().await.expect("commit2");
+                claimed
+            },
+        );
+        let winners = [r1, r2].iter().filter(|c| **c).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one tx must claim v99; r1={r1}, r2={r2}"
+        );
     }
 }

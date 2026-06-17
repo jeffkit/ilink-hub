@@ -1,738 +1,227 @@
 milestone: M1
-title: "Adversarial Rust security & concurrency review of M1 — schema_version 追踪表"
-reviewer: "rust-sec-concurrency-specialist"
+review_type: adversarial-security-concurrency
+reviewer: "Rust 安全与并发专家 (Claude)"
 date: 2026-06-17
-re_review_date: 2026-06-17
-worktree: /Users/kongjie/projects/ilink-hub
-base_commit: 59c45344912b19fc3b32bbe2d97e62e3b374f985
-combined_commit_under_review: e6a63fa3b2e607f2aaa3f9c1eb5f61b4bcbce4c4
-re_review_commit: PENDING
-resolution: >-
-  All CRITICAL and HIGH findings are fixed in this re-review. The migration
-  runner now uses an atomic `INSERT ... ON CONFLICT DO NOTHING RETURNING`
-  claim primitive (F-M1-01, F-M1-04), the v4 ALTER is gated by an
-  information_schema/pragma_table_info pre-check rather than an error-string
-  match (F-M1-02), and column-decode errors are propagated to the caller
-  rather than silently coerced to `Ok(0)` (F-M1-03, F-M1-10). Six new
-  adversarial tests pin the changes down; cargo fmt, clippy, test, and
-  build all pass.
+verdict: PASS
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: e53fc0d
+fix_commit: 4b76916
 
 scope:
-  - "src/store/mod.rs: Store::get_current_version, is_migration_run, record_migration_run (new)"
-  - "src/store/mod.rs: Store::run_migrations (refactored to gate each step on is_migration_run + record_migration_run)"
-  - "src/store/mod.rs: schema_version table DDL at top of run_migrations"
-  - "src/store/mod.rs: store_tests::test_schema_version_tracking, test_migration_idempotency, test_migration_incremental_from_v2 (new)"
-
-# ─── Method ──────────────────────────────────────────────────────────────────
-# Read review-request.yaml against the actual source. For each claim (schema
-# table created, version helpers, idempotency, migration runner), try to
-# construct a counter-example that breaks the claim. Findings are organised
-# by severity (CRITICAL first), with CWE / OWASP references and concrete
-# remediation. Re-ran the commands the request claims to have run; results
-# are noted in the claim_audit section.
+  - "src/store/mod.rs: Store::get_current_version"
+  - "src/store/mod.rs: Store::is_migration_run"
+  - "src/store/mod.rs: Store::try_claim_migration"
+  - "src/store/mod.rs: Store::record_migration_run"
+  - "src/store/mod.rs: Store::try_claim_migration_in_tx"
+  - "src/store/mod.rs: Store::run_migrations"
+  - "src/store/mod.rs: Store::ensure_sqlite_file"
+  - "src/store/mod.rs: Store::column_exists"
+  - "src/store/mod.rs: Store::migrate_to_v4_tx"
+  - "src/store/mod.rs: Store::connect"
+  - "src/store/mod.rs: Store::v5_create_messages_sql"
+  - "src/main.rs: main"
 
 # ─── Findings ────────────────────────────────────────────────────────────────
 findings:
 
-  # ─── CRITICAL ──────────────────────────────────────────────────────────────
-  - id: F-M1-01
-    severity: CRITICAL
-    cwe: CWE-362
-    category: race / TOCTOU on migration runner
-    status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Replaced the `is_migration_run(N) → DDL → record_migration_run(N)` TOCTOU
-      with a single `INSERT INTO schema_version (version) VALUES ($1) ON
-      CONFLICT (version) DO NOTHING RETURNING version` statement exposed as
-      `Store::try_claim_migration`. The DDL only runs when this statement
-      returns a row, atomically claiming the version. Concurrent writers
-      see the row already present (ON CONFLICT DO NOTHING) and skip the
-      DDL. New test `adversarial_concurrent_store_connect_succeeds_and_converges`
-      (sequential) and `adversarial_many_concurrent_connects_converge`
-      (10 sequential connects) verify convergence to version 5.
-    title: >-
-      `run_migrations` is not atomic — two concurrent `Store::connect` calls
-      on the same Postgres/MySQL database can both observe `!is_migration_run(N)`,
-      both run the DDL, and both insert the same version row, racing the
-      non-idempotent v3 / v4 DDL on each other
-    evidence:
-      - "src/store/mod.rs:144 — v1 guard `if !self.is_migration_run(1).await?`"
-      - "src/store/mod.rs:190 — v2 guard `if !self.is_migration_run(2).await?`"
-      - "src/store/mod.rs:219 — v3 guard `if !self.is_migration_run(3).await?`"
-      - "src/store/mod.rs:242 — v4 guard `if !self.is_migration_run(4).await?`"
-      - "src/store/mod.rs:287 — v5 guard `if !self.is_migration_run(5).await?`"
-      - "src/store/mod.rs:185 / 214 / 229 / 280 / 324 — `record_migration_run(N)` is called AFTER the DDL, in a separate statement, with no enclosing transaction"
-      - "src/store/mod.rs:50-52 — for non-SQLite URLs `AnyPool::connect(url)` is used with the default pool size; the SQLite single-connection fix at lines 45-49 does NOT apply"
-      - "src/store/mod.rs:65-91 — `ensure_sqlite_file` is the only path that restricts the pool; nothing similar exists for PostgreSQL or MySQL"
-    why_it_matters: >
-      The M1 refactor converts each migration step into a
-      `check-then-do-then-mark` sequence:
-          is_migration_run(N)  →  DDL  →  record_migration_run(N)
-      The check and the mark are two separate `pool.execute(...)` calls
-      (or pool connection acquires for DDL). Two concurrent
-      `Store::connect` calls on the same Postgres/MySQL database — e.g.
-      a Tauri restart firing while the previous instance is still in
-      its shutdown grace period, or a CLI admin tool running alongside
-      the desktop app — can both pass `is_migration_run(N)` returning
-      `false`, both execute the v3 / v4 DDL.
-
-      For v3 (`CREATE UNIQUE INDEX IF NOT EXISTS`) the second writer
-      is a no-op — both observe the index already exists. For v4
-      (`ALTER TABLE context_token_map ADD COLUMN created_at ...`)
-      the second writer is NOT idempotent. Both writers will hit
-      the "duplicate column" path; the current v4 implementation
-      catches that as a soft-noop and proceeds. So the data
-      integrity is not corrupted — but the migration is logged
-      twice, the second writer's `record_migration_run(4)` is
-      `ON CONFLICT DO NOTHING` (no error), and the user's
-      `tracing::info!` says "migration v4 applied" twice. Worse,
-      a `CREATE UNIQUE INDEX` on a database that has *duplicate
-      `real_ctx` rows from before v3* (the v3 migration exists
-      precisely to prevent this race in the application path;
-      see `map_context_token` at src/store/mod.rs:718-740)
-      will FAIL for both writers, and both will propagate the
-      error up through `Store::connect`.
-
-      On a multi-connection Postgres pool the test
-      `file_sqlite_serializes_concurrent_read_and_write_without_busy`
-      (src/store/mod.rs:1193-1285) does not run, and no test in
-      this M1 exercises a concurrent-connect race against
-      Postgres/MySQL. The tests that DO exercise the new
-      `run_migrations` logic (`test_migration_incremental_from_v2`,
-      test_migration_idempotency) all use `sqlite::memory:` with
-      `max_connections(1)`, which the SQLite fix at line 47 forces.
-      So the M1 test surface is silent on this race.
-    fix: >
-      Three layers, pick at least one (the first is the smallest
-      diff; the third is the most robust):
-
-      (a) Wrap the `is_migration_run(N) → DDL → record_migration_run(N)`
-          triple in a single `BEGIN IMMEDIATE` / `BEGIN` transaction
-          on a dedicated connection, with `is_migration_run` and
-          `record_migration_run` reading/writing the SAME
-          transaction. Postgres' `INSERT ... ON CONFLICT DO NOTHING`
-          already serialises the mark, so under SERIALIZABLE or
-          REPEATABLE READ the loser of the race would get a
-          serialisation conflict and retry cleanly.
-
-      (b) Refactor to a single SQL statement: `INSERT INTO
-          schema_version (version) VALUES ($1) ON CONFLICT (version)
-          DO NOTHING RETURNING version`. If the returning row is
-          `None`, another writer beat us — skip the DDL. If the
-          returning row is `Some(v)`, we own the DDL and must run
-          it. This is the canonical "atomic check-and-claim" pattern
-          and works on SQLite, Postgres, and MySQL with the same SQL.
-
-      (c) Serialize migration runs process-wide via a `tokio::sync::Mutex`
-          acquired at the top of `run_migrations`, held for the
-          entire migration walk. Crude but works. The M2 plan
-          already says it will refactor `run_migrations` —
-          option (a) or (b) should be in M2's scope.
-
-      In addition, add a regression test that simulates a
-      concurrent `Store::connect` race against a multi-connection
-      pool (e.g. by issuing two concurrent
-      `tokio::spawn(Store::connect(url))` against a tempfile-backed
-      SQLite with `busy_timeout(100ms)` and `max_connections(2)`,
-      asserting both succeed and the final version is correct).
-      The existing tests do not cover this.
-
   # ─── HIGH ─────────────────────────────────────────────────────────────────
-  - id: F-M1-02
-    severity: HIGH
+  - id: SEC-ADV-001
+    severity: high
+    cwe: CWE-367
+    category: "TOCTOU / 数据丢失"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 149-162
+    symbol: Store::ensure_sqlite_file
+    title: >
+      `ensure_sqlite_file` 在并发 `Store::connect` 场景下通过 `File::create` 截断
+      已有数据库文件，导致数据丢失
+    fix_applied: >
+      `File::create(path)` 替换为 `OpenOptions::new().create_new(true).write(true).open(path)`，
+      `create_new(true)` 对应 `O_CREAT | O_EXCL`，若文件已存在则返回 `ErrorKind::AlreadyExists`，
+      安全跳过创建步骤。
+
+    adversarial_tests:
+      - adversarial_ensure_sqlite_file_does_not_truncate_existing_db — 验证已有 DB 文件不被截断
+      - adversarial_ensure_sqlite_file_concurrent_threads_safe — 16 线程 × 50 次并发压测，确保无截断
+
+  # ─── MEDIUM ────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-002
+    severity: medium
     cwe: CWE-754
-    category: error-handling / over-broad substring match
+    category: "error_handling / 静默错误吞没"
     status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Replaced the `msg.contains("duplicate")` substring heuristic with a
-      `Store::column_exists(table, column)` pre-check. SQLite path uses
-      `pragma_table_info('<table>')` (with identifier whitelist
-      `is_safe_identifier` to prevent SQL injection through the unspliceable
-      pragma); Postgres / MySQL path uses `information_schema.columns`.
-      Driver detection: `current_database()` succeeds on Postgres/MySQL and
-      errors on SQLite, which is the discriminator. The ALTER only runs
-      when the column does NOT already exist, so the substring match is
-      removed entirely. New test `adversarial_v4_skips_alter_when_column_already_present`
-      verifies the skip path on a simulated pre-schema_version DB.
-    title: >-
-      v4's "duplicate column" detection is an unanchored `.to_lowercase().contains("duplicate")`
-      match that swallows unrelated errors
-    evidence:
-      - "src/store/mod.rs:251-256 — `if msg.contains(\"duplicate column\") || msg.contains(\"already exists\") || msg.contains(\"duplicate\")`"
-      - "src/store/mod.rs:252 — `let msg = e.to_string().to_lowercase()`"
-      - "src/store/mod.rs:255 — the trailing `contains(\"duplicate\")` matches `error 1: table 'x' has duplicate key 'y'` (e.g. a UNIQUE constraint violation) as if it were a benign column-already-exists case"
-    why_it_matters: >
-      The pattern is meant to catch "this column already exists
-      from a previous untracked run, so the ALTER is a no-op for
-      this specific DB". The trailing `contains("duplicate")`
-      arm is over-broad: a Postgres / MySQL error string like
-      `ERROR: duplicate key value violates unique constraint
-      "idx_context_token_map_real_ctx"` (which is the
-      v3-index-collision case the comment in
-      `map_context_token` at src/store/mod.rs:719-722 is
-      guarding against) would be matched by this arm and
-      silently swallowed. The migration runner would log
-      "v4 migration: created_at column already present,
-      skipping ALTER" and continue, leaving the database in
-      the same inconsistent state the v3 migration was
-      designed to prevent.
+    file: src/store/mod.rs
+    line: 548-549
+    symbol: Store::migrate_to_v4_tx
+    title: >
+      `migrate_to_v4_tx` 在 SQLite 路径上对 `pragma_table_info` 查询使用
+      `.unwrap_or(None)` 静默吞没所有错误
+    fix_applied: >
+      line 549 的 `.unwrap_or(None)` 改为 `?` 直接错误传播，与 Postgres/MySQL
+      分支保持一致。非事务版本 `column_exists` 保留 `.unwrap_or(None)` 作为
+      有意设计（调用方将列视为不存在，让 DDL 暴露真实错误）。
 
-      The same shape of error string is what
-      `find_assistant_message_by_content` (src/store/mod.rs:960-985)
-      and `map_context_token` rely on the unique index to
-      catch — a future call from one of those code paths
-      during a migration would surface a confusing "duplicate"
-      log line in the migration's info stream and never reach
-      the migration's error branch.
-    fix: >
-      Tighten the substring match. The actual error message
-      fragments that should pass through are database-specific:
+    adversarial_tests:
+      - adversarial_v4_tx_pragma_error_propagates — 验证 v4 tx 内 pragma 查询正确传播
+      - adversarial_column_exists_returns_false_on_nonexistent_table — 验证 column_exists 对不存在的表返回 Ok(false)
+      - adversarial_ddl_surfaces_error_after_column_exists_suppresses — 验证 DDL 在 column_exists 抑制后仍能暴露根因
 
-        SQLite:  "duplicate column name: created_at"
-        Postgres: "column \"created_at\" of relation \"context_token_map\" already exists"
-        MySQL:    "Error 1060: Duplicate column name 'created_at'"
-
-      Match the column name explicitly. The most robust fix
-      is to query the catalog before attempting the ALTER:
-
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'context_token_map'
-            AND column_name = 'created_at'
-
-      and short-circuit when the column is already present.
-      The information_schema query is portable across all
-      three supported drivers, avoids the string-match
-      footgun, and runs in microseconds against the
-      catalog. Apply it as a pre-check inside the
-      `if !is_migration_run(4)` branch, BEFORE the
-      `ALTER TABLE`.
-
-  - id: F-M1-03
-    severity: HIGH
+  - id: SEC-ADV-003
+    severity: medium
     cwe: CWE-754
-    category: silent-failure / type-error swallow
+    category: "silent_failure / 过度错误抑制"
     status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Replaced `r.try_get(0).unwrap_or(None)` with `r.try_get(0)?` in
-      `get_current_version` so column-decode errors propagate to the
-      caller. A DB that has rows but fails to decode them is no longer
-      conflated with a fresh DB. New test
-      `adversarial_get_current_version_propagates_decode_error` seeds
-      `schema_version` with a value > i32::MAX and asserts that
-      `get_current_version()` returns Err.
-    title: >-
-      `get_current_version` swallows column-type errors with `try_get(0).unwrap_or(None)`,
-      returning 0 (the "fresh DB" value) when the underlying query actually succeeded
-    evidence:
-      - "src/store/mod.rs:93-104 — `let val: Option<i32> = r.try_get(0).unwrap_or(None);`"
-      - "src/store/mod.rs:99-100 — `Ok(val.unwrap_or(0))`"
-      - "src/store/mod.rs:107-110 — `is_migration_run` reads `1` (literal int) into `fetch_optional` — if the column type shifts (e.g. someone changes `version` to BIGINT, or `0` is a valid MAX result) the unwrap_or chain produces wrong data"
-    why_it_matters: >
-      `try_get::<i32, _>(0)` on a non-i32 column (or a NULL returned
-      by an empty MAX) will fail with a `ColumnDecode` error.
-      `try_get(...).unwrap_or(None)` discards that error and
-      returns `None`. The outer `val.unwrap_or(0)` then returns
-      `0` — the same value the function returns for an empty
-      `schema_version` table. The two semantically different
-      conditions (the DB is fresh, vs. the DB has the table
-      but a column-type mismatch is preventing the read) are
-      indistinguishable from the caller's perspective.
+    file: src/store/mod.rs
+    line: 230-250
+    symbol: Store::try_claim_migration (MySQL 分支)
+    title: >
+      MySQL `INSERT IGNORE` 过度抑制所有错误类型，非重复键错误被静默丢弃
+    fix_applied: >
+      `try_claim_migration` 和 `try_claim_migration_in_tx` 的 MySQL 分支均添加
+      防御性 `SELECT` 验证：`INSERT IGNORE` 返回 `rows_affected() == 0` 后，
+      额外 SELECT 确认行确实存在；若行不存在则返回错误而非静默 `Ok(false)`。
 
-      A caller that uses `get_current_version() == 0` as a
-      "needs full migration" signal will silently re-run the
-      migration on a DB that already has the schema but where
-      sqlx's decode is failing. Combined with F-M1-04 (no
-      transaction around the migration runner), this can
-      produce a state where the migration is partially applied
-      and the gate is lying.
-    fix: >
-      Propagate the decode error. Replace the `unwrap_or(None)`
-      chain with a `match r.try_get::<Option<i32>, _>(0)` that
-      surfaces the error to the caller:
-
-          let val: Option<i32> = r.try_get(0)?;
-          Ok(val.unwrap_or(0))
-
-      The same applies to `is_migration_run` — if the column
-      type drifts, the read should fail loudly, not silently
-      return `false` (which the migration runner interprets
-      as "needs to apply"). The current `row.is_some()` is
-      the only signal, and it does not distinguish "no row
-      matches" from "row exists but column type is wrong".
-
-  - id: F-M1-04
-    severity: HIGH
-    cwe: CWE-362
-    category: TOCTOU between `is_migration_run` and `record_migration_run`
-    status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Same fix as F-M1-01. The TOCTOU is closed by the atomic
-      `try_claim_migration` primitive; `is_migration_run` and
-      `record_migration_run` are no longer used as the gate in
-      `run_migrations`. The unit-level guarantee is pinned by
-      `adversarial_try_claim_is_mutually_exclusive` (two back-to-back
-      claims produce exactly one true and one false).
-    title: >-
-      A concurrent `Store::connect` between the vN check and the vN mark can
-      double-run the DDL; the M1 design has no atomic check-and-claim primitive
-    evidence:
-      - "src/store/mod.rs:144-187 — v1 walk: is_migration_run(1) → four CREATE TABLE statements → record_migration_run(1)"
-      - "src/store/mod.rs:190-216 — v2 walk: same pattern, two CREATE TABLEs"
-      - "src/store/mod.rs:242-284 — v4 walk: is_migration_run(4) → ALTER TABLE (with substring-suppressed errors) → CREATE INDEX → record_migration_run(4)"
-      - "src/store/mod.rs:65-91 — `ensure_sqlite_file` is the only path that pins `max_connections(1)`; the Postgres / MySQL pool is the default"
-    why_it_matters: >
-      This is a refinement of F-M1-01. Even if the v3 / v4 DDL
-      were idempotent (v3's `CREATE UNIQUE INDEX IF NOT EXISTS`
-      is; v4's `ALTER TABLE ADD COLUMN` is not), the M1 design
-      has no primitive that atomically claims the version
-      before running the DDL. The migration runner reads
-      "have I done vN?", runs the DDL, then writes "I have
-      done vN". Between the read and the write, another
-      writer can do the same read, do the same DDL, and
-      then write the same row. `ON CONFLICT (version) DO
-      NOTHING` only deduplicates the final mark; the DDL
-      itself is not deduplicated.
-
-      On SQLite, the pool-serialization at
-      src/store/mod.rs:45-49 makes this race impossible
-      because only one writer holds the connection at a
-      time. On Postgres / MySQL, the default pool size
-      is 10, so the race is real. The M1 test surface
-      only covers the SQLite path.
-    fix: >
-      Adopt option (b) from F-M1-01: `INSERT INTO schema_version
-      (version) VALUES ($1) ON CONFLICT (version) DO NOTHING
-      RETURNING version` is the atomic claim. If the returning
-      value is non-null, the caller OWNS the DDL. If null, another
-      writer owns it; skip the DDL. This single change closes
-      F-M1-01, F-M1-04, and (with the F-M1-02 fix) the v4
-      `ALTER TABLE` race as a single conceptual unit.
-
-  # ─── MEDIUM ───────────────────────────────────────────────────────────────
-  - id: F-M1-05
-    severity: MEDIUM
-    cwe: CWE-754
-    category: error-handling / partial-apply window
-    status: ACKNOWLEDGED
-    fix_summary: >-
-      Out of M1 scope. Documented the "every DDL must be idempotent"
-      invariant at the top of `run_migrations` and added a SAFETY-style
-      comment. The claim row is now written BEFORE the DDL (the
-      `try_claim_migration` shape), so a partial DDL failure leaves
-      the version row present and a subsequent connect will skip the
-      broken step (DBA drops the row manually). M2's full-transaction
-      refactor is the proper fix; this finding remains open and is
-      folded into the M2 scope.
-    title: >-
-      `run_migrations` is not a single transaction — a DDL failure mid-migration
-      leaves the schema partially applied with no `schema_version` row
-    evidence:
-      - "src/store/mod.rs:144-187 — v1 issues four `self.ddl(...)` calls in sequence, each acquiring its own pool connection"
-      - "src/store/mod.rs:185 — `record_migration_run(1)` is called only after ALL four v1 DDLs succeed"
-      - "src/store/mod.rs:337-344 — `ddl` helper does NOT take a transaction; each call is its own autocommit"
-    why_it_matters: >
-      If the third v1 DDL (context_token_map) fails — disk full,
-      permission error, driver quirk — the first two (clients,
-      routing_state) are committed. The migration runner returns
-      Err to `Store::connect`, which returns Err to the caller,
-      which panics / shuts down. On the next `Store::connect`,
-      `is_migration_run(1)` returns `false` (no mark row was
-      written) and v1 re-runs. For `CREATE TABLE IF NOT EXISTS`
-      this is fine — but if a future migration includes a
-      non-idempotent DDL (e.g. an `INSERT INTO` seed, or an
-      `ALTER TABLE ... ADD CONSTRAINT`), the second run will
-      fail. The current migrations are all idempotent
-      (CREATE TABLE IF NOT EXISTS, CREATE UNIQUE INDEX IF NOT
-      NOT EXISTS, CREATE INDEX IF NOT EXISTS), so this is
-      latent, not active. But the design has no guard against
-      the next author writing a non-idempotent DDL and being
-      surprised when a partial-apply leaves the DB in a
-      half-migrated state.
-    fix: >
-      Either (a) document the "every DDL must be idempotent"
-      invariant at the top of `run_migrations` and add a
-      `// SAFETY:` line on each non-idempotent block (currently
-      v4's ALTER, which has the substring heuristic), or
-      (b) make the whole `run_migrations` walk one big
-      transaction (not all DDLs support this on all drivers —
-      Postgres DDL is transactional; SQLite DDL is also
-      transactional; MySQL DDL is NOT transactional in
-      InnoDB for many operations, so option (b) is not
-      portable). Option (a) is the realistic M1 fix; the
-      future M2 refactor can do option (b) for the SQLite
-      + Postgres drivers.
-
-  - id: F-M1-06
-    severity: MEDIUM
-    cwe: CWE-754
-    category: test-coverage gap on the v4 fallback
-    status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      New test `adversarial_v4_skips_alter_when_column_already_present`
-      pre-creates `context_token_map` with `created_at` already present,
-      marks v1+v2 as run, then runs `run_migrations`. Asserts v1-v5 are
-      all marked applied, no DDL error is raised, and the `created_at`
-      column is still present (we only skip the ALTER, never drop). The
-      pre-check is now `pragma_table_info` / `information_schema.columns`
-      rather than the substring match, so the test pins the new
-      behaviour down.
-    title: >-
-      `test_migration_incremental_from_v2` does not exercise v4's
-      "column already exists" fallback — the substring match is uncovered
-    evidence:
-      - "src/store/mod.rs:1062-1161 — test_migration_incremental_from_v2 creates the v1 / v2 tables and marks v1+v2 as run, but does NOT pre-create the `created_at` column on `context_token_map`"
-      - "src/store/mod.rs:1100-1106 — the test's `context_token_map` DDL omits the `created_at` column"
-      - "src/store/mod.rs:1149-1153 — the test then runs `run_migrations`, which hits the v4 ALTER as a fresh column add — never exercises the `msg.contains(\"duplicate\")` branch at src/store/mod.rs:251-256"
-    why_it_matters: >
-      The F-M1-02 substring heuristic is load-bearing for any
-      pre-schema_version deployment that already has the
-      `created_at` column. The test that should pin the
-      behaviour down — "v4 fallback works on a DB where the
-      column was added by a prior untracked ALTER" — does not
-      exist. If a future refactor changes the substring or
-      the driver's error message format (Postgres 16, MySQL 9),
-      the v4 fallback will silently break and no CI run will
-      catch it. CWE-754 (improper check for unusual
-      conditions) on the test side.
-    fix: >
-      Add a third scenario to the test (or a new test):
-
-        1. Manually create the v1 + v2 tables.
-        2. Manually `ALTER TABLE context_token_map ADD COLUMN
-           created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)`
-           (simulating the pre-schema_version state).
-        3. Mark v1 + v2 as run.
-        4. Call `run_migrations`.
-        5. Assert: v3, v4, v5 are all marked; the
-           `tracing::debug!("v4 migration: created_at column
-           already present, skipping ALTER")` was emitted.
-
-      A second test that asserts the F-M1-02 fix is preferred
-      over the substring match (e.g. by checking the
-      information_schema pre-check) would be the strongest
-      regression guard.
-
-  - id: F-M1-07
-    severity: MEDIUM
-    cwe: CWE-1188
-    category: API surface / foot-gun
-    status: ACKNOWLEDGED
-    fix_summary: >-
-      Documented the API surface. The M1 review surface for migrations
-      is now: `get_current_version` (pub), `is_migration_run` (pub),
-      `try_claim_migration` (pub — the new atomic primitive), and
-      `record_migration_run` (pub, kept for symmetry). All four bind
-      the version through the driver, so non-i32 inputs surface as
-      decode errors rather than being silently accepted. Tightening
-      `pub` → `pub(crate)` for `record_migration_run` is folded into
-      the M2 cleanup; M1 accepts the wider surface as the cost of
-      leaving the public API unchanged for downstream callers. New
-      test `adversarial_version_api_boundaries` pins down the
-      boundary behaviour for version = 0 and negative values.
-    title: >-
-      `record_migration_run` is `pub` and accepts any `i32` — external
-      callers can insert ghost version rows and confuse the migration runner
-    evidence:
-      - "src/store/mod.rs:114-123 — `pub async fn record_migration_run(&self, version: i32)`"
-      - "src/store/mod.rs:106-112 — `is_migration_run` accepts any `i32`, including 0, negative, or arbitrarily large"
-      - "src/store/mod.rs:93-104 — `get_current_version` returns MAX(version) over all rows, including any ghost"
-    why_it_matters: >
-      The current call sites are internal to `run_migrations`
-      (versions 1..=5). The `pub` visibility means a future
-      contributor writing a CLI admin tool, a recovery script,
-      or a Tauri command can call `record_migration_run(99)`
-      and insert a row that does not correspond to a real
-      migration. On the next `Store::connect`, the runner
-      sees `is_migration_run(99) == true` and skips the
-      "v99" block (which does not exist), but `get_current_version`
-      returns 99, which any external "is the DB fully migrated?"
-      check would interpret as "the DB has 99 migrations
-      applied". The `get_hub_ext_batch` and other query paths
-      are unaffected, but the semantic of `get_current_version`
-      is now lying.
-    fix: >
-      Tighten the API:
-        - `record_migration_run` should be `pub(crate)` or
-          `async fn` with a small `pub(crate)` wrapper
-          that validates `1 <= version <= MIGRATION_LATEST`.
-        - `is_migration_run` should clamp input to a sensible
-          range (e.g. reject negatives with an explicit Err,
-          or document that it returns false for any version
-          outside 1..=5).
-        - `get_current_version` should be the only public
-          "what is the schema state" query; the others
-          should be private helpers for `run_migrations`.
-
-      This is a small-surface refactor (one `pub` → `pub(crate)`,
-      one input-range check) and pins the M1 surface down so
-      a future maintainer can't accidentally widen it.
-
-  - id: F-M1-08
-    severity: MEDIUM
-    cwe: CWE-1188
-    category: test-coverage gap on concurrent-`Store::connect`
-    status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Added `adversarial_concurrent_store_connect_succeeds_and_converges`
-      (two sequential `Store::connect` calls on the same file DB) and
-      `adversarial_many_concurrent_connects_converge` (10 sequential
-      connects, all converging to version 5). These are sequential
-      rather than `tokio::join!` because two Stores on the same SQLite
-      file each open their own connection (`max_connections(1)` is
-      per-Store), racing on the file lock with timing-sensitive
-      SQLITE_BUSY behaviour. The atomic-claim guarantee being tested
-      is the `INSERT ... ON CONFLICT DO NOTHING RETURNING` SQL
-      semantics, not the SQLite file-lock timing — that has its own
-      `file_sqlite_serializes_concurrent_read_and_write_without_busy`
-      test. The Postgres / MySQL claim semantics are unit-tested by
-      `adversarial_try_claim_is_mutually_exclusive`.
-    title: >-
-      The M1 test inventory does not cover concurrent `Store::connect`
-      against the same file-backed SQLite database — the exact scenario
-      that the M1 design surface makes observable
-    evidence:
-      - "src/store/mod.rs:1193-1285 — file_sqlite_serializes_concurrent_read_and_write_without_busy tests a SHARED `Store` instance; it does NOT test two concurrent `Store::connect(url)` calls"
-      - "src/store/mod.rs:1019-1037 — test_schema_version_tracking uses a single Store::connect"
-      - "src/store/mod.rs:1042-1057 — test_migration_idempotency uses a single Store::connect (calls `run_migrations` twice on the same instance)"
-      - "src/store/mod.rs:1062-1161 — test_migration_incremental_from_v2 uses a single Store::connect"
-    why_it_matters: >
-      The M1 design's correctness depends on the pool's
-      single-connection invariant for SQLite AND on the
-      atomic check-and-claim for Postgres/MySQL. The
-      existing tests verify the former only for shared
-      instances (the 8-task race in
-      `file_sqlite_serializes_concurrent_read_and_write_without_busy`
-      uses a SINGLE `Store` Arc); they do NOT verify
-      that two `Store::connect` calls in flight against
-      the same file URL serialise correctly via the
-      pool's `max_connections(1)` constraint.
-
-      A subtle race: if the URL doesn't go through
-      `ensure_sqlite_file` (e.g. a future URL form
-      like `sqlite:file::memory:?cache=shared`), the
-      pool will get the default size. The test does
-      not cover this. Even on the supported URL forms,
-      a regression that removed the `if url.starts_with("sqlite:")`
-      guard at src/store/mod.rs:45 would not be caught
-      by the existing tests (the tests would still
-      pass because they use `sqlite::memory:` which
-      goes through the guard).
-    fix: >
-      Add a regression test:
-
-          #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-          async fn concurrent_store_connect_serialises_migrations() {
-              let tmp = tempfile::tempdir().unwrap();
-              let url = format!("sqlite:{}/concurrent.db", tmp.path().display());
-              let url1 = url.clone();
-              let url2 = url.clone();
-              let (s1, s2) = tokio::join!(
-                  async move { Store::connect(&url1).await.unwrap() },
-                  async move { Store::connect(&url2).await.unwrap() },
-              );
-              assert_eq!(s1.get_current_version().await.unwrap(), 5);
-              assert_eq!(s2.get_current_version().await.unwrap(), 5);
-          }
-
-      This pins the M1 invariant (max_connections(1) on
-      sqlite URLs) end-to-end through the public
-      `Store::connect` surface. If a future refactor
-      removes the `if url.starts_with("sqlite:")` branch,
-      this test fails loudly with an obvious diff.
+    adversarial_tests:
+      - adversarial_try_claim_in_tx_is_mutually_exclusive — 验证 in-tx claim 互斥性（两个并发事务仅一个获胜）
 
   # ─── LOW ──────────────────────────────────────────────────────────────────
-  - id: F-M1-09
-    severity: LOW
+  - id: SEC-ADV-004
+    severity: low
     cwe: CWE-1188
-    category: log/code drift hazard
+    category: "defense_in_depth / 依赖隐式默认值"
     status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      All `tracing::info!("migration vN applied: ...")` log lines now use
-      the structured `version = N` field:
-      `tracing::info!(version = N, "migration applied: ...")`. Operators
-      can filter by `version=N` and verify that exactly one log line
-      was emitted for each row in `schema_version`.
-    title: >-
-      `tracing::info!` hard-codes the version number in the log message;
-      future renumbering will desync the log from the `schema_version` row
-    evidence:
-      - "src/store/mod.rs:186 — `tracing::info!(\"migration v1 applied: initial schema\");`"
-      - "src/store/mod.rs:215 — `tracing::info!(\"migration v2 applied: backend session tables\");`"
-      - "src/store/mod.rs:230 — `tracing::info!(\"migration v3 applied: real_ctx unique index\");`"
-      - "src/store/mod.rs:281-283 — `tracing::info!(\"migration v4 applied: context_token_map created_at column + index\");`"
-      - "src/store/mod.rs:325 — `tracing::info!(\"migration v5 applied: messages table + indexes\");`"
-    why_it_matters: >
-      A future refactor that re-numbers versions (e.g.
-      inserting a new v2.5 between v2 and v3, or splitting
-      v4 into v4 + v4b) will need to update both the
-      `is_migration_run(N)` call AND the log message.
-      A maintainer who updates only the gate would leave
-      the log saying "v4 applied" when v4 was actually
-      skipped. Operators reading the migration log have
-      no easy way to verify the log matches the
-      `schema_version` table content. CWE-1188
-      (incomplete documentation of behaviour).
-    fix: >
-      Use the version as a structured field:
+    file: src/store/mod.rs
+    line: 96-106
+    symbol: Store::connect
+    title: >
+      SQLite `busy_timeout` 依赖 sqlx 内部默认值，未显式配置，
+      版本升级可能改变行为
+    fix_applied: >
+      通过 `after_connect` 回调显式执行 `PRAGMA busy_timeout=5000`。
 
-          tracing::info!(version = 1, "migration applied: initial schema");
+    adversarial_tests:
+      - adversarial_sqlite_connect_configures_wal_and_busy_timeout — 验证连接后 busy_timeout=5000 + journal_mode=wal
 
-      Operators can then filter by `version=4` and verify
-      that exactly one log line was emitted for each row
-      in `schema_version`. This is a 5-line cosmetic
-      change; low priority but good hygiene.
-
-  - id: F-M1-10
-    severity: LOW
-    cwe: CWE-440
-    category: expected-behaviour / API surface
+  - id: SEC-ADV-005
+    severity: low
+    cwe: CWE-754
+    category: "code_quality / 脆弱错误检测"
     status: FIXED
-    fixed_in_commit: PENDING
-    fix_summary: >-
-      Covered by the F-M1-03 fix. With `r.try_get(0)?` in place,
-      `get_current_version` returns `Ok(0)` ONLY when the table is
-      empty (or does not exist). Any column-decode error is now
-      propagated as `Err` and surfaces to the caller. A `Store` with
-      a fully-applied schema can no longer silently return 0.
-    title: >-
-      `get_current_version` returns 0 for an empty table AND for any
-      column-decode error (after the F-M1-03 swallow), but does not
-      distinguish the two — a `Store` with a fully-applied schema can
-      return 0 if the decode is failing
-    evidence:
-      - "src/store/mod.rs:98-103 — `match row { Some(r) => ..., None => Ok(0) }`"
-      - "src/store/mod.rs:99-100 — `let val: Option<i32> = r.try_get(0).unwrap_or(None); Ok(val.unwrap_or(0))`"
-    why_it_matters: >
-      The two paths to `Ok(0)` are not equivalent: the first
-      ("the table is empty — fresh DB") is the documented
-      behaviour; the second ("the table has rows but the
-      decode failed") is a silent failure. From the
-      caller's perspective, the return value is the same
-      and the error chain is empty. The migration runner
-      (when M2 is implemented) will likely use this value
-      as a gate; a silent 0 from a decode error will
-      cause M2 to re-run a migration that was already
-      applied, potentially corrupting state.
-    fix: >
-      Tighten the decode (F-M1-03's fix already covers
-      this). Then, if `get_current_version` returns 0,
-      the caller knows the table is empty (or does not
-      exist), not that some other error occurred.
+    file: src/store/mod.rs
+    line: 2110-2118
+    symbol: "adversarial_many_concurrent_connects_converge (测试代码)"
+    title: >
+      并发连接测试中的重试逻辑依赖字符串匹配 `contains("database is locked")`，
+      跨 SQLite 版本/语言环境可能失效
+    fix_applied: >
+      替换为结构化错误码判断：`db_err.code().as_deref() == Some("5")`
+      (SQLITE_BUSY)，不依赖错误消息文本。
 
-# ─── Claims in review-request.yaml — verification status ────────────────────
-# Each claim in the request is annotated with the finding that catches it
-# (if any) or "verified" (if the source matches the claim and no exploit
-# was found).
-claim_audit:
-  - claim: "schema_version table has been defined and is created at the beginning of run_migrations"
-    status: verified
-    note: "src/store/mod.rs:135-141 — `CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))` runs as the first DDL."
-  - claim: "Implemented Store::is_migration_run and Store::record_migration_run to check and log migrated versions"
-    status: verified
-    note: "src/store/mod.rs:106-123 — both helpers are present, use bind parameters, and use ON CONFLICT DO NOTHING for the mark. The API surface is wider than necessary (F-M1-07) but functionally correct."
-  - claim: "Implemented Store::get_current_version which queries the MAX version from schema_version"
-    status: PARTIALLY_VERIFIED
-    note: "src/store/mod.rs:93-104 — the query is correct, but the `try_get(0).unwrap_or(None)` chain silently swallows decode errors (F-M1-03). On a working DB the function returns the right value."
-  - claim: "Test test_schema_version_tracking covers the v1-v5 migration gate, version query, and id-query"
-    status: verified
-    note: "src/store/mod.rs:1018-1037 — three assertions: get_current_version==5, is_migration_run(1..=5)==true, is_migration_run(0)==false. All pass on a fresh in-memory DB."
-  - claim: "Test test_migration_idempotency verifies that running run_migrations twice is safe"
-    status: verified
-    note: "src/store/mod.rs:1042-1057 — second run_migrations is a no-op (every DDL is IF NOT EXISTS; the gates short-circuit; the marks are ON CONFLICT DO NOTHING)."
-  - claim: "Test test_migration_incremental_from_v2 verifies the upgrade path from a pre-v3 DB"
-    status: PARTIALLY_VERIFIED
-    note: "src/store/mod.rs:1062-1161 — the test exercises the v3, v5 paths and the v4 fresh-ALTER path. It does NOT exercise v4's `column already exists` fallback (F-M1-06). The fallback's correctness is therefore unverified by CI."
-  - claim: "cargo fmt / clippy / test / build all pass"
-    status: verified
-    note: "Re-ran all four commands locally; cargo fmt --check exits 0 with no output, cargo clippy -- -D warnings exits 0, cargo test exits 0 (206 passed, 0 failed, 0 ignored), cargo build exits 0. desktop-frontend and desktop-tauri builds also pass."
-  - claim: "Schema design separates v1-v5 cleanly with idempotency via IF NOT EXISTS and schema_version guards"
-    status: VERIFIED
-    note: "Re-reviewed. v1, v2, v3, v5 are all IF NOT EXISTS or guarded by `try_claim_migration` (the new atomic check-and-claim primitive, F-M1-01/F-M1-04). v4's ALTER is now gated by `Store::column_exists` (information_schema.columns on Postgres/MySQL, pragma_table_info on SQLite, F-M1-02) — no more substring match, no more silent swallow of unrelated errors. The substring heuristic was removed; the new pre-check is covered by `adversarial_v4_skips_alter_when_column_already_present` (F-M1-06)."
+    adversarial_tests:
+      - (内嵌于 adversarial_many_concurrent_connects_converge — 10 并发 connect 压测)
 
-# ─── New adversarial tests added in this re-review ───────────────────────
-adversarial_tests:
-  - name: adversarial_concurrent_store_connect_succeeds_and_converges
-    covers: F-M1-01, F-M1-04, F-M1-08
-  - name: adversarial_many_concurrent_connects_converge
-    covers: F-M1-01
-  - name: adversarial_v4_skips_alter_when_column_already_present
-    covers: F-M1-02, F-M1-06
-  - name: adversarial_get_current_version_propagates_decode_error
-    covers: F-M1-03, F-M1-10
-  - name: adversarial_version_api_boundaries
-    covers: F-M1-07
-  - name: adversarial_try_claim_is_mutually_exclusive
-    covers: F-M1-01, F-M1-04
+  - id: SEC-ADV-006
+    severity: low
+    cwe: CWE-1188
+    category: "performance / 并发吞吐"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 101-105
+    symbol: Store::connect
+    title: >
+      SQLite 未启用 WAL 模式，`max_connections(1)` 完全串行化读写，
+      多任务场景下吞吐量受限
+    fix_applied: >
+      通过 `after_connect` 回调执行 `PRAGMA journal_mode=WAL;`。
+      WAL 模式下写操作不阻塞读操作，提升 crash 安全性和写吞吐。
 
-# ─── Verification status (re-review) ─────────────────────────────────────
-re_verification:
-  cargo_fmt: PASS
-  cargo_clippy: PASS
-  cargo_test: PASS
-  cargo_build: PASS
-  notes: >-
-    All 287 tests pass (214 unit + 20 + 10 + 27 + 1 + 15 across the
-    test binary targets). 6 new adversarial tests added; 3 sequential
-    re-runs of `cargo test --lib store_tests` produced 15 passed / 0
-    failed each time, confirming no flakiness in the new tests.
+    adversarial_tests:
+      - adversarial_sqlite_connect_configures_wal_and_busy_timeout — 验证 journal_mode=wal
 
-# ─── Verdict ─────────────────────────────────────────────────────────────────
-verdict: PASS
-previous_verdict: NEEDS_FIX
-blocking_findings: []  # all blocking findings from the previous review are FIXED
-non_blocking:
-  - F-M1-05  # MEDIUM — partial-apply window on DDL failure mid-migration (folded into M2)
-  - F-M1-07  # MEDIUM — record_migration_run visibility / input validation (folded into M2)
+  # ─── INFO ─────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-007
+    severity: info
+    cwe: CWE-1188
+    category: "observation / 冗余调用"
+    status: FIXED
+    file: src/main.rs
+    line: 80
+    symbol: main
+    title: >
+      `sqlx::any::install_default_drivers()` 每次 `connect` 都被调用，幂等但冗余
+    fix_applied: >
+      移到 `main` 函数中一次性调用；`Store::connect` 中不再调用。
 
-# ─── Resolution summary ────────────────────────────────────────────────────
-resolution_summary:
-  fixed_in_this_re_review:
-    - F-M1-01  # CRITICAL — atomic try_claim_migration primitive
-    - F-M1-02  # HIGH — information_schema / pragma_table_info pre-check
-    - F-M1-03  # HIGH — propagate column-decode errors
-    - F-M1-04  # HIGH — atomic check-and-claim closes TOCTOU
-    - F-M1-06  # MEDIUM — v4 pre-check now covered by adversarial_v4_skips_alter test
-    - F-M1-08  # MEDIUM — sequential adversarial connect tests
-    - F-M1-09  # LOW — structured version field in log lines
-    - F-M1-10  # LOW — covered by F-M1-03 fix
-  acknowledged_carried_to_m2:
-    - F-M1-05  # MEDIUM — full-transaction DDL refactor is M2's scope
-    - F-M1-07  # MEDIUM — pub → pub(crate) for record_migration_run is M2's scope
-  verification:
-    cargo_fmt: PASS
-    cargo_clippy: PASS
-    cargo_test: "PASS (287 tests, 0 failed)"
-    cargo_build: PASS
+# ─── 已验证通过的 M1 关键条件 ───────────────────────────────────────────────
+verified_conditions:
+  - id: claim-atomicity
+    description: >
+      `try_claim_migration` 的 SQLite/Postgres 分支使用
+      `INSERT ... ON CONFLICT DO NOTHING RETURNING version` 实现了正确的原子操作。
+      并发测试 `adversarial_try_claim_is_mutually_exclusive_concurrent`
+      验证了两个 `tokio::join!` 并发 claim 的互斥性。**无问题。**
+  - id: cross-version-race
+    description: >
+      `run_migrations` 在单个连接+事务内编排 v1-v5，每个 per-version migrator
+      通过 `try_claim_migration_in_tx` 在当前事务内 claim。事务提交前 claim 行
+      对其他连接不可见（SQLite/Postgres），正确关闭了跨版本竞态窗口。**无问题。**
+  - id: sentinel-filter
+    description: >
+      `get_current_version` 正确排除 i32::MAX 哨兵行（`WHERE version < $1`），
+      外部调用方始终看到真实版本号。**无问题。**
+  - id: ddl-idempotency
+    description: >
+      所有 DDL 使用 `IF NOT EXISTS` 守卫或 `column_exists` 预检查，
+      幂等安全。v4 的预检查在事务内执行（`migrate_to_v4_tx`），
+      避免了 F-M3-04 的死锁问题。**无问题。**
+  - id: driver-dispatch
+    description: >
+      `DatabaseKind::from_url` 正确解析 URL scheme，`v5_create_messages_sql`
+      按驱动生成正确的 id 列语法。**无问题。**
+  - id: error-propagation
+    description: >
+      DDL 失败通过 `?` 传播到 `run_migrations` 调用方，事务回滚。
+      不会被静默吞没。**无问题。**
+  - id: sql-injection
+    description: >
+      `column_exists` 在 SQLite 路径使用 `is_safe_identifier` 白名单校验
+      （仅允许 `[a-zA-Z0-9_]`）后才将 table/column 名拼接到
+      `pragma_table_info` 查询。单引号不在白名单中，无法逃逸字符串上下文。**无问题。**
+  - id: timestamp-unification
+    description: >
+      所有 DDL 和 SQL 文件统一使用 `CURRENT_TIMESTAMP`，
+      无 `datetime('now')` 残留。**无问题。**
+  - id: wal-and-busy-timeout-explicit
+    description: >
+      `after_connect` 回调显式设置 `PRAGMA journal_mode=WAL` 和
+      `PRAGMA busy_timeout=5000`，不再依赖 sqlx 内部默认值。**无问题。**
+  - id: insert-ignore-defensive-check
+    description: >
+      MySQL `INSERT IGNORE` 路径添加防御性 SELECT 验证：
+      若 INSERT 返回 0 行但 SELECT 确认行不存在，则返回错误而非静默 `Ok(false)`。
+      `try_claim_migration` 和 `try_claim_migration_in_tx` 均已修复。**无问题。**
 
-# ─── Suggested M2 scope additions ──────────────────────────────────────────
-# The M2 plan already says it will refactor `run_migrations` and
-# fix the `if let Err(e) = ...` swallow-logic. The following M1
-# findings should fold into M2's refactor:
-#
-#   F-M1-01 / F-M1-04 → refactor to the `INSERT ... ON CONFLICT
-#     DO NOTHING RETURNING` check-and-claim pattern. The vN DDL
-#     runs only when the returning value is non-null. This single
-#     change closes both findings.
-#   F-M1-02 → replace the substring match with an information_schema
-#     pre-check, OR tighten the substring to require both
-#     "duplicate" and the column name "created_at" / the table name
-#     "context_token_map" to be present in the error string.
-#   F-M1-03 / F-M1-10 → propagate column-decode errors with
-#     `r.try_get(0)?` instead of `r.try_get(0).unwrap_or(None)`.
-#   F-M1-05 → add the "every DDL must be idempotent" comment, or
-#     make the whole walk one transaction on SQLite/Postgres.
-#   F-M1-06 → add a test that pre-creates the `created_at` column
-#     to exercise the v4 fallback.
-#   F-M1-07 → tighten `record_migration_run` / `is_migration_run`
-#     visibility and input validation.
-#   F-M1-08 → add a concurrent-Store::connect regression test.
-#
-# The low-severity findings (F-M1-09, F-M1-10) can ship with M1
-# as-is and be cleaned up in a later "M1 hardening" commit.
+# ─── Summary ─────────────────────────────────────────────────────────────────
+summary:
+  total_findings: 7
+  high: 1
+  medium: 2
+  low: 3
+  info: 1
+  fixed: 7
+  open: 0
+  blocking: 0
+  adversarial_tests_added: 9
+  adversarial_tests_detail: >
+    新增 9 个对抗性测试：
+    - adversarial_ensure_sqlite_file_does_not_truncate_existing_db (SEC-ADV-001)
+    - adversarial_ensure_sqlite_file_concurrent_threads_safe (SEC-ADV-001)
+    - adversarial_v4_tx_pragma_error_propagates (SEC-ADV-002)
+    - adversarial_column_exists_returns_false_on_nonexistent_table (SEC-ADV-002)
+    - adversarial_ddl_surfaces_error_after_column_exists_suppresses (SEC-ADV-002)
+    - adversarial_try_claim_in_tx_is_mutually_exclusive (SEC-ADV-003)
+    - adversarial_sqlite_connect_configures_wal_and_busy_timeout (SEC-ADV-004/006)
+    - adversarial_many_concurrent_connects_converge 内嵌结构化错误码检查 (SEC-ADV-005)
+    全部 315 测试通过（242 lib + 20 breaking + 10 e2e + 27 routing + 1 metrics + 15 queue），
+    clippy 零警告，build 成功。
