@@ -1,0 +1,62 @@
+milestone: M4
+title: "最终质量门 — 全量验证"
+verdict: PASS
+reviewer: ci-gate
+date: "2026-06-17"
+
+summary: |
+  M4 最终质量门验证：所有 6 项检查全部通过，分支可合并。
+
+verification_results:
+  - id: VFY-01
+    check: cargo fmt --check
+    result: PASS
+    output: "(无输出 — 零差异)"
+
+  - id: VFY-02
+    check: cargo clippy -- -D warnings
+    result: PASS
+    output: "Finished `dev` profile — 零警告"
+
+  - id: VFY-03
+    check: cargo test
+    result: PASS
+    output: "308 passed, 0 failed (235 unit + 20 breaking + 10 e2e + 27 integration + 1 metrics + 15 queue)"
+
+  - id: VFY-04
+    check: cargo build
+    result: PASS
+    output: "Finished `dev` profile"
+
+  - id: VFY-05
+    check: npm run build (desktop/ilink-hub-desktop)
+    result: PASS
+    output: "vite v6.4.3 — 3 modules, built in 265ms"
+
+  - id: VFY-06
+    check: cargo check (desktop/ilink-hub-desktop/src-tauri)
+    result: PASS
+    output: "Finished `dev` profile"
+
+milestone_summary:
+  M1:
+    title: "安全文档与 Docker 示例完善"
+    status: DONE
+  M2:
+    title: "AUTH_ERROR_KEYWORDS 常量提取"
+    status: DONE
+  M3:
+    title: "bridge 超时行为文档化"
+    status: DONE
+  M4:
+    title: "最终质量门"
+    status: PASS
+
+code_quality_notes:
+  - "cargo fmt — 代码格式化零差异"
+  - "cargo clippy -D warnings — 零 lint 警告"
+  - "cargo test — 308 测试全部通过，零失败"
+  - "cargo build — 编译成功"
+  - "桌面端前端 Vite 构建成功"
+  - "桌面端 Tauri 原生层编译检查通过"
+  - "E2E_PASS: 分支可合并"

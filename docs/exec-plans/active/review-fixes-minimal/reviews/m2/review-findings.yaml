@@ -1,0 +1,74 @@
+milestone: M2
+title: "AUTH_ERROR_KEYWORDS 常量提取 — 对抗性审查"
+verdict: PASS
+reviewer: rust-security-expert
+date: "2026-06-17"
+
+summary: |
+  变更仅将 `handle_one_message` 和 `dry_run_profile` 中重复的本地 `keywords` 数组提取为
+  模块级 `const AUTH_ERROR_KEYWORDS: &[&str]`。编译时常量，无共享可变状态，行为与提取前完全一致。
+  未发现内存安全、data race、tokio 异步陷阱或 OWASP 安全问题。
+
+findings:
+  - id: MEM-01
+    severity: info
+    category: memory_safety
+    title: const 引用无内存安全风险
+    description: |
+      `AUTH_ERROR_KEYWORDS` 声明为 `const &[&str]`，所有元素均为 `&'static str` 字面量。
+      Rust `const` 值在编译时求值，每个使用点内联展开，不涉及堆分配或运行时初始化。
+      不存在悬垂指针、use-after-free、buffer overflow 等内存安全风险。
+    verdict: 无需修改
+
+  - id: RACE-01
+    severity: info
+    category: data_race
+    title: 只读常量，无 data race 可能
+    description: |
+      两个使用点（`handle_one_message` 第 513 行、`dry_run_profile` 第 1097 行）均为
+      只读访问。`const` 在 Rust 中不具有内存地址（不存在 `&AUTH_ERROR_KEYWORDS` 表达式），
+      因此不存在跨线程共享引用的竞争条件。tokio 任务间无需同步。
+    verdict: 无需修改
+
+  - id: ASYNC-01
+    severity: info
+    category: tokio_async
+    title: 关键字匹配不跨越 .await 点
+    description: |
+      两个调用点（`AUTH_ERROR_KEYWORDS.iter().any(...)`）都在同步上下文中执行：
+      - `handle_one_message` 中位于 `Err(e)` 分支内，无 `.await` 跨跃
+      - `dry_run_profile` 中在 `child.wait_with_output()` 完成后执行，同步判断
+      不存在将非 Send 类型跨 `.await` 持有、或阻塞运行时线程的风险。
+    verdict: 无需修改
+
+  - id: OWASP-01
+    severity: info
+    category: owasp_a02_cryptographic_failures
+    title: 关键字列表不包含机密信息
+    description: |
+      AUTH_ERROR_KEYWORDS 包含的是纯文本检测关键词（"login", "token" 等），
+      不是密钥、密码或 token 值。编译进二进制不会造成信息泄露。
+    verdict: 无需修改
+
+  - id: OWASP-02
+    severity: low
+    category: owasp_a05_security_misconfiguration
+    title: 关键词匹配可能存在误报（false positive）
+    description: |
+      `contains()` 子串匹配可能将非认证错误的 CLI 输出误判为认证失败。
+      例如：CLI 输出 "Processing 401 records" 会匹配 "401"。
+      误报的后果是 bridge 进程 `std::process::exit(1)` 退出（handle_one_message）
+      或返回 `ProbeError::Unauthenticated`（dry_run_profile），导致服务中断。
+    recommendation: |
+      考虑将 `"401"` 替换为更精确的模式（如 `"401 unauthorized"`），或采用
+      正则匹配（如 `\b401\b`）避免数字巧合。当前风险为 low，因为 bridge 运行的
+      CLI 命令由管理员配置，输出可控。
+    affected_files:
+      - src/bridge/mod.rs:48
+
+code_quality_notes:
+  - "const AUTH_ERROR_KEYWORDS 消除了代码重复，遵循 DRY 原则"
+  - "const 而非 static 的选择正确 — 避免静态内存地址和潜在的初始化顺序问题"
+  - "类型标注 &[&str] 准确表达了不可变切片语义"
+  - "两处使用点的大小写处理一致（均先 to_lowercase 再匹配）"
+  - "\"not found\" 和 \"no such file\" 保留在 AUTH_ERROR_KEYWORDS 之外是合理的 — 这些关键词的语义范围更广"

@@ -21,7 +21,7 @@
 - [x] `npm run build` (desktop frontend) — 成功
 - [x] `cargo check` (desktop tauri) — 成功
 - [x] M3 待执行 → ✅
-- [ ] M4 待执行
+- [x] M4 ✅
 
 ## M2 — AUTH_ERROR_KEYWORDS 常量提取 ✅
 
@@ -42,6 +42,24 @@
 - [x] `cargo build` — 成功
 - [x] `npm run build` (desktop frontend) — 成功
 - [x] `cargo check` (desktop tauri) — 成功
+
+## M4 — 最终质量门 ✅
+
+**完成时间**: 2026-06-17
+
+### 验证结果
+
+| 检查项 | 命令 | 结果 |
+|--------|------|------|
+| fmt | `cargo fmt --check` | PASS — 零差异 |
+| clippy | `cargo clippy -- -D warnings` | PASS — 零警告 |
+| test | `cargo test` | PASS — 308 passed, 0 failed |
+| build | `cargo build` | PASS |
+| desktop-frontend | `npm run build` (desktop/ilink-hub-desktop) | PASS — vite built in 265ms |
+| desktop-tauri | `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | PASS |
+
+- [x] M4 review-request.yaml 已写入
+- [x] E2E_PASS — 分支可合并
 
 ## M3 — bridge 超时行为文档化 ✅
 
