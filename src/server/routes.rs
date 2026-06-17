@@ -770,7 +770,8 @@ pub async fn admin_delete_client(
         );
     }
 
-    match crate::server::pairing::unregister_client_in_hub(state.as_ref(), name, query.force).await {
+    match crate::server::pairing::unregister_client_in_hub(state.as_ref(), name, query.force).await
+    {
         Ok(()) => (
             StatusCode::OK,
             Json(AdminDeleteClientResponse {
