@@ -177,4 +177,38 @@ Commit: 81ab0e4
 
 Commit: 099971e
 
+---
+
+## M6: 质量门禁 — done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：执行六项质量门禁命令（fmt、clippy、test、build 以及桌面端编译和 Tauri check），保证所有检查全绿通过。
+- **审查请求**：[reviews/m6/review-request.yaml](./reviews/m6/review-request.yaml)
+
+### 关键改动
+
+- 执行并验证了以下六项质量门禁命令，均无任何错误或警告：
+  - `cargo fmt --check`
+  - `cargo clippy -- -D warnings`
+  - `cargo test`
+  - `cargo build`
+  - `cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build`
+  - `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml`
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: 3407250
+
 

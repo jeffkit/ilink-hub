@@ -1,0 +1,59 @@
+milestone: M6
+title: SEC-010 Body Limit + SEC-007 Metrics Auth — 质量门禁
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 跑通所有质量门禁命令以保证代码质量和向后兼容性。
+  - fmt、clippy、test、build 以及 desktop 端的各项验证命令均需全绿。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m6/review-request.yaml
+    lines:
+      - 1-50: 新建 M6 审查请求文件。
+  - file: docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md
+    lines:
+      - 追加记录 M6 里里程碑的执行结果与通过状态。
+
+# ─── 验证命令（M6 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 无特别风险。六项验证命令已全部成功跑通，确认没有引起新的 clippy 警告或编译/测试失败。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m6/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md (M6 状态更新)
+  - git commit (M6 提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否包含 cargo fmt --check 验证？
+  - [x] 是否包含 cargo clippy -- -D warnings 验证？
+  - [x] 是否包含 cargo test 验证？
+  - [x] 是否包含 cargo build 验证？
+  - [x] 是否包含 desktop-frontend 的编译验证？
+  - [x] 是否包含 desktop-tauri 的 check 验证？
