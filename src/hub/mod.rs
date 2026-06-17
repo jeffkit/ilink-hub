@@ -1513,11 +1513,12 @@ mod tests {
             .await
             .expect("in-memory store");
 
-        tokio::time::pause();
-
         // sqlx uses connection pool with max_connections = 1 for sqlite::memory:
         // Begin a transaction to acquire and hold the only connection.
+        // Must begin() before pausing time, otherwise the pool acquire itself times out.
         let _tx = store.pool().begin().await.unwrap();
+
+        tokio::time::pause();
 
         // Call build_hub_ext_for_vctx. It will attempt to get connection to call
         // get_active_session_name. This will block.
@@ -1538,10 +1539,11 @@ mod tests {
             .await
             .expect("in-memory store");
 
-        tokio::time::pause();
-
         // Begin a transaction to acquire and hold the only connection.
+        // Must begin() before pausing time, otherwise the pool acquire itself times out.
         let _tx = store.pool().begin().await.unwrap();
+
+        tokio::time::pause();
 
         // Call build_hub_ext_for_vctx with session_override.
         // It will skip get_active_session_name, but will block on get_backend_session.
