@@ -21,6 +21,9 @@ fn parse_origins(raw: &str) -> Vec<HeaderValue> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| {
+            if !s.contains("://") {
+                panic!("ILINK_CORS_ORIGINS contains origin without scheme: {s}");
+            }
             HeaderValue::from_str(s)
                 .unwrap_or_else(|_| panic!("ILINK_CORS_ORIGINS contains invalid origin: {s}"))
         })
@@ -38,7 +41,10 @@ fn build_cors_layer() -> CorsLayer {
                 .allow_methods(Any)
                 .allow_headers(Any)
         }
-        _ => CorsLayer::permissive(),
+        _ => {
+            tracing::warn!("ILINK_CORS_ORIGINS not set or empty, falling back to permissive CORS");
+            CorsLayer::permissive()
+        }
     }
 }
 
@@ -136,32 +142,29 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "invalid origin")]
+    #[should_panic(expected = "without scheme")]
     fn origins_rejects_control_chars() {
         parse_origins("bad\norigin");
     }
 
-    // ── adversarial: parse_origins input edge cases ───────────────────
+    // ── M2: boundary handling ─────────────────────────────────────────
 
     #[test]
-    fn origins_rejects_wildcard() {
-        // "*" passes HeaderValue validation but is a security footgun —
-        // it allows all origins, defeating the purpose of the env var.
-        let origins = parse_origins("*");
-        assert_eq!(origins.len(), 1);
-        // Documented as accepted by HeaderValue but semantically dangerous;
-        // the CorsLayer will treat it as a literal origin "*", not a wildcard.
-        // tower-http AllowOrigin::list(["*"]) matches any Origin: * header,
-        // effectively permissive.  This test locks in current behavior.
+    #[should_panic(expected = "without scheme")]
+    fn origins_rejects_no_scheme() {
+        parse_origins("bad-origin");
     }
 
     #[test]
-    fn origins_accepts_null_origin() {
-        // "null" is a valid origin per RFC 6454 (sandboxed iframes, data: URLs).
-        // HeaderValue accepts it; the CorsLayer will match Origin: null requests.
-        let origins = parse_origins("null");
-        assert_eq!(origins.len(), 1);
-        assert_eq!(origins[0], HeaderValue::from_static("null"));
+    #[should_panic(expected = "without scheme")]
+    fn origins_rejects_wildcard() {
+        parse_origins("*");
+    }
+
+    #[test]
+    #[should_panic(expected = "without scheme")]
+    fn origins_rejects_null_origin() {
+        parse_origins("null");
     }
 
     #[test]
@@ -175,6 +178,13 @@ mod tests {
         let origins = parse_origins("https://a.com,");
         assert_eq!(origins.len(), 1);
         assert_eq!(origins[0], HeaderValue::from_static("https://a.com"));
+    }
+
+    #[test]
+    #[should_panic(expected = "without scheme")]
+    fn origins_rejects_mixed_with_bad_origin() {
+        // Even if some origins are valid, a single bad one should fail fast.
+        parse_origins("https://a.com, bad-origin, https://b.com");
     }
 
     // ── build_cors_layer integration tests ────────────────────────────
