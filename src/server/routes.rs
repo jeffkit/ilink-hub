@@ -454,7 +454,10 @@ pub async fn sendmessage(
         // return early BEFORE appending the footer. Without this early check, the footer text
         // itself would make the message appear non-empty, bypassing the guard below and causing
         // an empty-looking message (containing only the footer) to be forwarded to iLink.
-        if msg.text().map(|t| t.trim().is_empty()).unwrap_or(true) {
+        //
+        // Media messages (image/file/video) have no text but do have content — allow them through.
+        let is_text_empty = msg.text().map(|t| t.trim().is_empty()).unwrap_or(true);
+        if is_text_empty && !msg.has_content() {
             return Json(SendMessageResponse::default());
         }
 
@@ -504,12 +507,14 @@ pub async fn sendmessage(
     // consumed above), skip forwarding to iLink — an empty text message would be rejected or
     // would confuse the user. The only side-effect we needed (session UUID persistence) already
     // happened via set_backend_session above.
-    let msg_text_empty = req
+    // Media messages (image/file/video) have no text but do carry content — pass them through.
+    let has_text = req
         .msg
         .as_ref()
-        .map(|m| m.text().unwrap_or("").trim().is_empty())
-        .unwrap_or(true);
-    if msg_text_empty {
+        .map(|m| !m.text().unwrap_or("").trim().is_empty())
+        .unwrap_or(false);
+    let has_media = req.msg.as_ref().map(|m| m.has_content()).unwrap_or(false);
+    if !has_text && !has_media {
         return Json(SendMessageResponse::default());
     }
 

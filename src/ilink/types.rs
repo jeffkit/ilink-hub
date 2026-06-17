@@ -81,6 +81,57 @@ pub struct VoiceItem {
     pub text: Option<String>,
 }
 
+/// Image content inside a MessageItem (type=2).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ImageItem {
+    /// CDN URL for the image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdn_url: Option<String>,
+    /// MD5 hash of the image bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    /// media_id returned by getuploadurl (used when sending).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+}
+
+/// File content inside a MessageItem (type=4).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FileItem {
+    /// Original file name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// CDN URL for the file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdn_url: Option<String>,
+    /// File size in bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<u64>,
+    /// MD5 hash of the file bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    /// media_id returned by getuploadurl (used when sending).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+}
+
+/// Video content inside a MessageItem (type=5).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VideoItem {
+    /// CDN URL for the video.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdn_url: Option<String>,
+    /// Duration in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
+    /// MD5 hash of the video bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub md5: Option<String>,
+    /// media_id returned by getuploadurl (used when sending).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_id: Option<String>,
+}
+
 /// One item inside a WeixinMessage's item_list.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MessageItem {
@@ -91,7 +142,13 @@ pub struct MessageItem {
     pub text_item: Option<TextItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice_item: Option<VoiceItem>,
-    /// All other item fields (image_item, file_item, video_item, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_item: Option<ImageItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_item: Option<FileItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_item: Option<VideoItem>,
+    /// Catch-all for unknown fields from iLink upstream.
     #[serde(flatten)]
     pub extra: serde_json::Value,
 }
@@ -175,6 +232,19 @@ impl WeixinMessage {
             })
     }
 
+    /// Return the `item_type` of the first item in the list, if any.
+    pub fn first_item_type(&self) -> Option<i32> {
+        self.item_list.as_ref()?.first()?.item_type
+    }
+
+    /// Return true if the message contains at least one non-empty item (any type).
+    pub fn has_content(&self) -> bool {
+        self.item_list
+            .as_ref()
+            .map(|l| !l.is_empty())
+            .unwrap_or(false)
+    }
+
     /// Build a text reply to this message.
     pub fn build_text_reply(context_token: String, text: String) -> WeixinMessage {
         let mut msg = WeixinMessage {
@@ -186,8 +256,56 @@ impl WeixinMessage {
             item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(msg_type::TEXT),
                 text_item: Some(TextItem { text: Some(text) }),
-                voice_item: None,
-                extra: serde_json::Value::Object(Default::default()),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        msg.ensure_outbound();
+        msg
+    }
+
+    /// Build an image reply using a media_id obtained from `getuploadurl`.
+    pub fn build_image_reply(context_token: String, media_id: String) -> WeixinMessage {
+        let mut msg = WeixinMessage {
+            context_token: Some(context_token),
+            message_type: Some(2),
+            message_state: Some(message_state::FINISH),
+            from_user_id: Some(String::new()),
+            client_id: Some(new_client_id()),
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(msg_type::IMAGE),
+                image_item: Some(ImageItem {
+                    media_id: Some(media_id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        msg.ensure_outbound();
+        msg
+    }
+
+    /// Build a file reply using a media_id obtained from `getuploadurl`.
+    pub fn build_file_reply(
+        context_token: String,
+        media_id: String,
+        file_name: Option<String>,
+    ) -> WeixinMessage {
+        let mut msg = WeixinMessage {
+            context_token: Some(context_token),
+            message_type: Some(2),
+            message_state: Some(message_state::FINISH),
+            from_user_id: Some(String::new()),
+            client_id: Some(new_client_id()),
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(msg_type::FILE),
+                file_item: Some(FileItem {
+                    media_id: Some(media_id),
+                    file_name,
+                    ..Default::default()
+                }),
+                ..Default::default()
             }])),
             ..Default::default()
         };

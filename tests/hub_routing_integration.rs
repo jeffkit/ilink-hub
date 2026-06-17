@@ -41,8 +41,7 @@ fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
             text_item: Some(TextItem {
                 text: Some(text.to_string()),
             }),
-            extra: serde_json::Value::Object(Default::default()),
-            voice_item: None,
+            ..Default::default()
         }])),
         ..Default::default()
     }

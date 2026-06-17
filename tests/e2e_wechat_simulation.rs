@@ -223,8 +223,7 @@ fn text_item(s: &str) -> MessageItem {
         text_item: Some(TextItem {
             text: Some(s.to_string()),
         }),
-        voice_item: None,
-        extra: serde_json::Value::Object(Default::default()),
+        ..Default::default()
     }
 }
 

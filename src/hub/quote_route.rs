@@ -353,7 +353,7 @@ mod tests {
                     text: Some(scope_text.into()),
                 }),
                 extra: ref_item,
-                voice_item: None,
+                ..Default::default()
             }])),
             ..Default::default()
         }
@@ -457,8 +457,7 @@ mod tests {
                 text_item: Some(TextItem {
                     text: Some("hi".into()),
                 }),
-                extra: serde_json::Value::Object(Default::default()),
-                voice_item: None,
+                ..Default::default()
             }])),
             ..Default::default()
         };

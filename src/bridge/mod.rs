@@ -392,6 +392,10 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
         return Ok(());
     }
 
+    // Collect media env vars from the first non-text item so CLI scripts can handle
+    // image / file / video inputs via ILINK_ITEM_TYPE, ILINK_IMAGE_URL, etc.
+    let media_env = extract_media_env(&msg);
+
     let (profile_name, profile, payload) = app
         .resolve(&text)
         .with_context(|| format!("route message for profile (text prefix): {text:?}"))?;
@@ -451,6 +455,7 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
         &session_name_for_cli,
         &from_user,
         &ctx,
+        &media_env,
         partial_tx, // consumed here; drop signals forwarding task to finish
     )
     .await;
@@ -554,6 +559,7 @@ async fn run_cli(
     session_name: &str,
     from_user: &str,
     context_token: &str,
+    media_env: &[(String, String)],
     partial_tx: mpsc::UnboundedSender<String>,
 ) -> Result<(String, Option<String>)> {
     let args: Vec<String> = cfg
@@ -582,6 +588,10 @@ async fn run_cli(
     cmd.env("ILINK_FROM_USER", from_user);
     cmd.env("ILINK_CONTEXT_TOKEN", context_token);
     cmd.env("ILINK_STREAMING", if cfg.streaming { "1" } else { "0" });
+
+    for (k, v) in media_env {
+        cmd.env(k, v);
+    }
 
     for (k, v) in &cfg.env {
         let v = apply_placeholders(v, message, session_id, session_name);
@@ -1113,6 +1123,63 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
     Ok(stdout_str)
 }
 
+/// Extract media-related environment variables from a WeChat message so that CLI scripts
+/// can handle image / file / video inputs without manually parsing the full JSON payload.
+///
+/// Emitted variables (only set when the corresponding field is present and non-empty):
+///
+/// | Variable            | Set when                         | Example value                          |
+/// |---------------------|----------------------------------|----------------------------------------|
+/// | `ILINK_ITEM_TYPE`   | any media item found             | `image` / `file` / `video`             |
+/// | `ILINK_IMAGE_URL`   | type=image and cdn_url present   | `https://novac2c.cdn.weixin.qq.com/…`  |
+/// | `ILINK_FILE_URL`    | type=file and cdn_url present    | `https://…`                            |
+/// | `ILINK_FILE_NAME`   | type=file and file_name present  | `report.pdf`                           |
+/// | `ILINK_VIDEO_URL`   | type=video and cdn_url present   | `https://…`                            |
+fn extract_media_env(msg: &WeixinMessage) -> Vec<(String, String)> {
+    use crate::ilink::types::msg_type;
+    let mut env = Vec::new();
+    let items = match msg.item_list.as_ref() {
+        Some(l) => l,
+        None => return env,
+    };
+    for item in items.iter() {
+        match item.item_type {
+            Some(msg_type::IMAGE) => {
+                env.push(("ILINK_ITEM_TYPE".into(), "image".into()));
+                if let Some(url) = item.image_item.as_ref().and_then(|i| i.cdn_url.as_deref()) {
+                    if !url.is_empty() {
+                        env.push(("ILINK_IMAGE_URL".into(), url.to_string()));
+                    }
+                }
+                break;
+            }
+            Some(msg_type::FILE) => {
+                env.push(("ILINK_ITEM_TYPE".into(), "file".into()));
+                if let Some(fi) = item.file_item.as_ref() {
+                    if let Some(url) = fi.cdn_url.as_deref().filter(|s| !s.is_empty()) {
+                        env.push(("ILINK_FILE_URL".into(), url.to_string()));
+                    }
+                    if let Some(name) = fi.file_name.as_deref().filter(|s| !s.is_empty()) {
+                        env.push(("ILINK_FILE_NAME".into(), name.to_string()));
+                    }
+                }
+                break;
+            }
+            Some(msg_type::VIDEO) => {
+                env.push(("ILINK_ITEM_TYPE".into(), "video".into()));
+                if let Some(url) = item.video_item.as_ref().and_then(|v| v.cdn_url.as_deref()) {
+                    if !url.is_empty() {
+                        env.push(("ILINK_VIDEO_URL".into(), url.to_string()));
+                    }
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1292,7 @@ mod tests {
             "session-name",
             "user-123",
             "ctx-123",
+            &[],
             partial_tx,
         )
         .await;
@@ -1317,8 +1385,7 @@ mod dispatcher_tests {
                 text_item: Some(TextItem {
                     text: Some("hello".into()),
                 }),
-                extra: serde_json::Value::Object(Default::default()),
-                voice_item: None,
+                ..Default::default()
             }])),
             from_user_id: Some("user1".into()),
             ..Default::default()

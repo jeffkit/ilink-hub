@@ -14,8 +14,7 @@ fn make_msg(content: &str) -> WeixinMessage {
             text_item: Some(TextItem {
                 text: Some(content.to_string()),
             }),
-            extra: serde_json::Value::Object(serde_json::Map::new()),
-            voice_item: None,
+            ..Default::default()
         }])),
         ..Default::default()
     }
