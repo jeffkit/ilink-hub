@@ -30,7 +30,7 @@ findings:
       });
       ```
     resolution: |
-      The test thread was updated to lock `m_clone.inner` directly and hold it across the panic. The test was also expanded with adversarial tests verifying all methods under poisoning.
+      The test thread was updated to lock `m_clone.inner` directly and hold it across the panic. The test was also expanded with sequential and concurrent adversarial tests verifying all methods under poisoning and concurrent multi-threaded load.
 
   - id: DOC-OUTDATED
     title: "Outdated documentation for InMemoryQueue referencing tokio::sync::Mutex"

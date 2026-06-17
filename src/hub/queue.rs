@@ -737,6 +737,25 @@ mod queue_config_tests {
             Some(("real_2".to_string(), "peer_2".to_string()))
         );
 
+        // Concurrent adversarial test on poisoned ContextTokenMap
+        let mut handles = vec![];
+        for thread_idx in 0..10 {
+            let m_thread = m.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    let real = format!("real_{thread_idx}_{i}");
+                    let peer = format!("peer_{thread_idx}_{i}");
+                    let v = m_thread.map(real.clone(), peer.clone(), None);
+                    assert!(!v.is_empty());
+                    let resolved = m_thread.resolve(&v);
+                    assert_eq!(resolved, Some(real));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
         // 2. Test InMemoryQueue (PerClientSlot) poison safety
         let slot = Arc::new(PerClientSlot::new(10));
         let slot_clone = slot.clone();
@@ -765,5 +784,27 @@ mod queue_config_tests {
         assert_eq!(drained.len(), 5);
         assert_eq!(drained[0].message_id, Some(0));
         assert_eq!(slot.len(), 0);
+
+        // Concurrent adversarial test on poisoned PerClientSlot
+        let mut slot_handles = vec![];
+        for thread_idx in 0..10 {
+            let slot_thread = slot.clone();
+            slot_handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    let msg = WeixinMessage {
+                        message_id: Some(thread_idx * 100 + i),
+                        ..Default::default()
+                    };
+                    slot_thread.push(msg);
+                    let drained = slot_thread.drain();
+                    for m in drained {
+                        assert!(m.message_id.is_some());
+                    }
+                }
+            }));
+        }
+        for h in slot_handles {
+            h.join().unwrap();
+        }
     }
 }
