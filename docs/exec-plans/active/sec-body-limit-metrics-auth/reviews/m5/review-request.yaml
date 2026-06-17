@@ -1,0 +1,55 @@
+milestone: M5
+title: SEC-007 Metrics Auth — 单元测试
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 在 `tests/metrics_auth_tests.rs` 中编写并执行单元测试，全面校验 `/metrics` 接口的鉴权机制。
+  - 校验无 admin token、带错误 token 时返回 401。
+  - 校验带正确 token 时返回 200。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: tests/metrics_auth_tests.rs
+    lines:
+      - 1-70: 新建 `tests/metrics_auth_tests.rs` 并实现了 `test_metrics_auth_with_configured_token` 测试用例。
+
+# ─── 验证命令（M5 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 无特别风险。通过将测试放置在独立的 `tests/metrics_auth_tests.rs` 文件中，利用 Cargo 的多进程测试机制，完全避免了 `OnceLock` 在并发测试时的缓存污染和干扰。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m5/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md (M5 状态更新)
+  - git commit (M5 提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否包含测试无 admin token 访问 `/metrics` 返回 401 的验证？
+  - [x] 是否包含测试带无效 token 访问 `/metrics` 返回 401 的验证？
+  - [x] 是否包含测试带有效 admin token 访问 `/metrics` 返回 200 的验证？
+  - [x] 六项质量门禁命令是否均全绿通过？

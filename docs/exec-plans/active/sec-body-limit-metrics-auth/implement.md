@@ -145,3 +145,36 @@ Commit: ea4ee57
 
 Commit: 81ab0e4
 
+---
+
+## M5: 单元测试 - Metrics 401/200 — done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：单元测试 - Metrics 401/200 验证。
+- **审查请求**：[reviews/m5/review-request.yaml](./reviews/m5/review-request.yaml)
+
+### 关键改动
+
+- 新建 `tests/metrics_auth_tests.rs`，包含 `test_metrics_auth_with_configured_token` 测试用例，全面覆盖了配置了 admin token 时访问 `/metrics` 的行为：
+  - 无 token 访问 -> 返回 401 Unauthorized。
+  - 错误 token 访问 -> 返回 401 Unauthorized。
+  - 正确 token 访问 -> 返回 200 OK 并能获取指标数据。
+- 通过使用独立的 integration test 目标文件，充分利用 Cargo 多进程运行机制，安全隔离了鉴权 `OnceLock` 变量的读写操作，避免了并行执行时的测试竞争或干扰。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: 099971e
+
+
