@@ -88,3 +88,32 @@ Commit: a5d2d59
 
 Commit: a0e2857
 
+## M4: 静态代码检查与质量保障 ─ done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：运行 Clippy 静态代码检查，消除所有警告，并验证没有遗留的 `std::sync::Mutex` 误用。
+- **审查请求**：[reviews/m4/review-request.yaml](./reviews/m4/review-request.yaml)
+
+### 关键改动
+
+- 运行 `cargo fmt --check`，代码格式符合规范。
+- 运行 `cargo clippy -- -D warnings`，无任何静态检查警告或错误，验证未引入或残留锁/unwrap误用问题。
+- 运行 `cargo test` 及相关构建、前端编译与 Tauri 校验命令，全部全绿通过。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: 6a1c3db
+
+
