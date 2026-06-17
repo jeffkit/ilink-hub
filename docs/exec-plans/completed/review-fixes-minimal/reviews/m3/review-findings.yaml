@@ -1,0 +1,90 @@
+milestone: M3
+title: "bridge 超时行为文档化 — 对抗性审查"
+verdict: PASS
+reviewer: rust-security-expert
+date: "2026-06-17"
+
+summary: |
+  变更仅为 `BridgeProfile::timeout_secs` 添加 doc comment，描述超时叠加行为。
+  无代码逻辑变更。doc comment 与 `src/bridge/mod.rs:run_cli` 的实际超时实现一致，
+  文档风格符合项目惯例。未发现内存安全、data race、tokio 异步陷阱或 OWASP 安全问题。
+
+findings:
+  - id: DOC-01
+    severity: info
+    category: documentation_accuracy
+    title: doc comment 与实现一致，`max(1)` 下限未提及但不影响实际使用
+    description: |
+      doc comment 描述：`timeout_secs` 覆盖 stdout 读取阶段，额外 10s `child.wait()`，
+      最坏情况 `timeout_secs + 10s`。
+
+      实现验证（`src/bridge/mod.rs`）：
+      - L613: `let dur = Duration::from_secs(cfg.timeout_secs.max(1))` — 实际使用的超时值为 `max(1, timeout_secs)`
+      - L658: `tokio::time::timeout(dur, async move { ... reader ... })` — 确实只覆盖 stdout 读取
+      - L699: `tokio::time::timeout(Duration::from_secs(10), child.wait())` — 确实有额外 10s
+      - L137-139: `default_timeout_secs()` 返回 1800 — 确认默认 30 分钟
+
+      微小偏差：`timeout_secs = 0` 时最坏情况为 `1 + 10 = 11s` 而非 `0 + 10 = 10s`，
+      因为实现使用了 `max(1)` 下限。但 `timeout_secs = 0` 是非实际配置（相当于立即超时），
+      不影响任何正常使用场景。
+    verdict: 无需修改
+
+  - id: DOC-02
+    severity: info
+    category: documentation_style
+    title: 中英文混合文档风格符合项目惯例
+    description: |
+      新增 doc comment 采用中文叙述 + 英文代码标识符（\`child.wait()\`、\`timeout_secs\`、\`stdout\`）风格，
+      与同文件中已有字段文档一致：
+      - L106-107: `If non-empty: stdout 的第一行若以该前缀开头...`
+      - L110: `是否启用流式部分回复（\`ILINK_PARTIAL:\`）。默认 \`true\`。`
+      CLI、stdout、10s 等技术术语的写法与项目惯例吻合。
+    verdict: 无需修改
+
+  - id: ASYNC-01
+    severity: info
+    category: tokio_async
+    title: tokio::time::timeout 取消时子进程通过 kill_on_drop 正确终止
+    description: |
+      超时触发时执行路径：
+      1. L658 `tokio::time::timeout(dur, ...)` 触发 → 内部 future 被取消丢弃
+      2. L694 `?` 传播 Err → `run_cli` 提前返回
+      3. 局部变量 `child: Child` 被 drop
+      4. L569 `cmd.kill_on_drop(true)` 确保子进程被 kill
+
+      此路径无僵尸进程风险。`stdin_task` 和 `stderr_task`（tokio::spawn）会在
+      子进程被杀后因 pipe 断开而自然退出，虽在超时返回后有短暂残留，但无资源泄漏。
+    verdict: 无需修改
+
+  - id: MEM-01
+    severity: info
+    category: memory_safety
+    title: doc comment 变更无内存安全影响
+    description: |
+      变更仅为 `///` 文档注释，不涉及任何可执行代码。无堆分配、无 unsafe 块、
+      无指针操作，零内存安全风险。
+    verdict: 无需修改
+
+  - id: RACE-01
+    severity: info
+    category: data_race
+    title: 无共享可变状态变更
+    description: |
+      纯文档变更，不引入任何新的共享状态或同步原语。
+    verdict: 无需修改
+
+  - id: OWASP-01
+    severity: info
+    category: owasp_general
+    title: 文档变更无安全影响
+    description: |
+      doc comment 描述的是超时行为，不涉及认证、授权、加密、注入等安全相关逻辑。
+      不会引入新的攻击面或安全漏洞。
+    verdict: 无需修改
+
+code_quality_notes:
+  - "doc comment 准确描述了 timeout_secs 的超时叠加行为（stdout + child.wait）"
+  - "kill_on_drop(true) 确保超时后子进程被正确终止，无僵尸进程风险"
+  - "默认 1800s（30 分钟）在 doc 中明确标注，提升可配置性认知"
+  - "中英文混合风格与项目现有文档一致，代码标识符使用反引号包裹"
+  - "额外 10s child.wait() 等待的文档化有助于运维理解最坏情况延迟"

@@ -92,6 +92,9 @@ pub struct BridgeProfile {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// CLI 主操作超时（秒），只覆盖 stdout 读取阶段。子进程退出后还有额外的
+    /// 10s `child.wait()` 等待，因此最坏情况总耗时为 `timeout_secs + 10s`。
+    /// 默认 1800s（30 分钟）。
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     #[serde(default = "default_max_reply_chars")]

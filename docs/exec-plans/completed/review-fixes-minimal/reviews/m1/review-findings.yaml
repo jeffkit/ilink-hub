@@ -1,0 +1,93 @@
+milestone: M1
+title: 安全文档与 Docker 示例完善 — 对抗性审查
+verdict: PASS
+reviewer: rust-security-expert
+date: "2026-06-17"
+
+summary: |
+  文档变更范围（README.md + deploy/docker-compose.example.yml）在安全措辞和行为准确性上
+  与代码实现一致。代码层面安全措施扎实（常数时间比较、Mutex poison 恢复、空 token 过滤）。
+  发现 2 个低风险文档改进点，不阻塞合入。
+
+findings:
+  - id: DOC-01
+    severity: low
+    category: owasp_a05_security_misconfiguration
+    title: README Docker Compose 示例中 ILINK_ADMIN_TOKEN 仍为注释状态
+    description: |
+      README.md 第 115 行的 Option C Docker Compose 示例中，ILINK_ADMIN_TOKEN 被注释掉：
+        # ILINK_ADMIN_TOKEN: your-secret-token
+      首次部署者若直接复制该示例，admin 端点将默认返回 403，用户体验不佳。
+      而 deploy/docker-compose.example.yml 中该变量为未注释状态（值为 your-secret-token），
+      两处不一致可能造成混淆。
+    recommendation: |
+      将 README.md Option C 的 ILINK_ADMIN_TOKEN 改为与 deploy/docker-compose.example.yml
+      一致（取消注释，使用 your-secret-token 占位），确保首次部署者能直接启动并访问 admin 面板。
+    affected_files:
+      - README.md:115
+
+  - id: DOC-02
+    severity: low
+    category: owasp_a04_insecure_design
+    title: 行为矩阵未在文档中以结构化形式呈现
+    description: |
+      代码中 admin auth 有三种状态组合：
+        A) ILINK_ADMIN_TOKEN 已设置 → Bearer 必须匹配，否则 401
+        B) ILINK_ADMIN_TOKEN 未设置 + ILINK_ADMIN_INSECURE_NO_AUTH=true → 无鉴权放行（有启动 WARN）
+        C) ILINK_ADMIN_TOKEN 未设置 + ILINK_ADMIN_INSECURE_NO_AUTH 未设置 → 403
+      README 以段落文字描述这三种状态，但没有结构化表格。首次部署者可能难以快速判断
+      自己处于哪种状态，以及如何切换。
+    recommendation: |
+      在 README admin auth 段落增加一个简短的表格，列出三种组合及其行为，
+      帮助部署者快速定位自己的配置状态。
+    affected_files:
+      - README.md:267-276
+
+  - id: CODE-01
+    severity: info
+    category: memory_safety
+    title: Mutex poison 恢复已验证通过
+    description: |
+      src/hub/queue.rs 对 ContextTokenMap (std::sync::Mutex) 和 PerClientSlot
+      进行了 poison 恢复测试（test_mutex_poison_safe），验证了 panic 后 Mutex
+      仍可正常 lock 和操作。这是良好的防御性编程实践。
+    verdict: 无需修改
+
+  - id: CODE-02
+    severity: info
+    category: data_race
+    title: DashMap + std::sync::Mutex 并发模型安全
+    description: |
+      InMemoryQueue 使用 DashMap 做无锁按 token 分片查找，PerClientSlot 内部
+      使用 std::sync::Mutex 保护队列。由于临界区极短（push/pop VecDeque），
+      使用同步 Mutex 而非 tokio::sync::Mutex 是正确的选择 — 不会阻塞 worker 线程。
+      ContextTokenMap 同理。未发现 data race 风险。
+    verdict: 无需修改
+
+  - id: CODE-03
+    severity: info
+    category: tokio_async
+    title: tokio::spawn fire-and-forget 有背压保护
+    description: |
+      src/hub/mod.rs 中 persist_context_token 和 save_message 的 tokio::spawn
+      调用使用了 Semaphore::try_acquire() 做背压保护。当信号量耗尽时，跳过本次
+      持久化并递增 Prometheus 计数器。这是文档中描述的 "fire-and-forget" 模式的
+      安全实现 — 不会因 DB 慢而导致无限堆积的 spawn 任务。
+    verdict: 无需修改
+
+  - id: CODE-04
+    severity: info
+    category: owasp_a02_cryptographic_failures
+    title: Admin token 使用常数时间比较
+    description: |
+      check_admin_auth() 使用 subtle::ConstantTimeEq 进行 Bearer token 比较，
+      防止时序侧信道攻击。admin_token() 对空字符串做了过滤（filter(|s| !s.is_empty())），
+      避免空 token 等同于无 token 的错误行为。
+    verdict: 无需修改
+
+code_quality_notes:
+  - "subtle::ConstantTimeEq 用于 token 比较 — 防御时序攻击"
+  - "空 ILINK_ADMIN_TOKEN 被过滤（等同于未设置），行为一致"
+  - "INSECURE_NO_AUTH 启动时有 tracing::warn 日志 — 运维可观测"
+  - "Mutex poison 恢复有专项测试覆盖（test_mutex_poison_safe）"
+  - "Semaphore 限流 fire-and-forget spawn — 防止任务堆积"

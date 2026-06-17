@@ -1,0 +1,24 @@
+# iLink Hub Docker Compose 部署示例
+# 复制本文件为 docker-compose.yml 并根据需要修改配置
+#
+# Copy to docker-compose.yml, adjust settings as needed.
+
+services:
+  ilink-hub:
+    image: ghcr.io/jeffkit/ilink-hub:latest
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    volumes:
+      - ilink-hub-data:/data
+    environment:
+      DATABASE_URL: sqlite:/data/ilink-hub.db
+      # ⚠️ 强烈建议设置 admin token，否则 /hub/ 管理端点默认拒绝所有请求（返回 403）。
+      #    仅在本地开发环境可设置 ILINK_ADMIN_INSECURE_NO_AUTH=true 跳过鉴权。
+      # ⚠️ Strongly recommended — without it, /hub/ admin endpoints return 403 by default.
+      #    Only set ILINK_ADMIN_INSECURE_NO_AUTH=true for local dev to bypass auth.
+      ILINK_ADMIN_TOKEN: your-secret-token
+      # ILINK_TOKEN: your-token  # Optional: skip QR login if you already have a token
+
+volumes:
+  ilink-hub-data:
