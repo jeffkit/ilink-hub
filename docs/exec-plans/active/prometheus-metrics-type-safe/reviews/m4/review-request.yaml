@@ -1,0 +1,39 @@
+milestone: M4
+title: "特殊字符安全验证 — 构造特殊字符 label value 并确认输出合法"
+status: ready_for_review
+date: "2026-06-17"
+
+summary: |
+  M4 重点验证了 Prometheus 指标中 label 值的特殊字符安全性。
+  在 `src/metrics.rs` 中新增了 3 个单元测试，分别覆盖了 `\`、`{`、`}` 以及组合特殊字符（`{`, `}`, `\`, `"`, `\n`）。
+  测试结果表明，底层的 `prometheus` crate 会自动对特殊字符进行转义（例如 `\` 转义为 `\\`，`"` 转义为 `\"`），
+  并且不会因为裸花括号打破 Prometheus 的文本指标格式。
+
+verification:
+  fmt:
+    command: "cargo fmt --check"
+    result: PASS
+  clippy:
+    command: "cargo clippy -- -D warnings"
+    result: PASS
+  test:
+    command: "cargo test"
+    result: "257 passed (unit) + 20 passed (breaking_changes) + 10 passed (e2e) + 27 passed (hub_routing) + 1 passed (metrics_auth) + 15 passed (queue_trait) = 330 passed, 0 failed"
+  build:
+    command: "cargo build"
+    result: PASS
+  desktop-frontend:
+    command: "cd desktop/ilink-hub-desktop && npm run build"
+    result: PASS
+  desktop-tauri:
+    command: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    result: PASS
+
+files_changed:
+  - path: "src/metrics.rs"
+    description: "新增三个特殊字符安全性单元测试以验证转义输出的合法性"
+
+notes: |
+  测试验证了 `prometheus` 官方 crate 在面对非安全字符时的稳健转义表现，
+  避免了手动拼接字符串可能导致的 metrics 解析错误（如注入非法的 label delimiters 或换行符）。
+  全部 6 项验证命令通过，330 项测试全部绿。

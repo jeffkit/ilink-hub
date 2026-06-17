@@ -532,6 +532,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_backslash_in_label_value_escaped() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "hub\\path").await.unwrap();
+
+        // Backslash must be escaped to \\ in label values.
+        assert!(!output.contains("hub\\path{"));
+        assert!(output.contains("hub\\\\path"));
+    }
+
+    #[tokio::test]
+    async fn test_braces_in_label_value_do_not_break_format() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "hub{with}braces").await.unwrap();
+
+        // Braces in label values must not be interpreted as label delimiters.
+        // The prometheus crate should handle them safely.
+        assert!(output.contains("ilink_hub_clients_online{hub=\"hub{with}braces\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn test_all_special_chars_combined_in_label() {
+        // Construct a label value containing all special characters: {, }, \, ", \n
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "a{b}\\c\"d\ne").await.unwrap();
+
+        // None of the raw special chars should appear unescaped in the output.
+        assert!(!output.contains("a{b}\\c\"d\ne"));
+        // The prometheus crate must escape them all.
+        assert!(output.contains("ilink_hub_clients_online"));
+    }
+
+    #[tokio::test]
     async fn test_unicode_hub_name_does_not_panic() {
         let state = make_test_state().await;
         let output = gather_metrics(&state, "服务中心-中文").await.unwrap();

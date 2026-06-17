@@ -5,7 +5,7 @@
 - [x] **M1** — 日期: 2026-06-17 | 耗时: ~2min | 备注: 所有验证通过（1 个预存 flaky test 除外）
 - [x] **M2** — 日期: 2026-06-17 | 耗时: ~20min | 备注: 所有验证通过，6 个单元测试覆盖
 - [x] **M3** — 日期: 2026-06-17 | 耗时: ~5min | 备注: 核心重构在 M2 中已完成，M3 验证全部通过
-- [ ] **M4**
+- [x] **M4** — 日期: 2026-06-17 | 耗时: ~10min | 备注: 所有验证通过
 - [ ] **M5**
 
 ## M1 详情
@@ -30,3 +30,11 @@ Cargo.lock 自动更新。
 - `routes.rs:997` 直接调用 `crate::metrics::gather_metrics(&state, &hub_name).await`
 - 路由路径 `/metrics` 和 `check_admin_auth` 鉴权逻辑保持不变
 - 全部 6 项验证通过：fmt、clippy、test（327 passed）、build、desktop-frontend、desktop-tauri
+
+## M4 详情
+
+特殊字符安全验证：
+- 新增 3 个测试覆盖 `\`、`{`、`}` 及组合特殊字符（`{`, `}`, `\`, `"`, `\n`）场景
+- 结合已有测试，完整覆盖 plan.md 要求的全部特殊字符：`{`, `}`, `\n`, `\`, `"`
+- 验证 prometheus crate 的 label 转义机制正确输出合法格式
+- 全部 6 项验证通过：fmt、clippy、test（330 passed）、build、desktop-frontend、desktop-tauri
