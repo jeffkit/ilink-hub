@@ -11,6 +11,7 @@ use uuid::Uuid;
 /// Whitelist check used by SQLite `pragma_table_info` splicing: the table
 /// and column names must contain only identifier characters, so the
 /// interpolated string cannot smuggle SQL.
+#[allow(dead_code)]
 fn is_safe_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -267,12 +268,10 @@ impl Store {
                 Ok(row.is_some())
             }
             DatabaseKind::MySql => {
-                let result = sqlx::query(
-                    "INSERT IGNORE INTO schema_version (version) VALUES (?)",
-                )
-                .bind(version)
-                .execute(&mut **tx)
-                .await?;
+                let result = sqlx::query("INSERT IGNORE INTO schema_version (version) VALUES (?)")
+                    .bind(version)
+                    .execute(&mut **tx)
+                    .await?;
                 Ok(result.rows_affected() == 1)
             }
         }
@@ -334,9 +333,9 @@ impl Store {
         )
         .execute(&mut *tx)
         .await
-        .map_err(|e| anyhow::anyhow!(
-            "DDL failed: CREATE TABLE IF NOT EXISTS schema_version\n  Error: {e}"
-        ))?;
+        .map_err(|e| {
+            anyhow::anyhow!("DDL failed: CREATE TABLE IF NOT EXISTS schema_version\n  Error: {e}")
+        })?;
 
         // Dispatch to the per-version migrators on the same transaction.
         // Each step is gated by `try_claim_migration_in_tx`, so a step that
@@ -363,10 +362,7 @@ impl Store {
     // transaction. The transactional variants take `&mut sqlx::Transaction`
     // and run every DDL and claim on that transaction.
 
-    async fn migrate_to_v1_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
-    ) -> Result<()> {
+    async fn migrate_to_v1_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
         if !self.try_claim_migration_in_tx(tx, 1).await? {
             return Ok(());
         }
@@ -404,9 +400,7 @@ impl Store {
         )
         .execute(&mut **tx)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE TABLE context_token_map\n  Error: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE context_token_map\n  Error: {e}"))?;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS bot_credentials (
@@ -418,18 +412,13 @@ impl Store {
         )
         .execute(&mut **tx)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE TABLE bot_credentials\n  Error: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE bot_credentials\n  Error: {e}"))?;
 
         tracing::info!(version = 1, "migration applied: initial schema");
         Ok(())
     }
 
-    async fn migrate_to_v2_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
-    ) -> Result<()> {
+    async fn migrate_to_v2_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
         if !self.try_claim_migration_in_tx(tx, 2).await? {
             return Ok(());
         }
@@ -460,18 +449,13 @@ impl Store {
         )
         .execute(&mut **tx)
         .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE TABLE active_sessions\n  Error: {e}")
-        })?;
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE active_sessions\n  Error: {e}"))?;
 
         tracing::info!(version = 2, "migration applied: backend session tables");
         Ok(())
     }
 
-    async fn migrate_to_v3_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
-    ) -> Result<()> {
+    async fn migrate_to_v3_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
         if !self.try_claim_migration_in_tx(tx, 3).await? {
             return Ok(());
         }
@@ -491,10 +475,7 @@ impl Store {
         Ok(())
     }
 
-    async fn migrate_to_v4_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
-    ) -> Result<()> {
+    async fn migrate_to_v4_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
         if !self.try_claim_migration_in_tx(tx, 4).await? {
             return Ok(());
         }
@@ -557,10 +538,7 @@ impl Store {
         Ok(())
     }
 
-    async fn migrate_to_v5_tx(
-        &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
-    ) -> Result<()> {
+    async fn migrate_to_v5_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
         if !self.try_claim_migration_in_tx(tx, 5).await? {
             return Ok(());
         }
@@ -581,9 +559,7 @@ impl Store {
         .execute(&mut **tx)
         .await
         .map_err(|e| {
-            anyhow::anyhow!(
-                "DDL failed: CREATE INDEX idx_messages_vctx_created\n  Error: {e}"
-            )
+            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_vctx_created\n  Error: {e}")
         })?;
 
         sqlx::query(
@@ -593,15 +569,17 @@ impl Store {
         .execute(&mut **tx)
         .await
         .map_err(|e| {
-            anyhow::anyhow!(
-                "DDL failed: CREATE INDEX idx_messages_peer_role_created\n  Error: {e}"
-            )
+            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_peer_role_created\n  Error: {e}")
         })?;
 
         tracing::info!(version = 5, "migration applied: messages table + indexes");
         Ok(())
     }
 
+    // Non-transactional single-version migrators.
+    // Called only from test code that exercises individual migrators in isolation.
+    // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
+    #[allow(dead_code)]
     /// v1: initial schema — clients, routing_state, context_token_map, bot_credentials.
     async fn migrate_to_v1(&self) -> Result<()> {
         if !self.try_claim_migration(1).await? {
@@ -651,6 +629,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// v2: backend session tables — backend_sessions_v2, active_sessions.
     async fn migrate_to_v2(&self) -> Result<()> {
         if !self.try_claim_migration(2).await? {
@@ -683,6 +662,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// v3: real_ctx unique index — backs race-free upsert in `map_context_token`.
     async fn migrate_to_v3(&self) -> Result<()> {
         if !self.try_claim_migration(3).await? {
@@ -698,6 +678,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     /// v4: `created_at` column + index on `context_token_map` for portable ORDER BY.
     ///
     /// `ALTER TABLE ADD COLUMN` is NOT idempotent — re-running it on a DB that
@@ -765,6 +746,7 @@ impl Store {
     /// `SELECT current_database()` probe returned `Err` on BOTH SQLite and
     /// MySQL, producing a false-positive `is_sqlite == true` on MySQL and
     /// breaking the migration. See F-M3-01 in the m3 review-findings.
+    #[allow(dead_code)]
     async fn migrate_to_v5(&self) -> Result<()> {
         if !self.try_claim_migration(5).await? {
             return Ok(());
@@ -836,6 +818,7 @@ impl Store {
     ///
     /// Returns Ok(false) on any error reading the catalog (caller treats the
     /// column as not present and lets the DDL surface the real error).
+    #[allow(dead_code)]
     async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         // The `pragma_table_info` form works on SQLite. `pragma` cannot be
         // parameterised, so we validate identifiers before splicing.
@@ -2268,9 +2251,10 @@ mod store_tests {
             .execute(&store.pool)
             .await
             .expect("delete lock sentinel");
-        let bad_insert = sqlx::query("INSERT INTO schema_version (version) VALUES ('not-a-number')")
-            .execute(&store.pool)
-            .await;
+        let bad_insert =
+            sqlx::query("INSERT INTO schema_version (version) VALUES ('not-a-number')")
+                .execute(&store.pool)
+                .await;
         assert!(
             bad_insert.is_err(),
             "SQLite INTEGER PRIMARY KEY must reject non-integer insert — F-M1-03 defence-in-depth"
