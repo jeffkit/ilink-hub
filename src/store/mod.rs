@@ -75,9 +75,13 @@ impl Store {
         // `create_if_missing` by default and will return SQLITE_CANTOPEN (14).
         if is_sqlite {
             let url_owned = url.to_string();
-            tokio::task::spawn_blocking(move || Self::ensure_sqlite_file(&url_owned))
-                .await
-                .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                tokio::task::spawn_blocking(move || Self::ensure_sqlite_file(&url_owned)),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("ensure_sqlite_file timed out after 10s"))?
+            .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
         }
 
         // For SQLite :memory: databases each new physical connection gets its own

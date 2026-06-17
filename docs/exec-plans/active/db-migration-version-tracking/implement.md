@@ -1,5 +1,36 @@
 # Database Migration Version Tracking Implement Log
 
+## M5 深度 Review 修复与版本发布 (2026-06-17, worktree: feat/db-migration-version-tracking)
+
+在 `feat/db-migration-version-tracking` worktree 中验证 M5 全部任务完成。
+
+### 验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo clippy -- -D warnings` | PASS |
+| `cargo test` | PASS (317 tests: 244 lib + 73 integration/e2e) |
+| `cargo build` | PASS |
+| `desktop-frontend` build | PASS |
+| `desktop-tauri` cargo check | PASS |
+
+### M5 任务完成
+
+| 任务 | 描述 | 状态 |
+|---|---|---|
+| B-01 | SQLite busy_timeout 保持默认 5s | RESOLVED |
+| SEC-002 | is_safe_identifier 校验 pragma_table_info 拼接 | RESOLVED |
+| SEC-011 | Store::connect 确保 install_default_drivers() | RESOLVED |
+| TO-03 | spawn_blocking 调用带 tokio::time::timeout(10s) 保护 | RESOLVED |
+
+### 文件变更
+
+- `src/store/mod.rs` — TO-03: ensure_sqlite_file 的 spawn_blocking 包装 timeout(10s)
+- `src/bridge/connection.rs` — fmt 修复
+- `docs/exec-plans/active/db-migration-version-tracking/reviews/m5/review-request.yaml` — M5 验证结果
+- `docs/exec-plans/active/db-migration-version-tracking/implement.md` — 本次更新
+
 ## M4 Review 发现修复 (2026-06-17, worktree: feat/db-migration-version-tracking)
 
 在 `feat/db-migration-version-tracking` worktree 中验证 M4 全部 Review 发现修复结果。

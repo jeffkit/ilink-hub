@@ -454,7 +454,9 @@ mod tests {
         assert!(!hostname.is_empty(), "local_hostname must return non-empty");
         // Must be valid UTF-8 (CStr::from_ptr + to_str would panic/crash otherwise).
         assert!(
-            hostname.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.'),
+            hostname
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '.'),
             "hostname must contain only valid chars"
         );
     }
