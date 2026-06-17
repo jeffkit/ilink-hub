@@ -1,0 +1,52 @@
+milestone: M4
+title: Poison-Safe Locks - 静态代码检查与质量保障
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 运行 Clippy 静态代码检查，消除所有警告，并验证没有遗留的 `std::sync::Mutex` 误用。
+  - 验证所有关键质量保障命令（fmt, clippy, test, build, desktop-frontend, desktop-tauri）全部全绿通过。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: N/A (此里程碑无功能代码改动，主要为质量检查和验证)
+    lines: []
+
+# ─── 验证命令（M4 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 无，所有静态检查和测试均全绿通过，不存在遗留警告和错误。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/lock-mutex-poison-safe/reviews/m4/review-request.yaml (本文件)
+  - docs/exec-plans/active/lock-mutex-poison-safe/implement.md (M4 状态更新)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否已通过 `cargo fmt --check` 格式化检查？
+  - [x] 是否已通过 `cargo clippy -- -D warnings` 且没有发现任何锁/unwrap相关的错误和警告？
+  - [x] 所有单元测试与集成测试（`cargo test`）是否全部通过？
+  - [x] Desktop Frontend 和 Desktop Tauri 构建/检查命令是否均全部成功？

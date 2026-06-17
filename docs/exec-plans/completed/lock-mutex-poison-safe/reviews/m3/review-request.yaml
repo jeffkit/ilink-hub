@@ -1,0 +1,64 @@
+milestone: M3
+title: Lock and Unwrap risks - src/ilink/upstream.rs HeaderValue unwrap() risk fix
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 将 `UpstreamClient::headers` 签名变更为 `fn headers(&self) -> Result<reqwest::header::HeaderMap>`。
+  - 使用 `HeaderValue::from_str(...)?` 替换 `HeaderValue::from_str(...).unwrap()`。
+  - 在所有调用 `self.headers()` 的异步方法中，使用 `?` 传播错误（例如 `.headers(self.headers()?)`）。
+  - 在 `src/ilink/upstream.rs` 单元测试中补充对非法 Token/UIN 生成的错误处理边界测试 `headers_fail_with_invalid_token`。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: src/ilink/upstream.rs
+    lines:
+      - 110: `notify_start` 方法中传播 headers 错误
+      - 124-139: 修改 `headers` 签名返回 `Result`，并将 `HeaderValue::from_str(...).unwrap()` 改为 `?` 传播错误
+      - 156: `get_updates` 错误传播
+      - 177: `send_message` 错误传播
+      - 211: `send_typing` 错误传播
+      - 224: `get_config` 错误传播
+      - 238: `get_upload_url` 错误传播
+      - 538-546: 新增 `headers_fail_with_invalid_token` 单元测试验证非法 Token 导致 `HeaderValue::from_str` 失败时的错误传播
+
+# ─── 验证命令（M3 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 改为使用 `?` 传播错误会将原本可能发生 Panic 的场景转化为 `Result::Err` 并由外层（例如 `UpstreamClient::run_polling_loop` 或是 Hub 调用者）统一以 `Result` 错误形式捕获处理，不会导致 Tokio Worker panic 崩溃，显著提升了系统的鲁棒性。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/lock-mutex-poison-safe/reviews/m3/review-request.yaml (本文件)
+  - docs/exec-plans/active/lock-mutex-poison-safe/implement.md (M3 状态更新)
+  - src/ilink/upstream.rs
+  - git commit (M3 实施提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否已将 `src/ilink/upstream.rs` 中所有 `HeaderValue::from_str(...).unwrap()` 替换为 `?` 错误传播？
+  - [x] 调用 `self.headers()` 的全部异步方法是否正确使用了 `?`？
+  - [x] `headers_fail_with_invalid_token` 单元测试是否已通过，并能验证非法 Token 时的错误捕获逻辑？
+  - [x] 验证命令（fmt, clippy, test, build, desktop-frontend, desktop-tauri）是否全绿通过？

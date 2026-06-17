@@ -37,7 +37,7 @@ impl RateLimiter {
 
     pub fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut inner = self.inner.lock().expect("rate limiter lock");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let bucket = inner
             .buckets
             .entry(key.to_string())
@@ -86,5 +86,26 @@ mod tests {
         // window_secs=0 means the window is 0 Duration; any subsequent call
         // that observes elapsed >= window resets the counter.
         assert!(limiter.allow("a"));
+    }
+
+    #[test]
+    fn test_ratelimit_poison_safe() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let limiter = Arc::new(RateLimiter::new(2, 60));
+        let limiter_clone = Arc::clone(&limiter);
+
+        // Explicitly lock and panic in a sub-thread to poison the Mutex
+        let handle = thread::spawn(move || {
+            let _lock = limiter_clone.inner.lock().unwrap();
+            panic!("poisoning the lock");
+        });
+        let _ = handle.join();
+
+        // When the Mutex is poisoned, calling allow should still succeed and not panic
+        assert!(limiter.allow("1.2.3.4"));
+        assert!(limiter.allow("1.2.3.4"));
+        assert!(!limiter.allow("1.2.3.4"));
     }
 }

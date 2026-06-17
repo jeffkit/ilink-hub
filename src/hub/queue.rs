@@ -1,7 +1,7 @@
 //! Per-client message queue — trait-based abstraction with in-memory default.
 //!
 //! The [`MessageQueue`] trait defines the contract for all queue backends.
-//! [`InMemoryQueue`] is the default implementation backed by a `tokio::sync::Mutex`.
+//! [`InMemoryQueue`] is the default implementation backed by a `DashMap` with per-slot synchronous `std::sync::Mutex`.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -191,7 +191,7 @@ impl ContextTokenMap {
     }
 
     pub fn has_conversation(&self, conv_key: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.conv_to_v.contains(conv_key)
     }
 
@@ -203,7 +203,7 @@ impl ContextTokenMap {
         real_ctx: String,
         peer_user_id: String,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, peer_user_id, Some(conv_key));
     }
 
@@ -220,7 +220,7 @@ impl ContextTokenMap {
         group_id: Option<&str>,
         client_scope: Option<&str>,
     ) -> String {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let conv_key = conversation_key(&peer_user_id, group_id).map(|k| match client_scope {
             Some(scope) => format!("{k}@{scope}"),
             None => k,
@@ -281,25 +281,25 @@ impl ContextTokenMap {
 
     /// Number of virtual context token entries currently held in memory.
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.len()
     }
 
     /// Whether the map currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.is_empty()
     }
 
     pub fn resolve(&self, vtoken: &str) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.get(vtoken).map(|r| r.real_token.clone())
     }
 
     /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
     /// Uses `get` (updates LRU promotion) to correctly update the LRU cache priority.
     pub fn resolve_full(&self, vtoken: &str) -> Option<(String, String)> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .v_to_record
             .get(vtoken)
@@ -308,13 +308,13 @@ impl ContextTokenMap {
 
     /// Seed a known mapping into the in-memory cache (without peer_user_id).
     pub fn seed(&self, vctx: String, real_ctx: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, "".to_string(), None);
     }
 
     /// Seed a known mapping including peer_user_id.
     pub fn seed_full(&self, vctx: String, real_ctx: String, peer_user_id: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, peer_user_id, None);
     }
 }
@@ -561,7 +561,7 @@ impl PerClientSlot {
     }
 
     fn push(&self, msg: WeixinMessage) -> bool {
-        let mut q = self.messages.lock().unwrap();
+        let mut q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
         let dropped = if q.len() >= self.max_queue_size {
             q.pop_front();
             warn!(
@@ -578,11 +578,18 @@ impl PerClientSlot {
     }
 
     fn drain(&self) -> Vec<WeixinMessage> {
-        self.messages.lock().unwrap().drain(..).collect()
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
     }
 
     fn len(&self) -> usize {
-        self.messages.lock().unwrap().len()
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -684,5 +691,120 @@ mod queue_config_tests {
         assert_eq!(drained.len(), 10);
         assert_eq!(drained[0].message_id, Some(1));
         assert_eq!(drained[9].message_id, Some(10));
+    }
+
+    #[test]
+    fn test_mutex_poison_safe() {
+        use std::thread;
+
+        // 1. Test ContextTokenMap poison safety
+        let m = Arc::new(ContextTokenMap::default());
+        let m_clone = m.clone();
+        // Hold the lock directly and panic to poison it
+        let handle = thread::spawn(move || {
+            let _guard = m_clone.inner.lock().unwrap();
+            panic!("force panic to poison ContextTokenMap Mutex");
+        });
+        let _ = handle.join();
+
+        // Adversarial tests on the poisoned ContextTokenMap:
+        // All methods should be checked to ensure they do not panic and correctly function.
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+
+        // Can we seed?
+        m.seed("vctx_1".into(), "real_1".into());
+        m.seed_full("vctx_2".into(), "real_2".into(), "peer_2".into());
+        m.seed_conversation(
+            "conv_3".into(),
+            "vctx_3".into(),
+            "real_3".into(),
+            "peer_3".into(),
+        );
+
+        assert_eq!(m.len(), 3);
+        assert!(!m.is_empty());
+
+        // Can we map?
+        let v_token = m.map("real_4".into(), "peer_4".into(), None);
+        assert!(!v_token.is_empty());
+
+        // Can we query / resolve?
+        assert!(m.has_conversation("conv_3"));
+        assert_eq!(m.resolve("vctx_1"), Some("real_1".to_string()));
+        assert_eq!(
+            m.resolve_full("vctx_2"),
+            Some(("real_2".to_string(), "peer_2".to_string()))
+        );
+
+        // Concurrent adversarial test on poisoned ContextTokenMap
+        let mut handles = vec![];
+        for thread_idx in 0..10 {
+            let m_thread = m.clone();
+            handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    let real = format!("real_{thread_idx}_{i}");
+                    let peer = format!("peer_{thread_idx}_{i}");
+                    let v = m_thread.map(real.clone(), peer.clone(), None);
+                    assert!(!v.is_empty());
+                    let resolved = m_thread.resolve(&v);
+                    assert_eq!(resolved, Some(real));
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 2. Test InMemoryQueue (PerClientSlot) poison safety
+        let slot = Arc::new(PerClientSlot::new(10));
+        let slot_clone = slot.clone();
+        let handle3 = thread::spawn(move || {
+            let _lock = slot_clone.messages.lock().unwrap();
+            panic!("force panic to poison PerClientSlot Mutex");
+        });
+        let _ = handle3.join();
+
+        // Now test push/drain/len on the poisoned slot should not panic and should behave correctly
+        assert!(!slot.push(WeixinMessage::default()));
+        assert_eq!(slot.len(), 1);
+        assert_eq!(slot.drain().len(), 1);
+        assert_eq!(slot.len(), 0);
+
+        // Push multiple messages into the poisoned slot
+        for i in 0..5 {
+            let msg = WeixinMessage {
+                message_id: Some(i),
+                ..Default::default()
+            };
+            slot.push(msg);
+        }
+        assert_eq!(slot.len(), 5);
+        let drained = slot.drain();
+        assert_eq!(drained.len(), 5);
+        assert_eq!(drained[0].message_id, Some(0));
+        assert_eq!(slot.len(), 0);
+
+        // Concurrent adversarial test on poisoned PerClientSlot
+        let mut slot_handles = vec![];
+        for thread_idx in 0..10 {
+            let slot_thread = slot.clone();
+            slot_handles.push(thread::spawn(move || {
+                for i in 0..50 {
+                    let msg = WeixinMessage {
+                        message_id: Some(thread_idx * 100 + i),
+                        ..Default::default()
+                    };
+                    slot_thread.push(msg);
+                    let drained = slot_thread.drain();
+                    for m in drained {
+                        assert!(m.message_id.is_some());
+                    }
+                }
+            }));
+        }
+        for h in slot_handles {
+            h.join().unwrap();
+        }
     }
 }
