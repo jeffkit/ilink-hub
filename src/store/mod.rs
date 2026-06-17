@@ -90,146 +90,239 @@ impl Store {
         Ok(())
     }
 
+    pub async fn get_current_version(&self) -> Result<i32> {
+        let row = sqlx::query("SELECT MAX(version) FROM schema_version")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => {
+                let val: Option<i32> = r.try_get(0).unwrap_or(None);
+                Ok(val.unwrap_or(0))
+            }
+            None => Ok(0),
+        }
+    }
+
+    pub async fn is_migration_run(&self, version: i32) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = $1")
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    pub async fn record_migration_run(&self, version: i32) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO schema_version (version) VALUES ($1) \
+             ON CONFLICT (version) DO NOTHING",
+        )
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn run_migrations(&self) -> Result<()> {
         // AnyPool does not support DDL (CREATE TABLE / ALTER TABLE) or sqlx::migrate!.
-        // For each supported driver we use a typed pool just for the migration run,
-        // then close it — the AnyPool used for normal queries shares the same
-        // on-disk file (or in-memory instance for SQLite, which is connection-scoped
-        // and handled separately).
+        // We implement our own lightweight version-tracking table (`schema_version`)
+        // so each migration step is applied exactly once and can be safely re-run.
         //
-        // The migration SQL files under migrations/ are the canonical schema record.
-        // The Rust code here must stay in sync with those files.
+        // The migration SQL files under migrations/ are the canonical human-readable
+        // reference. The Rust code here must stay in sync with those files.
+
+        // Bootstrap the version-tracking table before anything else.
+        // This is always idempotent via IF NOT EXISTS.
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await?;
 
         // ── v1: initial schema ────────────────────────────────────────────────
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS clients (
-                vtoken      TEXT PRIMARY KEY,
-                name        TEXT NOT NULL UNIQUE,
-                label       TEXT,
-                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                last_seen   TEXT
-            )",
-        )
-        .await?;
+        if !self.is_migration_run(1).await? {
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS clients (
+                    vtoken      TEXT PRIMARY KEY,
+                    name        TEXT NOT NULL UNIQUE,
+                    label       TEXT,
+                    created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    last_seen   TEXT
+                )",
+            )
+            .await?;
 
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS routing_state (
-                from_user     TEXT PRIMARY KEY,
-                active_vtoken TEXT NOT NULL,
-                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .await?;
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS routing_state (
+                    from_user     TEXT PRIMARY KEY,
+                    active_vtoken TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await?;
 
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS context_token_map (
-                vctx         TEXT PRIMARY KEY,
-                real_ctx     TEXT NOT NULL,
-                peer_user_id TEXT NOT NULL DEFAULT '',
-                expires_at   TEXT
-            )",
-        )
-        .await?;
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS context_token_map (
+                    vctx         TEXT PRIMARY KEY,
+                    real_ctx     TEXT NOT NULL,
+                    peer_user_id TEXT NOT NULL DEFAULT '',
+                    expires_at   TEXT
+                )",
+            )
+            .await?;
 
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS bot_credentials (
-                id         INTEGER PRIMARY KEY,
-                token      TEXT NOT NULL,
-                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .await?;
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS bot_credentials (
+                    id         INTEGER PRIMARY KEY,
+                    token      TEXT NOT NULL,
+                    base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
+                    updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await?;
+
+            self.record_migration_run(1).await?;
+            tracing::info!("migration v1 applied: initial schema");
+        }
 
         // ── v2: backend session tables ────────────────────────────────────────
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
-                vctx               TEXT NOT NULL,
-                vtoken             TEXT NOT NULL,
-                session_name       TEXT NOT NULL,
-                backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken, session_name)
-            )",
-        )
-        .await?;
+        if !self.is_migration_run(2).await? {
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+                    vctx               TEXT NOT NULL,
+                    vtoken             TEXT NOT NULL,
+                    session_name       TEXT NOT NULL,
+                    backend_session_id TEXT NOT NULL DEFAULT '',
+                    created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    PRIMARY KEY (vctx, vtoken, session_name)
+                )",
+            )
+            .await?;
 
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS active_sessions (
-                vctx         TEXT NOT NULL,
-                vtoken       TEXT NOT NULL,
-                session_name TEXT NOT NULL DEFAULT 'default',
-                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken)
-            )",
-        )
-        .await?;
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS active_sessions (
+                    vctx         TEXT NOT NULL,
+                    vtoken       TEXT NOT NULL,
+                    session_name TEXT NOT NULL DEFAULT 'default',
+                    updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                    PRIMARY KEY (vctx, vtoken)
+                )",
+            )
+            .await?;
+
+            self.record_migration_run(2).await?;
+            tracing::info!("migration v2 applied: backend session tables");
+        }
 
         // ── v3: real_ctx unique index (race-free upsert) ──────────────────────
-        if let Err(e) = self
-            .ddl(
+        if !self.is_migration_run(3).await? {
+            self.ddl(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
                  ON context_token_map (real_ctx)",
             )
             .await
-        {
-            tracing::warn!(error = %e, "v3 migration: CREATE UNIQUE INDEX failed (may already exist)");
+            .map_err(|e| {
+                anyhow::anyhow!("v3 migration: CREATE UNIQUE INDEX idx_context_token_map_real_ctx failed: {e}")
+            })?;
+
+            self.record_migration_run(3).await?;
+            tracing::info!("migration v3 applied: real_ctx unique index");
         }
 
         // ── v4: created_at column + index for portable ORDER BY ───────────────
-        if let Err(e) = self
-            .ddl(
-                "ALTER TABLE context_token_map \
-                 ADD COLUMN created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)",
-            )
-            .await
-        {
-            tracing::debug!(error = %e, "v4 migration: ALTER TABLE skipped (column likely already exists)");
-        }
+        //
+        // ALTER TABLE ADD COLUMN is not idempotent — re-running it on a DB that
+        // already has the column returns a "duplicate column" error. The
+        // schema_version guard prevents this for DBs that went through v4 normally.
+        //
+        // For DBs upgrading from a pre-schema_version era the column may already
+        // exist. We detect that specific error and treat it as a no-op so that old
+        // deployments can bootstrap schema_version tracking without data loss.
+        if !self.is_migration_run(4).await? {
+            match self
+                .ddl(
+                    "ALTER TABLE context_token_map \
+                     ADD COLUMN created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)",
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("duplicate column")
+                        || msg.contains("already exists")
+                        || msg.contains("duplicate")
+                    {
+                        // Column already present from a previous untracked run — safe to proceed.
+                        tracing::debug!(
+                            "v4 migration: created_at column already present, skipping ALTER"
+                        );
+                    } else {
+                        return Err(e.context(
+                            "v4 migration: ALTER TABLE context_token_map ADD COLUMN created_at failed",
+                        ));
+                    }
+                }
+            }
 
-        if let Err(e) = self
-            .ddl(
+            self.ddl(
                 "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
                  ON context_token_map (created_at DESC)",
             )
             .await
-        {
-            tracing::warn!(error = %e, "v4 migration: CREATE INDEX failed (may already exist)");
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "v4 migration: CREATE INDEX idx_context_token_map_created_at failed: {e}"
+                )
+            })?;
+
+            self.record_migration_run(4).await?;
+            tracing::info!(
+                "migration v4 applied: context_token_map created_at column + index"
+            );
         }
 
         // ── v5: chat message history ──────────────────────────────────────────
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS messages (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                vctx         TEXT NOT NULL,
-                vtoken       TEXT,
-                session_name TEXT NOT NULL DEFAULT 'default',
-                peer_user_id TEXT NOT NULL DEFAULT '',
-                role         TEXT NOT NULL,
-                content      TEXT NOT NULL,
-                created_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .await?;
+        if !self.is_migration_run(5).await? {
+            self.ddl(
+                "CREATE TABLE IF NOT EXISTS messages (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    vctx         TEXT NOT NULL,
+                    vtoken       TEXT,
+                    session_name TEXT NOT NULL DEFAULT 'default',
+                    peer_user_id TEXT NOT NULL DEFAULT '',
+                    role         TEXT NOT NULL,
+                    content      TEXT NOT NULL,
+                    created_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await?;
 
-        if let Err(e) = self
-            .ddl(
+            self.ddl(
                 "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
                  ON messages (vctx, created_at DESC)",
             )
             .await
-        {
-            tracing::warn!(error = %e, "v5 migration: CREATE INDEX failed (may already exist)");
-        }
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "v5 migration: CREATE INDEX idx_messages_vctx_created failed: {e}"
+                )
+            })?;
 
-        if let Err(e) = self
-            .ddl(
+            self.ddl(
                 "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
                  ON messages (peer_user_id, role, created_at DESC)",
             )
             .await
-        {
-            tracing::warn!(error = %e, "v5 migration: CREATE INDEX (peer) failed (may already exist)");
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "v5 migration: CREATE INDEX idx_messages_peer_role_created failed: {e}"
+                )
+            })?;
+
+            self.record_migration_run(5).await?;
+            tracing::info!("migration v5 applied: messages table + indexes");
         }
 
         Ok(())
@@ -920,6 +1013,42 @@ impl Store {
 #[cfg(test)]
 mod store_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_schema_version_tracking() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        // Initial version should be 0 since no incremental migration is implemented yet
+        let version = store
+            .get_current_version()
+            .await
+            .expect("get_current_version");
+        assert_eq!(version, 0);
+
+        // Test metadata logic: version 0 should be run
+        let run_0 = store.is_migration_run(0).await.expect("is_migration_run");
+        assert!(run_0);
+
+        // Version 1 should not be run yet
+        let run_1 = store.is_migration_run(1).await.expect("is_migration_run");
+        assert!(!run_1);
+
+        // Record a migration run for version 1
+        store
+            .record_migration_run(1)
+            .await
+            .expect("record_migration_run");
+
+        // Now version 1 should be run
+        let run_1_after = store.is_migration_run(1).await.expect("is_migration_run");
+        assert!(run_1_after);
+
+        // Current version should now be 1
+        let version_after = store
+            .get_current_version()
+            .await
+            .expect("get_current_version");
+        assert_eq!(version_after, 1);
+    }
 
     #[tokio::test]
     async fn migration_runs_on_in_memory_sqlite() {
