@@ -31,3 +31,30 @@
 ### Commit
 
 Commit: fdc860c
+
+## M2: 修复 `src/relay/ratelimit.rs` 锁安全 ─ done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：修改 `src/relay/ratelimit.rs` 中的 `RateLimiter::allow` 的锁，改为 poison-safe，并补充单元测试。
+- **审查请求**：[reviews/m2/review-request.yaml](./reviews/m2/review-request.yaml)
+
+### 关键改动
+
+- 修改 `src/relay/ratelimit.rs` 中的 `RateLimiter::allow` 内部的 `self.inner.lock().expect(...)` 调用，替换为 `lock().unwrap_or_else(|e| e.into_inner())`。
+- 在 `src/relay/ratelimit.rs` 的 `tests` 模块中新增 `test_ratelimit_poison_safe` 单元测试，通过显式在子线程获取锁后 panic 来毒化 `RateLimiter` 内部的 `Mutex`，然后验证主线程再次调用 `allow` 能够安全返回数据而不发生 panic，确保了毒化安全性。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: a5d2d59
