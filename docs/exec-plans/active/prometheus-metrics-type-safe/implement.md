@@ -38,3 +38,15 @@ Cargo.lock 自动更新。
 - 结合已有测试，完整覆盖 plan.md 要求的全部特殊字符：`{`, `}`, `\n`, `\`, `"`
 - 验证 prometheus crate 的 label 转义机制正确输出合法格式
 - 全部 6 项验证通过：fmt、clippy、test（330 passed）、build、desktop-frontend、desktop-tauri
+
+## M5 详情
+
+全量检查与集成验证：
+- 格式化检查：`cargo fmt --check` 通过。
+- 静态代码分析：`cargo clippy -- -D warnings` 无 warning 通过。
+- 单元与集成测试：`cargo test` 通过，共 330 个测试全部 PASS。
+- 编译检查：`cargo build` 成功。
+- 桌面端前端构建：`cd desktop/ilink-hub-desktop && npm run build` 成功。
+- 桌面端 Tauri 编译：`cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` 成功。
+- 所有 6 项验证指令均已通过。
+
