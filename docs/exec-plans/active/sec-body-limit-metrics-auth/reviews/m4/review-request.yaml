@@ -1,0 +1,55 @@
+milestone: M4
+title: SEC-010 Body Limit 413 — 单元测试
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 在 `tests/breaking_changes.rs` 中编写并执行单元测试，对全局和 sendmessage 分别进行限制验证。
+  - 边界值验证：正好 256 KB 允许通过，超过 256 KB 触发 413 Payload Too Large。
+  - 放宽限制验证：/ilink/bot/sendmessage 刚好 4 MB 允许通过，超过 4 MB 触发 413 Payload Too Large。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: tests/breaking_changes.rs
+    lines:
+      - 624-663: 新增 `test_body_limit_global` 测试用例，验证全局边界值
+      - 665-720: 新增 `test_body_limit_sendmessage_override` 测试用例，验证 sendmessage 覆盖边界值
+
+# ─── 验证命令（M4 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 需确保测试中的 size 正好是边界值（256 * 1024 字节 and 4 * 1024 * 1024 字节），以保证边界行为的正确性。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m4/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md (M4 状态更新)
+  - git commit (M4 提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 新增测试用例是否有效覆盖了正好 256 KB（通过）与 256 KB + 1 字节（413）的边界情况？
+  - [x] 新增测试用例是否有效覆盖了 sendmessage 正好 4 MB（通过）与 4 MB + 1 字节（413）的边界情况？
+  - [x] 六项质量门禁命令是否均全绿通过？

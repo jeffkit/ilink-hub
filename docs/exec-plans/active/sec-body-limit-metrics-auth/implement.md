@@ -113,7 +113,35 @@ Commit: 59723a2
 | `cd desktop/ilink-hub-desktop && npm run build` | pass |
 | `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
 
+Commit: ea4ee57
+
+---
+
+## M4: 单元测试 - Body Limit 413 — done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：单元测试 - Body Limit 413 边界条件及 sendmessage 放宽限制验证。
+- **审查请求**：[reviews/m4/review-request.yaml](./reviews/m4/review-request.yaml)
+
+### 关键改动
+
+- 验证并执行 `tests/breaking_changes.rs` 中的 `test_body_limit_global` 与 `test_body_limit_sendmessage_override` 两个单元测试：
+  - 验证全局 256 KB 边界：刚好 256 KB 可接受，多 1 字节返回 413 Payload Too Large。
+  - 验证 sendmessage 4 MB 边界：刚好 4 MB 可接受，多 1 字节返回 413 Payload Too Large，而在 256 KB + 1 字节时可顺利通过（不报 413）。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
 ### Commit
 
-Commit: ea4ee57
+Commit: 81ab0e4
 
