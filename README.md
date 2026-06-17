@@ -110,6 +110,9 @@ services:
       - ilink-hub-data:/data
     environment:
       DATABASE_URL: sqlite:/data/ilink-hub.db
+      # 强烈建议设置 — 不设置时 /hub/ 管理端点仅当显式开启 ILINK_ADMIN_INSECURE_NO_AUTH=true 才允许无鉴权访问
+      # Strongly recommended — if unset, /hub/ admin endpoints require ILINK_ADMIN_INSECURE_NO_AUTH=true
+      # ILINK_ADMIN_TOKEN: your-secret-token
       # ILINK_TOKEN: your-token  # Optional: skip QR login if you have a token
 
 volumes:
@@ -261,9 +264,16 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 | `GET` | `/metrics` | Prometheus-format metrics |
 | `GET` | `/health` | Health check |
 
-**Admin auth:** Set `ILINK_ADMIN_TOKEN=<secret>` on the Hub. Then pass `Authorization: Bearer <secret>`
-when calling `/hub/register` or `/hub/clients`. If the env var is unset, these endpoints are open (suitable
-for local dev / private networks).
+**Admin auth（必填/Required）:** 部署时必须设置 `ILINK_ADMIN_TOKEN=<secret>`，客户端调用
+`/hub/register` 或 `/hub/clients` 时需传递 `Authorization: Bearer <secret>`。未设置 token 时，
+管理端点默认返回 403；若要允许无鉴权访问（**仅限本地开发环境**），需显式设置
+`ILINK_ADMIN_INSECURE_NO_AUTH=true`。
+
+> [!WARNING]
+> **安全警告 / Security Warning**:
+> 绝不要在生产环境设置 `ILINK_ADMIN_INSECURE_NO_AUTH=true`。该选项会完全移除 `/hub/` 管理端点的
+> 身份验证，使任何人都能注册客户端、查看所有 vtoken 并操作 Hub。仅在本地开发或完全隔离的私有网络
+> 中使用。
 
 ---
 

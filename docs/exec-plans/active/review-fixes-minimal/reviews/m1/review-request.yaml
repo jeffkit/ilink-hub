@@ -1,0 +1,19 @@
+milestone: M1
+title: 安全文档与 Docker 示例完善
+description: |
+  README.md 中 ILINK_ADMIN_TOKEN 标注为必填，ILINK_ADMIN_INSECURE_NO_AUTH=true 添加安全警告；
+  新增 deploy/docker-compose.example.yml 含 ILINK_ADMIN_TOKEN 强制建议。
+files:
+  - path: README.md
+    changes:
+      - Docker Compose 示例（Option C）添加 ILINK_ADMIN_TOKEN 注释，标注强烈建议设置及不安全模式说明
+      - Admin auth 段落重写：标注 ILINK_ADMIN_TOKEN 为必填，ILINK_ADMIN_INSECURE_NO_AUTH=true 添加 WARNING 块
+  - path: deploy/docker-compose.example.yml
+    changes:
+      - 新建独立 Docker Compose 部署示例，ILINK_ADMIN_TOKEN 为必填项，含中英文注释说明
+review_focus:
+  - 安全警告措辞是否清晰充分
+  - ILINK_ADMIN_INSECURE_NO_AUTH 的风险是否显著标注
+  - Docker Compose 示例是否便于首次部署者正确配置
+verify_commands:
+  - grep -n "ILINK_ADMIN_TOKEN\|ILINK_ADMIN_INSECURE_NO_AUTH" README.md deploy/docker-compose.example.yml
