@@ -498,20 +498,6 @@ async fn renew_expired_session(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::UpstreamClient;
-
-    #[test]
-    fn well_formed_bot_token() {
-        assert!(UpstreamClient::is_well_formed_bot_token(
-            "bot@im.bot:secret"
-        ));
-        assert!(!UpstreamClient::is_well_formed_bot_token(""));
-        assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
-    }
-}
-
 #[async_trait]
 impl UpstreamSink for UpstreamClient {
     async fn notify_start(&self) -> Result<()> {
@@ -537,5 +523,19 @@ impl UpstreamSink for UpstreamClient {
     }
     fn relogin_attempts(&self) -> u64 {
         self.relogin_attempts.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpstreamClient;
+
+    #[test]
+    fn well_formed_bot_token() {
+        assert!(UpstreamClient::is_well_formed_bot_token(
+            "bot@im.bot:secret"
+        ));
+        assert!(!UpstreamClient::is_well_formed_bot_token(""));
+        assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
     }
 }
