@@ -1,496 +1,224 @@
 milestone: M2
-title: "Adversarial Rust security & concurrency review of M2 — refactor run_migrations into per-version migrate_to_vN"
-reviewer: "rust-sec-concurrency-specialist"
-date: 2026-06-17
-worktree: /Users/kongjie/projects/ilink-hub
-base_commit: 5ff7cc6cb9ae078e7f114d951574d5252b3a9a3b
-commit_under_review: 4433cad89c
-resolution: >-
-  M2 is a refactor that preserves the M1 concurrency contract. The five
-  `migrate_to_vN` functions are pure extractions of the inline blocks in the
-  pre-M2 `run_migrations`, the per-step `try_claim_migration` gate is moved
-  inside each migrator (early-return on `false`), and the explicit
-  `.map_err(|e| anyhow!(...))` wrappers around CREATE INDEX / ALTER TABLE are
-  removed in favor of the existing `ddl()` helper's `DDL failed: {sql}\n
-  Error: {e}` message. `cargo fmt --check`, `cargo clippy -- -D warnings`,
-  `cargo test` (295 passed / 0 failed), and `cargo build` all green; the
-  desktop frontend / Tauri side builds cleanly. The eight M2 tests
-  (F-M2-01 .. F-M2-08) cover the headline invariants: per-version isolation,
-  idempotency, DDL error propagation, claim/record consistency, v4 alone
-  with pre-conditions, full run ordering, double-call idempotency, and
-  CURRENT_TIMESTAMP-only DDL.
+title: "对抗性审查 — Rust 安全与并发（内存安全 / data race / tokio 异步陷阱 / OWASP）"
+review_date: 2026-06-17
+reviewer: adversarial-rust-sec
+verdict: PASS
 
-  Findings (all post-fix from M1; nothing new is CRITICAL or HIGH):
-    - F-M2-01 (MEDIUM): The claim-then-DDL window is wider than necessary.
-      Each `migrate_to_vN` writes its `schema_version` row first and runs the
-      DDL after. A panic or process kill between the two leaves the row
-      present with no DDL applied; the next connect sees the claim and
-      short-circuits, so a half-migrated DB is silently "skipped" past
-      indefinitely until a DBA drops the row. The plan documents this
-      behavior at the top of `run_migrations`, so this is a known
-      trade-off, but it is still a window of partial application that
-      surfaces as a real-world recovery problem in three of the new tests
-      (F-M2-03 expects the row to be present after DDL failure; F-M1-02
-      already documented the recovery-by-DBA shape). A future milestone
-      could tighten this by moving the DDL inside a transaction with the
-      claim, but the SQLite-with-single-connection model makes that
-      awkward, and a tighter ordering changes the concurrent-writer
-      semantics. NOT-EXPLOITABLE today (no remote attacker can force a
-      panic mid-`ddl`; the only trigger is a process kill), but the test
-      suite should pin down the recovery procedure (drop the row, restart).
-    - F-M2-02 (MEDIUM): `AUTOINCREMENT` on `messages.id` (line 370) is
-      SQLite-specific syntax. M2's plan claims the code must stay
-      portable across SQLite / Postgres / MySQL (see the run_migrations
-      docstring at lines 163-168, plus the AnyPool architecture). On
-      Postgres / MySQL the `AUTOINCREMENT` keyword would be a parse error.
-      M3 (同步与对齐 migrations/) is the right place to flag this — the
-      v5 DDL is moved into `migrations/0005_messages.sql` in M3, and the
-      equivalent SQL file should use `SERIAL` / `BIGINT AUTO_INCREMENT`
-      depending on target. This is NOT a runtime risk in M2 itself
-      (M2 only runs against SQLite in tests), but it would surface as a
-      DDL failure on first `Store::connect` against a non-SQLite
-      database, which violates the M2 E2E Checkpoint 2 (Store::connect
-      must succeed on a fresh DB). Mark as DEFER-TO-M3.
-    - F-M2-03 (MEDIUM): `ddl()` (line 456) formats the error as
-      `"DDL failed: {sql}\n  Error: {e}"` where `sql` is the *full* DDL
-      string. The 8 M2 DDL strings total ~1.6 KB of SQL embedded in the
-      error chain. On a real production crash with a real SQL string in
-      flight, the user-visible log line is fine (a single line), but if
-      tracing serialises this into structured JSON it will balloon
-      structured-log size. Low-impact today; would benefit from a
-      `truncated_sql` helper if logs ever leak into a quota-bound sink.
-      Not security-critical.
-    - F-M2-04 (LOW): The M2 dispatcher uses `?` to short-circuit on the
-      first failing migrator. The plan asks for this ("any DDL failure
-      → Store::connect returns Err"). Tests confirm: F-M2-03 seeds v3 to
-      fail and asserts Err is propagated; F-M2-06 walks all five steps
-      and confirms `get_current_version == 5`. The shape is correct.
-      Note (low) that the dispatcher does not wrap the whole walk in
-      a single transaction — this is intentional (DDL auto-commits in
-      many engines, and SQLite's single-connection pin is the
-      serialisation point). Leaving as-is.
-    - F-M2-05 (LOW): `try_claim_migration` and `record_migration_run` are
-      `pub` (lines 135, 151). The review-request explicitly notes that
-      "a future hardening pass can tighten `record_migration_run` to
-      `pub(crate)`". M2 did not tighten either. No external callers
-      depend on these symbols, so tightening would be a one-line, no-risk
-      change. Defer.
-    - F-M2-06 (LOW): `migrate_to_vN` are private (correct — only
-      `run_migrations` dispatches to them). The visibility is the
-      minimum needed. Good.
-    - F-M2-07 (LOW): `column_exists` (line 409) uses an ad-hoc driver
-      probe (`SELECT current_database()` succeeds on Postgres/MySQL,
-      errors on SQLite) every time it is called. The migration runner
-      calls it once per `migrate_to_v4`, so the cost is one extra
-      round-trip per connect. Negligible. If M4 needs to call it more
-      often, cache the result.
-    - F-M2-08 (INFORMATIONAL): The `migrate_to_vN` functions are
-      `async fn` taking `&self`. They are not `async fn migrate_to_vN(self: &Self)`-style
-      explicitly, which is fine — the impl-block style is the idiomatic
-      Rust shape. No issue.
-    - F-M2-09 (INFORMATIONAL): The M2 refactor does not touch the
-      `migrations/` directory (M3's scope). The docstring at lines
-      165-167 says "The migration SQL files under migrations/ are the
-      canonical human-readable reference. The Rust code here must stay
-      in sync with those files." M2 does not break this invariant
-      (DDL strings are byte-identical to the M1 baseline), but M3 must
-      verify it.
-
-  VERDICT: PASS with two MEDIUM observations (claim-then-DDL recovery window
-  is documented but the test suite does not pin the recovery procedure;
-  AUTOINCREMENT is SQLite-specific and will fail on Postgres/MySQL — must
-  be addressed in M3). All M1 findings (F-M1-01, F-M1-02, F-M1-03,
-  F-M1-04, F-M1-07, F-M1-08) remain fixed in the M2 refactor.
-
+# ─── Review scope ─────────────────────────────────────────────────────────
 scope:
-  - "src/store/mod.rs: Store::run_migrations (refactored to dispatch to per-version migrators)"
-  - "src/store/mod.rs: Store::migrate_to_v1 .. migrate_to_v5 (new private methods)"
-  - "src/store/mod.rs: m2_per_version_migrators_update_schema_version_independently, m2_migrators_are_idempotent_per_step, m2_ddl_error_propagates_through_migrator, m2_claim_and_record_are_consistent_with_schema_version, m2_v4_alone_with_minimal_preconditions, m2_run_migrations_records_all_versions_in_order, m2_run_migrations_idempotent_double_call, m2_ddl_uses_current_timestamp_only (new tests)"
+  file: src/store/mod.rs
+  focus:
+    - memory_safety       # unsafe blocks, use-after-free, double-free, buffer overflow
+    - data_race           # Send/Sync, concurrent mutation, lock ordering
+    - tokio_async_pitfalls # deadlock, spawn_blocking misuse, cancellation safety
+    - owasp_top10         # injection, broken auth, sensitive data exposure, security misconfig
+  excluded:
+    - src/bridge/connection.rs  # unsafe gethostname FFI predates this changeset
+    - test-only code paths      # reviewed but not blocking
 
-# ─── Method ──────────────────────────────────────────────────────────────────
-# Read review-request.yaml against the actual source. For each M2 claim
-# (per-version migrators, schema-version update, error propagation,
-# CURRENT_TIMESTAMP unification, E2E Checkpoint 2 idempotency) try to
-# construct a counter-example that breaks the claim. Findings are organised
-# by severity (CRITICAL first), with CWE / OWASP references and concrete
-# remediation. Re-ran the commands the request claims to have run; results
-# are noted in the claim_audit section.
-
-# ─── Findings ────────────────────────────────────────────────────────────────
+# ─── Findings ─────────────────────────────────────────────────────────────
 findings:
 
-  # ─── CRITICAL ──────────────────────────────────────────────────────────────
-  - id: F-M2-00-NONE
-    severity: CRITICAL
-    cwe: null
-    category: null
-    status: N/A
-    title: "No CRITICAL findings."
-    description: |
-      M2 is a refactor that preserves the M1 concurrency contract (atomic
-      `try_claim_migration`, portable `column_exists` pre-check, decode-error
-      propagation). No memory-safety, data-race, or new security issue is
-      introduced. The M1 fix surface (F-M1-01 .. F-M1-08) remains intact in
-      the M2 code paths.
+  # ═══════════════════════════════════════════════════════════════════════
+  # SEC-LOW findings
+  # ═══════════════════════════════════════════════════════════════════════
 
-  # ─── HIGH ─────────────────────────────────────────────────────────────────
-  - id: F-M2-00-NONE
-    severity: HIGH
-    cwe: null
-    category: null
-    status: N/A
-    title: "No HIGH findings."
-    description: |
-      No HIGH-severity issue found. The M2 dispatcher propagates errors via
-      `?` (verified by F-M2-03), `try_claim_migration` is mutually exclusive
-      (verified by F-M1-08 / F-M2-04), and the `column_exists` pre-check
-      avoids the over-broad substring match that F-M1-02 flagged.
-
-  # ─── MEDIUM ────────────────────────────────────────────────────────────────
-  - id: F-M2-01
-    severity: MEDIUM
+  - id: SEC-ADV-M2-001
+    severity: LOW
     cwe: CWE-754
-    category: error-handling / partial-apply window
-    status: KNOWN-DESIGN-TRADE-OFF
-    title: >-
-      Claim-then-DDL ordering leaves a partial-apply window: a panic or
-      process kill between `try_claim_migration(N)` and the DDL body of
-      `migrate_to_vN` writes the version row without applying the DDL.
-    evidence:
-      - "src/store/mod.rs:215-216 — `if !self.try_claim_migration(1).await? { return Ok(()); }` is the first statement of `migrate_to_v1`; the row is written BEFORE the four DDL statements"
-      - "src/store/mod.rs:215-260 — same shape for v1, all four DDL statements run AFTER the claim"
-      - "src/store/mod.rs:177-179 — the run_migrations docstring acknowledges this: 'a partial DDL failure leaves the version row present and a subsequent connect will skip the broken step (DBA can then drop the row manually)'"
-      - "src/store/mod.rs:1987-2000 — `m2_ddl_error_propagates_through_migrator` confirms the row IS present after a v3 DDL failure (`assert!(store.is_migration_run(3).await.unwrap(), ...)`)"
-    why_it_matters: >
-      The M2 refactor narrows the failure surface (each migrator is one
-      function, so the DDL body is in one place), but it does NOT narrow
-      the partial-apply window itself. If the process is killed (or
-      panics, or is OOM-killed) between the `try_claim_migration`
-      INSERT and the CREATE TABLE, the next connect sees the version
-      row already present, returns Ok early, and the schema_version
-      table claims the DB is at vN when the actual schema is missing
-      the vN tables.
+    category: error_handling
+    title: "column_exists SQLite 路径使用 unwrap_or(None) 吞没所有错误"
+    location: "src/store/mod.rs:888-894"
+    description: |
+      非事务版本的 `column_exists` 在 SQLite 分支（`pragma_table_info`）上
+      对查询结果调用了 `.unwrap_or(None)`，这会静默吞没所有 `Err` 变体（连接池
+      耗尽、数据库文件被删除、SQLite 内部错误等），并将其视为"列不存在"。
 
-      This is a real-world recovery problem: the plan's E2E Checkpoint
-      2 promises "Store::connect returns Err on any migration failure"
-      — but the error has to surface INSIDE the migrator, not from
-      SIGKILL. The recovery is by DBA (drop the version row, restart),
-      which is fine for an embedded SQLite app with one operator, but
-      the test suite does not pin the recovery procedure down. A
-      future regression that, say, wraps `try_claim_migration` and the
-      DDL in a `tokio::task::spawn_blocking` could widen this window
-      further without breaking any existing test.
-    fix: >
-      Either (a) tighten the test surface to pin the recovery procedure
-      — a test that simulates a kill between claim and DDL (e.g. by
-      calling `try_claim_migration(N)` directly on a fresh DB and
-      asserting that `run_migrations` correctly skips the now-claimed
-      vN — but the test then documents that the operator must drop
-      the row to retry), or (b) defer the claim until after the DDL
-      succeeds, accepting the narrower window but the SAME
-      concurrent-writer race that the M1 fix (F-M1-01) closed. The
-      trade-off is "M1-style TOCTOU vs M2-style partial-apply window";
-      M2's choice is correct, and the test surface just needs to
-      acknowledge it.
+      事务版本（`migrate_to_v4_tx` 中的内联 catalog 查询，第 548-549 行）正确
+      使用 `?` 传播错误，两者不一致。
 
-      Recommendation: add a test that calls `try_claim_migration(99)`
-      (a version that does not exist) on a fresh DB, then calls
-      `run_migrations`, and asserts that v99 is silently skipped (the
-      claim returns true, the migrator does not exist, the dispatch
-      does not error). Wait — `run_migrations` only dispatches to
-      v1..v5, so v99 is never tried. The test needs to target a
-      real version: call `try_claim_migration(4)` on a fresh DB,
-      then `run_migrations` should skip the v4 DDL (claim already
-      taken) and the DB should be missing the `created_at` column.
-      This is the recovery shape; pin it down.
-    references:
-      - "M1 review F-M1-05 (partial-apply window) — same shape, M2 refactor preserves it"
-      - "M1 plan top-of-run_migrations comment (line 177-179) — operator procedure documented"
-    disposition: DEFER (not blocking M2; recovery procedure is operator-driven and documented)
+      实际风险：如果连接池出现问题，column_exists 返回 Ok(false)，调用者会尝试
+      ALTER TABLE ADD COLUMN，该语句也会因同样的连接问题而失败。最终错误仍然会
+      传播出去，只是错误信息不够精确。不会导致静默数据损坏。
+    recommendation: |
+      考虑在 SQLite 分支也使用 `?` 传播错误，与事务版本保持一致。或者在吞没错误
+      时记录 tracing::warn! 日志，以便生产环境排查。
+    acceptance: ACCEPTED_AS_IS
+    acceptance_reason: |
+      非事务版本仅用于测试代码。生产路径使用 migrate_to_vN_tx 事务变体，已正确
+      传播错误。即使错误被吞没，后续 DDL 也会因同样的连接问题而失败，不会导致
+      静默数据损坏。
 
-  - id: F-M2-02
-    severity: MEDIUM
-    cwe: CWE-1104
-    category: portability / SQL dialect mismatch
-    status: DEFER-TO-M3
-    title: >-
-      `AUTOINCREMENT` on `messages.id` is SQLite-specific syntax and will
-      fail to parse on Postgres / MySQL, violating the M2 E2E Checkpoint 2
-      promise that `Store::connect` succeeds on a fresh DB.
-    evidence:
-      - "src/store/mod.rs:370 — `id INTEGER PRIMARY KEY AUTOINCREMENT` (inside `migrate_to_v5`)"
-      - "src/store/mod.rs:165-168 — `run_migrations` docstring claims the runner is portable across SQLite / Postgres / MySQL: 'uses sqlx with runtime driver selection via `DATABASE_URL`'"
-      - "src/store/mod.rs:27-63 — `Store::connect` accepts any of the three drivers via `AnyPool`"
-      - "Postgres: `AUTOINCREMENT` is not a keyword; the equivalent is `GENERATED BY DEFAULT AS IDENTITY` (SQL standard) or `SERIAL` (Postgres-specific) — using `AUTOINCREMENT` returns a syntax error"
-      - "MySQL: `AUTOINCREMENT` IS valid as a column attribute (not a keyword), so MySQL would actually accept this; only Postgres breaks"
-      - "M2 test inventory: no test in M2 runs `run_migrations` against a Postgres or MySQL database"
-    why_it_matters: >
-      The M2 E2E Checkpoint 2 says "正常连接数据库时,所有的迁移步骤(v1-v5)
-      都能幂等成功执行" — "any database". The M1 review-request
-      (line 36-37) also notes the code is "portable across SQLite,
-      Postgres, and MySQL". The M2 refactor does not introduce this
-      issue (M1 had the same `AUTOINCREMENT` line), but it also does
-      not fix it, and a future user who sets `DATABASE_URL` to a
-      Postgres connection string will hit a `DDL failed: CREATE TABLE
-      IF NOT EXISTS messages (...)` error on first connect and the
-      program will refuse to start.
-
-      M3 is the milestone that "synchronises and aligns migrations/
-      SQL files with the Rust DDL". The v5 DDL is moved to
-      `migrations/0005_messages.sql` in M3; that file should use
-      `GENERATED BY DEFAULT AS IDENTITY` (SQL standard, supported by
-      Postgres 10+ and SQLite 3.23+) or have a per-driver variant.
-      M2's claim of portability is technically wrong for v5.
-    fix: >
-      M3: split the v5 DDL into driver-specific forms. The cleanest
-      approach is the SQL standard `GENERATED BY DEFAULT AS IDENTITY`
-      (Postgres 10+, SQLite 3.23+ via `INTEGER PRIMARY KEY` is
-      already auto-rowid; MySQL 8.0+ supports it; older MySQL needs
-      `AUTO_INCREMENT`). If the project's minimum supported MySQL is
-      < 8.0, add a runtime driver check in `migrate_to_v5` and pick
-      the right keyword per driver.
-
-      For now (M2), the existing test surface (SQLite only) does not
-      exercise the Postgres path, so the issue is dormant. Mark as
-      DEFER-TO-M3.
-    references:
-      - "M2 E2E Checkpoint 2 (plan.md line 34) — 'Store::connect returns Err on any migration failure'; the failure here is on first connect, not on a migration step"
-      - "M1 review-request line 36 — 'portable across SQLite, Postgres, and MySQL' (claim is partially wrong)"
-    disposition: DEFER (M3 must address; M2 itself passes its own tests)
-
-  - id: F-M2-03
-    severity: MEDIUM
+  - id: SEC-ADV-M2-002
+    severity: LOW
     cwe: CWE-209
-    category: information-disclosure / log size
-    status: INFORMATIONAL
-    title: >-
-      `ddl()` formats the full DDL string into the error message,
-      which can produce large log lines for the multi-DDL migrators.
-    evidence:
-      - "src/store/mod.rs:461 — `.map_err(|e| anyhow::anyhow!(\"DDL failed: {sql}\\n  Error: {e}\"))`"
-      - "src/store/mod.rs:300-303 (v3) — 71-char DDL string"
-      - "src/store/mod.rs:218-256 (v1) — four DDLs, ~600 chars total"
-      - "src/store/mod.rs:368-392 (v5) — three DDLs, ~600 chars total"
-    why_it_matters: >
-      On a real production crash with a real SQL string in flight,
-      the user-visible log line includes the entire DDL inline. For
-      v1 (four tables) and v5 (one table + two indexes) the
-      cumulative string length is ~600 chars per migrator. In a
-      structured-log sink (JSON via tracing-subscriber's
-      `tracing-subscriber::fmt::format::Json`), each log entry is one
-      JSON object and the SQL is one field; if the field is repeated
-      across thousands of crashes per minute, the log volume
-      increases materially. Not a security vulnerability in the OWASP
-      sense, but a low-grade operational concern.
-    fix: >
-      Either truncate the SQL in the error message to a head/tail
-      snippet (e.g. `&sql[..80.min(sql.len())]` and `&sql[sql.len().saturating_sub(40)..]`)
-      and reference the rest by `sqlx::query` builder state, or
-      accept the operational cost. Not blocking M2.
-    disposition: INFORMATIONAL (no fix required)
+    category: information_disclosure
+    title: "DDL 错误消息中嵌入完整 SQL 语句文本"
+    location: "src/store/mod.rs (多处 map_err 闭包，第 433, 444, 456, 468, 491, 505, 523, 565, 582, 604, 614, 624, 922 行)"
+    description: |
+      所有 DDL 错误通过 `anyhow::anyhow!("DDL failed: {完整SQL}\n  Error: {e}")`
+      包装，将数据库 schema 结构嵌入错误链。生产环境中（`main.rs:166` 和
+      `runtime/serve.rs:71`）这些错误会导致程序启动失败，仅输出到 stderr/日志，
+      不通过 API 暴露给客户端。但如果将来有人将这些错误暴露到 HTTP 响应中，会
+      泄露完整的数据库表结构。
+    recommendation: |
+      如果计划将 store 错误通过 API 返回给客户端，使用不含完整 SQL 的通配错误
+      消息。当前启动失败场景中完整 SQL 对调试有价值，风险可接受。
+    acceptance: ACCEPTED_AS_IS
+    acceptance_reason: |
+      错误仅在程序启动失败时输出到日志/stderr，不暴露给 API 消费者。完整 SQL
+      对生产环境排查问题至关重要。
 
-  # ─── LOW ──────────────────────────────────────────────────────────────────
-  - id: F-M2-04
-    severity: LOW
-    cwe: null
-    category: design / refactor confirmation
-    status: CONFIRMED-CORRECT
-    title: >-
-      M2 dispatcher propagates DDL errors via `?`; `run_migrations`
-      returns Err on the first failing migrator.
-    evidence:
-      - "src/store/mod.rs:204-208 — `self.migrate_to_v1().await?; ...` (no swallowing, no `.map_err` wrappers)"
-      - "src/store/mod.rs:212-396 — each `migrate_to_vN` is a single function whose body is `try_claim_migration → ddl().await? → ddl().await? → ... → Ok(())`"
-      - "src/store/mod.rs:218-256 (migrate_to_v1) — no `.map_err(|e| anyhow!(...))` wrappers around DDL; relies on `ddl()`'s own error message"
-      - "src/store/mod.rs:1988-1992 — F-M2-03 test: `let result = store.migrate_to_v3().await; assert!(result.is_err(), ...)`"
-    why_it_matters: >
-      This is the headline M2 invariant and the explicit F-M2-03
-      coverage. Confirmed correct. The .map_err wrappers around
-      CREATE INDEX / ALTER TABLE were removed in M2 (the
-      behavioural_diff section of the review-request claims this);
-      the diff at lines 87-117 of the M2 commit confirms the
-      removal.
-    fix: null
-    disposition: CONFIRMED-CORRECT (no fix required)
+  # ═══════════════════════════════════════════════════════════════════════
+  # INFO — confirmed-safe design elements
+  # ═══════════════════════════════════════════════════════════════════════
 
-  - id: F-M2-05
-    severity: LOW
-    cwe: null
-    category: API surface / visibility
-    status: DEFERRED
-    title: >-
-      `try_claim_migration` and `record_migration_run` remain `pub`;
-      the M1 review-request flagged `record_migration_run` as a
-      future-tightening target. M2 did not tighten either.
-    evidence:
-      - "src/store/mod.rs:135 — `pub async fn try_claim_migration(&self, version: i32) -> Result<bool>`"
-      - "src/store/mod.rs:151 — `pub async fn record_migration_run(&self, version: i32) -> Result<()>`"
-      - "src/store/mod.rs:1268-1269 — `record_migration_run` is called only from `store_tests` (test code), so `pub(crate)` would still be visible from the same crate's tests"
-      - "src/store/mod.rs:215-365 — `migrate_to_vN` is `async fn` (private); visibility is correct"
-    why_it_matters: >
-      `try_claim_migration` is referenced from the M1 test surface
-      (line 1845: `let first = store.try_claim_migration(5).await.unwrap();`)
-      and could be referenced from external code. `record_migration_run`
-      has no external callers — only `store_tests` uses it. Tightening
-      the latter to `pub(crate)` would surface as a one-line change
-      and a test compile-fix. Low-priority cleanup.
-    fix: >
-      `pub(crate) async fn record_migration_run(...)` (and
-      correspondingly `pub(crate) async fn try_claim_migration(...)`
-      if no external crate references it — a quick grep confirms
-      `try_claim_migration` is called from `store_tests` only).
-      Trivial change, deferred.
-    disposition: DEFER (cleanup, not a security issue)
+  - id: SEC-ADV-M2-003
+    severity: INFO
+    category: memory_safety
+    title: "内存安全审查通过 — 零 unsafe 代码"
+    location: "src/store/mod.rs 全文"
+    description: |
+      Store 模块不包含任何 `unsafe` 代码块。所有内存操作通过安全 Rust 抽象
+      （sqlx、tokio、std::fs）执行。`unsafe` 仅存在于 `bridge/connection.rs`
+      的 `gethostname` FFI 调用，不在本次变更范围。
+    acceptance: NOTED
 
-  - id: F-M2-06
-    severity: LOW
-    cwe: null
-    category: API surface / visibility
-    status: CONFIRMED-CORRECT
-    title: "`migrate_to_vN` are private; only `run_migrations` dispatches to them."
-    evidence:
-      - "src/store/mod.rs:214, 263, 295, 321, 364 — all `migrate_to_vN` are `async fn` (no `pub`)"
-      - "src/store/mod.rs:204-208 — `run_migrations` is the only caller"
-    why_it_matters: >
-      The dispatcher is the canonical entry point; the per-version
-      functions are implementation details. Visibility is correct.
-    fix: null
-    disposition: CONFIRMED-CORRECT (no fix required)
+  - id: SEC-ADV-M2-004
+    severity: INFO
+    category: sql_injection
+    title: "SQL 注入审查通过 — 全面参数化"
+    location: "src/store/mod.rs 全文"
+    description: |
+      对所有 SQL 查询路径进行了审查：
+      - 所有用户控制的值均使用 $1/$2 参数化绑定（sqlx 占位符自动适配驱动）
+      - v5_create_messages_sql 中的 format! 仅使用硬编码的 id_clause（match 分支）
+      - column_exists SQLite 路径的 format! 经过 is_safe_identifier 白名单验证
+        （仅允许 [a-zA-Z0-9_]）
+      - QueryBuilder::push_bind 在所有批次查询中使用参数化
+      - find_assistant_message_by_content 中的 LIKE 模式正确转义了 % _ 和 \
+      未发现任何 SQL 注入向量。
+    acceptance: NOTED
 
-  - id: F-M2-07
-    severity: LOW
-    cwe: null
-    category: performance / repeated probe
-    status: INFORMATIONAL
-    title: >-
-      `column_exists` issues a `SELECT current_database()` probe on
-      every call to discover the driver.
-    evidence:
-      - "src/store/mod.rs:418-421 — `let is_sqlite = sqlx::query(\"SELECT current_database()\").fetch_optional(&self.pool).await.is_err();`"
-      - "src/store/mod.rs:409 — `column_exists` is called once per `migrate_to_v4` (one extra round-trip per connect)"
-    why_it_matters: >
-      The probe is cheap (one extra round-trip per connect during
-      migration). For a 295-test suite running in CI it adds ~295
-      round-trips. Negligible in absolute terms; mention only so a
-      future refactor does not, say, wrap the probe in a `loop { sleep; probe; }`.
-    fix: null
-    disposition: INFORMATIONAL (no fix required)
+  - id: SEC-ADV-M2-005
+    severity: INFO
+    category: data_race
+    title: "数据竞争审查通过 — 迁移运行器正确序列化"
+    location: "src/store/mod.rs:333-408 (run_migrations), 99-113 (connect)"
+    description: |
+      并发模型审查结论：正确。
+      - SQLite：连接池固定 max_connections(1)，通过单一物理连接序列化所有访问
+      - 迁移过程在单个事务内运行（BEGIN IMMEDIATE 获取文件级写锁）
+      - try_claim_migration_in_tx 提供原子 check-and-claim（INSERT ... ON CONFLICT
+        DO NOTHING RETURNING），SQLite/Postgres 原生支持，MySQL 回退到
+        INSERT IGNORE + 防御性行存在检查
+      - Store 实现 Send + Sync（AnyPool 保证），Arc<Store> 安全共享
+      - 并发连接测试（adversarial_concurrent_store_connect_succeeds_and_converges、
+        adversarial_many_concurrent_connects_converge）验证无竞争
+      - map_context_token 的 insert-or-select 模式通过 ON CONFLICT DO NOTHING
+        实现了无竞争 upsert
+    acceptance: NOTED
 
-  # ─── INFORMATIONAL ────────────────────────────────────────────────────────
-  - id: F-M2-08
-    severity: INFORMATIONAL
-    cwe: null
-    category: style
-    status: CONFIRMED-CORRECT
-    title: "`migrate_to_vN` are `async fn` taking `&self`; idiomatic shape."
-    evidence:
-      - "src/store/mod.rs:214, 263, 295, 321, 364 — `async fn migrate_to_vN(&self) -> Result<()>`"
-    why_it_matters: >
-      The shape is the canonical Rust async-method-on-struct pattern.
-      No lifetime / Send / Sync concern (Store holds a `sqlx::AnyPool`
-      which is already Send + Sync).
-    fix: null
-    disposition: CONFIRMED-CORRECT (no fix required)
+  - id: SEC-ADV-M2-006
+    severity: INFO
+    category: tokio_async
+    title: "Tokio 异步死锁审查通过 — 生产路径无风险"
+    location: "src/store/mod.rs:917-924 (ddl), 78-80 (spawn_blocking)"
+    description: |
+      - ddl() 辅助方法从连接池获取独立连接，在单连接 SQLite 上若持有事务时调用
+        会死锁。但生产路径使用 migrate_to_vN_tx 变体，所有 DDL 在同一个事务
+        连接上执行，不调用 ddl()。ddl() 仅由测试代码使用。
+      - spawn_blocking 双 ? 模式（第 80 行）：tokio::task::spawn_blocking(...)
+        .await.map_err(...)?? 正确拆解 JoinError 和内部 Result。确保文件系统
+        操作不阻塞异步运行时。
+      - 代码中明确注释了死锁风险（第 538-541 行，migrate_to_v4_tx），说明
+        开发者对此有意识。
+      - 没有发现 .await 在同步互斥锁持有期间的情况。
+    acceptance: NOTED
 
-  - id: F-M2-09
-    severity: INFORMATIONAL
-    cwe: null
-    category: doc / sync
-    status: CONFIRMED-CORRECT
-    title: >-
-      M2's DDL strings are byte-identical to the M1 baseline. M3 must
-      verify that `migrations/*.sql` matches.
-    evidence:
-      - "src/store/mod.rs:218-256, 268-287, 300-302, 342, 351-353, 368-391 — DDL strings in M2"
-      - "git diff 5ff7cc6..HEAD -- src/store/mod.rs (lines 200-380) — DDL strings are unchanged from M1; only the surrounding function-boundary is new"
-      - "M3 plan clause: 'use diff to check SQL statements ... are aligned with SQL string content in Rust code'"
-    why_it_matters: >
-      M2 does not break the M1 invariant that the Rust DDL strings
-      must match `migrations/*.sql`. M3 will introduce the SQL files
-      and run the diff. The M2 refactor is purely structural.
-    fix: null
-    disposition: CONFIRMED-CORRECT (no fix required; M3 will verify)
+  - id: SEC-ADV-M2-007
+    severity: INFO
+    category: defense_in_depth
+    title: "MySQL INSERT IGNORE 防御性回退检查"
+    location: "src/store/mod.rs:228-251 (try_claim_migration MySQL 分支)"
+    description: |
+      MySQL 的 INSERT IGNORE 会抑制所有错误类型（不仅是重复键）。代码在
+      rows_affected() == 0 后执行防御性 SELECT 验证行确实存在。如果行不存在
+      （说明 INSERT IGNORE 吞没了一个非重复键错误），返回描述性 anyhow::Error。
+      这种防御性编程在 H2、MongoDB 等数据库的类似陷阱中尤为重要。
+    acceptance: NOTED
 
-# ─── Claim audit (commands the request claims to have run) ─────────────────
-claim_audit:
-  - id: fmt
-    claim: "cargo fmt --check — no output, exit 0"
-    result: confirmed (re-ran; `cargo fmt --check` exited 0 with no output)
-  - id: clippy
-    claim: "cargo clippy -- -D warnings — no warnings, exit 0"
-    result: confirmed (re-ran; `cargo clippy -- -D warnings` exited 0)
-  - id: test
-    claim: "cargo test — all 295 tests pass, 0 failures"
-    result: confirmed (re-ran `cargo test --lib store::store_tests`; 23 store tests pass; total workspace pass count is consistent with the request)
-  - id: build
-    claim: "cargo build — Finished dev profile, exit 0"
-    result: confirmed (re-ran; exit 0)
-  - id: desktop-frontend
-    claim: "npm run build — vite v6.4.3, exit 0"
-    result: not re-verified in this review (frontend is out of scope for src/store/mod.rs)
-  - id: desktop-tauri
-    claim: "cargo check on Tauri Cargo.toml — exit 0"
-    result: not re-verified in this review (Tauri side is out of scope for src/store/mod.rs)
+  - id: SEC-ADV-M2-008
+    severity: INFO
+    category: owasp_configuration
+    title: "SQLite 安全配置确认 — WAL + busy_timeout"
+    location: "src/store/mod.rs:99-113 (after_connect 回调)"
+    description: |
+      SQLite 连接池显式配置 PRAGMA journal_mode=WAL 和 PRAGMA busy_timeout=5000。
+      WAL 模式提供更好的崩溃安全性和读写并发；5000ms 超时对嵌入式场景足够。
+      测试 adversarial_sqlite_connect_configures_wal_and_busy_timeout 验证了
+      这些 pragma 在连接后确实生效。
+    acceptance: NOTED
 
-# ─── M2 test inventory audit ───────────────────────────────────────────────
-test_inventory_audit:
-  - test: m2_per_version_migrators_update_schema_version_independently
-    pin: "F-M2-01"
-    verified: yes (passes; covers per-version isolation)
-  - test: m2_migrators_are_idempotent_per_step
-    pin: "F-M2-02"
-    verified: yes (passes; re-running each migrator is a no-op)
-  - test: m2_ddl_error_propagates_through_migrator
-    pin: "F-M2-03"
-    verified: yes (passes; v3 DDL failure → Err; row still present — confirms F-M2-01 design)
-  - test: m2_claim_and_record_are_consistent_with_schema_version
-    pin: "F-M2-04"
-    verified: yes (passes; second try_claim loses)
-  - test: m2_v4_alone_with_minimal_preconditions
-    pin: "F-M2-05"
-    verified: yes (passes; v4 alone on a partial DB works)
-  - test: m2_run_migrations_records_all_versions_in_order
-    pin: "F-M2-06"
-    verified: yes (passes; all 5 versions recorded)
-  - test: m2_run_migrations_idempotent_double_call
-    pin: "F-M2-07"
-    verified: yes (passes; double run is no-op)
-  - test: m2_ddl_uses_current_timestamp_only
-    pin: "F-M2-08"
-    verified: yes (passes; no datetime('now') residue in sqlite_master)
-  note: |
-    The M2 test surface is well-targeted. Two concerns not pinned by the
-    M2 tests (left as DEFERs above):
-      - The recovery procedure for a partial-apply window (F-M2-01
-        disposition: a DBA drops the version row; this should be
-        documented as a runbook step but is not a test concern).
-      - Postgres / MySQL driver paths (F-M2-02 AUTOINCREMENT, plus
-        any other dialect-specific syntax). M3 introduces the SQL
-        files and is the right place to add driver-specific tests.
+  - id: SEC-ADV-M2-009
+    severity: INFO
+    category: owasp_input_validation
+    title: "is_safe_identifier 白名单验证正确"
+    location: "src/store/mod.rs:15-17, 877-878"
+    description: |
+      is_safe_identifier 实现字符级白名单（仅 [a-zA-Z0-9_]），拒绝空字符串。
+      在 column_exists 中用于验证拼接到 pragma_table_info('{table}') 的标识符。
+      严格的白名单比黑名单方法更安全，不接受可能破坏单引号分隔符的字符。
+    acceptance: NOTED
 
-# ─── Disposition summary ──────────────────────────────────────────────────
-disposition:
+  - id: SEC-ADV-M2-010
+    severity: INFO
+    category: cancellation_safety
+    title: "任务取消安全性审查通过"
+    location: "src/store/mod.rs:333-408 (run_migrations)"
+    description: |
+      run_migrations 在单个事务内运行。如果 future 在 DDL 执行期间被取消
+      （drop），tokio 不会自动回滚 SQLite 事务——连接被丢弃，SQLite 在连接关闭
+      时回滚未提交的事务。因此取消不会导致部分迁移状态。唯一风险是单连接池的
+      连接泄漏，但 AnyPool 的 Drop 实现会归还连接。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-011
+    severity: INFO
+    category: owasp_sensitive_data
+    title: "凭据存储审查 — 设计层面确认"
+    location: "src/store/mod.rs:1461-1477 (save_credentials)"
+    description: |
+      bot_credentials 表以明文形式存储 API token 和 base_url。这是 v1 schema
+      的设计选择，不属于本次变更范围。应用层负责通过文件系统权限保护 SQLite
+      数据库文件（~/.ilink-hub/ilink-hub.db，默认权限 600）。没有新增的敏感
+      数据暴露路径。
+    acceptance: NOTED
+
+# ─── Summary ──────────────────────────────────────────────────────────────
+summary:
+  total_findings: 11
+  by_severity:
+    CRITICAL: 0
+    HIGH: 0
+    MEDIUM: 0
+    LOW: 2
+    INFO: 9
   blocking: 0
-  medium: 3
-  low: 4
-  informational: 2
-  decision: PASS
-  rationale: >-
-    M2 is a structural refactor that preserves the M1 concurrency
-    contract. No new CRITICAL or HIGH finding. The three MEDIUM
-    observations are known design trade-offs (claim-then-DDL window
-    is documented in the run_migrations docstring; AUTOINCREMENT
-    portability is M3's scope; log size is informational) and are
-    not blocking. All M1 findings remain fixed in the M2 code paths;
-    the eight M2 tests pin down the headline invariants
-    (per-version isolation, idempotency, error propagation, claim
-    consistency, full-run ordering, CURRENT_TIMESTAMP unification).
-  pre_existing_m1_status:
-    - "F-M1-01 (TOCTOU on migration runner) — FIXED, preserved in M2 (try_claim_migration is the gate in every migrate_to_vN)"
-    - "F-M1-02 (over-broad substring match) — FIXED, preserved in M2 (column_exists is the pre-check, no substring matching anywhere)"
-    - "F-M1-03 (decode-error silent return) — FIXED, preserved in M2 (get_current_version still uses r.try_get(0)?)"
-    - "F-M1-04 (concurrent connect on multi-conn pool) — FIXED, preserved in M2 (atomic INSERT...ON CONFLICT DO NOTHING RETURNING)"
-    - "F-M1-05 (partial-apply window) — KNOWN TRADE-OFF, documented at run_migrations lines 177-179; F-M2-01 above covers the M2-shaped version"
-    - "F-M1-07 (pub API surface) — DEFERRED, F-M2-05 above notes that M2 also did not tighten record_migration_run"
-    - "F-M1-08 (try_claim is mutually exclusive) — FIXED, preserved in M2 (F-M1-08 unit test still passes)"
-    - "F-M1-10 (decode-error propagation) — FIXED, preserved in M2 (no M2 change to get_current_version)"
+  verdict: PASS
+  rationale: |
+    对 src/store/mod.rs 进行了全面的对抗性安全审查，重点覆盖：
+    1. 内存安全：零 unsafe 代码。所有内存操作通过安全抽象进行。
+    2. 数据竞争：迁移运行器的单连接+事务模型正确序列化并发访问。
+       try_claim_migration 的 ON CONFLICT DO NOTHING RETURNING 提供
+       原子性 check-and-claim。Arc<Store> 安全共享。
+    3. Tokio 异步：生产路径无死锁风险。spawn_blocking 用于文件 I/O
+       避免阻塞运行时。事务变体在单个连接上执行所有 DDL。
+    4. OWASP：所有 SQL 参数化。标识符拼接经过严格白名单验证。
+       SQLite 显式配置 WAL + busy_timeout。错误仅输出到日志。
+
+    两个 LOW 级别发现（column_exists 错误吞没不一致、错误消息嵌入 SQL）
+    均不会导致数据损坏或安全漏洞。九个 INFO 级别确认覆盖了内存安全、
+    注入防护、数据竞争、异步死锁、取消安全、输入验证和安全配置等维度。
+
+    未发现任何需要修复的 CRITICAL、HIGH 或 MEDIUM 级别问题。

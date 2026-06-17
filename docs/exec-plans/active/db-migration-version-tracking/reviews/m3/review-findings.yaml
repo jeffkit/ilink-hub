@@ -1,39 +1,269 @@
 milestone: M3
-title: "Adversarial Rust security & concurrency review of M3 — 同步与对齐 migrations/ 下的 SQL 文件"
+title: "Adversarial Rust security & concurrency review — 同步与对齐 migrations/ 下的 SQL 文件"
 reviewer: "rust-sec-concurrency-specialist"
 date: 2026-06-17
 worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
-base_commit: 4433cad50b20ac058449db77643daef5b068a044
-commit_under_review: cf2df72
+base_commit: cf2df72
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Review scope ────────────────────────────────────────────────────────────
+# Files examined:
+#   src/store/mod.rs          — 迁移引擎、DDL、连接管理、全部测试
+#   src/main.rs               — CLI entry、Store::connect 调用点
+#   src/lib.rs                — redact_token、模块导出
+#   src/error.rs              — HubError 枚举
+#   src/runtime/serve.rs      — run_serve、Store Arc 化
+#   migrations/*.sql          — SQL 参考文件（0000–0005）
+#
+# Dimensions: memory safety, data races, tokio async pitfalls, OWASP Top 10
+# for Rust web applications.
+
+# ─── Findings ────────────────────────────────────────────────────────────────
+
+findings:
+
+  - id: SEC-ADV-M3-01
+    severity: LOW
+    category: owasp_injection
+    title: "column_exists 非事务路径中的字符串插值（死代码，有 is_safe_identifier 防护）"
+    file: src/store/mod.rs
+    lines: [888, 889, 893]
+    description: >-
+      `column_exists`（`#[allow(dead_code)]`，仅用于非事务 `migrate_to_v4` 测试路径）
+      在 SQLite 分支通过 `format!` 拼接 `table`/`column` 标识符到 `pragma_table_info`
+      查询中。虽然调用了 `is_safe_identifier` 进行验证（仅允许 `[a-zA-Z0-9_]`），但如果
+      未来重构移除了该检查，此处的字符串插值将构成 SQL 注入向量。生产路径
+      `migrate_to_v4_tx` 已将查询内联并使用参数化形式，不涉及此问题。
+    impact: >-
+      当前无实际风险（死代码 + is_safe_identifier 防护）。未来若有人移除
+      `#[allow(dead_code)]` 并在此处复用生产调用，但遗漏了 is_safe_identifier
+      检查，则可能被利用。
+    recommendation: >-
+      考虑在 `column_exists` 的 SQLite 分支上也使用参数化查询（sqlx 的 `bind`），
+      或移除该死代码方法，只保留事务版本。
+
+  - id: SEC-ADV-M3-02
+    severity: LOW
+    category: tokio_async
+    title: "column_exists SQLite 路径的 .unwrap_or(None) 吞没所有错误"
+    file: src/store/mod.rs
+    lines: [893]
+    description: >-
+      非事务 `column_exists`（死代码）的 SQLite 路径对 `fetch_optional` 结果调用
+      `.unwrap_or(None)`，这意味着连接池耗尽、连接断开、pragma 语法错误等所有运行时
+      错误都会被静默抹除为 `Ok(false)`（「列不存在」）。调用方随后执行 `ALTER TABLE
+      ADD COLUMN`，可能在列已存在但因连接错误而未能检测到的情况下失败。
+    impact: >-
+      死代码，仅用于测试路径。生产路径 `migrate_to_v4_tx` 使用 `?` 传播错误，
+      不涉及此问题。
+    recommendation: >-
+      在注释中已有说明。如果该方法将来重新启用，应改为 `?` 传播或至少记录错误日志。
+
+  - id: SEC-ADV-M3-03
+    severity: INFO
+    category: tokio_async
+    title: "迁移中的 claim-then-DDL 模式在取消时留下孤儿行"
+    file: src/store/mod.rs
+    lines: [332, 359, 363]
+    description: >-
+      `try_claim_migration` / `try_claim_migration_in_tx` 在 DDL 执行之前写入
+      `schema_version` 行。如果持有连接的 future 在 claim 写入之后、DDL 执行之前被
+      取消（例如 tokio `select!` 超时或进程崩溃），则版本行存在但 DDL 未被应用。
+    impact: >-
+      这是已知设计权衡（F-M3-03，已推迟）。恢复步骤在 `run_migrations` 文档注释中
+      有说明（删除版本行，重启）。进程崩溃的风险远高于 tokio 取消（tokio 不会自动
+      取消随机 future），因此实际风险低。
+    recommendation: >-
+      接受当前设计。已在 `run_migrations` 文档注释中记录恢复步骤。
+
+  - id: SEC-ADV-M3-04
+    severity: LOW
+    category: owasp_input_validation
+    title: "get_hub_ext_batch 对输入 pairs 数量无上限限制"
+    file: src/store/mod.rs
+    lines: [1173, 1256]
+    description: >-
+      `get_hub_ext_batch` 接收 `&[(String, String)]` 并为每个 pair 生成 OR 条件。
+      没有对 pairs 数量设置上限。如果传入极大量 pairs（例如 10000+），生成的 SQL
+      字符串可能超出 SQLite 的 `SQLITE_MAX_SQL_LENGTH`（默认 1,000,000,000 字节）
+      或达到表达式深度限制（`SQLITE_MAX_EXPR_DEPTH`，默认 1000）。
+    impact: >-
+      当前所有调用方都是内部广播/扇出路径，使用受控的 token 集合，不受外部输入
+      直接影响。但若未来通过外部 API 暴露此方法，将成为 DoS 向量。
+    recommendation: >-
+      添加 `const MAX_BATCH_PAIRS: usize = 500` 并提前返回错误，或在函数文档中
+      标注调用方责任。
+
+  - id: SEC-ADV-M3-05
+    severity: LOW
+    category: owasp_input_validation
+    title: "persist_context_tokens_batch 对条目数无上限"
+    file: src/store/mod.rs
+    lines: [1352, 1378]
+    description: >-
+      `persist_context_tokens_batch` 在单个事务中循环写入所有条目，没有条目数上限。
+      如果传入大量条目，将持有写事务很长时间，阻塞同一连接上的所有读写操作。
+    impact: >-
+      与 SEC-ADV-M3-04 类似——当前调用方均在内部广播路径上，使用受控的 token 集合。
+      若未来暴露为外部 API，可能被用于 DoS。
+    recommendation: >-
+      可考虑分批提交（每 N 个条目提交一次），或添加上限检查。
+
+  - id: SEC-ADV-M3-06
+    severity: INFO
+    category: data_race
+    title: "ensure_sqlite_file 的 TOCTOU 窗口与并发安全性已验证通过"
+    file: src/store/mod.rs
+    lines: [127, 165]
+    description: >-
+      `ensure_sqlite_file` 使用 `create_new(true)` 替代 `File::create`，并通过
+      `AlreadyExists` 错误处理来安全应对 exists-check 与 create 之间的竞态条件。
+      这是正确实现。`adversarial_ensure_sqlite_file_concurrent_threads_safe` 测试
+      通过 16 个 OS 线程并发锤击验证了此行为。`spawn_blocking` 确保文件系统操作
+      不在 tokio 工作线程上阻塞。
+    impact: >-
+      无。当前实现对并发安全是正确的。
+    recommendation: >-
+      无需更改。
+
+  - id: SEC-ADV-M3-07
+    severity: INFO
+    category: memory_safety
+    title: "store/mod.rs 中无 unsafe 代码块"
+    file: src/store/mod.rs
+    lines: [1, 3442]
+    description: >-
+      对整个 `src/store/mod.rs`（3442 行）进行了 unsafe 代码块审查。未发现任何
+      `unsafe` 块。所有 FFI 交互均通过 sqlx 安全封装完成。
+    impact: >-
+      无。
+    recommendation: >-
+      无需更改。
+
+  - id: SEC-ADV-M3-08
+    severity: LOW
+    category: owasp_logging
+    title: "DDL 错误消息可能暴露数据库结构信息"
+    file: src/store/mod.rs
+    lines: [390, 433, 490, 521, 564, 601, 918]
+    description: >-
+      多个 `migrate_to_vN_tx` 方法中的 DDL 错误消息包含完整的 SQL 语句文本。
+      虽然这些是静态迁移 DDL（不包含用户数据），但错误消息会被 tracing 记录，
+      可能暴露内部数据库表结构给日志读取者。
+    impact: >-
+      低。迁移 DDL 本身就是项目 open source 的一部分（`migrations/*.sql` 文件），
+      因此表结构并非秘密。但若未来将含有敏感默认值的 DDL 放入此路径，可能成为
+      信息泄漏向量。
+    recommendation: >-
+      可接受。如果未来 DDL 包含敏感默认值，应考虑在错误消息中脱敏。
+
+  - id: SEC-ADV-M3-09
+    severity: INFO
+    category: tokio_async
+    title: "after_connect 回调使用 Box::pin 正确实现"
+    file: src/store/mod.rs
+    lines: [102, 108]
+    description: >-
+      SQLite 连接的 `after_connect` 回调使用 `Box::pin(async move { ... })` 返回
+      一个已固定的 future。这是 sqlx `after_connect` 的正确用法，避免了悬垂引用或
+      生命周期不匹配的问题。
+    impact: >-
+      无。
+    recommendation: >-
+      无需更改。
+
+  - id: SEC-ADV-M3-10
+    severity: INFO
+    category: owasp_authentication
+    title: "token 脱敏函数正确处理了 Unicode 边界"
+    file: src/lib.rs
+    lines: [22, 25]
+    description: >-
+      `redact_token` 使用 `t.chars().take(8)` 而非 `&t[..8]` 来截取 token 前缀，
+      避免了在 UTF-8 多字节字符中间切割导致的 panic。测试覆盖了多字节 Unicode 场景。
+    impact: >-
+      无。
+    recommendation: >-
+      无需更改。
+
+  - id: SEC-ADV-M3-11
+    severity: LOW
+    category: owasp_input_validation
+    title: "save_message 未对 role/content 进行长度或内容校验"
+    file: src/store/mod.rs
+    lines: [1516, 1538]
+    description: >-
+      `save_message` 将 `role` 和 `content` 直接写入数据库，无长度限制或内容校验。
+      `role` 预期为 `user` 或 `assistant`，但接受任意字符串。虽然参数化查询防止了
+      SQL 注入，但恶意调用方可能插入超大数据行（导致 DB 膨胀）或垃圾 role 值
+      （导致 `find_assistant_message_by_content` 查询逻辑失效）。
+    impact: >-
+      低。`save_message` 的调用方目前是内部 Hub 路径（消息转发和广播），不受
+      外部直接输入影响。但内部代码若传入超大内容，可能影响性能。
+    recommendation: >-
+      可添加 `role` 的白名单校验（`user` / `assistant`），以及 `content` 的长度
+      上限检查（如 64KB）。
+
+# ─── Positive findings (confirmed secure patterns) ──────────────────────────
+
+positive_findings:
+  - id: POS-M3-01
+    title: "WAL + busy_timeout 通过 after_connect 显式配置"
+    description: >-
+      SQLite 连接池在 after_connect 中显式设置 `PRAGMA journal_mode=WAL` 和
+      `PRAGMA busy_timeout=5000`，通过 `adversarial_sqlite_connect_configures_wal_and_busy_timeout`
+      测试验证。WAL 模式提高了崩溃安全性和写吞吐量，busy_timeout(5s) 在多写入者
+      场景下提供了合理的重试窗口。
+
+  - id: POS-M3-02
+    title: "MySQL INSERT IGNORE 有防御性二次检查"
+    description: >-
+      MySQL 的 `try_claim_migration` 在 `INSERT IGNORE` 返回 `rows_affected() == 0`
+      后，执行了防御性 `SELECT 1` 以区分「行已存在」和「INSERT IGNORE 静默抑制了
+      非重复键错误」。若 SELECT 未找到行，则返回 `Err` 而非 `Ok(false)`，避免
+      静默丢失迁移版本。
+
+  - id: POS-M3-03
+    title: "并发 Store::connect 测试使用 tokio::join! / spawn + join_all 实现真正并发"
+    description: >-
+      `adversarial_concurrent_store_connect_succeeds_and_converges` 和
+      `adversarial_many_concurrent_connects_converge` 测试使用 `tokio::join!` /
+      `tokio::spawn` 实现真正并发，而旧的顺序执行无法触发竞态条件。
+      这确保了迁移引擎在并发场景下正确工作。
+
+  - id: POS-M3-04
+    title: "migrate_to_v4_tx 的 column_exists 内联查询避免死锁"
+    description: >-
+      v4 ALTER TABLE 的列存在性预检在 `migrate_to_v4_tx` 中内联到同一事务连接上，
+      而非调用 `self.column_exists`（后者会 `pool.acquire()` 获取第二个连接）。
+      由于 SQLite 使用 `max_connections(1)`，第二个 `acquire()` 会在
+      `busy_timeout` 后超时并被 `unwrap_or(None)` 静默处理，导致 ALTER TABLE
+      重复执行。内联查询修复了此死锁（F-M3-04）。
+
+  - id: POS-M3-05
+    title: "try_claim_migration 在事务中正确实现原子性"
+    description: >-
+      `try_claim_migration_in_tx` 是加载到事务上的原子 check-and-claim 原语。
+      在 SQLite 上，事务持有文件级写锁（`BEGIN IMMEDIATE`），在 Postgres 上通过
+      MVCC 串行化。测试 `adversarial_try_claim_in_tx_is_mutually_exclusive` 验证了
+      两个并发事务中恰好只有一个能认领成功。
+
+# ─── Resolution from M1/M2 reviews (re-verified in M3) ────────────────────
 resolution: >-
   M3 re-verification on the feat/db-migration-version-tracking worktree.
-  All three original findings have been addressed by subsequent commits
-  (21ff66e, 1c86adc):
+  All three original M3 findings have been addressed:
 
   F-M3-01 (CRITICAL, MySQL compatibility): RESOLVED.
-    - `DatabaseKind::from_url()` parses the URL scheme (`postgres:`, `mysql:`,
-      `mariadb:`) instead of probing `SELECT current_database()` at runtime.
-      SQLite is the fallback for unrecognised schemes and file paths.
-    - `try_claim_migration` uses per-driver SQL (Postgres/SQLite: ON CONFLICT
-      DO NOTHING RETURNING; MySQL: INSERT IGNORE with a follow-up SELECT).
-    - `column_exists` uses `pragma_table_info` on SQLite and
-      `information_schema.columns` on Postgres/MySQL.
-    - `v5_create_messages_sql` has three branches: SQLite (AUTOINCREMENT),
-      Postgres (GENERATED BY DEFAULT AS IDENTITY), MySQL (BIGINT AUTO_INCREMENT).
-    - Tests `adversarial_database_kind_from_url` and
-      `adversarial_database_kind_drives_v5_ddl_branch` pin these behaviours.
-
   F-M3-02 (HIGH, Flawed concurrency tests): RESOLVED.
-    - `adversarial_concurrent_store_connect_succeeds_and_converges` and
-      `adversarial_many_concurrent_connects_converge` now use `tokio::spawn` +
-      `tokio::join!` for true concurrent execution.
-    - `adversarial_try_claim_is_mutually_exclusive` and
-      `adversarial_try_claim_in_tx_is_mutually_exclusive` verify the atomic
-      claim behaviour under concurrent access.
+  F-M3-03 (MEDIUM, TOCTOU / Partial DDL Application): DEFERRED (known design trade-off).
 
-  F-M3-03 (MEDIUM, TOCTOU / Partial DDL Application): DEFERRED.
-    - Known design trade-off: claim-then-DDL means a crash between claim and
-      DDL leaves the version row. Recovery procedure (drop the version row,
-      restart) is documented in `run_migrations` docstring. Not blocking M3.
+  No new CRITICAL or HIGH findings discovered. All 11 adversarial review
+  findings are LOW severity or INFO level, and none require immediate
+  remediation. The codebase demonstrates strong Rust safety practices:
+  zero unsafe blocks in the store module, proper tokio concurrency patterns,
+  correct file I/O safety (create_new for TOCTOU-safe file creation),
+  and parameterized SQL queries throughout the production path.
 
 verdict: PASS

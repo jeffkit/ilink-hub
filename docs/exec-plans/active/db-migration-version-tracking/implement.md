@@ -1,5 +1,44 @@
 # Database Migration Version Tracking Implement Log
 
+## M4 Review 发现修复 (2026-06-17, worktree: feat/db-migration-version-tracking)
+
+在 `feat/db-migration-version-tracking` worktree 中验证 M4 全部 Review 发现修复结果。
+
+### 验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo clippy -- -D warnings` | PASS |
+| `cargo test` | PASS (315 tests: 242 lib + 73 integration/e2e) |
+| `cargo build` | PASS |
+| `desktop-frontend` build | PASS |
+| `desktop-tauri` cargo check | PASS |
+
+### M4 测试覆盖
+
+| 测试 | 覆盖点 | 结果 |
+|---|---|---|
+| `adversarial_concurrent_store_connect_succeeds_and_converges` | F-M1-01/F-M1-04 — 单连接 + F-M3-02 — 真正并发 | PASS |
+| `adversarial_many_concurrent_connects_converge` | F-M1-01/F-M1-04 — 10 并发 converge 到同一版本 | PASS |
+| `adversarial_v4_skips_alter_when_column_already_present` | F-M1-02 — catalog 预检查 + F-M3-04 — inline tx 查询 | PASS |
+
+### Review Findings 处理
+
+| Finding | 严重度 | 状态 |
+|---|---|---|
+| F-M1-01 / F-M1-04 | HIGH | RESOLVED — `run_migrations` 单连接持有整个迁移过程 |
+| F-M1-02 | MEDIUM | RESOLVED — v4 使用 catalog 预检查替代错误字符串匹配 |
+| F-M3-01 | CRITICAL | RESOLVED — `DatabaseKind::from_url()` 解析 URL scheme |
+| F-M3-02 | HIGH | RESOLVED — 并发测试使用 `tokio::spawn` + `tokio::join!` |
+| F-M3-04 | HIGH | RESOLVED — `column_exists` 在事务内执行 inline 查询 |
+| SEC-ADV-M3-01..11 | LOW/INFO | ACCEPTED — M3 对抗性审查全部 11 个发现均无阻塞问题 |
+
+### 文件变更
+
+- `docs/exec-plans/active/db-migration-version-tracking/reviews/m4/review-request.yaml` — M4 再验证结果
+- `docs/exec-plans/active/db-migration-version-tracking/implement.md` — 本次更新
+
 ## M3 再验证 (2026-06-17, worktree: feat/db-migration-version-tracking)
 
 在 `feat/db-migration-version-tracking` worktree 中重新验证 M3 全部验证命令。

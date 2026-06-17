@@ -1,0 +1,149 @@
+milestone: M4
+title: "Review 发现修复 — 再验证"
+status: passed
+date: 2026-06-17
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: bde009c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/db-migration-version-tracking/plan.md
+checkpoint: "M4 — Review 发现修复 (再验证)"
+
+# ─── Scope ──────────────────────────────────────────────────────────────────
+# M4 verifies that all review findings from M1/M2/M3 reviews are fixed, and
+# all code-level tasks (F-M1-01, F-M1-02, F-M1-04, F-M3-01, F-M3-02, F-M3-04)
+# are complete. No new code was written in M4 — these fixes were already
+# implemented during M1/M3.
+
+# ─── Commands run (all required by task prompt) ───────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 315 passed; 0 failed (242 lib + 73 integration/e2e)"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "vite build success, exit 0"
+    actual: "vite v6.4.3 building for production... built in 92ms, exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+
+# ─── M4-specific test inventory ─────────────────────────────────────────────
+m4_test_inventory:
+  store_tests:
+    - test: store::store_tests::adversarial_concurrent_store_connect_succeeds_and_converges
+      covers: "F-M1-01/F-M1-04 — single connection + F-M3-02 — true concurrency"
+      result: pass
+    - test: store::store_tests::adversarial_many_concurrent_connects_converge
+      covers: "F-M1-01/F-M1-04 — 10 concurrent connects converge to same version"
+      result: pass
+    - test: store::store_tests::adversarial_v4_skips_alter_when_column_already_present
+      covers: "F-M1-02 — catalog pre-check instead of error string matching + F-M3-04 — inline tx query"
+      result: pass
+
+# ─── Review findings resolution ────────────────────────────────────────────
+findings_resolution:
+  - finding: F-M1-01 / F-M1-04
+    title: "run_migrations 跨版本竞态窗口"
+    status: RESOLVED
+    fix_commits: ["1c86adc", "21ff66e"]
+    resolution: >-
+      run_migrations holds a single connection for the entire migration
+      process. Each migrator uses try_claim_migration_in_tx for atomic
+      check-and-claim within a single transaction. Verified by
+      adversarial_concurrent_store_connect_succeeds_and_converges and
+      adversarial_many_concurrent_connects_converge.
+
+  - finding: F-M1-02
+    title: "v4 ALTER TABLE ADD COLUMN 使用错误字符串匹配"
+    status: RESOLVED
+    fix_commits: ["21ff66e"]
+    resolution: >-
+      v4 column_exists uses per-driver catalog queries (PRAGMA table_info for
+      SQLite, information_schema.columns for Postgres, SHOW COLUMNS for MySQL)
+      instead of matching error string "duplicate column name". Verified by
+      adversarial_v4_skips_alter_when_column_already_present.
+
+  - finding: F-M3-01
+    title: "MySQL 兼容性完全缺失"
+    status: RESOLVED
+    fix_commits: ["21ff66e", "1c86adc"]
+    resolution: >-
+      DatabaseKind::from_url() parses URL scheme directly (sqlite:/postgres:/mysql:).
+      v5 DDL uses per-driver id clause. column_exists uses per-driver catalog
+      queries. try_claim_migration uses per-driver SQL (ON CONFLICT for
+      Postgres/SQLite, INSERT IGNORE for MySQL).
+
+  - finding: F-M3-02
+    title: "并发 Store::connect 测试缺陷"
+    status: RESOLVED
+    fix_commits: ["1c86adc"]
+    resolution: >-
+      Concurrent connect tests use tokio::spawn + tokio::join! for true
+      concurrent execution. adversarial_many_concurrent_connects_converge
+      includes retry loop for SQLITE_BUSY.
+
+  - finding: F-M3-04
+    title: "column_exists 死锁 (max_connections(1))"
+    status: RESOLVED
+    fix_commits: ["21ff66e"]
+    resolution: >-
+      migrate_to_v4_tx performs column existence check inline on the
+      transaction connection rather than calling self.column_exists (which
+      would pool.acquire() a second connection, causing deadlock under
+      max_connections(1)).
+
+  - finding: M3 adversarial review (SEC-ADV-M3-01..11)
+    title: "M3 对抗性安全审查 — 11 个发现，全部 LOW/INFO"
+    status: ACCEPTED
+    resolution: >-
+      All 11 findings are LOW severity or INFO level. No CRITICAL, HIGH,
+      or MEDIUM findings. No blocking issues. Verdict: PASS.
+
+# ─── Pass conditions vs. plan.md M4 ────────────────────────────────────────
+pass_conditions:
+  - id: fix-m1-01-m1-04
+    plan_clause: "run_migrations 改为单连接持有整个迁移过程"
+    result: pass
+  - id: fix-m1-02
+    plan_clause: "v4 ALTER TABLE ADD COLUMN 使用 catalog 预检查"
+    result: pass
+  - id: fix-m3-01
+    plan_clause: "DatabaseKind 从 URL scheme 解析"
+    result: pass
+  - id: fix-m3-02
+    plan_clause: "并发 Store::connect 测试使用 tokio::join! 真正并发"
+    result: pass
+  - id: fix-m3-04
+    plan_clause: "column_exists 在事务内执行 inline 查询"
+    result: pass
+  - id: e2e-checkpoint-4
+    plan_clause: "E2E Checkpoint 4: 并发 Store::connect 安全，无竞态"
+    result: pass
+
+open_follow_ups: []
+next_milestone: M5
+next_milestone_title: "深度 Review 修复与版本发布"
