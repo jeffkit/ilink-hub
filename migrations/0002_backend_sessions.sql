@@ -7,7 +7,7 @@ CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
     vtoken             TEXT NOT NULL,
     session_name       TEXT NOT NULL,
     backend_session_id TEXT NOT NULL DEFAULT '',
-    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     PRIMARY KEY (vctx, vtoken, session_name)
 );
 
@@ -15,6 +15,6 @@ CREATE TABLE IF NOT EXISTS active_sessions (
     vctx         TEXT NOT NULL,
     vtoken       TEXT NOT NULL,
     session_name TEXT NOT NULL DEFAULT 'default',
-    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
     PRIMARY KEY (vctx, vtoken)
 );

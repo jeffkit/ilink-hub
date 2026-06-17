@@ -1,0 +1,57 @@
+milestone: M5
+title: "SEC-007 Metrics Auth — 单元测试对抗性审查"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+scope_audited:
+  - tests/metrics_auth_tests.rs
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m5/review-request.yaml
+
+findings:
+  - id: A-M5-1
+    severity: INFO
+    status: RESOLVED
+    cwe: CWE-362 (Concurrent Execution using Shared Resource with Improper Synchronization)
+    title: >-
+      Safety of `unsafe` `std::env::set_var` in a dedicated integration test process
+    location: tests/metrics_auth_tests.rs:16-20
+    description: >-
+      The test uses `unsafe { std::env::set_var(...) }` to configure the test admin token.
+      Since Rust 1.79.0, `std::env::set_var` is marked unsafe because modifying environment
+      variables concurrently with other threads reading them is not thread-safe.
+      This has been safely mitigated by placing the test in a dedicated, isolated integration
+      test file `tests/metrics_auth_tests.rs` containing only a single test case. Because
+      Cargo runs each integration test file in its own process, there are no other concurrent
+      test threads executing within the process, eliminating the risk of data races on the
+      process environment.
+    impact: >-
+      Prevents undefined behavior due to thread-unsafe environment modification.
+    recommended_fix: >-
+      Keep the test isolated. If future tests are added to `tests/metrics_auth_tests.rs`,
+      ensure they do not rely on a different environment or run in parallel threads that
+      could conflict with this variable.
+    test_gap: >-
+      None.
+
+pass_items:
+  - "The test correctly validates all three required scenarios (no token, wrong token, correct token)."
+  - "The test uses tower::ServiceExt::oneshot to mock requests in-memory without opening real TCP sockets, preventing port conflicts."
+  - "Constant-time comparison is preserved in the application routes via `subtle::ConstantTimeEq`."
+
+verdict_rationale: >-
+  PASS.
+  The new test suite `tests/metrics_auth_tests.rs` successfully verifies the `/metrics` authentication logic.
+  By placing the test in a dedicated integration test file, the team successfully avoided the OnceLock/environment
+  mutation data race and cache pollution pitfalls identified in M1. All quality gates (fmt, clippy, test, build) pass.
+
+sign_off:
+  status: "PASS"
+  next_action: "Proceed to M6 and M7 to finalize the milestone and complete the execution plan."
+  blocking_findings: []

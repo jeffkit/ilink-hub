@@ -1,0 +1,116 @@
+milestone: M1
+title: "SEC-010 / SEC-007 — 调查与定位对抗性审查"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+scope_audited:
+  - src/server/mod.rs
+  - src/server/routes.rs
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m1/review-request.yaml
+
+findings:
+  - id: A-M1-1
+    severity: MEDIUM
+    status: DEFERRED
+    cwe: CWE-362 (Concurrent Execution using Shared Resource with Improper Synchronization)
+    title: >-
+      `admin_token()` and `insecure_no_auth()` use `OnceLock`, preventing dynamic token state toggling in parallel unit tests (Tokio Concurrency / Test Pitfall)
+    location: src/server/routes.rs:38-48, 71-87
+    description: >-
+      The static `OnceLock` caches env vars `ILINK_ADMIN_TOKEN` and `ILINK_ADMIN_INSECURE_NO_AUTH`
+      upon first read. In cargo tests, multiple test cases run concurrently within the same process.
+      If a test verifying unauthorized access (token unset) runs first, it permanently initializes
+      the OnceLock to `None`. Any subsequent test attempting to set `ILINK_ADMIN_TOKEN` via
+      `std::env::set_var` to assert 200 OK authorization success will fail to override the OnceLock
+      and will receive 401 instead. This makes it impossible to reliably test both 401 and 200 paths
+      inside the same test binary, a classic Rust concurrency test flakiness hazard.
+    impact: >-
+      Unit tests inside routes.rs cannot dynamically mock admin tokens. Tests for M5 ("correct token -> 200")
+      would become flaky or fail outright if grouped with unset-token tests.
+    recommended_fix: >-
+      To cover both 200 and 401 paths reliably without refactoring the core implementation:
+      1. Create a dedicated integration test file (e.g., `tests/metrics_auth_success.rs`). Because each
+         file in `tests/` is compiled as a separate executable and runs in a separate process, it will have
+         its own `OnceLock` instance.
+      2. In `tests/metrics_auth_success.rs`, call `std::env::set_var("ILINK_ADMIN_TOKEN", "test-token")`
+         before building the router and executing requests, verifying the 200 OK path safely.
+      3. Keep the 401 (unauthorized / wrong token) tests in the main test suite where `ILINK_ADMIN_TOKEN`
+         is left unset.
+    test_gap: >-
+      Identified at design time; will prevent test suite failures during M5.
+
+  - id: A-M1-2
+    severity: LOW
+    status: DEFERRED
+    cwe: CWE-400 (Uncontrolled Resource Consumption)
+    title: >-
+      DefaultBodyLimit layer ordering sensitivity and custom body extractor bypass potential
+    location: src/server/mod.rs:17-61
+    description: >-
+      In Axum, middleware layers are evaluated from the outside in (last added executes first).
+      Adding a global `DefaultBodyLimit::max(256 * 1024)` at the outermost router level, and a local
+      `DefaultBodyLimit::max(4 * 1024 * 1024)` specifically on `/ilink/bot/sendmessage` correctly overrides
+      the limit because the local layer executes closer to the handler, overriding the Extension value.
+      However, if future maintainers alter the layer ordering or router nesting, the global 256 KB limit
+      could shadow the 4 MB limit, causing silent payload rejections. Furthermore, any future custom
+      handlers reading raw `axum::body::Body` directly without utilizing axum's standard extractors
+      will bypass `DefaultBodyLimit` entirely.
+    impact: >-
+      Risk of service denial due to incorrect layer ordering (causing legitimate 4MB payloads to fail)
+      or potential OOM vectors if custom handlers bypass extractors.
+    recommended_fix: >-
+      Explicitly assert both the 256 KB denial and the 4 MB allowance boundaries in M4 integration tests.
+      Document in the codebase that future file-upload or streaming endpoints must manually apply size bounds
+      if they extract raw request bodies.
+    test_gap: >-
+      None; to be covered by the M4 test suite.
+
+  - id: A-M1-3
+    severity: LOW
+    status: DEFERRED
+    cwe: CWE-200 (Information Exposure)
+    title: >-
+      Sensitive client data exposure in `/metrics` when insecure mode is activated
+    location: src/server/routes.rs:978-989
+    description: >-
+      The `/metrics` endpoint exposes a complete map of client names to virtual tokens
+      (`client_names_by_vtoken`) which constitutes PII (personally identifiable information) and internal
+      routing secrets. In `insecure_no_auth()` mode (triggered when `ILINK_ADMIN_TOKEN` is unset
+      and `ILINK_ADMIN_INSECURE_NO_AUTH` is explicitly enabled), these metrics are fully exposed
+      to unauthenticated clients. While this mode is meant as an operator escape hatch, it represents
+      a significant risk if exposed to the public internet.
+    impact: >-
+      Unauthenticated disclosure of virtual tokens and client mappings.
+    recommended_fix: >-
+      In a future iteration, consider stripping `client_names_by_vtoken` or redacting the tokens
+      in the Prometheus metrics output when insecure mode is active, or log a loud startup warning
+      when both insecure mode and metrics are exposed.
+    test_gap: >-
+      None today.
+
+pass_items:
+  - "The baseline quality gate (fmt, clippy, unit tests, cargo build) all pass on HEAD prior to code modification."
+  - "Memory Safety: Audited current codebase FFI usages (e.g. `gethostname` in connection.rs L233). It is safe because gethostname outputs are handled properly, though a trailing null byte write is recommended for robustness."
+  - "Data Race: State-sharing Mutexes and RwLocks (e.g., `state.clients.registry`) are correctly held in tight synchronous blocks without cross-await holding, preventing tokio executor stalls."
+
+verdict_rationale: >-
+  PASS.
+  Milestone M1 is a pure investigation and positioning phase. The baseline build is clean, and the plans
+  accurately identify the target sites for implementing HTTP body limit controls (SEC-010) and metrics endpoint
+  authentication (SEC-007).
+  The three identified adversarial findings (A-M1-1, A-M1-2, A-M1-3) focus on Rust concurrency test flaky vectors,
+  axum limit ordering sensitivity, and PII disclosure risks. None of these block the M1 sign-off as they are deferred
+  and can be fully addressed during implementation in milestones M2-M5 (specifically by splitting the 200 OK test
+  into a separate integration test process).
+
+sign_off:
+  status: "PASS"
+  next_action: "Proceed to M2 (Body Limit implementation) and M3 (Metrics Auth implementation), taking into account the split-process test strategy for M5."
+  blocking_findings: []

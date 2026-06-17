@@ -1,0 +1,42 @@
+verdict: PASS
+reviewed_by: Antigravity (Rust Safety and Concurrency Expert)
+timestamp: "2026-06-17T14:34:00+08:00"
+milestone: M3
+scope:
+  - src/ilink/upstream.rs
+
+summary: |
+  Milestone M3 focuses on replacing the `unwrap()` call on `HeaderValue::from_str` in `src/ilink/upstream.rs` with error propagation (`?`) to prevent panic risks when initializing header maps. All calling functions now propagate errors properly using `?`. Unit testing (`headers_fail_with_invalid_token`) was added to cover error cases with invalid tokens containing newline characters. All tests pass successfully, showing robustness under malformed inputs.
+
+findings:
+  - id: DOS-PREVENTION
+    title: "Denial of Service Prevention via HeaderValue Error Propagation"
+    severity: Medium
+    category: Security & Robustness
+    file: src/ilink/upstream.rs
+    lines: 124-139
+    status: RESOLVED
+    description: |
+      Previously, any invalid character (e.g., control characters or non-ASCII characters) inside a token loaded from database or environment would trigger a panic inside `HeaderValue::from_str(...).unwrap()`. This could lead to a Denial of Service (DoS) of the upstream polling loop. Replacing the unwrap with error propagation prevents such panics.
+    impact: |
+      If a malformed token is supplied, the application now fails gracefully with an error Result, which is captured and logged by the polling loop (or caller) rather than panicking and crashing the process or the tokio worker thread.
+    recommendation: |
+      Ensure that the error is handled at the call site in a way that avoids busy-waiting/infinite loop without backoff.
+    resolution: |
+      The polling loop logs the error and sleeps with exponential backoff (starting at 1s up to a maximum of 30s), which protects the CPU and downstream systems from high-frequency retries under failure.
+
+  - id: UIN-SAFETY-ASSESSMENT
+    title: "Safe X-WECHAT-UIN Value Generation"
+    severity: Info
+    category: Concurrency & Safety
+    file: src/ilink/upstream.rs
+    lines: 118-122
+    status: RESOLVED
+    description: |
+      `X-WECHAT-UIN` is generated dynamically using `random_uin()`. This returns a base64 encoded representation of a random `u32` string.
+    impact: |
+      Because base64 encodes data into standard alphanumeric characters (`+`, `/`, `=`), the generated string is guaranteed to be a valid header value. Thus, `HeaderValue::from_str(&self.random_uin())?` will never fail in practice under this implementation, avoiding any run-time errors for the UIN header.
+    recommendation: |
+      Maintain the base64 encoding scheme to ensure compatibility and safety for this header value.
+    resolution: |
+      No modification is required as the current implementation is already fully safe.

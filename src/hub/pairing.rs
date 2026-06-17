@@ -5,6 +5,11 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const PAIRING_TTL: Duration = Duration::from_secs(600);
+/// How long a session that has been scanned (phone confirmed QR) but not yet
+/// confirmed (operator pressed "allow") remains valid. A short window limits the
+/// replay risk: an attacker who captures a scan request has at most 60 seconds to
+/// race the legitimate confirm (SEC-002).
+const SCANNED_TTL: Duration = Duration::from_secs(60);
 /// How long a `Confirmed` pairing session is retained before being purged.
 /// The session is no longer needed once confirmed: the vtoken, name, and
 /// label are persisted in the registry and store, so the in-memory entry
@@ -29,6 +34,9 @@ pub enum PairingStatus {
 pub struct PairingSession {
     pub code: String,
     pub created_at: Instant,
+    /// When the QR code was first scanned (phone confirmed). Used to enforce the short
+    /// `SCANNED_TTL` replay window (SEC-002): confirmation must happen within 60s of scan.
+    pub scanned_at: Option<Instant>,
     pub status: PairingStatus,
     pub vtoken: Option<String>,
     pub client_name: Option<String>,
@@ -40,9 +48,17 @@ pub struct PairingSession {
 
 impl PairingSession {
     fn is_expired(&self) -> bool {
-        // Live (Wait / Scanned) sessions expire after PAIRING_TTL; the
-        // pre-existing semantics for get()/public_status() are preserved.
-        self.status != PairingStatus::Confirmed && self.created_at.elapsed() > PAIRING_TTL
+        match self.status {
+            PairingStatus::Confirmed => false,
+            // Once scanned, the confirmation window shrinks to SCANNED_TTL (60s) to reduce
+            // the replay attack window (SEC-002). Fall back to PAIRING_TTL if scanned_at is
+            // unexpectedly absent.
+            PairingStatus::Scanned => self
+                .scanned_at
+                .map(|t| t.elapsed() > SCANNED_TTL)
+                .unwrap_or_else(|| self.created_at.elapsed() > PAIRING_TTL),
+            _ => self.created_at.elapsed() > PAIRING_TTL,
+        }
     }
 
     /// F-M1-C: Confirmed sessions are dropped by `purge_expired` after
@@ -53,6 +69,10 @@ impl PairingSession {
     fn should_evict(&self) -> bool {
         match self.status {
             PairingStatus::Confirmed => self.created_at.elapsed() > CONFIRMED_TTL,
+            PairingStatus::Scanned => self
+                .scanned_at
+                .map(|t| t.elapsed() > SCANNED_TTL)
+                .unwrap_or_else(|| self.created_at.elapsed() > PAIRING_TTL),
             _ => self.created_at.elapsed() > PAIRING_TTL,
         }
     }
@@ -107,6 +127,7 @@ impl PairingRegistry {
             PairingSession {
                 code: code.clone(),
                 created_at: Instant::now(),
+                scanned_at: None,
                 status: PairingStatus::Wait,
                 vtoken: None,
                 client_name: None,
@@ -136,7 +157,9 @@ impl PairingRegistry {
             }
             if session.status == PairingStatus::Wait {
                 session.status = PairingStatus::Scanned;
-                session.created_at = Instant::now(); // Reset TTL/created_at to 60s
+                // Record scan time only on the first transition Wait→Scanned.
+                // is_expired() uses scanned_at to enforce the SCANNED_TTL (60s) window.
+                session.scanned_at = Some(Instant::now());
             }
             // Mint a CSRF token the first time a session is scanned. Subsequent
             // re-scans (page reloads, re-renders) are no-ops on the token so a
@@ -330,6 +353,25 @@ mod tests {
             .unwrap_err();
         // AlreadyConfirmed is checked first, so we see that here.
         assert_eq!(err, PairingError::AlreadyConfirmed);
+    }
+
+    #[test]
+    fn scanned_session_expires_after_scanned_ttl_not_pairing_ttl() {
+        // SEC-002: once scanned, only SCANNED_TTL (60s) remains, not PAIRING_TTL (600s).
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+
+        // Backdate scanned_at past SCANNED_TTL but keep created_at recent.
+        let session = reg.sessions.get_mut(&code).unwrap();
+        session.scanned_at = Some(Instant::now() - Duration::from_secs(SCANNED_TTL.as_secs() + 5));
+
+        // The session should now appear Expired despite created_at being recent.
+        assert_eq!(
+            reg.get(&code).unwrap().status_str(),
+            "expired",
+            "scanned session must expire after SCANNED_TTL, not PAIRING_TTL"
+        );
     }
 
     #[test]

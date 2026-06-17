@@ -621,11 +621,13 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 .iter()
                 .map(|(vt, vc)| (vc.clone(), vt.clone()))
                 .collect();
-            let hub_ext_data = state
-                .store
-                .get_hub_ext_batch(&pairs)
-                .await
-                .unwrap_or_default();
+            let hub_ext_data = match state.store.get_hub_ext_batch(&pairs).await {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(error = %e, "get_hub_ext_batch failed; broadcast will proceed without HubExt");
+                    Default::default()
+                }
+            };
 
             for (vtoken, vctx) in vctx_by_vtoken {
                 let hub_ext = hub_ext_data.get(&(vctx.clone(), vtoken.clone())).map(

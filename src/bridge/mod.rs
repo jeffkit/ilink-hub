@@ -158,15 +158,38 @@ fn session_dispatch_key(msg: &WeixinMessage) -> String {
 ///
 /// Processes messages one at a time so that `--resume` calls for the same Claude session
 /// never race against each other.
+///
+/// On repeated CLI failures the worker applies exponential backoff (up to
+/// [`SESSION_WORKER_MAX_BACKOFF_SECS`]) before processing the next message, preventing
+/// tight crash-loops when the underlying CLI binary is unavailable or misconfigured.
 async fn run_session_worker(
     key: String,
     mut rx: mpsc::Receiver<WeixinMessage>,
     client: HubClient,
     app: Arc<BridgeApp>,
 ) {
+    const SESSION_WORKER_MAX_BACKOFF_SECS: u64 = 60;
+    let mut consecutive_failures: u32 = 0;
+
     while let Some(msg) = rx.recv().await {
-        if let Err(e) = handle_one_message(&client, &app, msg).await {
-            error!(session_key = %key, error = %e, "message handler failed");
+        match handle_one_message(&client, &app, msg).await {
+            Ok(()) => {
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                // Exponential backoff: 1s, 2s, 4s, … up to SESSION_WORKER_MAX_BACKOFF_SECS.
+                let backoff_secs =
+                    SESSION_WORKER_MAX_BACKOFF_SECS.min(1_u64 << consecutive_failures.min(63));
+                error!(
+                    session_key = %key,
+                    error = %e,
+                    consecutive_failures,
+                    backoff_secs,
+                    "message handler failed; backing off before next message"
+                );
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+            }
         }
     }
     info!(session_key = %key, "session worker exiting");
@@ -247,6 +270,11 @@ pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> Bridg
     let app = Arc::new(app);
     let dispatcher = SessionDispatcher::new(client.clone(), Arc::clone(&app));
     let mut buf = String::new();
+    // Exponential backoff for getupdates errors (Hub down / transient network).
+    // Caps at 60s; resets to initial value on the first successful poll.
+    let mut backoff_secs: u64 = 3;
+    const MAX_BACKOFF_SECS: u64 = 60;
+
     info!(
         routing = %app.routing_label(),
         profiles = ?app.profile_names(),
@@ -255,11 +283,15 @@ pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> Bridg
 
     loop {
         let resp = match client.getupdates(&mut buf).await {
-            Ok(GetUpdatesOutcome::Ok(r)) => r,
+            Ok(GetUpdatesOutcome::Ok(r)) => {
+                backoff_secs = 3; // reset on success
+                r
+            }
             Ok(GetUpdatesOutcome::TokenRejected) => return BridgeStop::TokenRejected,
             Err(e) => {
-                error!(error = %e, "getupdates failed; retrying in 3s");
-                tokio::time::sleep(Duration::from_secs(3)).await;
+                error!(error = %e, backoff_secs, "getupdates failed; retrying with backoff");
+                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
                 continue;
             }
         };
