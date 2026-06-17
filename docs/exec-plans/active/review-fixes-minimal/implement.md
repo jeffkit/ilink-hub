@@ -20,7 +20,7 @@
 - [x] `cargo build` — 成功
 - [x] `npm run build` (desktop frontend) — 成功
 - [x] `cargo check` (desktop tauri) — 成功
-- [ ] M3 待执行
+- [x] M3 待执行 → ✅
 - [ ] M4 待执行
 
 ## M2 — AUTH_ERROR_KEYWORDS 常量提取 ✅
@@ -39,6 +39,26 @@
 - [x] `cargo fmt --check` — 零差异
 - [x] `cargo clippy -- -D warnings` — 零警告
 - [x] `cargo test` — 293 passed, 0 failed
+- [x] `cargo build` — 成功
+- [x] `npm run build` (desktop frontend) — 成功
+- [x] `cargo check` (desktop tauri) — 成功
+
+## M3 — bridge 超时行为文档化 ✅
+
+**完成时间**: 2026-06-17
+
+### 变更摘要
+
+| 文件 | 变更 |
+|------|------|
+| `src/bridge/config.rs` | `BridgeProfile::timeout_secs` 添加 doc comment，说明最坏情况 `timeout_secs + 10s`（主超时 + `child.wait()` 10s） |
+
+### 验证结果
+
+- [x] `grep -A2 timeout_secs src/bridge/config.rs` — 确认注释存在
+- [x] `cargo fmt --check` — 零差异
+- [x] `cargo clippy -- -D warnings` — 零警告
+- [x] `cargo test` — 308 passed, 0 failed
 - [x] `cargo build` — 成功
 - [x] `npm run build` (desktop frontend) — 成功
 - [x] `cargo check` (desktop tauri) — 成功

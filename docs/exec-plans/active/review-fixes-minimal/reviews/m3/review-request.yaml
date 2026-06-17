@@ -1,0 +1,26 @@
+milestone: M3
+title: bridge 超时行为文档化 — 审查请求
+status: pending
+date: "2026-06-17"
+
+review_request: |
+  M3 仅为 `BridgeProfile::timeout_secs` 字段添加文档注释，说明超时叠加行为：
+  主超时覆盖 stdout 读取阶段，子进程退出后有额外 10s `child.wait()` 等待，
+  最坏情况总耗时为 `timeout_secs + 10s`。无代码逻辑变更，无行为变更。
+
+changes:
+  - file: src/bridge/config.rs
+    description: 为 `BridgeProfile::timeout_secs` 添加 doc comment 说明超时叠加行为
+    lines: "93-99"
+
+verification:
+  - cargo fmt --check: PASS
+  - cargo clippy -- -D warnings: PASS
+  - cargo test: PASS (308 passed, 0 failed)
+  - cargo build: PASS
+  - npm run build (desktop frontend): PASS
+  - cargo check (desktop tauri): PASS
+
+review_focus:
+  - doc comment 准确性：超时叠加行为描述是否与 `src/bridge/mod.rs` 中实际实现一致
+  - 中英文混合文档风格是否符合项目惯例
