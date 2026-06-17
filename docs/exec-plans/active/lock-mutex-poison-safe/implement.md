@@ -58,3 +58,33 @@ Commit: fdc860c
 ### Commit
 
 Commit: a5d2d59
+
+## M3: 修复 `src/ilink/upstream.rs` 中 `HeaderValue::unwrap()` ─ done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：修改 `src/ilink/upstream.rs` 中的 `HeaderValue::from_str(...).unwrap()`，改为 `?` 错误传播，并补充单元测试。
+- **审查请求**：[reviews/m3/review-request.yaml](./reviews/m3/review-request.yaml)
+
+### 关键改动
+
+- 修改 `UpstreamClient::headers` 签名变更为 `fn headers(&self) -> Result<reqwest::header::HeaderMap>`。
+- 将 `HeaderValue::from_str(...).unwrap()` 替换为 `HeaderValue::from_str(...)?`。
+- 在 `notify_start`、`get_updates`、`send_message`、`send_typing`、`get_config`、`get_upload_url` 等异步方法中，使用 `?` 传播错误。
+- 在 `src/ilink/upstream.rs` 的单元测试中新增 `headers_fail_with_invalid_token`，测试在非法 token 导致 `HeaderValue::from_str` 失败时能够正确返回错误而不 panic。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: a0e2857
+
