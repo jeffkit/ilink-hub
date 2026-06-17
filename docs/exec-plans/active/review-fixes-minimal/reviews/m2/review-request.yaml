@@ -1,0 +1,16 @@
+milestone: M2
+title: "AUTH_ERROR_KEYWORDS 常量提取"
+status: ready_for_review
+files:
+  - path: src/bridge/mod.rs
+    changes:
+      - "新增 const AUTH_ERROR_KEYWORDS: &[&str]"
+      - "handle_one_message 使用 AUTH_ERROR_KEYWORDS 替代本地 keywords 数组"
+      - "dry_run_profile 使用 AUTH_ERROR_KEYWORDS 替代本地 keywords 数组"
+verification:
+  fmt: pass
+  clippy: pass
+  test: "293 passed, 0 failed"
+  build: pass
+  desktop-frontend: pass
+  desktop-tauri: pass

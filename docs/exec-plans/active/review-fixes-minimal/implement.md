@@ -20,6 +20,25 @@
 - [x] `cargo build` — 成功
 - [x] `npm run build` (desktop frontend) — 成功
 - [x] `cargo check` (desktop tauri) — 成功
-- [ ] M2 待执行
 - [ ] M3 待执行
 - [ ] M4 待执行
+
+## M2 — AUTH_ERROR_KEYWORDS 常量提取 ✅
+
+**完成时间**: 2026-06-17
+
+### 变更摘要
+
+| 文件 | 变更 |
+|------|------|
+| `src/bridge/mod.rs` | 新增 `const AUTH_ERROR_KEYWORDS: &[&str]`（12 个关键词）；`handle_one_message` 和 `dry_run_profile` 均使用该常量替代本地 `keywords` 数组 |
+
+### 验证结果
+
+- [x] `grep AUTH_ERROR_KEYWORDS src/bridge/mod.rs` — 3 处引用（1 定义 + 2 使用）
+- [x] `cargo fmt --check` — 零差异
+- [x] `cargo clippy -- -D warnings` — 零警告
+- [x] `cargo test` — 293 passed, 0 failed
+- [x] `cargo build` — 成功
+- [x] `npm run build` (desktop frontend) — 成功
+- [x] `cargo check` (desktop tauri) — 成功

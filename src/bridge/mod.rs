@@ -38,6 +38,23 @@ use crate::ilink::types::{
 };
 use crate::paths::expand_user_path;
 
+/// Keywords in CLI stderr that indicate an auth/credential problem (missing login, expired token, etc.).
+/// When any of these appear in the error output, the bridge treats the failure as fatal (needs user action).
+const AUTH_ERROR_KEYWORDS: &[&str] = &[
+    "login",
+    "logout",
+    "auth",
+    "credential",
+    "sign in",
+    "unauthorized",
+    "unauthenticated",
+    "401",
+    "not logged in",
+    "keychain",
+    "api key",
+    "token",
+];
+
 enum GetUpdatesOutcome {
     Ok(GetUpdatesResponse),
     TokenRejected,
@@ -493,21 +510,7 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
                 }
             }
             let err_str = e.to_string().to_lowercase();
-            let keywords = [
-                "login",
-                "logout",
-                "auth",
-                "credential",
-                "sign in",
-                "unauthorized",
-                "unauthenticated",
-                "401",
-                "not logged in",
-                "keychain",
-                "api key",
-                "token",
-            ];
-            if keywords.iter().any(|&k| err_str.contains(k))
+            if AUTH_ERROR_KEYWORDS.iter().any(|&k| err_str.contains(k))
                 || err_str.contains("not found")
                 || err_str.contains("no such file")
             {
@@ -1091,21 +1094,7 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
 
     if !output.status.success() {
         let all_output = format!("{}\n{}", stdout_str, stderr_str).to_lowercase();
-        let keywords = [
-            "login",
-            "logout",
-            "auth",
-            "credential",
-            "sign in",
-            "unauthorized",
-            "unauthenticated",
-            "401",
-            "not logged in",
-            "keychain",
-            "api key",
-            "token",
-        ];
-        if keywords.iter().any(|&k| all_output.contains(k)) {
+        if AUTH_ERROR_KEYWORDS.iter().any(|&k| all_output.contains(k)) {
             return Err(ProbeError::Unauthenticated(format!(
                 "exit code: {:?}\n--- stderr ---\n{}\n--- stdout ---\n{}",
                 output.status.code(),
