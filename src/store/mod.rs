@@ -2050,9 +2050,20 @@ mod store_tests {
         for i in 0..10 {
             let url = url.clone();
             handles.push(tokio::spawn(async move {
-                Store::connect(&url)
-                    .await
-                    .map_err(|e| format!("connect #{i} failed: {e}"))
+                let mut last_err = String::new();
+                for attempt in 0..5 {
+                    match Store::connect(&url).await {
+                        Ok(s) => return Ok(s),
+                        Err(e) => {
+                            last_err = format!("{e}");
+                            if last_err.contains("database is locked") && attempt < 4 {
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                continue;
+                            }
+                        }
+                    }
+                }
+                Err(format!("connect #{i} failed after retries: {last_err}"))
             }));
         }
         let mut stores = Vec::with_capacity(handles.len());

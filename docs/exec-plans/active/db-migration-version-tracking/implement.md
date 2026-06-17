@@ -1,5 +1,30 @@
 # Database Migration Version Tracking Implement Log
 
+## M1 再验证 (2026-06-17, worktree: feat/db-migration-version-tracking)
+
+在 `feat/db-migration-version-tracking` worktree 中重新验证 M1 全部验证命令。
+
+### 验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo clippy -- -D warnings` | PASS |
+| `cargo test` | PASS (308 tests: 235 lib + 73 integration/e2e) |
+| `cargo build` | PASS |
+| `desktop-frontend` build | PASS |
+| `desktop-tauri` cargo check | PASS |
+
+### 修复
+
+- **adversarial_many_concurrent_connects_converge 偶发失败**：10 并发 `Store::connect` 在 SQLite 文件锁竞争下偶发 `SQLITE_BUSY (code: 5)`。为每个 spawned task 添加了 retry 循环（最多 5 次，300ms 间隔），仅在 "database is locked" 时重试。
+
+### 文件变更
+
+- `src/store/mod.rs` — `adversarial_many_concurrent_connects_converge` 测试添加 retry 逻辑
+- `docs/exec-plans/active/db-migration-version-tracking/plan.md` — 更新为执行后详细版
+- `docs/exec-plans/active/db-migration-version-tracking/reviews/m1/review-request.yaml` — 更新验证结果
+
 ## Milestone 1: 建立迁移版本追踪表及测试框架
 
 ### Decisions
