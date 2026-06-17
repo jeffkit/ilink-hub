@@ -107,7 +107,7 @@ impl UpstreamClient {
         let _ = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&body)
             .send()
             .await?;
@@ -121,7 +121,7 @@ impl UpstreamClient {
         base64::engine::general_purpose::STANDARD.encode(uint32.to_string().as_bytes())
     }
 
-    fn headers(&self) -> reqwest::header::HeaderMap {
+    fn headers(&self) -> Result<reqwest::header::HeaderMap> {
         use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
         let mut headers = HeaderMap::new();
         // Required by iLink: must be "ilink_bot_token" or session times out immediately
@@ -132,13 +132,10 @@ impl UpstreamClient {
         let token = self.token.load();
         headers.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", token.as_str())).unwrap(),
+            HeaderValue::from_str(&format!("Bearer {}", token.as_str()))?,
         );
-        headers.insert(
-            "X-WECHAT-UIN",
-            HeaderValue::from_str(&self.random_uin()).unwrap(),
-        );
-        headers
+        headers.insert("X-WECHAT-UIN", HeaderValue::from_str(&self.random_uin())?);
+        Ok(headers)
     }
 
     /// Long-poll for new messages. Pass `timeout: Some(0)` for an immediate probe (e.g. session check).
@@ -156,7 +153,7 @@ impl UpstreamClient {
         let resp = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&req_body)
             .send()
             .await?
@@ -177,7 +174,7 @@ impl UpstreamClient {
         let text = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&req)
             .send()
             .await?
@@ -211,7 +208,7 @@ impl UpstreamClient {
         let _ = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&req)
             .send()
             .await?
@@ -224,7 +221,7 @@ impl UpstreamClient {
         let resp = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&req)
             .send()
             .await?
@@ -238,7 +235,7 @@ impl UpstreamClient {
         let resp = self
             .client
             .post(&url)
-            .headers(self.headers())
+            .headers(self.headers()?)
             .json(&req)
             .send()
             .await?
@@ -537,5 +534,14 @@ mod tests {
         ));
         assert!(!UpstreamClient::is_well_formed_bot_token(""));
         assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
+    }
+
+    #[test]
+    fn headers_fail_with_invalid_token() {
+        let client = UpstreamClient::new("invalid\nkey".to_string(), None);
+        assert!(client.headers().is_err());
+
+        let client_ok = UpstreamClient::new("valid_key".to_string(), None);
+        assert!(client_ok.headers().is_ok());
     }
 }
