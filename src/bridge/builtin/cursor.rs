@@ -28,14 +28,15 @@ use tokio::process::Command;
 ///
 /// The Cursor agent uses the same stream-json schema as the Claude CLI:
 /// `type == "assistant"` carries incremental text; `type == "result"` carries the
-/// final session_id. The result text duplicates the last assistant event and is
-/// therefore not separately output.
+/// final session_id and result text.
 #[derive(Debug, Deserialize)]
 struct CursorStreamEvent {
     #[serde(rename = "type")]
     event_type: Option<String>,
     /// Session ID (present on `type == "result"` events).
     session_id: Option<String>,
+    /// Final result text (present on `type == "result"` events).
+    result: Option<String>,
     /// Present on `type == "assistant"` events.
     message: Option<CursorMessage>,
 }
@@ -84,9 +85,9 @@ pub async fn run() -> Result<()> {
 /// Call `agent --output-format stream-json`, emit every assistant text chunk as an
 /// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via ILINK_PARTIAL; the `result` field text is
-/// not separately output because empirically it equals the last assistant text event,
-/// which was already streamed.
+/// All visible response text is streamed via ILINK_PARTIAL. When the model uses tools
+/// between turns, the final assistant reply may only appear in `result.result` (with no
+/// preceding `assistant` event); we emit it as an extra ILINK_PARTIAL in that case.
 async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -145,6 +146,8 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_session_id: Option<String> = None;
+    // Track the last partial text sent so we can detect when result.result differs.
+    let mut last_partial: Option<String> = None;
 
     loop {
         line.clear();
@@ -164,9 +167,6 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
 
         match event.event_type.as_deref() {
             Some("assistant") => {
-                // Stream all assistant text blocks as ILINK_PARTIAL immediately.
-                // Empirically, the `result` field equals only the last assistant event's
-                // text, so every piece of text is captured here without duplication.
                 if let Some(msg) = &event.message {
                     if let Some(blocks) = &msg.content {
                         let text: String = blocks
@@ -178,13 +178,23 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                         if !text.is_empty() {
                             println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
                             std::io::Write::flush(&mut std::io::stdout()).ok();
+                            last_partial = Some(text);
                         }
                     }
                 }
             }
             Some("result") => {
-                // Only extract session_id; the text is already covered by ILINK_PARTIAL above.
                 found_session_id = event.session_id;
+                // When the model uses tools between turns, the final assistant reply text
+                // may only appear in result.result and have no corresponding assistant event.
+                // Send it as a partial if it differs from the last streamed chunk.
+                if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
+                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
+                    if !already_sent {
+                        println!("ILINK_PARTIAL:{}", serde_json::to_string(&result_text)?);
+                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                    }
+                }
             }
             _ => {}
         }
@@ -210,6 +220,7 @@ mod tests {
         let json = r#"{"type":"result","result":"Hello!","session_id":"sess-abc"}"#;
         let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type.as_deref(), Some("result"));
+        assert_eq!(event.result.as_deref(), Some("Hello!"));
         assert_eq!(event.session_id.as_deref(), Some("sess-abc"));
     }
 

@@ -21,7 +21,7 @@ profiles:
   cursor:
     type: cursor                          # 内置：自动管理 --resume 续接上下文 + ILINK_PARTIAL 流式
     cwd: /path/to/your/project            # ← 改为你的项目目录（agent 会在此目录下运行）
-    timeout_secs: 600
+    timeout_secs: 1800
     max_reply_chars: 8000
     env:
       CURSOR_MODEL: claude-4.6-sonnet-medium  # 可选：不设则使用 agent 默认模型

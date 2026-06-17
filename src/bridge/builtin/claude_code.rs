@@ -358,4 +358,22 @@ mod tests {
         assert_eq!(result_event.result.as_deref(), Some("Final answer"));
         assert_eq!(result_event.session_id.as_deref(), Some("sess-xyz"));
     }
+
+    /// Regression test using the full real-world JSON array from CLI v2.1.153+ with extra fields.
+    #[test]
+    fn oneshot_parses_real_world_json_array() {
+        let json = r#"[{"type":"system","subtype":"init","cwd":"/Users/kongjie/projects/ilink-hub","session_id":"7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0","tools":["Task","AskUserQuestion","Bash"],"mcp_servers":[{"name":"plugin:argusai:argusai","status":"pending"}],"model":"claude-sonnet-4-6","permissionMode":"bypassPermissions","slash_commands":["daily-standup"],"apiKeySource":"none","claude_code_version":"2.1.153","output_style":"default","agents":[],"skills":[],"plugins":[],"analytics_disabled":false,"product_feedback_disabled":false,"uuid":"9372f0d2-4f9c-4c0a-b183-0d81451aed9b","memory_paths":{"auto":"/tmp/memory/"},"fast_mode_state":"off"},{"type":"assistant","message":{"model":"claude-sonnet-4-6","id":"msg_01VmAu37HNMuZLz92EAcAwv1","type":"message","role":"assistant","content":[{"type":"text","text":"你好！有什么我可以帮你的吗？"}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":3,"cache_creation_input_tokens":13924,"cache_read_input_tokens":12758},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0","uuid":"3f3d7d18-41da-4d87-ba6a-a9f50251b82c","request_id":"req_011Cc6yh3haovj7ig9Fr6ozw"},{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":1781618400,"rateLimitType":"five_hour","overageStatus":"rejected","overageDisabledReason":"org_level_disabled","isUsingOverage":false},"uuid":"8308bf99-2c6e-460c-b9df-ccc105251444","session_id":"7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0"},{"type":"result","subtype":"success","is_error":false,"api_error_status":null,"duration_ms":2628,"duration_api_ms":2587,"ttft_ms":2549,"num_turns":1,"result":"你好！有什么我可以帮你的吗？","stop_reason":"end_turn","session_id":"7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0","total_cost_usd":0.0563514,"usage":{"input_tokens":3,"cache_creation_input_tokens":13924,"cache_read_input_tokens":12758,"output_tokens":20},"modelUsage":{"claude-sonnet-4-6":{"inputTokens":3,"outputTokens":20}},"permission_denials":[],"terminal_reason":"completed","fast_mode_state":"off","uuid":"c2fd8595-2544-4c3f-bc2d-8d7db4bf941d"}]"#;
+
+        let trimmed = json.trim();
+        assert!(trimmed.starts_with('['), "test input must be an array");
+
+        let events: Vec<ClaudeStreamEvent> = serde_json::from_str(trimmed).unwrap();
+        let result_event = events
+            .into_iter()
+            .find(|e| e.event_type.as_deref() == Some("result"))
+            .expect("result event must be found");
+
+        assert_eq!(result_event.result.as_deref(), Some("你好！有什么我可以帮你的吗？"));
+        assert_eq!(result_event.session_id.as_deref(), Some("7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0"));
+    }
 }

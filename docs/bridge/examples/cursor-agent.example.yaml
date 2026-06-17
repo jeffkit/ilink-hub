@@ -6,7 +6,7 @@ command: agent
 args: ["-p", "{{MESSAGE}}"]
 stdin: none
 cwd: /path/to/your/project
-timeout_secs: 600
+timeout_secs: 1800
 max_reply_chars: 8000
 # env:
 #   CURSOR_API_KEY: "key-..."  # 建议仅在 shell 中 export，勿提交到 Git
