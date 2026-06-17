@@ -61,3 +61,23 @@
 | `cargo build` | pass |
 | `npm run build` (desktop) | pass |
 | `cargo check --manifest-path desktop/.../Cargo.toml` | pass |
+
+## M4: 文档与质量门禁 ✅ 完成 (2026-06-17)
+
+**变更文件：** `README.md`、`docs/exec-plans/active/cors-configurable-origins/implement.md`、`docs/exec-plans/active/cors-configurable-origins/reviews/m4/review-request.yaml`
+
+**改动摘要：**
+- `README.md` Security Recommendations 区域新增 ILINK_CORS_ORIGINS 环境变量文档说明
+- `implement.md` 新增 M4 完成记录
+- `reviews/m4/review-request.yaml` 新建 M4 review 请求文件
+
+**验证状态：**
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | 337 passed (254 unit + 83 integration) |
+| `cargo build` | pass |
+| `npm run build` (desktop) | pass |
+| `cargo check --manifest-path desktop/.../Cargo.toml` | pass |
+| `grep -r "ILINK_CORS_ORIGINS" README.md docs/` | pass |

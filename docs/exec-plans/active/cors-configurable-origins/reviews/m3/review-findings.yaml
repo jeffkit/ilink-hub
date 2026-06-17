@@ -1,0 +1,203 @@
+milestone: M3
+verdict: PASS
+reviewer: adversarial-rust-security
+date: 2026-06-17
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_cors_misconfiguration
+  - cwe_classification
+
+scope_audited:
+  - src/server/mod.rs
+  - tests/cors_tests.rs
+  - Cargo.toml (dev-dependencies unchanged from M1)
+
+# ── M1/M2 遗留项复查 ──────────────────────────────────────────────────
+carryover_review:
+  - id: A-M1-2-recheck
+    status: RESOLVED
+    original: "ILINK_CORS_ORIGINS=* 可配置通配符绕过，且 null origin 无防护"
+    resolution: >
+      M2 在 parse_origins 中新增 contains("://") 检查，* 和 null 均因不含 :// 而被 panic 拒绝。
+      单元测试 origins_rejects_wildcard、origins_rejects_null_origin 验证此行为。
+      M3 集成测试 parse_origins_panics_on_bad_format 从外部 crate 验证了拒绝逻辑。
+
+  - id: M2-medium-recheck
+    status: UNCHANGED
+    original: "contains(\"://\") 为子串匹配，可能放过畸形值"
+    assessment: >
+      M3 未修改 parse_origins 的实现，该风险保持 M2 评估的 MEDIUM/LOW（实际利用不可行）。
+      建议后续 milestone 考虑 starts_with 替代 contains。
+
+  - id: M2-low-tokio-test-recheck
+    status: UNFIXED
+    original: "cors_layer_is_cloneable_for_tower 无 async 代码但使用 #[tokio::test]"
+    assessment: >
+      M3 在 tests/cors_tests.rs 中新增的 cors_layer_is_cloneable 已使用 #[test]（正确），
+      但 src/server/mod.rs 内联测试 cors_layer_is_cloneable_for_tower 仍保留 #[tokio::test]（line 397）。
+      无安全影响，纯性能浪费。
+
+# ── M3 新增发现 ───────────────────────────────────────────────────────
+findings:
+  - id: A-M3-1
+    severity: LOW
+    status: NOTED
+    cwe: CWE-1041 (Use of Redundant Code)
+    title: "src/server/mod.rs 与 tests/cors_tests.rs 存在 7 个重复测试"
+    location:
+      - src/server/mod.rs:200-403 (inline #[cfg(test)] mod tests)
+      - tests/cors_tests.rs:22-264 (外部集成测试)
+    description: >
+      M3 新增 tests/cors_tests.rs 作为外部集成测试，但其中的 7 个测试函数
+      （permissive_allows_any_origin、permissive_preflight_returns_allow_methods、
+      list_mode_allows_configured_origin、list_mode_allows_multiple_origins、
+      list_mode_preflight_includes_allow_methods_and_headers、list_mode_rejects_unlisted_origin、
+      list_mode_preflight_rejects_unlisted_origin、cors_layer_is_cloneable）与
+      src/server/mod.rs 内联测试模块中的对应测试几乎完全一致。
+      内联测试编译为 lib crate 内部测试，外部测试编译为独立 crate 测试。
+    risk: >
+      非安全风险。重复代码增加了维护负担——修改 CORS 行为时需同时更新两处测试。
+      但两个测试文件测试的是同一函数，逻辑相同是可预期的。
+    recommendation: >
+      可考虑移除内联测试中的重复用例，保留 parse_origins 单元测试，
+      将所有涉及 build_cors_layer 响应头验证的测试收敛到 tests/cors_tests.rs。
+
+  - id: A-M3-2
+    severity: INFO
+    status: NOTED
+    cwe: CWE-1118 (Insufficient Documentation of Error Handling Code)
+    title: "tests/cors_tests.rs 文档注释声称测试 build_router 但实际仅测试 build_cors_layer"
+    location: tests/cors_tests.rs:3-5
+    description: >
+      tests/cors_tests.rs 头部注释写 "These tests exercise the full router stack (build_router)
+      so that CORS middleware, route matching, and body-limit layers all interact as they do in
+      production." 但实际上所有测试都通过私有的 test_router() 辅助函数构建最小 Router，
+      并未调用 build_router()，也未涉及 route matching 和 body-limit layers。
+    risk: >
+      无安全风险。注释与实际测试范围不一致，可能误导后续维护者。
+      build_cors_layer 的 CORS 行为独立于 router 的其他层（TraceLayer、DefaultBodyLimit），
+      因此最小 Router 测试是充分的。
+    recommendation: >
+      修正注释为 "These tests exercise build_cors_layer() through a minimal axum Router
+      to verify CORS header behaviour in isolation."
+
+  - id: A-M3-3
+    severity: INFO
+    status: NOTED
+    title: "测试未覆盖 port 非默认的 origin 匹配"
+    location: tests/cors_tests.rs:82-145
+    description: >
+      所有 list 模式测试均使用默认端口 origin（https://my.app、https://a.com、https://b.com）。
+      未覆盖带显式端口的 origin（如 https://my.app:8443）。由于 AllowOrigin::list 执行精确字符串匹配，
+      配置 https://my.app 不会匹配浏览器发送的 Origin: https://my.app:8080。
+    risk: >
+      无代码缺陷。这是 CORS 规范的预期行为（origin 包含端口时需精确匹配）。
+      但若运维人员不了解此行为而配置了不含端口的 origin，可能导致端口上的请求被意外拒绝。
+    recommendation: >
+      可选：新增测试验证 port 匹配行为（配置含端口 origin，请求匹配/不匹配），
+      文档化 CORS origin 精确匹配（含端口）的语义。
+
+  - id: A-M3-4
+    severity: INFO
+    status: NOTED
+    title: "list 模式下未设置 Access-Control-Expose-Headers"
+    description: >
+      build_cors_layer 的 list 分支未调用 .expose_headers()。
+      tower-http 默认不暴露任何非简单响应头。若 bot API 响应包含自定义头
+      （如 X-Request-Id），浏览器端 JavaScript 将无法通过 getResponseHeader() 读取。
+      permissive 模式同样存在此行为。
+    risk: >
+      低。当前 bot API 响应仅依赖简单头（Content-Type: application/json），
+      未使用自定义响应头。若未来添加自定义头，需要同步更新 CORS 配置。
+    recommendation: >
+      当 bot API 开始返回自定义响应头时，添加 .expose_headers() 配置。
+
+# ── 安全维度逐项检查 ──────────────────────────────────────────────────
+checks:
+  memory_safety:
+    status: pass
+    details: >
+      M3 仅新增测试代码，无 unsafe 块，无手动内存管理。
+      parse_origins 返回 Vec<HeaderValue>，所有权由 Rust 自动管理。
+      CorsLayer::clone() 由 tower-http 实现，内部使用 Arc 共享不可变配置。
+
+  data_race:
+    status: pass
+    details: >
+      build_cors_layer() 中的 env::var 仅在 Router 构建时同步调用一次，
+      此时服务器尚未启动，无并发访问。CorsLayer 通过 Clone 分发到各 worker，
+      内部为不可变共享配置。测试使用 temp_env 全局互斥锁保护 env var 操作。
+      Arc<HubState> 正确使用 DashMap 等内部并发安全类型。
+
+  tokio_async_pitfalls:
+    status: pass
+    details: >
+      - build_cors_layer / parse_origins 均为同步函数，在 build_router 中同步调用，
+        不跨越 .await 持有锁。
+      - 内联测试使用 Runtime::new() + block_on 模式，每次创建独立 runtime，
+        测试结束后 runtime 随 block_on 退出而 drop，无资源泄漏。
+      - 每个 temp_env::with_var 闭包内创建独立 runtime，无跨 runtime 状态共享。
+      - 无 spawn_blocking 内部使用同步阻塞操作的风险。
+      - tests/cors_tests.rs:121 中 app.clone() 用于循环内多次 oneshot 请求，
+        Router::clone() 为廉价操作（内部 Arc 引用计数+1），无阻塞风险。
+
+  owasp_cors_configuration:
+    status: pass
+    details: >
+      1) allow_credentials 未设置（默认 false）—— CORS 安全基线满足。
+      2) Access-Control-Allow-Origin: *（permissive 模式）与 credentials 不共存，浏览器合规。
+      3) list 模式仅返回请求 Origin 匹配的单一 origin（非 *），符合 CORS 规范。
+      4) 未列出的 origin 不返回 Access-Control-Allow-Origin 头，浏览器正确拒绝跨域请求。
+      5) CorsLayer 自动设置 Vary: Origin（list 多 origin 时），防止缓存污染。
+      6) admin_api 路由无 CORS 层，管理接口只能同源调用，符合最小权限原则。
+      7) bot_api 仅应用 CORS 层，不影响其他路由。
+
+  owasp_http_header_injection:
+    status: pass
+    details: >
+      parse_origins 两层防御：
+      - contains("://") 预检拒绝无 scheme 的原始输入
+      - HeaderValue::from_str 按 RFC 7230 拒绝 CR(\r) / LF(\n) / NUL 等控制字符
+      tests/cors_tests.rs parse_origins_panics_on_bad_format 从外部 crate 验证此行为。
+
+  owasp_fail_safe:
+    status: pass
+    details: >
+      - 非法 ILINK_CORS_ORIGINS 值在启动时 panic（fail-fast），不会以不安全配置运行。
+      - env var 缺失/为空时回退到 permissive（显式决策，有 WARN 日志）。
+      - 无静默降级到不安全配置的代码路径。
+
+  test_isolation:
+    status: pass
+    details: >
+      - 所有 env var 相关测试使用 temp_env::with_var 隔离，该 crate 内部使用全局 Mutex
+        序列化对 env var 的并发访问。
+      - 无 env var 在 temp_env 闭包外泄漏到其他并行测试的风险。
+      - parse_origins 的 should_panic 测试不依赖 env var，与 CORS 测试无干扰。
+
+# ── 非 M1/M2 直接相关的代码观察 ──────────────────────────────────────
+additional_observations:
+  - title: "build_cors_layer / parse_origins 可见性提升为 pub"
+    assessment: >
+      将两个函数的可见性从 fn 改为 pub fn 以支持 tests/ 目录的外部集成测试。
+      该变更不暴露内部可变状态，不引入安全风险。parse_origins 的 panic 行为
+      在 build_cors_layer 之外的调用者同样安全（fail-fast）。
+      建议：如果仅测试使用，可考虑 #[doc(hidden)] 或 #[cfg(test)] 重导出，
+      避免成为稳定的公开 API 承诺。
+
+verdict_rationale: >
+  PASS。
+  M3 为纯测试增量，不修改生产逻辑。无新增内存安全、data race、tokio 异步陷阱或
+  OWASP 级别安全问题。M1/M2 遗留的所有安全发现均已修复或确认无风险。
+  10 个集成测试覆盖了 CORS 行为的正反路径，测试隔离正确。
+  A-M3-1（测试重复）和 A-M3-2（注释不准确）属于代码质量建议，不影响安全性。
+
+sign_off:
+  status: "PASS"
+  next_action: "M3 签出完成。可进入 M4（文档与质量门禁）。"
+  open_suggestions:
+    - "A-M3-1: 收敛重复测试到 tests/cors_tests.rs"
+    - "A-M3-2: 修正 tests/cors_tests.rs 头部文档注释"
+    - "M2-low-tokio-test: 将 cors_layer_is_cloneable_for_tower 从 #[tokio::test] 改为 #[test]"

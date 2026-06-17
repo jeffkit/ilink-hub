@@ -1,0 +1,21 @@
+milestone: m4
+title: "CORS 可配置起源 — 文档与质量门禁"
+files:
+  - path: README.md
+    summary: "在 Security Recommendations 区域新增 ILINK_CORS_ORIGINS 环境变量文档说明"
+    new_code: false
+  - path: docs/exec-plans/active/cors-configurable-origins/implement.md
+    summary: "新增 M4 完成记录，包含验证结果表"
+    new_code: false
+  - path: docs/exec-plans/active/cors-configurable-origins/reviews/m4/review-request.yaml
+    summary: "M4 review 请求文件"
+    new_code: true
+
+verify:
+  fmt: pass
+  clippy: pass
+  test: "337 passed (254 unit + 83 integration)"
+  build: pass
+  desktop_frontend: pass
+  desktop_tauri: pass
+  doc_grep: "ILINK_CORS_ORIGINS found in README.md and docs/"
