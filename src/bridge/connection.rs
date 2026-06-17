@@ -225,11 +225,13 @@ fn local_hostname() -> String {
             ) -> libc_types::CInt;
         }
         mod libc_types {
-            pub type CChar = i8;
+            // c_char is i8 on x86_64 Linux but u8 on aarch64 Linux and Apple Silicon.
+            // Using std::os::raw::c_char ensures the type matches CStr::from_ptr on all targets.
+            pub type CChar = std::os::raw::c_char;
             pub type SizeT = usize;
             pub type CInt = i32;
         }
-        let mut buf = [0i8; 256];
+        let mut buf = [0 as libc_types::CChar; 256];
         let ret = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };
         if ret == 0 {
             let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };

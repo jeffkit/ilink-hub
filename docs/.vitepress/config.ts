@@ -8,6 +8,11 @@ export default defineConfig({
   // GitHub Pages 部署地址：https://jeffkit.github.io/ilink-hub/
   base: '/ilink-hub/',
 
+  // Exclude internal design docs from VitePress processing.
+  // These files contain angle-bracket fragments (<tag>, code snippets) that Vue's
+  // HTML compiler misinterprets as component tags, causing build errors.
+  srcExclude: ['exec-plans/**', 'adr/**', 'proposals/**'],
+
   head: [
     ['link', { rel: 'icon', href: '/ilink-hub/favicon.svg' }],
     ['meta', { name: 'theme-color', content: '#6366f1' }],
