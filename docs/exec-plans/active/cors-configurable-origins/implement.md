@@ -39,3 +39,25 @@
 | `cargo build` | pass |
 | `npm run build` (desktop) | pass |
 | `cargo check --manifest-path desktop/.../Cargo.toml` | pass |
+
+## M3: 集成测试 ✅ 完成 (2026-06-17)
+
+**变更文件：** `tests/cors_tests.rs`（新建）
+
+**改动摘要：**
+- 新建 `tests/cors_tests.rs`，包含 10 个集成测试
+- 覆盖 permissive 回退（无 env var 时任意 origin 允许 + preflight）
+- 覆盖 list 模式允许（单 origin、多 origin、preflight 含 allow-methods/allow-headers）
+- 覆盖 list 模式拒绝（未列出 origin 不返回 allow-origin，普通请求 + preflight）
+- 覆盖非法格式 panic（无 scheme 的 origin）
+- 覆盖 CorsLayer Clone trait 健全性
+
+**验证状态：**
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | 337 passed (254 unit + 83 integration) |
+| `cargo build` | pass |
+| `npm run build` (desktop) | pass |
+| `cargo check --manifest-path desktop/.../Cargo.toml` | pass |

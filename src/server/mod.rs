@@ -16,7 +16,7 @@ use crate::hub::HubState;
 use pairing::*;
 use routes::*;
 
-fn parse_origins(raw: &str) -> Vec<HeaderValue> {
+pub fn parse_origins(raw: &str) -> Vec<HeaderValue> {
     raw.split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
@@ -32,7 +32,7 @@ fn parse_origins(raw: &str) -> Vec<HeaderValue> {
 
 /// Build CORS layer from `ILINK_CORS_ORIGINS` env var (comma-separated origins).
 /// Falls back to permissive CORS when the env var is absent or empty.
-fn build_cors_layer() -> CorsLayer {
+pub fn build_cors_layer() -> CorsLayer {
     match env::var("ILINK_CORS_ORIGINS") {
         Ok(ref val) if !val.trim().is_empty() => {
             let origins = parse_origins(val);
