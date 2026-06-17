@@ -874,3 +874,37 @@ async fn over_cap_concurrent_polls_get_429() {
         "exactly one poll should be rejected with 429, got {too_many}, statuses={statuses:?}"
     );
 }
+
+#[tokio::test]
+async fn test_metrics_endpoint_auth() {
+    let h = boot().await;
+    let client = reqwest::Client::new();
+
+    // 1. No auth header -> 401 Unauthorized
+    let resp = client
+        .get(format!("{}/metrics", h.base_url))
+        .send()
+        .await
+        .expect("metrics http request");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Wrong auth token -> 401 Unauthorized
+    let resp = client
+        .get(format!("{}/metrics", h.base_url))
+        .header(header::AUTHORIZATION, "Bearer wrong-token")
+        .send()
+        .await
+        .expect("metrics http request");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Correct auth token -> 200 OK
+    let resp = client
+        .get(format!("{}/metrics", h.base_url))
+        .header(header::AUTHORIZATION, format!("Bearer {ADMIN_TOKEN}"))
+        .send()
+        .await
+        .expect("metrics http request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("read metrics body");
+    assert!(body.contains("ilink_hub_clients_online"));
+}

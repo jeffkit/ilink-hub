@@ -1,0 +1,65 @@
+milestone: M3
+title: SEC-007 Metrics Auth — 实现
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 修改 `metrics` handler，引入 `headers: HeaderMap` 参数并调用 `check_admin_auth(&headers)`。
+  - 鉴权失败时返回 `401 Unauthorized`，鉴权成功时继续输出 Prometheus 格式的监控指标。
+  - 在 `tests/breaking_changes.rs` 和 `tests/e2e_wechat_simulation.rs` 中新增单元与集成测试验证鉴权流程。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: src/server/routes.rs
+    lines:
+      - 978-985: 修改 `metrics` 函数签名，添加 `HeaderMap` 参数，校验 `check_admin_auth`
+  - file: tests/breaking_changes.rs
+    lines:
+      - 721-754: 新增 `metrics_requires_auth_when_no_token_configured` 单元测试，确保无 token 时被拒绝
+  - file: tests/e2e_wechat_simulation.rs
+    lines:
+      - 877-910: 新增 `test_metrics_endpoint_auth` E2E 校验无 token/错误 token 401 及正确 token 200 情况
+
+# ─── 验证命令（M3 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pending
+    - name: rust build
+      cmd: cargo build
+      result: pending
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pending
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pending
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 无 admin token 访问 /metrics 必将返回 401，符合 SEC-007 的安全强化设计。
+  - 沿用 OnceLock 鉴权机制，对外部调用与已完成的客户端注册均不会产生其他副作用。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m3/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md (M3 状态更新)
+  - src/server/routes.rs
+  - tests/breaking_changes.rs
+  - tests/e2e_wechat_simulation.rs
+  - git commit (M3 实施提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否已修改 /metrics 路由使其通过 check_admin_auth 校验？
+  - [x] 在未配置 token 及错误 token 时，是否返回 401 Unauthorized？
+  - [x] 在提供正确 Bearer Token 时，是否返回 200 OK 以及 Prometheus 监控格式数据？
+  - [x] 所有单元测试与质量门禁是否全绿跑通？

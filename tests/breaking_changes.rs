@@ -706,7 +706,6 @@ async fn test_body_limit_sendmessage_override() {
     // It should be rejected with 413 Payload Too Large.
     let body_too_large_4mb = "a".repeat(limit_4mb + 1);
     let resp = app
-        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -718,4 +717,39 @@ async fn test_body_limit_sendmessage_override() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+// ─── S-01-metrics: Metrics Auth ──────────────────────────────────────────────
+//
+// SEC-007: Metrics endpoint must require admin authentication.
+
+/// Without ILINK_ADMIN_TOKEN set, GET /metrics must return 401.
+#[tokio::test]
+async fn metrics_requires_auth_when_no_token_configured() {
+    if std::env::var("ILINK_ADMIN_TOKEN").is_ok() {
+        return;
+    }
+    if std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let state = make_state().await;
+    let app = build_router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

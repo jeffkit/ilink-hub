@@ -975,7 +975,14 @@ pub async fn admin_ui() -> axum::response::Html<&'static str> {
 
 // ─── Metrics (Prometheus text format) ────────────────────────────────────────
 
-pub async fn metrics(State(state): State<Arc<HubState>>) -> (StatusCode, String) {
+pub async fn metrics(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+) -> (StatusCode, String) {
+    if !check_admin_auth(&headers) {
+        return (StatusCode::UNAUTHORIZED, "Unauthorized".into());
+    }
+
     let (online, total, client_names_by_vtoken) = {
         let registry = state.clients.registry.read().await;
         let online = registry.online_clients().len() as u64;
