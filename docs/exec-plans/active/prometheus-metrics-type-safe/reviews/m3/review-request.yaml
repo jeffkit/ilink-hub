@@ -1,0 +1,41 @@
+milestone: M3
+title: "重构 /metrics 端点 — 用 prometheus::TextEncoder 替换 format! 拼接"
+status: ready_for_review
+date: "2026-06-17"
+
+summary: |
+  M3 的核心工作（用 `prometheus::TextEncoder::encode` 替换 `routes.rs` 中手写
+  Prometheus 文本格式的 `format!` 拼接）在 M2 中已经完成。`routes.rs:997` 直接调用
+  `crate::metrics::gather_metrics`，后者使用 `TextEncoder::encode_to_string` 编码输出。
+  路由路径和鉴权逻辑保持不变。
+
+verification:
+  fmt:
+    command: "cargo fmt --check"
+    result: PASS
+  clippy:
+    command: "cargo clippy -- -D warnings"
+    result: PASS
+  test:
+    command: "cargo test"
+    result: "254 passed (unit) + 20 passed (breaking_changes) + 10 passed (e2e) + 27 passed (hub_routing) + 1 passed (metrics_auth) + 15 passed (queue_trait) = 327 passed, 0 failed"
+  build:
+    command: "cargo build"
+    result: PASS
+  desktop-frontend:
+    command: "cd desktop/ilink-hub-desktop && npm run build"
+    result: PASS
+  desktop-tauri:
+    command: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    result: PASS
+
+files_changed:
+  - path: "src/server/routes.rs"
+    description: "metrics handler 调用 crate::metrics::gather_metrics（M2 已完成），旧 format! 拼接逻辑已移除"
+  - path: "src/metrics.rs"
+    description: "gather_metrics 使用 TextEncoder::encode_to_string（M2 已完成）"
+
+notes: |
+  M3 的实质代码变更在 M2 中已一并完成（M2 新建 metrics.rs 时就直接使用了
+  TextEncoder，routes.rs 的 metrics handler 也同步改为调用 gather_metrics）。
+  本次 M3 主要是验证和文档里程碑。全部 6 项验证命令通过，327 个测试全绿。
