@@ -296,9 +296,15 @@ impl BridgeManager {
                         .ok()
                         .filter(|t| !t.trim().is_empty());
                     tokio::spawn(async move {
-                        match deregister_from_hub(&hub_url, &register_name, admin_token.as_deref()).await {
-                            Ok(()) => info!(profile = %register_name, "auto-deregistered deleted profile from Hub"),
-                            Err(e) => warn!(profile = %register_name, error = %e, "failed to auto-deregister deleted profile from Hub"),
+                        match deregister_from_hub(&hub_url, &register_name, admin_token.as_deref())
+                            .await
+                        {
+                            Ok(()) => {
+                                info!(profile = %register_name, "auto-deregistered deleted profile from Hub")
+                            }
+                            Err(e) => {
+                                warn!(profile = %register_name, error = %e, "failed to auto-deregister deleted profile from Hub")
+                            }
                         }
                     });
                 }
