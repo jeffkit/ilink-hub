@@ -2,7 +2,7 @@
 
 > 生成日期：2026-06-12  
 > 状态说明：`open` = 待处理，`in_progress` = 进行中，`done` = 已完成  
-> 已完成项（本轮已修复）：R-01, R-02, R-03, P-01, P-04, A-02, A-03, D-03, O-03, D-04, S-02(CORS), S-01(admin token)
+> 已完成项（本轮已修复）：R-01, R-02, R-03, P-01, P-04, A-02, A-03, D-03, O-03, D-04, S-02(CORS), S-01(admin token), SEC-007, SEC-010
 
 ---
 
@@ -163,7 +163,7 @@
 
 ### SEC-007 · /metrics 无认证，泄露客户端名称和消息量（CWE-284）
 
-- **状态**：done
+- **状态**：done (commit: ea4ee57)
 - **文件**：`src/server/mod.rs:53-54`，`src/server/routes.rs:825-933`
 - **问题**：`GET /metrics` 无任何认证，暴露所有注册客户端名称（通过 Prometheus label）、队列深度、消息吞吐量、iLink 连接状态，可用于攻击者对部署进行指纹识别。
 - **修复方向**：对 `/metrics` 应用 `check_admin_auth` 中间件，或通过独立内部端口暴露（推荐 Prometheus 最佳实践）。
@@ -184,7 +184,7 @@
 
 ### SEC-010 · 所有路由无 HTTP body 大小限制（CWE-400）
 
-- **状态**：done
+- **状态**：done (commit: f7f8110)
 - **文件**：`src/server/mod.rs:17-61`（router 定义处无 `RequestBodyLimitLayer`）
 - **问题**：Axum 默认 body 限制为 2MB，但未显式配置 `DefaultBodyLimit`。`sendmessage` 接受含 `item_list`（嵌套 voice、text、binary payload）的请求体，relay 的 `body: String` 字段不做长度检查，可被恶意 relay 推送超大 body 到 Hub 本地 HTTP 栈。
 - **修复方向**：在 `build_router` 中加入显式限制：
@@ -488,3 +488,5 @@
 | D-04 DefaultHasher 不稳定 | 已改用 fnv1a32 |
 | S-02(CORS) 全局 permissive | CORS 已仅作用于 `bot_api`，admin 路由不带 CORS |
 | S-01(admin token) 无认证开放 | 已改为需显式设 `ILINK_ADMIN_INSECURE_NO_AUTH=true` |
+| SEC-007 /metrics 无认证 | 为 /metrics 路由加上 admin token 鉴权校验 |
+| SEC-010 无 HTTP body 限制 | 在全局路由添加 256KB 大小限制，同时对 sendmessage 放宽至 4MB |

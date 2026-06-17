@@ -211,4 +211,36 @@ Commit: 099971e
 
 Commit: 3407250
 
+---
 
+## M7: 文档同步 — done (2026-06-17)
+
+### 状态
+- **状态**：done
+- **范围**：文档同步工作。标记 docs/TODO.md 中的 SEC-007 和 SEC-010 状态并补充修复的 commit 详情。
+- **审查请求**：[reviews/m7/review-request.yaml](./reviews/m7/review-request.yaml)
+
+### 关键改动
+
+- 在 `docs/TODO.md` 中：
+  - 将 SEC-007 和 SEC-010 追加到已完成项列表中。
+  - 将 SEC-007 的状态更新为 `done (commit: ea4ee57)`。
+  - 将 SEC-010 的状态更新为 `done (commit: f7f8110)`。
+  - 在“已完成的修复记录”表格中追加 SEC-007 和 SEC-010 的修复简述。
+- 确认了 `docs/DOC_CODE_MAP.md` 无需新增条目（项目无此文件）。
+- 创建了 `docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m7/review-request.yaml` 审查文件。
+
+### 验证结果
+
+| 命令 | 结果 |
+|------|------|
+| `cargo fmt --check` | pass |
+| `cargo clippy -- -D warnings` | pass |
+| `cargo test` | pass |
+| `cargo build` | pass |
+| `cd desktop/ilink-hub-desktop && npm run build` | pass |
+| `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` | pass |
+
+### Commit
+
+Commit: 9e3bf78
