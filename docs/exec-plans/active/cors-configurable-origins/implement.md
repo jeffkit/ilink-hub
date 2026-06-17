@@ -81,3 +81,9 @@
 | `npm run build` (desktop) | pass |
 | `cargo check --manifest-path desktop/.../Cargo.toml` | pass |
 | `grep -r "ILINK_CORS_ORIGINS" README.md docs/` | pass |
+
+- **Antigravity 重新验证记录 (2026-06-17)：**
+  - 所有 337 个测试 (254 个单元测试 + 83 个集成测试) 全部通过。
+  - `cargo fmt` 与 `cargo clippy` 检查无警告/无错误。
+  - Desktop 前端与 Tauri 编译均通过。
+  - 确认 README.md 及文档中包含配置说明。
