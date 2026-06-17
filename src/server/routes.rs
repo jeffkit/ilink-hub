@@ -1002,153 +1002,18 @@ pub async fn metrics(
         return (StatusCode::UNAUTHORIZED, "Unauthorized".into());
     }
 
-    let (online, total, client_names_by_vtoken) = {
-        let registry = state.clients.registry.read().await;
-        let online = registry.online_clients().len() as u64;
-        let total = registry.all_clients().len() as u64;
-        let names: std::collections::HashMap<String, String> = registry
-            .all_clients()
-            .iter()
-            .map(|c| (c.vtoken.clone(), c.name.clone()))
-            .collect();
-        (online, total, names)
-    };
+    let hub_name = std::env::var("HUB_NAME").unwrap_or_else(|_| "default".to_string());
 
-    let queue_sizes = state.clients.queue.queue_sizes().await.unwrap_or_else(|e| {
-        error!(error = %e, "queue_sizes failed");
-        std::collections::HashMap::new()
-    });
-
-    let messages_dispatched = state.metrics.messages_dispatched.load(Ordering::Relaxed);
-    let messages_dropped = state.metrics.messages_dropped.load(Ordering::Relaxed);
-    let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
-    let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
-    let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
-    let upstream_polls_ok = state.ilink.upstream.polls_ok();
-    let upstream_polls_err = state.ilink.upstream.polls_err();
-    let relogin_attempts = state.ilink.upstream.relogin_attempts();
-    let persist_faf_failures_forward = state
-        .metrics
-        .persist_fire_and_forget_failures_forward
-        .load(Ordering::Relaxed);
-    let persist_faf_failures_broadcast = state
-        .metrics
-        .persist_fire_and_forget_failures_broadcast
-        .load(Ordering::Relaxed);
-    let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let ctx_map_size = state.routing.ctx_map.len();
-    let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
-
-    let mut out = String::with_capacity(1024);
-
-    out.push_str("# HELP ilink_hub_clients_online Number of online clients\n");
-    out.push_str("# TYPE ilink_hub_clients_online gauge\n");
-    out.push_str(&format!("ilink_hub_clients_online {}\n", online));
-
-    out.push_str("# HELP ilink_hub_clients_total Total registered clients\n");
-    out.push_str("# TYPE ilink_hub_clients_total gauge\n");
-    out.push_str(&format!("ilink_hub_clients_total {}\n", total));
-
-    out.push_str("# HELP ilink_hub_messages_dispatched_total Messages dispatched\n");
-    out.push_str("# TYPE ilink_hub_messages_dispatched_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dispatched_total {}\n",
-        messages_dispatched
-    ));
-
-    out.push_str("# HELP ilink_hub_messages_dropped_total Messages dropped\n");
-    out.push_str("# TYPE ilink_hub_messages_dropped_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dropped_total {}\n",
-        messages_dropped
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_user_messages_total User-side messages received from upstream (excl. bot echo copies)\n");
-    out.push_str("# TYPE ilink_hub_upstream_user_messages_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_user_messages_total {}\n",
-        upstream_user_messages
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_polls_ok_total Successful upstream polls\n");
-    out.push_str("# TYPE ilink_hub_upstream_polls_ok_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_ok_total {}\n",
-        upstream_polls_ok
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_polls_err_total Failed upstream polls\n");
-    out.push_str("# TYPE ilink_hub_upstream_polls_err_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_err_total {}\n",
-        upstream_polls_err
-    ));
-
-    out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
-    out.push_str("# TYPE ilink_hub_queue_size gauge\n");
-    for (vtoken, size) in &queue_sizes {
-        let name = client_names_by_vtoken
-            .get(vtoken)
-            .map(String::as_str)
-            .unwrap_or("unknown");
-        out.push_str(&format!(
-            "ilink_hub_queue_size{{client=\"{}\"}} {}\n",
-            name, size
-        ));
+    match crate::metrics::gather_metrics(&state, &hub_name).await {
+        Ok(text) => (StatusCode::OK, text),
+        Err(e) => {
+            tracing::error!(error = %e, "gather_metrics failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("metrics collection error: {e}"),
+            )
+        }
     }
-
-    out.push_str(
-        "# HELP ilink_hub_sendmessage_total Total sendmessage calls from backend clients\n",
-    );
-    out.push_str("# TYPE ilink_hub_sendmessage_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_sendmessage_total {}\n",
-        sendmessage_total
-    ));
-
-    out.push_str("# HELP ilink_hub_sendmessage_errors_total sendmessage calls rejected (unknown token, missing context, etc.)\n");
-    out.push_str("# TYPE ilink_hub_sendmessage_errors_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_sendmessage_errors_total {}\n",
-        sendmessage_errors
-    ));
-
-    out.push_str("# HELP ilink_hub_dispatcher_lagged_total Number of messages missed because the dispatcher lagged behind the broadcast channel\n");
-    out.push_str("# TYPE ilink_hub_dispatcher_lagged_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_dispatcher_lagged_total {}\n",
-        dispatcher_lagged
-    ));
-
-    out.push_str("# HELP ilink_hub_relogin_attempts_total Number of QR re-login attempts (manual or automatic)\n");
-    out.push_str("# TYPE ilink_hub_relogin_attempts_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_relogin_attempts_total {}\n",
-        relogin_attempts
-    ));
-
-    out.push_str("# HELP ilink_hub_persist_fire_and_forget_failures_total Fire-and-forget persist_context_token(s)_batch failures on the dispatch path; non-zero rate means context-token mappings were dropped on the floor\n");
-    out.push_str("# TYPE ilink_hub_persist_fire_and_forget_failures_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"forward_to\"}} {}\n",
-        persist_faf_failures_forward
-    ));
-    out.push_str(&format!(
-        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"broadcast\"}} {}\n",
-        persist_faf_failures_broadcast
-    ));
-
-    out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
-    out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
-    out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
-
-    out.push_str(
-        "# HELP ilink_hub_ctx_map_size Number of virtual context token entries in memory cache\n",
-    );
-    out.push_str("# TYPE ilink_hub_ctx_map_size gauge\n");
-    out.push_str(&format!("ilink_hub_ctx_map_size {}\n", ctx_map_size));
-
-    (StatusCode::OK, out)
 }
 
 /// Wait for a queue notification or hub shutdown, whichever comes first.

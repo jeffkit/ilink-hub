@@ -206,9 +206,44 @@ mod tests {
         HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
     }
 
+    /// Create a test state with a registered client so that `queue_size` gauge
+    /// has at least one label value and appears in the output.
+    async fn make_test_state_with_client() -> Arc<HubState> {
+        use crate::ilink::types::WeixinMessage;
+
+        let state = make_test_state().await;
+        let (vtoken, _is_new) = {
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("test-client".to_string(), None)
+        };
+        // Push a message to create a queue entry so queue_sizes() returns data.
+        let msg = WeixinMessage {
+            seq: None,
+            message_id: None,
+            from_user_id: Some("user1".into()),
+            to_user_id: None,
+            client_id: None,
+            create_time_ms: None,
+            update_time_ms: None,
+            session_id: None,
+            group_id: None,
+            message_type: None,
+            message_state: None,
+            item_list: None,
+            context_token: None,
+            ilink_hub_ext: None,
+        };
+        let _ = state.clients.queue.push(&vtoken, msg).await;
+        state
+    }
+
     #[tokio::test]
     async fn test_all_metrics_present() {
-        let state = make_test_state().await;
+        let state = make_test_state_with_client().await;
         let output = gather_metrics(&state, "test-hub").await.unwrap();
 
         let expected_names = [
@@ -225,6 +260,7 @@ mod tests {
             "ilink_hub_relogin_attempts_total",
             "ilink_hub_ilink_status",
             "ilink_hub_ctx_map_size",
+            "ilink_hub_queue_size",
             "ilink_hub_persist_fire_and_forget_failures_total",
         ];
         for name in &expected_names {
@@ -315,5 +351,261 @@ mod tests {
         assert!(
             output.contains("ilink_hub_messages_dispatched_total{cmd=\"all\",hub=\"hub-a\"} 10")
         );
+    }
+
+    // ── Adversarial tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_hub_name_with_special_chars_escaped() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "hub\"with\nquotes").await.unwrap();
+
+        // The prometheus crate must escape special characters in label values.
+        // A literal quote or newline in output would break the text format.
+        assert!(!output.contains("hub\"with\nquotes"));
+        assert!(output.contains("hub\\\"with\\nquotes"));
+    }
+
+    #[tokio::test]
+    async fn test_empty_hub_name_does_not_panic() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "").await.unwrap();
+
+        assert!(output.contains("ilink_hub_clients_online{hub=\"\"} 0"));
+        assert!(output.contains("ilink_hub_clients_total{hub=\"\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn test_large_counter_values_f64_safe_max() {
+        // Prometheus internally converts counter values to f64 during collection,
+        // so integers beyond 2^53 (= 9_007_199_254_740_992) lose precision.
+        // 1 << 52 is the largest power-of-two safely representable as exact f64.
+        let state = make_test_state().await;
+        let val: u64 = 1 << 52;
+        state.metrics.messages_dropped.store(val, Ordering::Relaxed);
+
+        let output = gather_metrics(&state, "h").await.unwrap();
+        assert!(
+            output.contains(&format!("ilink_hub_messages_dropped_total {}", val)),
+            "large counter value within f64 exact range should appear verbatim"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_calls_independent_registries() {
+        let state = make_test_state_with_client().await;
+
+        let state_ref = &state;
+        let (a, b) = tokio::join!(
+            gather_metrics(state_ref, "hub-a"),
+            gather_metrics(state_ref, "hub-b"),
+        );
+
+        let out_a = a.unwrap();
+        let out_b = b.unwrap();
+
+        assert!(
+            out_a.contains("ilink_hub_clients_online{hub=\"hub-a\"}"),
+            "hub-a output should contain its own label"
+        );
+        assert!(
+            out_b.contains("ilink_hub_clients_online{hub=\"hub-b\"}"),
+            "hub-b output should contain its own label"
+        );
+        // Both must independently contain all 15 metric families.
+        for name in &[
+            "ilink_hub_clients_online",
+            "ilink_hub_clients_total",
+            "ilink_hub_messages_dispatched_total",
+            "ilink_hub_messages_dropped_total",
+            "ilink_hub_upstream_user_messages_total",
+            "ilink_hub_upstream_polls_ok_total",
+            "ilink_hub_upstream_polls_err_total",
+            "ilink_hub_sendmessage_total",
+            "ilink_hub_sendmessage_errors_total",
+            "ilink_hub_dispatcher_lagged_total",
+            "ilink_hub_relogin_attempts_total",
+            "ilink_hub_ilink_status",
+            "ilink_hub_ctx_map_size",
+            "ilink_hub_queue_size",
+            "ilink_hub_persist_fire_and_forget_failures_total",
+        ] {
+            assert!(out_a.contains(name), "hub-a missing: {name}");
+            assert!(out_b.contains(name), "hub-b missing: {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_zero_counter_output_omitted() {
+        // Prometheus text format: if a counter has value 0, inc_by(0) should
+        // still produce output (prometheus crate always emits registered metrics).
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "h").await.unwrap();
+
+        // All counters start at 0 and must appear in the output.
+        assert!(output.contains("ilink_hub_messages_dropped_total 0"));
+        assert!(output.contains("ilink_hub_sendmessage_total 0"));
+    }
+
+    #[tokio::test]
+    async fn test_every_help_has_matching_type() {
+        let state = make_test_state_with_client().await;
+        let output = gather_metrics(&state, "h").await.unwrap();
+
+        let mut help_names = std::collections::HashSet::new();
+        let mut type_names = std::collections::HashSet::new();
+
+        for line in output.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split_whitespace().next().unwrap();
+                help_names.insert(name.to_string());
+            }
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap();
+                type_names.insert(name.to_string());
+            }
+        }
+
+        assert_eq!(
+            help_names, type_names,
+            "every HELP must have a matching TYPE"
+        );
+        assert_eq!(help_names.len(), 15, "expected exactly 15 metric families");
+    }
+
+    #[tokio::test]
+    async fn test_no_empty_lines_between_metric_lines() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "h").await.unwrap();
+
+        let non_comment_lines: Vec<&str> = output
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .collect();
+
+        for line in &non_comment_lines {
+            assert!(
+                line.starts_with("ilink_hub_"),
+                "metric line must start with prefix: {line}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_client_name_with_special_chars_escaped() {
+        let state = make_test_state().await;
+        // Register a client with special characters and push a message so
+        // queue_size gauge has a label value with special chars.
+        let (vtoken, _) = {
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("bad\"client\nname".to_string(), None)
+        };
+        use crate::ilink::types::WeixinMessage;
+        let msg = WeixinMessage {
+            seq: None,
+            message_id: None,
+            from_user_id: Some("u".into()),
+            to_user_id: None,
+            client_id: None,
+            create_time_ms: None,
+            update_time_ms: None,
+            session_id: None,
+            group_id: None,
+            message_type: None,
+            message_state: None,
+            item_list: None,
+            context_token: None,
+            ilink_hub_ext: None,
+        };
+        let _ = state.clients.queue.push(&vtoken, msg).await;
+
+        let output = gather_metrics(&state, "h").await.unwrap();
+
+        // Unescaped newlines or quotes in label values would break the format.
+        assert!(!output.contains("bad\"client\nname"));
+        // The prometheus crate must escape them.
+        assert!(output.contains("bad\\\"client\\nname"));
+    }
+
+    #[tokio::test]
+    async fn test_unicode_hub_name_does_not_panic() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "服务中心-中文").await.unwrap();
+        assert!(output.contains("ilink_hub_clients_online{hub=\"服务中心-中文\"} 0"));
+    }
+
+    #[tokio::test]
+    async fn test_no_duplicate_help_or_type_lines() {
+        let state = make_test_state_with_client().await;
+        let output = gather_metrics(&state, "h").await.unwrap();
+
+        let mut help_seen = std::collections::HashSet::new();
+        let mut type_seen = std::collections::HashSet::new();
+        for line in output.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(
+                    help_seen.insert(name.to_string()),
+                    "duplicate HELP line for: {name}"
+                );
+            }
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(
+                    type_seen.insert(name.to_string()),
+                    "duplicate TYPE line for: {name}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_one_client_many_queue_messages() {
+        let state = make_test_state_with_client().await;
+        // Push many messages for the same client.
+        let (vtoken, _) = {
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("busy-client".to_string(), None)
+        };
+        use crate::ilink::types::WeixinMessage;
+        for i in 0u32..50 {
+            let msg = WeixinMessage {
+                seq: Some(i as i64),
+                message_id: None,
+                from_user_id: Some(format!("user_{i}")),
+                to_user_id: None,
+                client_id: None,
+                create_time_ms: None,
+                update_time_ms: None,
+                session_id: None,
+                group_id: None,
+                message_type: None,
+                message_state: None,
+                item_list: None,
+                context_token: None,
+                ilink_hub_ext: None,
+            };
+            let _ = state.clients.queue.push(&vtoken, msg).await;
+        }
+
+        let output = gather_metrics(&state, "h").await.unwrap();
+        // The busy-client queue should report size 50.
+        assert!(output.contains("ilink_hub_queue_size{client=\"busy-client\"} 50"));
+    }
+
+    #[tokio::test]
+    async fn test_eof_newline() {
+        let state = make_test_state().await;
+        let output = gather_metrics(&state, "h").await.unwrap();
+        // Prometheus exposition format MUST end with a newline (and optionally # EOF).
+        assert!(output.ends_with('\n'), "output must end with newline");
     }
 }
