@@ -100,7 +100,10 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     let stderr_task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, BufReader};
         let mut buf = Vec::new();
-        BufReader::new(child_stderr).read_to_end(&mut buf).await.ok();
+        BufReader::new(child_stderr)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
         String::from_utf8_lossy(&buf).into_owned()
     });
 
@@ -108,7 +111,10 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     let stdout_task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, BufReader};
         let mut buf = Vec::new();
-        BufReader::new(child_stdout).read_to_end(&mut buf).await.ok();
+        BufReader::new(child_stdout)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
         String::from_utf8_lossy(&buf).into_owned()
     });
 
@@ -129,7 +135,11 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     let _ = tokio::fs::remove_file(&log_path).await;
 
     if !status.success() && stdout.trim().is_empty() {
-        let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
         anyhow::bail!("agy exited with status {:?}\n{detail}", status.code());
     }
 
@@ -144,7 +154,9 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
 async fn extract_conversation_id_from_log(log_path: &str, prefix: &str) -> Option<String> {
     let content = tokio::fs::read_to_string(log_path).await.ok()?;
     for line in content.lines() {
-        let Some(pos) = line.find(prefix) else { continue };
+        let Some(pos) = line.find(prefix) else {
+            continue;
+        };
         let after = line[pos + prefix.len()..].trim_start();
         // Take the first 36 characters and validate as UUID format.
         if after.len() >= 36 {

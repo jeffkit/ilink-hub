@@ -153,7 +153,10 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await.context("read claude stdout")?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("read claude stdout")?;
         if n == 0 {
             break;
         }
@@ -206,8 +209,15 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !status.success() && found_session_id.is_none() {
-        let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
-        anyhow::bail!("claude exited with status {:?}\nstderr: {detail}", status.code());
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
+        anyhow::bail!(
+            "claude exited with status {:?}\nstderr: {detail}",
+            status.code()
+        );
     }
 
     Ok(found_session_id)
@@ -277,8 +287,15 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
     };
 
     if !output.status.success() && event.session_id.is_none() {
-        let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
-        anyhow::bail!("claude exited with status {:?}\nstderr: {detail}", output.status.code());
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
+        anyhow::bail!(
+            "claude exited with status {:?}\nstderr: {detail}",
+            output.status.code()
+        );
     }
 
     let found_session_id = event.session_id.clone();
@@ -316,7 +333,8 @@ mod tests {
 
     #[test]
     fn deserialize_assistant_event_with_text_block() {
-        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there"}]}}"#;
+        let json =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there"}]}}"#;
         let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type.as_deref(), Some("assistant"));
         let blocks = event.message.unwrap().content.unwrap();
@@ -373,7 +391,13 @@ mod tests {
             .find(|e| e.event_type.as_deref() == Some("result"))
             .expect("result event must be found");
 
-        assert_eq!(result_event.result.as_deref(), Some("你好！有什么我可以帮你的吗？"));
-        assert_eq!(result_event.session_id.as_deref(), Some("7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0"));
+        assert_eq!(
+            result_event.result.as_deref(),
+            Some("你好！有什么我可以帮你的吗？")
+        );
+        assert_eq!(
+            result_event.session_id.as_deref(),
+            Some("7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0")
+        );
     }
 }

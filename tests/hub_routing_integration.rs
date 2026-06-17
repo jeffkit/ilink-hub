@@ -216,8 +216,12 @@ async fn at_mention_routes_to_named_backend_on_new_session() {
     let (tx, rx) = broadcast::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
-    tx.send(make_user_msg("user@wx", "real-ctx-at", "@claude 看下日志 有 空格"))
-        .unwrap();
+    tx.send(make_user_msg(
+        "user@wx",
+        "real-ctx-at",
+        "@claude 看下日志 有 空格",
+    ))
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let msgs_claude = state.clients.queue.drain(&vtoken_claude).await.unwrap();
@@ -282,8 +286,12 @@ async fn at_mention_unknown_backend_falls_through_to_normal_routing() {
     let (tx, rx) = broadcast::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
-    tx.send(make_user_msg("user@wx", "real-ctx-at-unknown", "@nobody hello"))
-        .unwrap();
+    tx.send(make_user_msg(
+        "user@wx",
+        "real-ctx-at-unknown",
+        "@nobody hello",
+    ))
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
@@ -764,7 +772,8 @@ async fn getupdates_returns_429_when_polls_exceed_cap() {
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
     loop {
         let n = state
-            .clients.poll_tracker
+            .clients
+            .poll_tracker
             .counts
             .lock()
             .map(|c| *c.get(&vtoken).unwrap_or(&0))
@@ -1150,7 +1159,13 @@ async fn rollback_preserves_legit_client_when_name_collides() {
 
     // 1. Pre-pair a legitimate client.
     let legit_vtoken = register(&state, "alice").await;
-    assert!(state.clients.registry.read().await.get_by_name("alice").is_some());
+    assert!(state
+        .clients
+        .registry
+        .read()
+        .await
+        .get_by_name("alice")
+        .is_some());
 
     // 2. Build a pairing session (just like a real QR page render).
     let code = {
@@ -1306,14 +1321,25 @@ async fn test_pair_confirm_auth_bypass_lockout_adversarial() {
         Path("invalid_code_xyz".to_string()),
         HeaderMap::new(),
         ConnectInfo(peer),
-        Json(PairConfirmRequest { name: "mac-home".to_string(), label: None }),
+        Json(PairConfirmRequest {
+            name: "mac-home".to_string(),
+            label: None,
+        }),
     )
     .await;
 
-    assert_ne!(status, axum::http::StatusCode::OK,
-        "confirm with invalid code must not return 200");
+    assert_ne!(
+        status,
+        axum::http::StatusCode::OK,
+        "confirm with invalid code must not return 200"
+    );
 
     let registry = state.clients.registry.read().await;
-    let client = registry.get_by_name("mac-home").expect("mac-home must still exist");
-    assert_eq!(client.vtoken, legitimate_vtoken, "vtoken must not be overwritten");
+    let client = registry
+        .get_by_name("mac-home")
+        .expect("mac-home must still exist");
+    assert_eq!(
+        client.vtoken, legitimate_vtoken,
+        "vtoken must not be overwritten"
+    );
 }

@@ -198,7 +198,9 @@ impl QuoteRouteIndex {
 
     /// Extract the quoted text and timestamp from a user message's ref_msg.
     /// Public so DB-backed fallback resolvers can reuse the same extraction logic.
-    pub fn collect_quoted(msg: &crate::ilink::types::WeixinMessage) -> Option<(String, Option<i64>)> {
+    pub fn collect_quoted(
+        msg: &crate::ilink::types::WeixinMessage,
+    ) -> Option<(String, Option<i64>)> {
         collect_quoted_content(msg)
     }
 

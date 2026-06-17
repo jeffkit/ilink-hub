@@ -454,7 +454,7 @@ async fn renew_expired_session(
                         return existing.clone();
                     }
                 }
-                renewal.cached_ui_tx = None; // drop old sender → old task exits
+                // Old sender is dropped here; old task will exit on its own.
                 let (unbounded_tx, mut unbounded_rx) = tokio::sync::mpsc::unbounded_channel();
                 let broadcast_tx = tx.clone();
                 let last_ready = renewal.qr_last_ready.clone();

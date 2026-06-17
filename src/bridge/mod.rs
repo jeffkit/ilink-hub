@@ -423,7 +423,12 @@ async fn handle_one_message(client: &HubClient, app: &BridgeApp, msg: WeixinMess
             if body.trim().is_empty() {
                 if let Some(sid) = cli_session {
                     if !sid.trim().is_empty() {
-                        let mut req = SendMessageRequest::reply_text(ctx, String::new(), &from_user, Some(sid));
+                        let mut req = SendMessageRequest::reply_text(
+                            ctx,
+                            String::new(),
+                            &from_user,
+                            Some(sid),
+                        );
                         if let Some(ref mut msg) = req.msg {
                             use crate::ilink::types::HubExt;
                             let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
@@ -505,6 +510,7 @@ fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<
     (stdout.to_string(), None)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_cli(
     cfg: &BridgeProfile,
     profile_name: &str,
@@ -1181,9 +1187,8 @@ mod tests {
         } else {
             "sleep"
         };
-        let yaml = format!(
-            "command: {sleep_cmd}\nargs: [\"10\"]\nstdin: message\ntimeout_secs: 1\n"
-        );
+        let yaml =
+            format!("command: {sleep_cmd}\nargs: [\"10\"]\nstdin: message\ntimeout_secs: 1\n");
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
 

@@ -133,7 +133,12 @@ async fn boot() -> Harness {
     let mock = Arc::new(MockUpstream::default());
     let queue: Arc<dyn ilink_hub::hub::MessageQueue> = Arc::new(InMemoryQueue::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(mock.clone() as Arc<dyn UpstreamSink>, store, queue, shutdown_rx);
+    let state = HubState::new(
+        mock.clone() as Arc<dyn UpstreamSink>,
+        store,
+        queue,
+        shutdown_rx,
+    );
 
     let router = server::build_router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -175,7 +180,12 @@ async fn boot_without_default() -> Harness {
     let mock = Arc::new(MockUpstream::default());
     let queue: Arc<dyn ilink_hub::hub::MessageQueue> = Arc::new(InMemoryQueue::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(mock.clone() as Arc<dyn UpstreamSink>, store, queue, shutdown_rx);
+    let state = HubState::new(
+        mock.clone() as Arc<dyn UpstreamSink>,
+        store,
+        queue,
+        shutdown_rx,
+    );
 
     // Override the default route to None — HubState::new starts with None,
     // and the only thing that would set it is the first /register call.
@@ -247,11 +257,7 @@ async fn register_client(base_url: &str, name: &str) -> String {
 
 /// Long-poll for messages on `vtoken`. Returns the first batch of messages
 /// received within `poll_secs`, or empty if the timeout fires.
-async fn poll_for_messages(
-    base_url: &str,
-    vtoken: &str,
-    poll_secs: u32,
-) -> Vec<WeixinMessage> {
+async fn poll_for_messages(base_url: &str, vtoken: &str, poll_secs: u32) -> Vec<WeixinMessage> {
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base_url}/ilink/bot/getupdates"))
@@ -379,14 +385,7 @@ async fn user_message_flows_through_dispatcher_to_bridge_and_reply_reaches_upstr
 
     // 3) The bridge forwards the AI's reply. We tag ilink_hub_ext.session_name
     //    to drive the round-trip without touching the store directly.
-    let _ = bridge_send(
-        &h.base_url,
-        &vtoken,
-        &vctx,
-        "alice@wechat",
-        "hi there",
-    )
-    .await;
+    let _ = bridge_send(&h.base_url, &vtoken, &vctx, "alice@wechat", "hi there").await;
 
     // 4) The Hub translates vctx → real_ctx and calls upstream.send_message.
     //    The mock records the call so we can assert against it.
@@ -693,8 +692,14 @@ async fn hub_command_list_reports_active_backend() {
     assert_eq!(sent.len(), 1, "/list should produce one upstream reply");
     let body = sent.into_iter().next().unwrap();
     let text = body.msg.as_ref().and_then(|m| m.text()).unwrap_or("");
-    assert!(text.contains("claude"), "/list body should include claude: {text}");
-    assert!(text.contains("codex"), "/list body should include codex: {text}");
+    assert!(
+        text.contains("claude"),
+        "/list body should include claude: {text}"
+    );
+    assert!(
+        text.contains("codex"),
+        "/list body should include codex: {text}"
+    );
     assert!(
         text.contains("广播模式") || text.contains("当前未选中"),
         "/list body should note no active backend; got: {text}"

@@ -139,7 +139,13 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
             relay = %relay_ws,
             "pairing relay enabled (zero-config)"
         );
-        crate::relay::client::spawn_relay_client(identity, hub_base, relay_ws, state.relay_secret.clone(), shutdown_rx.clone());
+        crate::relay::client::spawn_relay_client(
+            identity,
+            hub_base,
+            relay_ws,
+            state.relay_secret.clone(),
+            shutdown_rx.clone(),
+        );
     } else {
         info!("pairing relay disabled (set HUB_PAIR_URL or ILINKHUB_RELAY=0)");
     }
@@ -315,7 +321,10 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
         Ok(entries) => {
             let count = entries.len();
             for (vctx, real_ctx, peer_user_id) in entries {
-                state.routing.ctx_map.seed_full(vctx, real_ctx, peer_user_id);
+                state
+                    .routing
+                    .ctx_map
+                    .seed_full(vctx, real_ctx, peer_user_id);
             }
             info!(count, "warmed context_token cache from database");
         }

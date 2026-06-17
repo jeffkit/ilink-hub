@@ -870,7 +870,10 @@ impl Store {
         content_prefix: &str,
     ) -> Result<Option<(String, Option<String>)>> {
         // LIKE pattern: escape '%' and '_' in the prefix to avoid wildcard interpretation.
-        let escaped = content_prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let escaped = content_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         let pattern = format!("{escaped}%");
         let row = sqlx::query(
             "SELECT vtoken, session_name FROM messages \
@@ -888,11 +891,7 @@ impl Store {
         }))
     }
 
-    pub async fn list_messages(
-        &self,
-        vctx: &str,
-        limit: i64,
-    ) -> Result<Vec<MessageRow>> {
+    pub async fn list_messages(&self, vctx: &str, limit: i64) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(
             "SELECT id, vctx, vtoken, session_name, peer_user_id, role, content, created_at \
              FROM messages WHERE vctx = $1 ORDER BY created_at DESC LIMIT $2",

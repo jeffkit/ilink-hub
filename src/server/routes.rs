@@ -129,9 +129,7 @@ pub async fn register(
                 ret: 400,
                 vtoken: String::new(),
                 base_url: String::new(),
-                errmsg: Some(format!(
-                    "name must be 1–{MAX_CLIENT_NAME_LEN} characters"
-                )),
+                errmsg: Some(format!("name must be 1–{MAX_CLIENT_NAME_LEN} characters")),
             }),
         );
     }
@@ -367,7 +365,10 @@ pub async fn sendmessage(
         .unwrap_or_else(|_| Err(anyhow::anyhow!("context_token DB lookup timed out")));
         match db_result {
             Ok(Some((r, p))) => {
-                state.routing.ctx_map.seed_full(vctx.clone(), r.clone(), p.clone());
+                state
+                    .routing
+                    .ctx_map
+                    .seed_full(vctx.clone(), r.clone(), p.clone());
                 (r, p)
             }
             Ok(None) => {
@@ -494,29 +495,41 @@ pub async fn sendmessage(
     // consumed above), skip forwarding to iLink — an empty text message would be rejected or
     // would confuse the user. The only side-effect we needed (session UUID persistence) already
     // happened via set_backend_session above.
-    let msg_text_empty = req.msg.as_ref().map(|m| m.text().unwrap_or("").trim().is_empty()).unwrap_or(true);
+    let msg_text_empty = req
+        .msg
+        .as_ref()
+        .map(|m| m.text().unwrap_or("").trim().is_empty())
+        .unwrap_or(true);
     if msg_text_empty {
         return Json(SendMessageResponse::default());
     }
 
     // Fire-and-forget: record assistant reply to history (only non-empty, non-partial messages).
-    let is_partial = req.msg.as_ref()
+    let is_partial = req
+        .msg
+        .as_ref()
         .and_then(|m| m.message_state)
         .map(|s| s != crate::ilink::types::message_state::FINISH)
         .unwrap_or(false);
     if !is_partial {
         if let Some(content) = req.msg.as_ref().and_then(|m| m.text()).map(str::to_string) {
-            let session_name = active_session
-                .as_deref()
-                .unwrap_or("default")
-                .to_string();
+            let session_name = active_session.as_deref().unwrap_or("default").to_string();
             let store = state.store.clone();
             let (vctx4, vtoken4, peer4) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
             let sem = state.persist_sem.clone();
             tokio::spawn(async move {
-                let Ok(_permit) = sem.try_acquire() else { return };
+                let Ok(_permit) = sem.try_acquire() else {
+                    return;
+                };
                 if let Err(e) = store
-                    .save_message(&vctx4, Some(&vtoken4), &session_name, &peer4, "assistant", &content)
+                    .save_message(
+                        &vctx4,
+                        Some(&vtoken4),
+                        &session_name,
+                        &peer4,
+                        "assistant",
+                        &content,
+                    )
                     .await
                 {
                     warn!(error = %e, "failed to save assistant message to history");
