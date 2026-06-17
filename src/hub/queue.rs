@@ -1,7 +1,7 @@
 //! Per-client message queue — trait-based abstraction with in-memory default.
 //!
 //! The [`MessageQueue`] trait defines the contract for all queue backends.
-//! [`InMemoryQueue`] is the default implementation backed by a `tokio::sync::Mutex`.
+//! [`InMemoryQueue`] is the default implementation backed by a `DashMap` with per-slot synchronous `std::sync::Mutex`.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -700,14 +700,42 @@ mod queue_config_tests {
         // 1. Test ContextTokenMap poison safety
         let m = Arc::new(ContextTokenMap::default());
         let m_clone = m.clone();
+        // Hold the lock directly and panic to poison it
         let handle = thread::spawn(move || {
-            let _v = m_clone.map("real-ctx".into(), "user1".into(), None);
+            let _guard = m_clone.inner.lock().unwrap();
             panic!("force panic to poison ContextTokenMap Mutex");
         });
         let _ = handle.join();
-        // Should not panic on subsequent calls
-        let v = m.map("real-ctx-2".into(), "user2".into(), None);
-        assert!(!v.is_empty());
+
+        // Adversarial tests on the poisoned ContextTokenMap:
+        // All methods should be checked to ensure they do not panic and correctly function.
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+
+        // Can we seed?
+        m.seed("vctx_1".into(), "real_1".into());
+        m.seed_full("vctx_2".into(), "real_2".into(), "peer_2".into());
+        m.seed_conversation(
+            "conv_3".into(),
+            "vctx_3".into(),
+            "real_3".into(),
+            "peer_3".into(),
+        );
+
+        assert_eq!(m.len(), 3);
+        assert!(!m.is_empty());
+
+        // Can we map?
+        let v_token = m.map("real_4".into(), "peer_4".into(), None);
+        assert!(!v_token.is_empty());
+
+        // Can we query / resolve?
+        assert!(m.has_conversation("conv_3"));
+        assert_eq!(m.resolve("vctx_1"), Some("real_1".to_string()));
+        assert_eq!(
+            m.resolve_full("vctx_2"),
+            Some(("real_2".to_string(), "peer_2".to_string()))
+        );
 
         // 2. Test InMemoryQueue (PerClientSlot) poison safety
         let slot = Arc::new(PerClientSlot::new(10));
@@ -717,9 +745,25 @@ mod queue_config_tests {
             panic!("force panic to poison PerClientSlot Mutex");
         });
         let _ = handle3.join();
-        // Now test push/drain on the poisoned slot should not panic
+
+        // Now test push/drain/len on the poisoned slot should not panic and should behave correctly
         assert!(!slot.push(WeixinMessage::default()));
         assert_eq!(slot.len(), 1);
         assert_eq!(slot.drain().len(), 1);
+        assert_eq!(slot.len(), 0);
+
+        // Push multiple messages into the poisoned slot
+        for i in 0..5 {
+            let msg = WeixinMessage {
+                message_id: Some(i),
+                ..Default::default()
+            };
+            slot.push(msg);
+        }
+        assert_eq!(slot.len(), 5);
+        let drained = slot.drain();
+        assert_eq!(drained.len(), 5);
+        assert_eq!(drained[0].message_id, Some(0));
+        assert_eq!(slot.len(), 0);
     }
 }

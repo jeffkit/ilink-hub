@@ -1,0 +1,47 @@
+verdict: PASS
+reviewed_by: Antigravity (Rust Safety and Concurrency Expert)
+timestamp: "2026-06-17T14:01:00+08:00"
+milestone: M1
+scope:
+  - src/hub/queue.rs
+
+summary: |
+  All review findings have been resolved. The unit test `test_mutex_poison_safe` has been corrected to directly acquire and hold the private mutex lock on `ContextTokenMap::inner` inside the spawn thread to guarantee it is poisoned, and adversarial testing has been added to verify that all methods function properly under a poisoned state. Additionally, module documentation has been updated to correctly describe the `InMemoryQueue` backend.
+
+findings:
+  - id: TEST-POISON-FLAW
+    title: "Incomplete poison testing for ContextTokenMap in test_mutex_poison_safe"
+    severity: Low
+    category: Concurrency & Testing
+    file: src/hub/queue.rs
+    lines: 701-711
+    status: RESOLVED
+    description: |
+      In the unit test `test_mutex_poison_safe`, the subthread attempts to poison `ContextTokenMap` by calling `m_clone.map("real-ctx".into(), "user1".into(), None)` and then panicking. However, the mutex inside `ContextTokenMap` is acquired and released entirely within the scope of the `map` (and `map_scoped`) method. By the time the thread executes `panic!`, the mutex lock has already been released, so the mutex is NOT poisoned.
+    impact: |
+      The test passes but does not actually verify that ContextTokenMap is poison-safe under a poisoned mutex state. This is a false positive / silent test gap.
+    recommendation: |
+      Modify the test thread to directly acquire the private mutex lock on `m_clone.inner` and hold it across the panic. Since the test is located inside a submodule `queue_config_tests` of `hub::queue`, it has access to the private field `inner` of `ContextTokenMap`.
+      Example fix:
+      ```rust
+      let handle = thread::spawn(move || {
+          let _guard = m_clone.inner.lock().unwrap();
+          panic!("force panic to poison ContextTokenMap Mutex");
+      });
+      ```
+    resolution: |
+      The test thread was updated to lock `m_clone.inner` directly and hold it across the panic. The test was also expanded with adversarial tests verifying all methods under poisoning.
+
+  - id: DOC-OUTDATED
+    title: "Outdated documentation for InMemoryQueue referencing tokio::sync::Mutex"
+    severity: Info
+    category: Documentation
+    file: src/hub/queue.rs
+    lines: 4
+    status: RESOLVED
+    description: |
+      The module documentation states: "`InMemoryQueue` is the default implementation backed by a `tokio::sync::Mutex`." However, `InMemoryQueue` actually uses `std::sync::Mutex` per slot.
+    recommendation: |
+      Update the doc comment to correctly reference `std::sync::Mutex` or clarify that it uses DashMap with per-slot synchronous std::sync::Mutex.
+    resolution: |
+      The documentation comment in src/hub/queue.rs was updated to refer to a `DashMap` with per-slot synchronous `std::sync::Mutex`.
