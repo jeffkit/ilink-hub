@@ -1,0 +1,20 @@
+milestone: m1
+title: "CORS 可配置起源 — 核心实现"
+files:
+  - path: src/server/mod.rs
+    summary: "新增 build_cors_layer() 和 parse_origins()，读取 ILINK_CORS_ORIGINS 环境变量，用 CorsLayer::new().allow_origin(list) 替代硬编码 CorsLayer::permissive()"
+    new_code: true
+tests:
+  - "parse_origins 单起源解析"
+  - "parse_origins 多起源解析"
+  - "parse_origins 空白trim"
+  - "parse_origins 空字符串回退"
+  - "parse_origins 控制字符拒绝"
+
+verify:
+  fmt: pass
+  clippy: pass
+  test: "241 passed"
+  build: pass
+  desktop_frontend: pass
+  desktop_tauri: pass
