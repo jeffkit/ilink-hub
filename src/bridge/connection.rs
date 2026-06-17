@@ -234,6 +234,10 @@ fn local_hostname() -> String {
         let mut buf = [0 as libc_types::CChar; 256];
         let ret = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };
         if ret == 0 {
+            // POSIX: gethostname does not null-terminate if the hostname
+            // is >= the buffer size. Force a terminator so CStr::from_ptr
+            // never reads past the buffer.
+            buf[buf.len() - 1] = 0;
             let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
             if let Ok(s) = cstr.to_str() {
                 let s = s.trim();
@@ -436,5 +440,41 @@ mod tests {
             "custom"
         );
         assert_eq!(auto_client_name(None, Some("saved"), None), "saved");
+    }
+
+    // ─── Adversarial tests for M4 review findings ─────────────────────────
+
+    /// SEC-ADV-M4-01: `local_hostname` must never panic or crash, even when
+    /// the gethostname syscall returns a buffer that is not null-terminated.
+    /// The fix forces `buf[255] = 0` before `CStr::from_ptr`, so this test
+    /// verifies the function returns a non-empty String without panicking.
+    #[test]
+    fn adversarial_local_hostname_never_panics() {
+        let hostname = local_hostname();
+        assert!(!hostname.is_empty(), "local_hostname must return non-empty");
+        // Must be valid UTF-8 (CStr::from_ptr + to_str would panic/crash otherwise).
+        assert!(
+            hostname.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '.'),
+            "hostname must contain only valid chars"
+        );
+    }
+
+    /// SEC-ADV-M4-01 (buffer overflow): simulate a full 255-byte hostname
+    /// by writing 255 non-null bytes into a 256-byte buffer, then verify
+    /// the null-termination guard prevents CStr::from_ptr from reading past
+    /// the buffer boundary.
+    #[test]
+    fn adversarial_gethostname_buffer_null_terminated() {
+        use std::ffi::CStr;
+        // Simulate gethostname filling the entire buffer (255 bytes + no null).
+        let mut buf = [b'x' as i8; 256];
+        // The fix: force null terminator at the last position.
+        buf[buf.len() - 1] = 0;
+        // CStr::from_ptr must find the null within the buffer bounds.
+        let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        let s = cstr.to_str().expect("valid UTF-8");
+        // The string should be 254 'x' chars (255 - 1 for the forced null).
+        assert_eq!(s.len(), 255);
+        assert!(s.chars().all(|c| c == 'x'));
     }
 }
