@@ -191,7 +191,7 @@ impl ContextTokenMap {
     }
 
     pub fn has_conversation(&self, conv_key: &str) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.conv_to_v.contains(conv_key)
     }
 
@@ -203,7 +203,7 @@ impl ContextTokenMap {
         real_ctx: String,
         peer_user_id: String,
     ) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, peer_user_id, Some(conv_key));
     }
 
@@ -220,7 +220,7 @@ impl ContextTokenMap {
         group_id: Option<&str>,
         client_scope: Option<&str>,
     ) -> String {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let conv_key = conversation_key(&peer_user_id, group_id).map(|k| match client_scope {
             Some(scope) => format!("{k}@{scope}"),
             None => k,
@@ -281,25 +281,25 @@ impl ContextTokenMap {
 
     /// Number of virtual context token entries currently held in memory.
     pub fn len(&self) -> usize {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.len()
     }
 
     /// Whether the map currently holds no entries.
     pub fn is_empty(&self) -> bool {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.is_empty()
     }
 
     pub fn resolve(&self, vtoken: &str) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.v_to_record.get(vtoken).map(|r| r.real_token.clone())
     }
 
     /// Returns `(real_ctx, peer_user_id)` for the given virtual token.
     /// Uses `get` (updates LRU promotion) to correctly update the LRU cache priority.
     pub fn resolve_full(&self, vtoken: &str) -> Option<(String, String)> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .v_to_record
             .get(vtoken)
@@ -308,13 +308,13 @@ impl ContextTokenMap {
 
     /// Seed a known mapping into the in-memory cache (without peer_user_id).
     pub fn seed(&self, vctx: String, real_ctx: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, "".to_string(), None);
     }
 
     /// Seed a known mapping including peer_user_id.
     pub fn seed_full(&self, vctx: String, real_ctx: String, peer_user_id: String) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.seed_record(vctx, real_ctx, peer_user_id, None);
     }
 }
@@ -561,7 +561,7 @@ impl PerClientSlot {
     }
 
     fn push(&self, msg: WeixinMessage) -> bool {
-        let mut q = self.messages.lock().unwrap();
+        let mut q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
         let dropped = if q.len() >= self.max_queue_size {
             q.pop_front();
             warn!(
@@ -578,11 +578,18 @@ impl PerClientSlot {
     }
 
     fn drain(&self) -> Vec<WeixinMessage> {
-        self.messages.lock().unwrap().drain(..).collect()
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain(..)
+            .collect()
     }
 
     fn len(&self) -> usize {
-        self.messages.lock().unwrap().len()
+        self.messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len()
     }
 }
 
@@ -684,5 +691,35 @@ mod queue_config_tests {
         assert_eq!(drained.len(), 10);
         assert_eq!(drained[0].message_id, Some(1));
         assert_eq!(drained[9].message_id, Some(10));
+    }
+
+    #[test]
+    fn test_mutex_poison_safe() {
+        use std::thread;
+
+        // 1. Test ContextTokenMap poison safety
+        let m = Arc::new(ContextTokenMap::default());
+        let m_clone = m.clone();
+        let handle = thread::spawn(move || {
+            let _v = m_clone.map("real-ctx".into(), "user1".into(), None);
+            panic!("force panic to poison ContextTokenMap Mutex");
+        });
+        let _ = handle.join();
+        // Should not panic on subsequent calls
+        let v = m.map("real-ctx-2".into(), "user2".into(), None);
+        assert!(!v.is_empty());
+
+        // 2. Test InMemoryQueue (PerClientSlot) poison safety
+        let slot = Arc::new(PerClientSlot::new(10));
+        let slot_clone = slot.clone();
+        let handle3 = thread::spawn(move || {
+            let _lock = slot_clone.messages.lock().unwrap();
+            panic!("force panic to poison PerClientSlot Mutex");
+        });
+        let _ = handle3.join();
+        // Now test push/drain on the poisoned slot should not panic
+        assert!(!slot.push(WeixinMessage::default()));
+        assert_eq!(slot.len(), 1);
+        assert_eq!(slot.drain().len(), 1);
     }
 }

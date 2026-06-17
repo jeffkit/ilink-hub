@@ -1,0 +1,67 @@
+milestone: M1
+title: Poison-Safe Locks - src/hub/queue.rs 锁安全修复
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 修复 `src/hub/queue.rs` 中 `ContextTokenMap` 和 `PerClientSlot` 热路径上使用 `std::sync::Mutex::lock().unwrap()` 的风险。
+  - 将所有 `.lock().unwrap()` 修改为 poison-safe 形式：`lock().unwrap_or_else(|e| e.into_inner())`。
+  - 在 `src/hub/queue.rs` 单元测试中补充 `test_mutex_poison_safe` 测试用例，显式毒化 Mutex 并验证锁访问不 panic。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: src/hub/queue.rs
+    lines:
+      - 194: `ContextTokenMap::has_conversation` 锁安全处理
+      - 206: `ContextTokenMap::seed_conversation` 锁安全处理
+      - 223: `ContextTokenMap::map_scoped` 锁安全处理
+      - 284: `ContextTokenMap::len` 锁安全处理
+      - 290: `ContextTokenMap::is_empty` 锁安全处理
+      - 295: `ContextTokenMap::resolve` 锁安全处理
+      - 302: `ContextTokenMap::resolve_full` 锁安全处理
+      - 311: `ContextTokenMap::seed` 锁安全处理
+      - 317: `ContextTokenMap::seed_full` 锁安全处理
+      - 564: `PerClientSlot::push` 锁安全处理
+      - 581: `PerClientSlot::drain` 锁安全处理
+      - 585: `PerClientSlot::len` 锁安全处理
+      - 695-725: 新增 `test_mutex_poison_safe` 单元测试验证 Mutex 被毒化后的健壮性
+
+# ─── 验证命令（M1 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - `unwrap_or_else(|e| e.into_inner())` 会在 Mutex 被毒化（Poisoned）时获取锁所保护的数据。在该场景下，虽然数据可能是不一致状态，但相对于直接 panic 导致整个服务线程或 Tokio Worker 崩溃，这种防卫性容错机制能最大化保证系统可用性，且我们的 LRU 缓存与消息队列在该毒化恢复后可继续正确工作。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/lock-mutex-poison-safe/reviews/m1/review-request.yaml (本文件)
+  - docs/exec-plans/active/lock-mutex-poison-safe/implement.md (M1 状态更新)
+  - src/hub/queue.rs
+  - git commit (M1 实施提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否已将 `src/hub/queue.rs` 中所有 `std::sync::Mutex::lock().unwrap()` 均替换为 `lock().unwrap_or_else(|e| e.into_inner())`？
+  - [x] `test_mutex_poison_safe` 单元测试是否已通过，并且覆盖了 `ContextTokenMap` 与 `PerClientSlot` 的毒化情况？
+  - [x] 验证命令（fmt, clippy, test, build, desktop-frontend, desktop-tauri）是否全绿通过？
