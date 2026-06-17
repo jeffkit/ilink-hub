@@ -3138,9 +3138,7 @@ mod store_tests {
 
         // Create the database via Store::connect (this writes v1-v5 schema).
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let _store = rt.block_on(async {
-            Store::connect(&url).await.expect("first connect")
-        });
+        let _store = rt.block_on(async { Store::connect(&url).await.expect("first connect") });
 
         // Record the file size after schema creation.
         let size_before = std::fs::metadata(&db_path).expect("metadata").len();
@@ -3163,11 +3161,12 @@ mod store_tests {
         );
 
         // Verify the database is still usable (not corrupted by truncation).
-        let store2 = rt.block_on(async {
-            Store::connect(&url).await.expect("second connect")
-        });
+        let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
         let v = rt.block_on(store2.get_current_version()).unwrap();
-        assert_eq!(v, 5, "database must still be at v5 after ensure_sqlite_file");
+        assert_eq!(
+            v, 5,
+            "database must still be at v5 after ensure_sqlite_file"
+        );
     }
 
     /// SEC-ADV-001 (concurrent stress): hammer `ensure_sqlite_file` from
@@ -3185,9 +3184,7 @@ mod store_tests {
 
         // First, create the database and populate it.
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let _store = rt.block_on(async {
-            Store::connect(&url).await.expect("first connect")
-        });
+        let _store = rt.block_on(async { Store::connect(&url).await.expect("first connect") });
         let size_before = std::fs::metadata(&db_path).expect("metadata").len();
 
         // Now hammer `ensure_sqlite_file` from 16 threads concurrently.
@@ -3214,7 +3211,9 @@ mod store_tests {
 
         // Database must still be usable.
         let store2 = rt.block_on(async {
-            Store::connect(&url).await.expect("reconnect after concurrent race")
+            Store::connect(&url)
+                .await
+                .expect("reconnect after concurrent race")
         });
         let v = rt.block_on(store2.get_current_version()).unwrap();
         assert_eq!(v, 5);
@@ -3266,7 +3265,10 @@ mod store_tests {
             .expect("context_token_map");
 
         // v4 should succeed (column doesn't exist yet, so ALTER ADD COLUMN runs).
-        store.migrate_to_v4().await.expect("v4 must add created_at column");
+        store
+            .migrate_to_v4()
+            .await
+            .expect("v4 must add created_at column");
         assert!(
             store
                 .column_exists("context_token_map", "created_at")

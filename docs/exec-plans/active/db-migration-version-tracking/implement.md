@@ -1,5 +1,27 @@
 # Database Migration Version Tracking Implement Log
 
+## M2 再验证 (2026-06-17, worktree: feat/db-migration-version-tracking)
+
+在 `feat/db-migration-version-tracking` worktree 中重新验证 M2 全部验证命令。
+
+### 验证结果
+
+| 命令 | 结果 |
+|---|---|
+| `cargo fmt --check` | PASS |
+| `cargo clippy -- -D warnings` | PASS |
+| `cargo test` | PASS (315 tests: 242 lib + 73 integration/e2e) |
+| `cargo build` | PASS |
+| `desktop-frontend` build | PASS |
+| `desktop-tauri` cargo check | PASS |
+
+### 文件变更
+
+- `src/store/mod.rs` — 格式化修复（多行 assert 语句换行）
+- `desktop/ilink-hub-desktop/src-tauri/Cargo.lock` — 依赖锁定更新
+- `docs/exec-plans/active/db-migration-version-tracking/reviews/m2/review-request.yaml` — 更新验证结果
+- `docs/exec-plans/active/db-migration-version-tracking/implement.md` — 本次更新
+
 ## M1 再验证 (2026-06-17, worktree: feat/db-migration-version-tracking)
 
 在 `feat/db-migration-version-tracking` worktree 中重新验证 M1 全部验证命令。
