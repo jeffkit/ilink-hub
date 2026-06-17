@@ -1,0 +1,19 @@
+milestone: M1
+description: 引入 prometheus crate 依赖
+changes:
+  - file: Cargo.toml
+    description: 添加 prometheus v0.13 依赖（default-features = false）
+  - file: Cargo.lock
+    description: 自动生成的依赖锁文件
+verification:
+  fmt: PASS
+  clippy: PASS
+  test:
+    status: PASS_WITH_KNOWN_FLAKY
+    note: "adversarial_many_concurrent_connects_converge 为预存 flaky test"
+  build: PASS
+  desktop-frontend: PASS
+  desktop-tauri: PASS
+review_focus:
+  - prometheus crate 版本选择是否合适
+  - default-features = false 是否需要开启额外 features
