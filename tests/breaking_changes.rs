@@ -614,3 +614,108 @@ fn test_bind_failure_friendly_message() {
         stderr
     );
 }
+
+// ─── S-10: Body Limit ────────────────────────────────────────────────────────
+//
+// SEC-010: Request body size limits.
+// Default body limit is 256 KB.
+// /ilink/bot/sendmessage has an overridden limit of 4 MB.
+
+#[tokio::test]
+async fn test_body_limit_global() {
+    let state = make_state().await;
+    let app = build_router(state);
+
+    // 1. Sending exactly 256 KB to a regular route (e.g., /ilink/bot/sendtyping)
+    // It should not be rejected by DefaultBodyLimit (so status won't be 413, probably 400 Bad Request or 401 Unauthorized because of invalid json or missing token).
+    let limit = 256 * 1024;
+    let body_ok = "a".repeat(limit);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ilink/bot/sendtyping")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_ok))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 2. Sending 256 KB + 1 byte to the same route
+    // It should be rejected with 413 Payload Too Large.
+    let body_too_large = "a".repeat(limit + 1);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ilink/bot/sendtyping")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_too_large))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn test_body_limit_sendmessage_override() {
+    let state = make_state().await;
+    let app = build_router(state);
+
+    // 1. Sending 256 KB + 1 byte to /ilink/bot/sendmessage
+    // It should NOT be rejected with 413 because the limit is 4 MB.
+    let body_ok = "a".repeat(256 * 1024 + 1);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ilink/bot/sendmessage")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_ok))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 2. Sending 4 MB to /ilink/bot/sendmessage
+    // It should NOT be rejected with 413.
+    let limit_4mb = 4 * 1024 * 1024;
+    let body_ok_4mb = "a".repeat(limit_4mb);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ilink/bot/sendmessage")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_ok_4mb))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // 3. Sending 4 MB + 1 byte to /ilink/bot/sendmessage
+    // It should be rejected with 413 Payload Too Large.
+    let body_too_large_4mb = "a".repeat(limit_4mb + 1);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ilink/bot/sendmessage")
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_too_large_4mb))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}

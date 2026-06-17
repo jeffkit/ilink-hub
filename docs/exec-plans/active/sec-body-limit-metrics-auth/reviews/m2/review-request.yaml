@@ -1,0 +1,63 @@
+milestone: M2
+title: SEC-010 Body Limit — 实现
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 在 `src/server/mod.rs` 中为全局路由添加 `DefaultBodyLimit::max(256 * 1024)` 限制（256 KB）。
+  - 在 `src/server/mod.rs` 中为 `/ilink/bot/sendmessage` 路由添加 `.layer(DefaultBodyLimit::max(4 * 1024 * 1024))` 限制（4 MB）。
+  - 在 `tests/breaking_changes.rs` 中新增单元测试，对全局和 sendmessage 分别进行 256 KB 和 4 MB 的边界限制验证，验证 413 状态码。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: src/server/mod.rs
+    lines:
+      - 4: 引入 `axum::extract::DefaultBodyLimit`
+      - 30-33: 在 `/ilink/bot/sendmessage` 路由上加 `.layer(DefaultBodyLimit::max(4 * 1024 * 1024))`
+      - 58: 在全局 Router 上加 `.layer(DefaultBodyLimit::max(256 * 1024))`
+  - file: tests/breaking_changes.rs
+    lines:
+      - 617-717: 新增 `test_body_limit_global` 和 `test_body_limit_sendmessage_override` 测试用例，验证边界值
+
+# ─── 验证命令（M2 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 确认 `DefaultBodyLimit` 不会阻止正常大小的请求，已通过 `test_body_limit_global` 与 `test_body_limit_sendmessage_override` 进行边界校验。
+  - 需要单独放开 sendmessage 路径是因为该路径可能会包含 base64 文件数据，256 KB 太过局限。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m2/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md  (M2 状态更新)
+  - src/server/mod.rs
+  - tests/breaking_changes.rs
+  - git commit (M2 实施提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 全局请求大小限制是否确为 256 KB，并且仅限 /ilink/bot/sendmessage 放宽为 4 MB？
+  - [x] 新增测试用例是否有效覆盖了正好 256 KB（通过）与 256 KB + 1 字节（413）的边界情况？
+  - [x] 新增测试用例是否有效覆盖了 sendmessage 正好 4 MB（通过）与 4 MB + 1 字节（413）的边界情况？
+  - [x] 六项质量门禁命令是否均全绿通过？

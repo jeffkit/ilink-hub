@@ -8,6 +8,7 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -150,6 +151,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         info!("pairing relay disabled (set HUB_PAIR_URL or ILINKHUB_RELAY=0)");
     }
 
+    let state_for_drain = Arc::clone(&state);
     let router = build_router(state);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
@@ -192,6 +194,13 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
                 break;
             }
         }
+        // Wait for pending message queues to drain before closing connections.
+        // This gives bridge clients already in-flight time to poll remaining messages.
+        let drain_secs = std::env::var("ILINK_SHUTDOWN_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS);
+        drain_queues_before_shutdown(&state_for_drain, drain_secs).await;
     })
     .await?;
 
@@ -679,6 +688,140 @@ mod tests {
         assert_eq!(resolve_max_queue_size(), 10_000);
 
         env::remove_var("ILINK_MAX_QUEUE_SIZE");
+    }
+}
+
+/// Maximum time to wait for message queues to drain during graceful shutdown (seconds).
+///
+/// Configurable via `ILINK_SHUTDOWN_DRAIN_SECS`. Set to `0` to disable drain waiting.
+/// Default is 30 seconds — enough for most bridge clients to issue a final `getupdates` poll.
+const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
+
+/// Wait for all per-vtoken message queues to empty before returning, up to `drain_secs`.
+///
+/// Called during graceful shutdown while the Axum listener is still accepting connections,
+/// so bridge clients can continue long-polling and drain the queues normally. Once the queues
+/// are empty (or the timeout expires), this returns and Axum closes remaining connections.
+///
+/// On timeout, logs a warning with the number of undelivered messages so operators can tune
+/// the timeout or investigate why bridges are not polling fast enough.
+async fn drain_queues_before_shutdown(state: &HubState, drain_secs: u64) {
+    if drain_secs == 0 {
+        info!("shutdown queue drain disabled (ILINK_SHUTDOWN_DRAIN_SECS=0)");
+        return;
+    }
+
+    let timeout = Duration::from_secs(drain_secs);
+    let check_interval = Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let sizes = match state.clients.queue.queue_sizes().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "failed to check queue sizes during shutdown drain, proceeding");
+                return;
+            }
+        };
+
+        let total: usize = sizes.values().sum();
+        if total == 0 {
+            info!("all message queues drained; proceeding with shutdown");
+            return;
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                pending_messages = total,
+                timeout_secs = drain_secs,
+                "shutdown drain timeout: {} message(s) undelivered — \
+                 increase ILINK_SHUTDOWN_DRAIN_SECS or ensure bridges are online during shutdown",
+                total
+            );
+            return;
+        }
+
+        info!(
+            pending_messages = total,
+            "waiting for message queues to drain before shutdown"
+        );
+        tokio::time::sleep(check_interval).await;
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::hub::{HubState, InMemoryQueue};
+    use crate::ilink::{types::WeixinMessage, UpstreamClient};
+    use crate::store::Store;
+
+    async fn make_minimal_state() -> Arc<HubState> {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        HubState::new(upstream, store, queue, rx)
+    }
+
+    #[tokio::test]
+    async fn drain_returns_immediately_when_queues_empty() {
+        let state = make_minimal_state().await;
+        // No messages pushed — should return without waiting.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            drain_queues_before_shutdown(&state, 30),
+        )
+        .await
+        .expect("drain_queues_before_shutdown should return immediately for empty queues");
+    }
+
+    #[tokio::test]
+    async fn drain_times_out_when_queue_not_empty() {
+        let state = make_minimal_state().await;
+
+        // Push a message that will never be polled.
+        state
+            .clients
+            .queue
+            .push("vt-test", WeixinMessage::default())
+            .await
+            .unwrap();
+
+        tokio::time::pause();
+
+        // Advance virtual time past the 1-second timeout while drain runs.
+        let (_, _) = tokio::join!(drain_queues_before_shutdown(&state, 1), async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        // The queue should still have the message (drain timed out, didn't consume it).
+        let sizes = state.clients.queue.queue_sizes().await.unwrap();
+        assert_eq!(
+            sizes.values().sum::<usize>(),
+            1,
+            "message should remain unpolled after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_respects_zero_timeout_disable() {
+        let state = make_minimal_state().await;
+
+        state
+            .clients
+            .queue
+            .push("vt-x", WeixinMessage::default())
+            .await
+            .unwrap();
+
+        // Should return immediately without waiting.
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            drain_queues_before_shutdown(&state, 0),
+        )
+        .await
+        .expect("drain_secs=0 must return immediately");
     }
 }
 
