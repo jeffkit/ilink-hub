@@ -219,12 +219,15 @@ fn local_hostname() -> String {
     {
         use std::ffi::CStr;
         extern "C" {
-            fn gethostname(name: *mut libc_types::c_char, namelen: libc_types::size_t) -> libc_types::c_int;
+            fn gethostname(
+                name: *mut libc_types::CChar,
+                namelen: libc_types::SizeT,
+            ) -> libc_types::CInt;
         }
         mod libc_types {
-            pub type c_char = i8;
-            pub type size_t = usize;
-            pub type c_int = i32;
+            pub type CChar = i8;
+            pub type SizeT = usize;
+            pub type CInt = i32;
         }
         let mut buf = [0i8; 256];
         let ret = unsafe { gethostname(buf.as_mut_ptr(), buf.len()) };

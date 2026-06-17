@@ -1,0 +1,170 @@
+milestone: M1
+title: SEC-010 / SEC-007 — 调查与定位
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 仅调查与定位；M1 不修改任何业务代码。
+  - 输出本文件 + implement.md 状态更新 + 已跑通的质量门禁日志。
+  - 修改/实现推迟到 M2 (Body Limit) 与 M3 (Metrics Auth)。
+
+# ─── 目标问题 ────────────────────────────────────────────────────────────────
+objectives:
+  - id: SEC-010
+    title: HTTP body 大小限制
+    sources:
+      - docs/TODO.md (SEC-010 标 done 但代码未实现)
+      - docs/exec-plans/active/sec-body-limit-metrics-auth/prompt.md
+  - id: SEC-007
+    title: /metrics 鉴权
+    sources:
+      - docs/TODO.md (SEC-007 标 done 但代码未实现)
+      - docs/exec-plans/active/sec-body-limit-metrics-auth/prompt.md
+
+# ─── 调查发现（事实清单） ───────────────────────────────────────────────────
+findings:
+
+  - id: F-1
+    title: build_router 入口
+    location: src/server/mod.rs:17-61
+    detail: |
+      build_router 当前只 merge bot_api + admin_api，并应用 TraceLayer；无
+      DefaultBodyLimit，也无 RequestBodyLimitLayer。bot_api 独立 CORS，
+      admin_api 无 CORS（与代码内注释一致）。
+    consequence: 缺少全局 body 限制，是 SEC-010 的实施点。
+
+  - id: F-2
+    title: /metrics handler 未鉴权（SEC-007 未真实实现）
+    location:
+      handler: src/server/routes.rs:965
+      route:   src/server/mod.rs:53
+    detail: |
+      签名是 `pub async fn metrics(State(state)) -> (StatusCode, String)`，
+      函数体内只读 state、拼 Prometheus 文本，未读取 headers，未调用
+      check_admin_auth。TODO.md 把 SEC-007 标为 done 是误标——代码事实是
+      无鉴权，prompt.md 也明确指出这是要补的内容。
+    consequence: 必须修改（推迟到 M3）。
+
+  - id: F-3
+    title: /ilink/bot/sendmessage（不是 /hub/sendmessage）
+    location:
+      route:   src/server/mod.rs:31
+      handler: src/server/routes.rs:310
+    detail: |
+      handler 接收 `Json<SendMessageRequest>`，body 中 WeixinMessage.item_list
+      是 `Option<Arc<Vec<MessageItem>>>`，单个 MessageItem 通过
+      `extra: serde_json::Value` 兜底所有非 text/voice 字段（含 base64 二进制
+      字段），理论上可塞入大 payload。SendMessageRequest 还可能携带
+      ilink_hub_ext、context_token 等业务字段。
+    consequence: 4 MB 单独放开的阈值是合理的；prompt.md 用的 "/hub/sendmessage"
+      是 typo，实际路径是 /ilink/bot/sendmessage，M2 实施时按真实路径走。
+
+  - id: F-4
+    title: check_admin_auth 既有实现可复用
+    location: src/server/routes.rs:57-69
+    detail: |
+      签名 `fn check_admin_auth(headers: &HeaderMap) -> bool`。已使用
+      subtle::ConstantTimeEq 做常量时间比较，遵循 SEC-006。所有 admin
+      handler（register/admin_clients/admin_delete_client/admin_update_client/
+      admin_ilink_status/admin_ilink_relogin/admin_ilink_qr_stream/admin_ui）
+      一律采用 "if !check_admin_auth(&headers) { return 401; }" 早返回。
+      admin_token() 用 OnceLock 缓存 env；insecure_no_auth() 同。
+    consequence: M3 直接复用 check_admin_auth，沿用现有模式；不要新增中间件。
+
+  - id: F-5
+    title: DefaultBodyLimit 来源
+    location: Cargo.toml:34 (axum 0.8)
+    detail: |
+      `axum = "0.8"`，`DefaultBodyLimit` 已包含在 `axum::extract` 中，无
+      需新增依赖。M2 直接 `use axum::extract::DefaultBodyLimit;`。
+    consequence: 不修改 Cargo.toml，符合 prompt.md「不引入新依赖」约束。
+
+  - id: F-6
+    title: 现有测试结构
+    location: src/server/routes.rs:1149-1210
+    detail: |
+      `#[cfg(test)] mod shutdown_poll_tests` + `mod admin_auth_tests`；两个
+      mod 都放在 routes.rs 末尾。admin_auth_tests 直接调 check_admin_auth
+      单元测试，没有走完整 router。M4/M5 的测试需要构造完整 router
+      (build_router + HubState) 才能测 body limit 413 与 metrics 401/200。
+    consequence: M4/M5 可能需要新建测试 mod 或测试文件；先不动，留在对应
+      里程碑做。
+
+# ─── 实施路线（M2–M7 摘要） ───────────────────────────────────────────────
+planned_changes:
+  M2:
+    - 修改 src/server/mod.rs：build_router 全局加
+      `DefaultBodyLimit::max(256 * 1024)`；bot_api 中 /ilink/bot/sendmessage
+      单独 .layer(DefaultBodyLimit::max(4 * 1024 * 1024))。
+    - 验证：grep "DefaultBodyLimit" src/server/mod.rs + cargo build。
+  M3:
+    - 修改 src/server/routes.rs：metrics 签名改为接收 HeaderMap，函数体
+      入口加 `if !check_admin_auth(&headers) { return (401, "Unauthorized"); }`。
+    - 验证：grep "check_admin_auth" src/server/routes.rs + cargo build。
+  M4:
+    - 新建测试 mod（建议 routes.rs 末尾或独立 tests 文件），覆盖：
+      256 KB - 1 字节 → 200；256 KB → 200；256 KB + 1 字节 → 413；
+      sendmessage 4 MB - 1 字节 → 不被 413 拒绝（业务上可能是 401 等，但
+      不是 413 Payload Too Large）。
+  M5:
+    - 测试无 token → 401；带正确 admin token → 200；带错误 token → 401。
+  M6:
+    - cargo clippy -- -D warnings；cargo test；cargo build 全绿。
+  M7:
+    - docs/TODO.md SEC-007/SEC-010 的 done 标注已实际生效，可保留 done。
+      补 commit 引用；检查 docs/DOC_CODE_MAP.md 是否需要新增条目。
+
+# ─── 验证命令（M1 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+  note: |
+    M1 未触任何业务代码，预期全部 baseline 通过。如失败则说明仓库当前
+    主干已不健康，应在 implement.md 记录后停止后续里程碑。
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - SEC-007 的 "done" 标注与代码事实不符，prompt.md 与 plan.md 均明确指出
+    这是要补的；M3 实施后把代码提交信息与 TODO.md commit 引用对齐。
+  - DefaultBodyLimit 在 axum 0.8 行为：超过限制时由 axum 自动返回
+    413 Payload Too Large（无需 handler 主动判断）。M4 测试断言 413 即可。
+  - sendmessage 单独放开 4 MB 的依据：item_list 可能含 base64 编码的
+    image/voice/file/video，256 KB 全局上限会过紧；4 MB 是经验阈值
+    （参考 v0.1.x 历史 payload 大小）。
+  - 鉴权失败返回 401 vs 403：现有 admin handler 全部 401，M3 metrics
+    handler 保持一致。insecure_no_auth() 仅作为开发/测试逃生口，
+    生产环境必须设 ILINK_ADMIN_TOKEN。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m1/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md  (M1 状态更新)
+  - git commit（M1 调查产出，commit message 见 implement.md）
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [ ] F-2 (metrics 未鉴权) 描述是否准确，是否还有其他遗漏的未鉴权端点？
+  - [ ] F-3 (sendmessage 路径) 是否同意统一按 /ilink/bot/sendmessage 处理，
+        且 4 MB 阈值合理？
+  - [ ] F-4 (复用 check_admin_auth) 是否同意避免引入新中间件？
+  - [ ] M2/M3 的实施路线是否有遗漏的边界情况？
+  - [ ] 验证命令清单是否覆盖了用户指定的所有六条？

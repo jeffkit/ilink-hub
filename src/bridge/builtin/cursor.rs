@@ -151,7 +151,10 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await.context("read agent stdout")?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("read agent stdout")?;
         if n == 0 {
             break;
         }
@@ -204,8 +207,15 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !status.success() && found_session_id.is_none() {
-        let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
-        anyhow::bail!("agent exited with status {:?}\nstderr: {detail}", status.code());
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
+        anyhow::bail!(
+            "agent exited with status {:?}\nstderr: {detail}",
+            status.code()
+        );
     }
 
     Ok(found_session_id)
@@ -226,7 +236,8 @@ mod tests {
 
     #[test]
     fn deserialize_assistant_event_with_text_block() {
-        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there"}]}}"#;
+        let json =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi there"}]}}"#;
         let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type.as_deref(), Some("assistant"));
         let blocks = event.message.unwrap().content.unwrap();

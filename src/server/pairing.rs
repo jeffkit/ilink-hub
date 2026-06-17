@@ -696,7 +696,9 @@ pub async fn pair_confirm(
     if name.len() > MAX_NAME_LEN {
         return (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": format!("name must be at most {MAX_NAME_LEN} characters") })),
+            Json(
+                serde_json::json!({ "error": format!("name must be at most {MAX_NAME_LEN} characters") }),
+            ),
         );
     }
     let label = req
@@ -707,7 +709,9 @@ pub async fn pair_confirm(
         if l.len() > MAX_NAME_LEN {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": format!("label must be at most {MAX_NAME_LEN} characters") })),
+                Json(
+                    serde_json::json!({ "error": format!("label must be at most {MAX_NAME_LEN} characters") }),
+                ),
             );
         }
     }
@@ -721,7 +725,10 @@ pub async fn pair_confirm(
         .and_then(|v| v.to_str().ok())
         .map(|v| {
             use subtle::ConstantTimeEq;
-            v.as_bytes().ct_eq(state.relay_secret.as_bytes()).unwrap_u8() == 1
+            v.as_bytes()
+                .ct_eq(state.relay_secret.as_bytes())
+                .unwrap_u8()
+                == 1
         })
         .unwrap_or(false);
     let effective_ip = if peer_ip.0.ip().is_loopback() && relay_secret_ok {

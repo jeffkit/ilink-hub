@@ -19,6 +19,7 @@ use crate::ilink::types::WeixinMessage;
 
 /// Default maximum number of messages buffered per client.
 pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
+#[allow(dead_code)]
 const MAX_QUEUE_SIZE: usize = DEFAULT_MAX_QUEUE_SIZE;
 
 /// Maximum number of virtual context token mappings held in memory.
@@ -61,12 +62,12 @@ impl ContextTokenMapInner {
         if self
             .real_to_v
             .peek(&record.real_token)
-            .map_or(false, |v| v == vtoken)
+            .is_some_and(|v| v == vtoken)
         {
             self.real_to_v.pop(&record.real_token);
         }
         if let Some(ref k) = record.conv_key {
-            if self.conv_to_v.peek(k).map_or(false, |v| v == vtoken) {
+            if self.conv_to_v.peek(k).is_some_and(|v| v == vtoken) {
                 self.conv_to_v.pop(k);
             }
         }
@@ -119,11 +120,7 @@ impl ContextTokenMapInner {
             }
 
             if real_changed {
-                if self
-                    .real_to_v
-                    .peek(&old_real)
-                    .map_or(false, |v| v == &vtoken)
-                {
+                if self.real_to_v.peek(&old_real) == Some(&vtoken) {
                     self.real_to_v.pop(&old_real);
                 }
                 self.real_to_v.put(real_token.clone(), vtoken.clone());
@@ -131,11 +128,7 @@ impl ContextTokenMapInner {
 
             if conv_changed {
                 if let Some(ref old_k) = old_conv {
-                    if self
-                        .conv_to_v
-                        .peek(old_k)
-                        .map_or(false, |v| v == &vtoken)
-                    {
+                    if self.conv_to_v.peek(old_k) == Some(&vtoken) {
                         self.conv_to_v.pop(old_k);
                     }
                 }
@@ -245,11 +238,7 @@ impl ContextTokenMap {
                     }
 
                     if real_changed {
-                        if inner
-                            .real_to_v
-                            .peek(&old_real)
-                            .map_or(false, |v| v == &vtoken)
-                        {
+                        if inner.real_to_v.peek(&old_real) == Some(&vtoken) {
                             inner.real_to_v.pop(&old_real);
                         }
                         inner.real_to_v.put(real_token.clone(), vtoken.clone());
@@ -459,6 +448,7 @@ pub(crate) struct ClientQueue {
     pub(crate) notify: Arc<Notify>,
 }
 
+#[allow(dead_code)]
 impl ClientQueue {
     pub(crate) fn new() -> Self {
         Self {

@@ -123,7 +123,10 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
 
     loop {
         line.clear();
-        let n = reader.read_line(&mut line).await.context("read codex stdout")?;
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("read codex stdout")?;
         if n == 0 {
             break;
         }
@@ -161,8 +164,15 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !status.success() && found_thread_id.is_none() {
-        let detail = if !stderr.is_empty() { stderr } else { String::from("(no output)") };
-        anyhow::bail!("codex exited with status {:?}\nstderr: {detail}", status.code());
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
+        anyhow::bail!(
+            "codex exited with status {:?}\nstderr: {detail}",
+            status.code()
+        );
     }
 
     Ok(found_thread_id)
@@ -174,7 +184,8 @@ mod tests {
 
     #[test]
     fn deserialize_thread_started() {
-        let json = r#"{"type":"thread.started","thread_id":"019ecb0d-da0c-7002-bb29-a0fd8b2c2253"}"#;
+        let json =
+            r#"{"type":"thread.started","thread_id":"019ecb0d-da0c-7002-bb29-a0fd8b2c2253"}"#;
         let event: CodexEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type.as_deref(), Some("thread.started"));
         assert_eq!(

@@ -38,10 +38,13 @@ impl RateLimiter {
     pub fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
         let mut inner = self.inner.lock().expect("rate limiter lock");
-        let bucket = inner.buckets.entry(key.to_string()).or_insert_with(|| Bucket {
-            count: 0,
-            window_start: now,
-        });
+        let bucket = inner
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| Bucket {
+                count: 0,
+                window_start: now,
+            });
 
         if now.duration_since(bucket.window_start) >= self.window {
             bucket.count = 0;

@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Hub — 优雅停机队列 drain（ADR-001 方案 A）
+
+**新增**
+
+- **优雅停机时等待消息队列清空**：SIGTERM 触发 graceful shutdown 后，Hub 不再立即关闭 HTTP 连接，而是等待所有 vtoken 的 `InMemoryQueue` 被 bridge poll 到清空为止，最多等待 `ILINK_SHUTDOWN_DRAIN_SECS`（默认 30 秒）。超时后打印 `WARN` 日志，报告未投递消息数，然后继续关闭。设置 `ILINK_SHUTDOWN_DRAIN_SECS=0` 可禁用该等待。此改动消除了计划性重启（升级）场景下的消息丢失。
+
+**文档**
+
+- `docs/adr/001-message-queue-persistence.md`：记录三种持久化方案（优雅 drain / DB WAL / 停机快照）的决策过程与实施细节。
+- `docs/adr/002-in-memory-state-inventory.md`：内存状态全量盘点，记录各组件重启后的影响范围。
+- `docs/adr/003-sqlite-single-connection.md`：SQLite 单连接 `max_connections(1)` 设计决策与升级路径。
+- `docs/adr/004-fire-and-forget-persist.md`：ContextToken fire-and-forget 持久化的权衡与可观测性说明。
+
 ## [0.1.22] — 2026-06-17
 
 ### Bridge — Cursor / Claude Code 修复

@@ -2,6 +2,7 @@ pub mod pairing;
 pub mod routes;
 
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, patch, post},
     Router,
 };
@@ -28,7 +29,10 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         )
         .route("/ilink/bot/get_qrcode_status", get(get_qrcode_status))
         .route("/ilink/bot/getupdates", post(getupdates))
-        .route("/ilink/bot/sendmessage", post(sendmessage))
+        .route(
+            "/ilink/bot/sendmessage",
+            post(sendmessage).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route("/ilink/bot/sendtyping", post(sendtyping))
         .route("/ilink/bot/getconfig", post(getconfig))
         .route("/ilink/bot/getuploadurl", post(getuploadurl))
@@ -57,5 +61,6 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         .merge(bot_api)
         .merge(admin_api)
         .layer(TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(state)
 }

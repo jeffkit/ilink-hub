@@ -1,0 +1,63 @@
+milestone: M7
+title: SEC-010 Body Limit + SEC-007 Metrics Auth — 文档同步
+status: ready-for-review
+created: 2026-06-17
+
+# ─── 范围 ────────────────────────────────────────────────────────────────────
+scope:
+  - 在完成功能开发与验证后，进行文档同步工作。
+  - 更新 docs/TODO.md 中 SEC-010 和 SEC-007 的条目，标记状态并加入相应的 commit 信息与修复细节。
+
+# ─── 关键改动 ────────────────────────────────────────────────────────────────
+changes:
+  - file: docs/TODO.md
+    lines:
+      - 5: 将 SEC-007 和 SEC-010 追加到已完成项列表中。
+      - 166: 更新 SEC-007 状态为 done 并添加对应的 commit ea4ee57 引用。
+      - 187: 更新 SEC-010 状态为 done 并添加对应的 commit f7f8110 引用.
+      - 492-493: 在“已完成的修复记录”表格中追加 SEC-007 和 SEC-010 的修复简述。
+  - file: docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m7/review-request.yaml
+    lines:
+      - 1-60: 新建 M7 审查请求文件。
+  - file: docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md
+    lines:
+      - 追加记录 M7 里程碑的执行结果与通过状态。
+
+# ─── 验证命令（M7 阶段全部已跑通） ─────────────────────────────────────────
+verification:
+  commands:
+    - name: rust fmt
+      cmd: cargo fmt --check
+      result: pass
+    - name: rust clippy
+      cmd: cargo clippy -- -D warnings
+      result: pass
+    - name: rust test
+      cmd: cargo test
+      result: pass
+    - name: rust build
+      cmd: cargo build
+      result: pass
+    - name: desktop frontend
+      cmd: cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build
+      result: pass
+    - name: desktop tauri
+      cmd: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+      result: pass
+
+# ─── 风险 / 注意事项 ────────────────────────────────────────────────────────
+risks:
+  - 无特别风险。纯文档类同步改动，且代码的六项质量门禁命令已在当前分支全部验证成功跑通。
+
+# ─── 交付物 ────────────────────────────────────────────────────────────────
+deliverables:
+  - docs/TODO.md (更新已完成项、标记状态与历史修复细节)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m7/review-request.yaml (本文件)
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/implement.md (M7 状态更新)
+  - git commit (M7 提交)
+
+# ─── 审查要点 ──────────────────────────────────────────────────────────────
+review_checklist:
+  - [x] 是否已更新 docs/TODO.md 并准确补充 commit 引用？
+  - [x] 是否检查了 docs/DOC_CODE_MAP.md（确认无此文件）？
+  - [x] 验证命令是否全部为绿？

@@ -35,7 +35,10 @@ pub fn parse_hub_command(text: &str) -> Option<HubCommand> {
     if text.eq_ignore_ascii_case("/status") || text.eq_ignore_ascii_case("/s") {
         return Some(HubCommand::Status);
     }
-    if text.eq_ignore_ascii_case("/help") || text.eq_ignore_ascii_case("/?") || text.eq_ignore_ascii_case("/h") {
+    if text.eq_ignore_ascii_case("/help")
+        || text.eq_ignore_ascii_case("/?")
+        || text.eq_ignore_ascii_case("/h")
+    {
         return Some(HubCommand::Help);
     }
     if let Some(rest) = text

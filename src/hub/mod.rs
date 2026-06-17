@@ -32,7 +32,7 @@ pub use outbound_label::{
 };
 pub use pairing::PairingRegistry;
 pub use queue::{conversation_key, ContextTokenMap, InMemoryQueue, MessageQueue};
-pub use quote_route::{merge_routing_with_quote, QuoteRouteIndex, QuoteOrigin};
+pub use quote_route::{merge_routing_with_quote, QuoteOrigin, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 
@@ -409,7 +409,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         if let Some((backend_name, payload)) = router::parse_at_mention(text) {
             let vtoken = {
                 let registry = state.clients.registry.read().await;
-                registry.get_by_name(&backend_name).map(|c| c.vtoken.clone())
+                registry
+                    .get_by_name(&backend_name)
+                    .map(|c| c.vtoken.clone())
             };
             if let Some(vtoken) = vtoken {
                 handle_at_mention(state, msg, backend_name, vtoken, payload).await;
@@ -500,13 +502,21 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                     .unwrap_or("default")
                     .to_string();
                 let store = state.store.clone();
-                let (vctx3, vtoken3, peer3) =
-                    (vctx.clone(), vtoken.clone(), peer_user_id.clone());
+                let (vctx3, vtoken3, peer3) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
                 let sem = state.persist_sem.clone();
                 tokio::spawn(async move {
-                    let Ok(_permit) = sem.try_acquire() else { return };
+                    let Ok(_permit) = sem.try_acquire() else {
+                        return;
+                    };
                     if let Err(e) = store
-                        .save_message(&vctx3, Some(&vtoken3), &session_name, &peer3, "user", &content)
+                        .save_message(
+                            &vctx3,
+                            Some(&vtoken3),
+                            &session_name,
+                            &peer3,
+                            "user",
+                            &content,
+                        )
                         .await
                     {
                         warn!(error = %e, "failed to save user message to history");
@@ -651,11 +661,16 @@ async fn resolve_quote_from_db(
     if prefix.is_empty() {
         return None;
     }
-    match state.store.find_assistant_message_by_content(peer_user_id, &prefix).await {
+    match state
+        .store
+        .find_assistant_message_by_content(peer_user_id, &prefix)
+        .await
+    {
         Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
             let (name, label) = {
                 let registry = state.clients.registry.read().await;
-                registry.get_by_vtoken(&vtoken)
+                registry
+                    .get_by_vtoken(&vtoken)
                     .map(|c| (c.name.clone(), c.label.clone()))
                     .unwrap_or_else(|| (vtoken.clone(), None))
             };
@@ -665,7 +680,12 @@ async fn resolve_quote_from_db(
                 session = ?session_name,
                 "quote index miss — resolved via DB message history"
             );
-            Some(QuoteOrigin::Client { vtoken, name, label, session_name })
+            Some(QuoteOrigin::Client {
+                vtoken,
+                name,
+                label,
+                session_name,
+            })
         }
         Ok(_) => None,
         Err(e) => {
@@ -899,7 +919,10 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 
                 format!("✅ 已切换到 `{}`", name)
             } else {
-                format!("❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。", name)
+                format!(
+                    "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。",
+                    name
+                )
             }
         }
         HubCommand::Broadcast(ref text) => {

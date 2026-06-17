@@ -41,7 +41,13 @@ pub fn spawn_relay_client(
     relay_secret: String,
     shutdown: watch::Receiver<bool>,
 ) {
-    tokio::spawn(run_relay_loop(identity, hub_base, relay_ws_url, relay_secret, shutdown));
+    tokio::spawn(run_relay_loop(
+        identity,
+        hub_base,
+        relay_ws_url,
+        relay_secret,
+        shutdown,
+    ));
 }
 
 /// Reconnect loop body, factored out so tests can `await` it directly.
@@ -211,8 +217,15 @@ async fn run_session(
                         body: Some(r#"{"error":"forbidden path"}"#.into()),
                     }
                 } else {
-                    let forward_fut =
-                        forward_to_hub(&http, hub_base, &method, &path, &headers, body.as_deref(), relay_secret);
+                    let forward_fut = forward_to_hub(
+                        &http,
+                        hub_base,
+                        &method,
+                        &path,
+                        &headers,
+                        body.as_deref(),
+                        relay_secret,
+                    );
                     let res = tokio::select! {
                         biased;
                         _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
@@ -380,7 +393,7 @@ mod tests {
                 "http://127.0.0.1:1".to_string(),
                 "ws://127.0.0.1:1/ws/pairing".to_string(),
                 String::new(),
-            rx,
+                rx,
             ),
         )
         .await;
