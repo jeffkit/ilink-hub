@@ -1,0 +1,68 @@
+milestone: M3
+verdict: PASS
+reviewer: Antigravity (Rust Security & Concurrency Specialist)
+date: 2026-06-17
+summary: >-
+  Milestone M3 successfully implements SEC-007 metrics authentication.
+  The `metrics` handler in `src/server/routes.rs` has been updated to accept `HeaderMap`
+  and authenticate requests via the pre-existing `check_admin_auth(&headers)` helper.
+  If authentication fails, the handler responds with `401 Unauthorized` instead of exposing server metrics.
+  Two new test cases (one unit test verifying default denial/401 when no token is configured, and one E2E simulation
+  asserting 401 for missing/wrong tokens and 200 for the correct token) have been added and run successfully.
+  No security, memory safety, data race, or tokio async pitfalls were introduced.
+
+verdict_rationale: >-
+  All security checklist requirements for SEC-007 have been met. Specifically, the metrics endpoint now rejects unauthenticated
+  requests with a 401 status code, while admitting authenticated requests with the configured token. The existing constant-time
+  comparison checks are reused, preventing timing-based token leaks. The tests cover the change end-to-end and are fully green.
+
+findings:
+  - category: Memory Safety
+    status: PASS
+    description: >-
+      No `unsafe` blocks are introduced or modified. All reference handling is safe, and Rust's borrow checker
+      statically guarantees the lifetimes of the inputs (including `HeaderMap` and the `HubState` state container).
+
+  - category: Data Races & Concurrency
+    status: PASS
+    description: >-
+      The read lock `state.clients.registry.read().await` is acquired synchronously in a dedicated block inside the metrics handler
+      and dropped immediately after retrieving the stats, minimizing the critical section. No deadlocks or lock order issues
+      are present, as no await points occur while holding the read guard.
+
+  - category: Tokio Async Pitfalls
+    status: PASS
+    description: >-
+      No async pitfalls are introduced. The `metrics` handler has no complex tokio construct (such as `tokio::select!` or
+      long-lived loops), avoiding task leaks, cancellation safety hazards, or starvation.
+
+  - category: Test Correctness (adversarial)
+    status: PASS
+    description: >-
+      The new tests cover all edge cases:
+      1. `metrics_requires_auth_when_no_token_configured` ensures the handler returns 401 in default configuration when no token is specified.
+      2. `test_metrics_endpoint_auth` checks invalid tokens, empty tokens (both return 401), and a correct token (returns 200 and matches Prometheus output).
+      These tests run and pass as verified by the test suite execution.
+
+  - category: OWASP & General Security
+    status: PASS
+    description: >-
+      The metrics endpoint (which exposes details about connected client names, online count, messages dispatched, queue sizes, etc.)
+      is now secured with admin authentication, preventing unauthorized information disclosure. Constant-time comparison checks are
+      utilized to prevent timing attacks.
+
+commands_run_for_this_review:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    result: pass (all 202 unit/integration tests and all other targets pass successfully)
+  - id: build
+    cmd: "cargo build"
+    result: pass
+
+open_follow_ups: []

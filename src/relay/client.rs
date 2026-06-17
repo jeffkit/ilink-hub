@@ -14,6 +14,11 @@ use super::protocol::RelayMessage;
 
 const RECONNECT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Maximum time to wait for the next WebSocket frame. If no frame arrives within
+/// this window the connection is considered half-open and the client reconnects.
+/// The relay server is expected to send at least a ping or a request within this
+/// interval; 120 s gives ample room while still recovering from silent hangs.
+const WS_IDLE_TIMEOUT_SECS: u64 = 120;
 
 /// RFC 7230 §6.1 hop-by-hop headers that must not be forwarded by a proxy.
 const HOP_BY_HOP_HEADERS: &[&str] = &[
@@ -165,16 +170,30 @@ async fn run_session(
         .build()?;
 
     loop {
-        // Read the next message or react to shutdown before doing any work on
-        // the message — this also covers idle keep-alive (no message => wait).
-        let msg = tokio::select! {
-            biased;
-            _ = wait_for_shutdown(&mut shutdown) => return Ok(SessionExit::Shutdown),
-            msg = read.next() => match msg {
-                Some(Ok(m)) => m,
-                Some(Err(e)) => return Err(e.into()),
-                None => return Ok(SessionExit::EndedNormally),
-            },
+        // Read the next message or react to shutdown. A per-frame idle timeout
+        // (WS_IDLE_TIMEOUT_SECS) ensures half-open connections are detected and
+        // the client reconnects rather than hanging silently (TO-03).
+        let frame_result = tokio::time::timeout(Duration::from_secs(WS_IDLE_TIMEOUT_SECS), async {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut shutdown) => None,
+                msg = read.next() => Some(msg),
+            }
+        })
+        .await;
+
+        let msg = match frame_result {
+            Err(_) => {
+                warn!(
+                    ws_idle_timeout_secs = WS_IDLE_TIMEOUT_SECS,
+                    "relay WebSocket idle timeout; reconnecting"
+                );
+                return Ok(SessionExit::EndedNormally);
+            }
+            Ok(None) => return Ok(SessionExit::Shutdown),
+            Ok(Some(Some(Ok(m)))) => m,
+            Ok(Some(Some(Err(e)))) => return Err(e.into()),
+            Ok(Some(None)) => return Ok(SessionExit::EndedNormally),
         };
 
         if !msg.is_text() {

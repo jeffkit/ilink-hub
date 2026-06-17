@@ -1,0 +1,60 @@
+milestone: M6
+title: "SEC-010 Body Limit + SEC-007 Metrics Auth — 质量门禁对抗性审查"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+scope_audited:
+  - src/runtime/serve.rs
+  - src/server/mod.rs
+  - src/server/routes.rs
+  - tests/breaking_changes.rs
+  - tests/e2e_wechat_simulation.rs
+  - tests/metrics_auth_tests.rs
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m6/review-request.yaml
+
+findings:
+  - id: A-M6-1
+    severity: INFO
+    status: RESOLVED
+    cwe: CWE-400 (Uncontrolled Resource Consumption)
+    title: >-
+      Evaluation of Graceful Shutdown Queue Drain Loop and Timeout Fallback
+    location: src/runtime/serve.rs:695-748
+    description: >-
+      The graceful shutdown sequence implements a loop `drain_queues_before_shutdown` that blocks the Axum shutdown signal
+      until all per-vtoken queues are empty. Since Axum remains fully active and accepting requests during this period,
+      continuous message traffic from upstream could theoretically prevent the queues from emptying. This is successfully
+      mitigated by the deadline condition (`tokio::time::Instant::now() >= deadline`), which forcefully breaks the loop
+      after `ILINK_SHUTDOWN_DRAIN_SECS` (default 30 seconds), preventing the shutdown process from hanging indefinitely.
+    impact: >-
+      Prevents the service from hanging on shutdown during high traffic while still providing a window for client updates to be pulled.
+    recommended_fix: >-
+      No change is necessary. The current timeout mechanism is robust. Operators can tune the duration via `ILINK_SHUTDOWN_DRAIN_SECS`.
+    test_gap: >-
+      None. The boundary unit test `drain_times_out_when_queue_not_empty` verifies this behavior using virtual time manipulation.
+
+pass_items:
+  - "All verification commands (cargo fmt, cargo clippy, cargo test, cargo build, desktop frontend build, desktop tauri check) execute and pass successfully with zero errors or warnings."
+  - "Memory Safety: No unsafe blocks are introduced or modified in the production codebase. Safe Rust patterns are adhered to."
+  - "Data Races & Concurrency: RwLock guards in the metrics endpoint and DashMap guards in the message queue are kept short and do not cross await points, preventing deadlocks."
+  - "Tokio Async Traps: Standard async yield points (sleep, await) are correctly utilized in long loops to prevent blocking the async runtime executor threads."
+  - "OWASP & Security: Authentication for metrics and request body limits are robustly verified, preventing unauthenticated metrics access and Denial of Service (DoS) attacks."
+
+verdict_rationale: >-
+  PASS.
+  The M6 quality gate has been fully met. All compilation, linting, testing, and formatting checks are 100% green.
+  The underlying security features (SEC-010 request body size limit and SEC-007 metrics endpoint authentication)
+  are correctly implemented, verified by robust unit and integration tests, and introduce no memory safety,
+  concurrency, or asynchronous runtime defects.
+
+sign_off:
+  status: "PASS"
+  next_action: "Proceed to M7 (Documentation & Completion) to finalize the work and mark security todo items as complete."
+  blocking_findings: []

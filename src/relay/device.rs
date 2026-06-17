@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use percent_encoding;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -151,8 +152,8 @@ pub fn validate_device_id(id: &str) -> bool {
 ///     treat `//authority` as the host and rewrite the destination.
 ///   * query strings (`?...`) and fragments (`#...`) — relay-supplied
 ///     noise that the local hub has no contract for.
-///   * path traversal (`..`) — belt-and-braces, the forwarded path is
-///     appended verbatim to `hub_base`.
+///   * path traversal (`..`) — checked on both the literal path **and** the
+///     percent-decoded form to prevent `%2e%2e` bypass (SEC-011).
 ///   * anything that does not start with the single `/hub/pair/` prefix.
 pub fn is_allowed_relay_path(path: &str) -> bool {
     if !path.starts_with('/') {
@@ -163,7 +164,15 @@ pub fn is_allowed_relay_path(path: &str) -> bool {
     if path.starts_with("//") {
         return false;
     }
-    if path.contains("..") || path.contains('?') || path.contains('#') {
+    if path.contains('?') || path.contains('#') {
+        return false;
+    }
+    // Check for path traversal on both the raw bytes and the percent-decoded
+    // form to prevent `%2e%2e` / `%2E.` / `.%2e` bypass (SEC-011).
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8_lossy()
+        .into_owned();
+    if path.contains("..") || decoded.contains("..") {
         return false;
     }
     path.starts_with("/hub/pair/")
@@ -209,5 +218,22 @@ mod tests {
         assert!(!is_allowed_relay_path("hub/pair/abc"));
         assert!(!is_allowed_relay_path(""));
         assert!(!is_allowed_relay_path("/"));
+    }
+
+    /// SEC-011: URL-encoded path traversal variants must be rejected.
+    /// `is_allowed_relay_path` must decode the path before the `..` check so
+    /// that `%2e%2e`, `%2E%2E`, `%2E.`, and `.%2e` are all blocked.
+    #[test]
+    fn relay_path_rejects_url_encoded_path_traversal() {
+        // All-encoded: %2e%2e
+        assert!(!is_allowed_relay_path("/hub/pair/%2e%2e/admin"));
+        // Mixed-case: %2E%2E
+        assert!(!is_allowed_relay_path("/hub/pair/%2E%2E/admin"));
+        // Half-encoded: %2E.
+        assert!(!is_allowed_relay_path("/hub/pair/%2E./admin"));
+        // Half-encoded: .%2e
+        assert!(!is_allowed_relay_path("/hub/pair/.%2e/admin"));
+        // Double-slash variant after decoding.
+        assert!(!is_allowed_relay_path("/hub/pair/%2e%2e/%2e%2e/etc/passwd"));
     }
 }

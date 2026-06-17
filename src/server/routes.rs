@@ -404,11 +404,16 @@ pub async fn sendmessage(
         // the outbound-origin footer, avoiding two identical DB queries per message.
         active_session = match replied_session_name.clone() {
             Some(n) => Some(n),
-            None => state
-                .store
-                .get_active_session_name(&vctx, &vtoken)
-                .await
-                .ok(),
+            None => tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                state.store.get_active_session_name(&vctx, &vtoken),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                warn!(vctx = %vctx, "get_active_session_name timed out");
+                Err(anyhow::anyhow!("timed out"))
+            })
+            .ok(),
         };
 
         // Read cli_session_id from hub_ext and persist it to the correct session.
@@ -419,11 +424,15 @@ pub async fn sendmessage(
                     let session_name = active_session
                         .clone()
                         .unwrap_or_else(|| "default".to_string());
-                    if let Err(e) = state
-                        .store
-                        .set_backend_session(&vctx, &vtoken, &session_name, &t)
-                        .await
-                    {
+                    let set_result = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        state
+                            .store
+                            .set_backend_session(&vctx, &vtoken, &session_name, &t),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("set_backend_session timed out")));
+                    if let Err(e) = set_result {
                         warn!(error = %e, vctx = %vctx, "failed to persist backend session");
                     }
                 }

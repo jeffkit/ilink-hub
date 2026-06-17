@@ -1,0 +1,36 @@
+milestone: M2
+title: "SEC-010 Body Limit — 实施对抗性审查"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_authentication
+  - cwe_classification
+
+scope_audited:
+  - src/server/mod.rs
+  - tests/breaking_changes.rs
+  - docs/exec-plans/active/sec-body-limit-metrics-auth/reviews/m2/review-request.yaml
+
+findings: []
+
+pass_items:
+  - "The baseline quality gate (fmt, clippy, unit tests, cargo build) all pass on HEAD."
+  - "Memory Safety: No unsafe blocks are introduced. Memory management is strictly handled by Rust compiler."
+  - "Data Race: Shared states are protected. No locks are held across asynchronous await points, preventing thread blocking."
+  - "Tokio Async Traps: Standard axum middlewares and extractors are used. No blocking calls are executed in the asynchronous thread pool."
+  - "OWASP Security: Global 256 KB body size limit effectively mitigates DoS attacks (CWE-400), while the 4 MB route-specific limit for `/ilink/bot/sendmessage` permits larger valid payloads."
+
+verdict_rationale: >-
+  PASS.
+  Milestone M2 is successfully implemented. The configuration of `DefaultBodyLimit` in `src/server/mod.rs` correctly applies a 256 KB limit globally and a 4 MB override for the `/ilink/bot/sendmessage` endpoint.
+  The new integration tests in `tests/breaking_changes.rs` cover the limits and boundaries (limit vs limit + 1 byte) precisely and all pass.
+  No security vulnerabilities, data races, or asynchronous traps were identified in this implementation.
+
+sign_off:
+  status: "PASS"
+  next_action: "Proceed to M3 (Metrics Auth implementation)."
+  blocking_findings: []

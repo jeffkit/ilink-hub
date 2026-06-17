@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2088,6 +2088,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "lru",
+ "percent-encoding",
  "qrcode",
  "rand 0.8.6",
  "rand_core 0.6.4",

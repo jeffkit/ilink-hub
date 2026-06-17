@@ -4,6 +4,33 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-17
+
+### Bridge — B-01 session worker 指数退避
+
+**修复**
+
+- **CLI 崩溃后增加指数退避**：`run_session_worker` 对连续失败的 `handle_one_message` 调用实施指数退避（1s → 2s → 4s → … 最大 60s），防止 CLI 不可用时产生 tight crash-loop。成功处理后退避计数器重置为 0。
+
+### Pairing — SEC-002 Scanned 阶段 60s 窗口
+
+**修复**
+
+- **QR 扫码后 confirm 窗口收窄至 60s**：`PairingSession` 新增 `scanned_at` 字段，`mark_scanned` 记录扫码时刻，`is_expired`/`should_evict` 对 `Scanned` 状态使用 `SCANNED_TTL = 60s` 而非 `PAIRING_TTL = 600s`，降低 replay 窗口（SEC-002）。新增测试 `scanned_session_expires_after_scanned_ttl_not_pairing_ttl`。
+
+### Server — sendmessage DB 查询超时保护
+
+**修复**
+
+- **`sendmessage` 中 `get_active_session_name` / `set_backend_session` 添加 5s 超时**：SQLite 在高并发写入时若锁竞争严重，这两个调用原本无超时保护，现在与现有 `resolve_context_token_full` 调用保持一致的 5s 超时，超时时打印 `WARN` 并降级处理（不阻断消息发送）。
+
+### Relay — SEC-011 URL 解码路径穿越防护 + TO-03 WebSocket 单帧超时
+
+**修复**
+
+- **`is_allowed_relay_path` 增加 URL 解码检查**：新增 `percent-encoding` 依赖，对 relay 转发路径在字面和解码两个层面均检查 `..`，防止 `%2e%2e` / `%2E.` / `.%2e` 等编码绕过（SEC-011）。新增 5 个对抗性测试用例。
+- **WebSocket 单帧 120s 空闲超时**：`run_relay_session` 中 `read.next()` 现在受 `WS_IDLE_TIMEOUT_SECS = 120` 保护，超时后打印 `WARN` 并触发重连，防止半开连接无限挂起（TO-03）。
+
 ### Hub — 优雅停机队列 drain（ADR-001 方案 A）
 
 **新增**
@@ -16,6 +43,25 @@ All notable changes to this project will be documented in this file.
 - `docs/adr/002-in-memory-state-inventory.md`：内存状态全量盘点，记录各组件重启后的影响范围。
 - `docs/adr/003-sqlite-single-connection.md`：SQLite 单连接 `max_connections(1)` 设计决策与升级路径。
 - `docs/adr/004-fire-and-forget-persist.md`：ContextToken fire-and-forget 持久化的权衡与可观测性说明。
+
+### Store — DB 迁移版本追踪（H-1 修复）
+
+**修复**
+
+- **`run_migrations` 增加 `schema_version` 版本追踪**：v1–v5 各步骤在执行前先检查 `schema_version` 表，已应用的版本跳过，未应用的版本顺序执行，彻底解决"双轨维护"问题（架构审计 H-1）。每次 Hub 启动时迁移幂等，重复运行不会重跑已完成步骤。
+- **ALTER TABLE 失败不再静默吞掉**：v3（`CREATE UNIQUE INDEX`）和 v4（`CREATE INDEX`）失败时返回错误并阻断启动，而非 `warn!` 继续。v4 `ALTER TABLE ADD COLUMN` 正确处理"列已存在"的幂等场景（兼容从无 `schema_version` 版本升级的数据库）。
+- **修复 SQLite `ALTER TABLE ADD COLUMN` 兼容性**：SQLite 禁止将 `CURRENT_TIMESTAMP` 作为 `ALTER TABLE ADD COLUMN` 的 DEFAULT（被视为非常量表达式）。改为添加可空列 `TEXT`，所有 INSERT 语句显式传入 `CURRENT_TIMESTAMP`；`list_recent_context_tokens` 使用 `COALESCE(created_at, '')` 处理历史 NULL 行。
+- **`record_migration_run` 改为幂等**：使用 `ON CONFLICT DO NOTHING`，防止重复插入触发主键冲突。
+
+**新增测试**（`store::store_tests` 模块）：
+- `test_schema_version_tracking`：验证新建 DB 所有 5 个迁移均已应用
+- `test_migration_idempotency`：验证多次调用 `run_migrations` 不报错且版本不变
+- `test_migration_incremental_from_v2`：模拟 v2 旧库，验证 v3-v5 可增量升级
+
+**同步 `migrations/` SQL 文件**：
+- `migrations/0000_schema_version.sql`：`schema_version` 表文档参考（注：由代码自动创建，此文件为文档用途）
+- `migrations/0005_messages.sql`：新增，补全 v5 消息表迁移文件
+- `migrations/0001–0004`：`datetime('now')` 统一改为 `CURRENT_TIMESTAMP`
 
 ## [0.1.22] — 2026-06-17
 

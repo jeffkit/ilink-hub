@@ -101,16 +101,34 @@ impl UpstreamClient {
     }
 
     /// Calls `notifystart` — required before the bot can send messages.
+    ///
+    /// Parses the response body to surface iLink business-layer errors (e.g. `ret=-14`
+    /// which indicates session expiry) instead of discarding them silently.
     pub async fn notify_start(&self) -> Result<()> {
         let url = format!("{}/ilink/bot/msg/notifystart", self.base_url);
         let body = serde_json::json!({ "base_info": BaseInfo::default() });
-        let _ = self
+        let resp = self
             .client
             .post(&url)
             .headers(self.headers()?)
             .json(&body)
             .send()
-            .await?;
+            .await?
+            .error_for_status()?;
+
+        // Parse the body to surface iLink business errors.
+        // We tolerate JSON parse failures here — notifystart is best-effort.
+        if let Ok(parsed) = resp.json::<serde_json::Value>().await {
+            if let Some(ret) = parsed.get("ret").and_then(|v| v.as_i64()) {
+                if ret != 0 {
+                    let errmsg = parsed
+                        .get("errmsg")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(no errmsg)");
+                    tracing::warn!(ret, errmsg, "notifystart returned non-zero ret code");
+                }
+            }
+        }
         Ok(())
     }
 
