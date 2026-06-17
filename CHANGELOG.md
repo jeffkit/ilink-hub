@@ -4,15 +4,50 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.22] — 2026-06-17
+
+### Bridge — Cursor / Claude Code 修复
+
+**修复**
+
+- **Cursor bridge tool-use 场景回复丢失**：当 Cursor agent 在两轮之间使用工具时，最终回复文本只出现在 `result.result` 字段，而没有对应的 `assistant` 事件。原来的代码只从 `assistant` 事件流式发送 `ILINK_PARTIAL`，导致该场景下用户收不到回复。现在在 `result` 事件时判断 `result.result` 是否与最后一次发送的 partial 相同，若不同则额外发送一次 `ILINK_PARTIAL`。
+- **claude_code.rs 真实 JSON 数组格式回归测试**：新增基于 CLI v2.1.153+ 真实输出（含 `rate_limit_event`、`system/init` 等额外字段）的解析回归测试，防止序列化结构变更导致 oneshot 模式静默失效。
+
+**调整**
+
+- **Bridge 超时从 600s 调整为 1800s**：`cursor-agent.example.yaml` 和 `profiles-builtin.yaml` 中 `timeout_secs` 由 600 调整为 1800，避免复杂任务因超时被截断。
+
+## [0.1.21] — 2026-06-16
+
 ### Hub — 新增 `@<后端>` 快捷指令
 
 **新增**
 
 - **`@<名称> <消息>` 临时 @ 后端**：无需 `/use` 切换，直接 `@` 一个后端并发送消息，即可**临时**在该后端上**新建一个会话**处理这条消息，不改变当前 `/use` 的后端与活跃会话（性质与「引用回复」类似）。后端名取第一个空格之前的部分，名称与 `/use <名称>` 一致；`@` 优先级高于引用回复与当前路由；未匹配到已注册后端时整条消息按普通文本正常路由。要继续该临时会话，引用其回复即可。`/help` 帮助文案与 `docs/reference/commands.md` 已同步说明。
 
+### Bridge — ILINK_PARTIAL 流式支持
+
+**新增**
+
+- **内置 cursor profile 类型**：新增 `type: cursor`，自动管理 `--resume` 续接上下文，并通过 `ILINK_PARTIAL` 实现流式输出。
+- **内置 codex / agy profile 类型**：新增 `type: codex` 和 `type: agy`，统一升级为 `ILINK_PARTIAL` 流式。
+- **全部 CLI profile 升级流式**：`upgrade all CLI profiles to ILINK_PARTIAL streaming`。
+- **Bridge 本机主机名自动注册标签**：`fix(bridge): use local hostname as auto-registration label`。
+
+**修复**
+
+- **Hub 过滤空的 session-persist-only 消息**：footer 追加前先过滤空消息，避免发出空白气泡。
+- **Relay 客户端会话保活**：修复 relay client 每 5 秒被取消的问题，改为保持长连接。
+- **Hub 快捷指令与引用回复路由 fallback**：新增命令快捷方式，引用回复路由 footer-based fallback。
+- **Hub 出站 footer 格式**：em dash 前缀改为 markdown hr。
+
 ### 安全变更
 
 - **默认监听地址**：`serve` 默认监听地址由 `0.0.0.0:8765` 调整为 `127.0.0.1:8765`，防止默认情况下对局域网暴露未授权的管理接口。如果需要外部暴露（例如在 Docker 容器、虚拟机或需要局域网访问），请显式传入 `--addr 0.0.0.0:8765`。
+
+### 桌面版
+
+- **Desktop port 切换、bridge 目录隔离**：修复端口切换、bridge 目录隔离，以及 Hub URL 变更后自动重连。
 
 ## [0.1.20] — 2026-06-09
 
