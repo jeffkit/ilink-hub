@@ -1,0 +1,45 @@
+milestone: M3
+verdict: PASS
+reviewer: integration-test-coverage
+summary: >
+  M3 集成测试覆盖了 CORS 行为的完整维度：permissive 回退、list 模式允许/拒绝、
+  preflight 响应头验证、多 origin 支持、非法格式 panic、CorsLayer Clone 健全性。
+  共 10 个集成测试用例，所有验证命令全绿。
+
+files:
+  - path: tests/cors_tests.rs
+    kind: new
+    summary: "10 个集成测试：permissive 回退（2）、list 模式允许（3）、list 模式拒绝（2）、非法格式 panic（2）、Clone trait（1）"
+  - path: src/server/mod.rs
+    kind: modified
+    summary: "parse_origins / build_cors_layer 可见性从 fn 改为 pub fn，供集成测试调用"
+
+test_coverage:
+  permissive_fallback:
+    - permissive_allows_any_origin: "无 env var 时任意 origin 被允许，返回 *"
+    - permissive_preflight_returns_allow_methods: "无 env var 时 preflight 返回 allow-methods"
+  list_mode_allow:
+    - list_mode_allows_configured_origin: "单 origin 白名单允许"
+    - list_mode_allows_multiple_origins: "多 origin 白名单允许（a.com, b.com）"
+    - list_mode_preflight_includes_allow_methods_and_headers: "preflight 返回 allow-methods=* / allow-headers=*"
+  list_mode_reject:
+    - list_mode_rejects_unlisted_origin: "未列出 origin 不返回 allow-origin 头"
+    - list_mode_preflight_rejects_unlisted_origin: "preflight 对未列出 origin 不返回 allow-origin"
+  illegal_format:
+    - parse_origins_panics_on_bad_format: "无 scheme 的 origin panic"
+    - parse_origins_panics_on_mixed_bad_origin: "混合列表中含非法 origin panic"
+  sanity:
+    - cors_layer_is_cloneable: "CorsLayer 实现 Clone"
+
+verification:
+  fmt: pass
+  clippy: pass
+  test: "337 passed (254 unit + 83 integration)"
+  build: pass
+  desktop-frontend: pass
+  desktop-tauri: pass
+
+notes: |
+  测试通过 temp_env::with_var 隔离 env var 状态，避免并行测试相互干扰。
+  集成测试文件位于 tests/ 目录，作为外部 crate 测试 ilink_hub 的公开 API。
+  为支持外部测试，parse_origins 和 build_cors_layer 的可见性改为 pub。

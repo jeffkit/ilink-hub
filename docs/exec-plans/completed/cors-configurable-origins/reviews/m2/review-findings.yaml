@@ -1,0 +1,82 @@
+milestone: M2
+verdict: PASS
+reviewer: adversarial-rust-security
+summary: >
+  M2 边界处理与 scheme 验证通过了 Rust 安全与 OWASP/CORS 对抗性审查。
+  无内存安全问题、无 data race、无 tokio 异步陷阱。
+  CORS 安全属性满足 OWASP 要求。
+
+findings:
+  - severity: MEDIUM
+    category: correctness
+    title: "contains(\"://\") 为子串匹配，可能放过畸形值"
+    description: >
+      parse_origins 使用 s.contains("://") 来拒绝 * / null 等无 scheme 的 origin，
+      但 contains 是非锚定的子串匹配，理论上可能放过 "evil-://-example" 这类
+      包含 :// 但并非合法 URL 的字符串。
+    risk: >
+      实际风险极低：HeaderValue::from_str 提供二次验证（拒绝控制字符、非可见 ASCII），
+      且浏览器端 Origin 头遵循规范，不会发送畸形 origin。仅当操作者配置了畸形值且
+      攻击者能伪造匹配的 Origin 头时才可能被利用，但这在 HTTP 层面不可行。
+    recommendation: >
+      可选增强：使用 s.starts_with("http://") || s.starts_with("https://")
+      替代 contains("://")，以更严格地限定 scheme。当前实现可接受。
+
+  - severity: LOW
+    category: test
+    title: "origins_rejects_control_chars 测试命名与实现不匹配"
+    description: >
+      测试名为 origins_rejects_control_chars，但其输入 "bad\norigin" 实际被
+      contains("://") 检查拒绝，而非被显式的控制字符验证拒绝。如果未来有人
+      移除了 contains 检查，这个测试仍会通过（因为 HeaderValue::from_str
+      也会拒绝 \n），但测试的意图已改变。
+    risk: >
+      低。双层防御（contains + HeaderValue::from_str）都能捕获此输入。
+      但如果输入为 "https://evil\nInjected: x"（包含 :// 且包含控制字符），
+      当前测试不会覆盖到 —— 虽然 HeaderValue::from_str 仍然会拒绝它。
+    recommendation: >
+      可选：新增一个测试如 origins_rejects_control_chars_with_scheme，
+      输入 "https://evil.com\nX-Injected: true" 验证 HeaderValue::from_str
+      拒绝带 scheme 的含控制字符 origin。
+
+  - severity: LOW
+    category: code-quality
+    title: "cors_layer_is_cloneable_for_tower 测试无异步代码但使用了 #[tokio::test]"
+    description: >
+      cors_layer_is_cloneable_for_tower 测试不包含任何 .await，不需要 tokio runtime。
+      使用 #[test] 即可。
+    risk: 无安全风险，仅浪费一个 tokio runtime 的初始化和销毁。
+    recommendation: 将 #[tokio::test] 改为 #[test]。
+
+  - severity: INFO
+    category: architecture
+    title: "环境变量是进程级全局可变状态 —— 仅启动时安全"
+    description: >
+      build_cors_layer() 在 router 构建期间同步调用 env::var，此时服务器尚未启动，
+      无并发访问。测试中使用 temp_env crate 的全局互斥锁来序列化 env var 操作。
+    risk: 无。生产代码仅在启动时调用一次，测试代码已用 temp_env 保护。
+
+checks:
+  memory_safety:
+    status: pass
+    details: "无 unsafe 代码，无手动内存管理，所有分配由 Rust 所有权系统管理"
+  data_race:
+    status: pass
+    details: "Arc<HubState> 正确使用；CorsLayer 支持 Clone 且为不可变共享；env::var 仅在单线程启动路径调用"
+  tokio_async:
+    status: pass
+    details: "build_cors_layer() 在同步上下文中调用，正确；测试中使用 block_on 无死锁风险；无跨 await 持有非 Send 类型"
+  owasp_cors:
+    status: pass
+    details: >
+      1) 未启用 allow_credentials —— 默认安全；
+      2) Origin 验证两层防御：contains("://") + HeaderValue::from_str 阻止 HTTP 头注入；
+      3) 未列出的 origin 不会收到 Access-Control-Allow-Origin 响应头 —— 验证通过；
+      4) * / null 等特殊 origin 在解析阶段被拒绝；
+      5) permissive 回退仅在 env var 缺失时触发，且有 WARN 日志。
+  owasp_injection:
+    status: pass
+    details: "HeaderValue::from_str 拒绝 CR/LF 等控制字符，防止 HTTP 响应头注入"
+  owasp_configuration:
+    status: pass
+    details: "启动时 panic 策略（fail-fast）防止以不安全配置运行；permissive 回退不含 credentials"

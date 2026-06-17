@@ -1,0 +1,122 @@
+milestone: M1
+title: "CORS 可配置起源 — 对抗性安全/并发审查 (修复轮)"
+verdict: PASS
+date: 2026-06-17
+reviewer: "adversarial-rust-security"
+reviewer_focus:
+  - memory_safety
+  - data_race
+  - tokio_async_pitfalls
+  - owasp_cors_misconfiguration
+  - cwe_classification
+
+scope_audited:
+  - src/server/mod.rs
+  - Cargo.toml (dev-dependencies: temp-env)
+
+findings:
+  - id: A-M1-1
+    severity: HIGH
+    status: FIXED
+    cwe: CWE-942 (Permissive Cross-domain Policy with Untrusted Domains) / CWE-940 (Improper Verification of Source of a Communication Channel)
+    title: >-
+      CorsLayer::new() 缺少 allow_methods / allow_headers → 配置 ILINK_CORS_ORIGINS 后 preflight 请求静默失败
+    location: src/server/mod.rs:36-39
+    description: >-
+      build_cors_layer() 在非空 ILINK_CORS_ORIGINS 路径下构造 CorsLayer::new().allow_origin(AllowOrigin::list(origins))，
+      但 CorsLayer::new() 的默认值 allow_methods=Const(None)、allow_headers=Const(None)（tower-http 0.6.11 源码：
+      allow_methods.rs:127-130、allow_headers.rs:107-111）。
+      当浏览器发起 preflight（OPTIONS + Access-Control-Request-Method）时，CorsLayer 在 mod.rs:678-682
+      调用 allow_methods.to_header(&parts)，因为 Const(None) 返回 None，所以响应中缺少
+      Access-Control-Allow-Methods 头，浏览器拒绝 preflight，实际请求永远无法到达服务端。
+      简单请求（GET、POST form-data）不受影响，但任何带 Content-Type: application/json 或自定义头的 POST
+      请求会完全断掉。之前 CorsLayer::permissive() 设置了 allow_methods(Any) + allow_headers(Any)，
+      所以旧行为无此问题。配置 ILINK_CORS_ORIGINS 的用户期望只改变 origin 限制，而不是破坏现有功能。
+    impact: >-
+      配置了 ILINK_CORS_ORIGINS 后，所有需要 preflight 的跨域请求（如 application/json 的 POST）
+      将无法通过 CORS 校验，导致 bot API 不可用。用户可能因此放弃配置 ILINK_CORS_ORIGINS，回退到
+      permissive 模式，削弱整体安全性。
+    fix_applied: >-
+      在 build_cors_layer() 的 list 分支加上 .allow_methods(Any) 和 .allow_headers(Any)，
+      保持与 permissive() 一致的 method/header 宽松策略，仅限制 origin：
+      ```rust
+      CorsLayer::new()
+          .allow_origin(AllowOrigin::list(origins))
+          .allow_methods(Any)
+          .allow_headers(Any)
+      ```
+      添加 use tower_http::cors::Any;。
+    verification: >-
+      新增集成测试验证修复：
+      - list_mode_preflight_includes_allow_methods_and_headers: 验证 preflight OPTIONS 响应
+        包含 access-control-allow-methods: * 和 access-control-allow-headers: *
+      - list_mode_allows_configured_origin: 验证已配置 origin 的跨域 POST 正常通过
+      - list_mode_rejects_unlisted_origin: 验证未配置 origin 的 POST 不返回 allow-origin
+      - list_mode_preflight_rejects_unlisted_origin: 验证未配置 origin 的 preflight 不返回 allow-origin
+      - permissive_allows_any_origin: 验证无 env var 时退回到 permissive 模式
+      - permissive_preflight_returns_allow_methods: 验证 permissive 模式 preflight 正常
+
+  - id: A-M1-2
+    severity: LOW
+    status: NOTED
+    cwe: CWE-183 (Permissive List of Allowed Inputs)
+    title: >-
+      ILINK_CORS_ORIGINS=* 可配置通配符绕过，且 null origin 无防护
+    location: src/server/mod.rs:19-28 (parse_origins)
+    description: >-
+      parse_origins() 通过 HeaderValue::from_str() 校验每个 origin，该函数遵循 RFC 7230 合法字符集。
+      但以下值能通过校验并产生非预期行为：
+      1. "*" — 通配符 origin，HeaderValue::from_str("*") 成功，导致 AllowOrigin::list([*]) 对所有
+         origin 放行，等同于 permissive 模式。管理员可能误以为 "*" 意为模式匹配而非全放行。
+      2. "null" — null origin，可被 sandboxed iframe、data: URL、file: URL 触发。若配置
+         ILINK_CORS_ORIGINS=null，攻击者可在沙箱 iframe 中发起认证跨域请求，浏览器发送
+         Origin: null → 服务端返回 Access-Control-Allow-Origin: null → 攻击成功。
+      这是配置层面的 footgun，不是代码漏洞，但缺乏防御性校验会增加误配置风险。
+    impact: >-
+      管理员误配 ILINK_CORS_ORIGINS=* 或 ILINK_CORS_ORIGINS=null 会导致 CORS 限制形同虚设。
+    test_added: >-
+      新增对抗性测试锁定当前行为：
+      - origins_rejects_wildcard: 验证 "*" 通过 HeaderValue 校验（文档化 footgun）
+      - origins_accepts_null_origin: 验证 "null" 通过 HeaderValue 校验（文档化 footgun）
+    recommended_fix: >-
+      后续 milestone 可在 parse_origins() 中增加语义校验：拒绝 "*" 和 "null" 等危险值。
+
+  - id: A-M1-3
+    severity: INFO
+    status: NOTED
+    cwe: CWE-248 (Uncaught Exception)
+    title: >-
+      parse_origins() 对非法 origin 执行 panic — 启动即崩溃
+    location: src/server/mod.rs:24-26
+    description: >-
+      parse_origins() 中 unwrap_or_else(|_| panic!(...)) 在 HeaderValue::from_str 失败时
+      直接 panic。由于 build_cors_layer() 在 build_router() 中被同步调用（服务器启动阶段），
+      非法配置导致进程启动即崩溃，不会进入服务状态。这是 fail-fast 策略，从安全角度看优于
+      静默降级到 permissive，但也意味着一次配置错误即可导致整个服务不可用（服务可用性风险）。
+    impact: >-
+      启动失败，服务完全不可用。属于运维可用性问题而非安全漏洞。
+    status_note: 保持 fail-fast 策略不变。expect() 替代 panic! 仅风格差异。
+
+pass_items:
+  - "内存安全：零 unsafe 代码，无手动内存管理。"
+  - "Data Race：env::var 仅在 build_router() 启动时调用一次，CorsLayer 由 tower 内部 Clone 分发到各请求，无共享可变状态。"
+  - "Tokio 异步陷阱：build_cors_layer() 和 parse_origins() 均为同步函数，在 build_router() 中同步调用，不跨越 .await 持有锁，无 executor stall 风险。"
+  - "HeaderValue 校验：parse_origins 使用 HeaderValue::from_str() 进行输入校验，拒绝 CR/LF 等控制字符，防止 HTTP Header 注入（CWE-113）。测试 origins_rejects_control_chars 验证此行为。"
+  - "CORS 隔离正确：bot_cors 仅应用于 bot_api Router（line 63），admin_api 无 CORS 层，符合代码注释的设计意图。"
+  - "质量门全部通过：fmt、clippy、test (18 CORS tests + 250 other = 268 passed)、build (release)。"
+  - "新增对抗性集成测试：preflight OPTIONS 行为、origin 允许/拒绝、permissive 回退、env var 隔离。"
+
+verdict_rationale: >-
+  PASS。
+  A-M1-1（HIGH）已修复：build_cors_layer() 在非 permissive 路径下现在添加了
+  .allow_methods(Any) 和 .allow_headers(Any)，preflight 请求正确返回
+  Access-Control-Allow-Methods 和 Access-Control-Allow-Headers 头。
+  修复通过集成测试验证（包括 preflight 正常/拒绝场景、permissive 回退、origin 隔离）。
+  A-M1-2（LOW）和 A-M1-3（INFO）保留原评估，已添加文档化测试。
+  CI 流水线全部通过。
+
+sign_off:
+  status: "PASS"
+  next_action: "M1 签出完成。A-M1-2 的防御性校验（拒绝 * 和 null）可后续 milestone 跟进。"
+  resolved_findings:
+    - A-M1-1

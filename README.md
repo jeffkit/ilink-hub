@@ -367,6 +367,7 @@ an awaited write (or wrap it in a retry-with-backoff task and a bounded
 - **Use PostgreSQL for production** — SQLite works but isn't suited for high-concurrency deployments
 - **Rotate virtual tokens periodically** — re-register clients with a new name to get fresh vtokens
 - **Keep Hub on private network** — only expose port 8765 if needed; ideally put Nginx in front
+- **Configure CORS origins** — set `ILINK_CORS_ORIGINS` to a comma-separated list of allowed origins (e.g. `https://a.com,https://b.com`) to restrict cross-origin access to the bot API. When unset, the Hub falls back to permissive CORS (any origin allowed) with a WARN log. Origins must include the scheme (`https://` or `http://`); values without a scheme (e.g. `*`, `null`, bare hostnames) cause a startup error.
 
 ### Nginx example
 
