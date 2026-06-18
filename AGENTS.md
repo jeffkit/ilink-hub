@@ -22,6 +22,7 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 环境变量 | `docs/knowledge/api/configuration.md` | DATABASE_URL 等配置 |
 | force-dev | `docs/knowledge/dev-workflow/force-dev.md` | 启动/续跑 feature 分支 |
 | 常用命令 | `docs/knowledge/dev-workflow/common-commands.md` | cargo 命令速查 |
+| 发布部署 | `docs/knowledge/ops/release-and-deploy.md` | brew 发布三档路径、远程 Hub 部署 |
 | 部署加固 | `docs/knowledge/ops/deployment-hardening.md` | 生产部署安全清单 |
 
 ## 活跃执行计划
@@ -34,6 +35,7 @@ docs/knowledge/index.md    ← 入口，先读这里
 - 特性开发**禁止**在 main 分支直接提交，通过 force-dev worktree 隔离
 - commit **禁止**添加 `Co-authored-by` 信息
 - Rust 生产路径**禁止**裸 `unwrap()`，用 `thiserror` + `?` 传播
+- 本地部署 hub/bridge **必须经 brew**（`/opt/homebrew/bin`）并**递增版本号**，**禁止** `deploy-local-mac.sh` 裸拷 `~/.local/bin` 覆盖。日常调试用 `scripts/deploy-local-brew.sh`（方案 2），patch 对外用 `v*-mac` tag（方案 1），minor/major 走完整 `release.yml`。详见[发布与部署规范](docs/knowledge/ops/release-and-deploy.md)
 
 ## 提交前检查清单
 

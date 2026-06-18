@@ -1,0 +1,223 @@
+name: Release (mac-fast)
+
+# 方案 1：patch 级「发出去」的快速规范发布。
+# 只构建 macOS（arm64 + x86_64）的 ilink-hub + ilink-hub-bridge，上传到滚动预发布
+# `mac-latest`，并更新 jeffkit/homebrew-tap，让 `brew upgrade` 立即拿到新版本。
+# 跳过 linux / windows / desktop / crates.io，耗时 ~5 分钟（完整 release 30+ 分钟）。
+#
+# 触发：
+#   - 手动 dispatch，填 version（如 0.2.2）
+#   - 打 `v*-mac` tag（如 v0.2.2-mac），自动取版本号
+#
+# 注意：用固定 tag `mac-latest`（非 `v*`），不会触发完整 release.yml，也不会污染正式
+# 版本的 GitHub Release。minor/major 仍走完整 release.yml（打 vX.Y.0 tag）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（不含 v，例如 0.2.2）"
+        required: true
+        type: string
+  push:
+    tags:
+      - 'v*-mac'
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: ilink-hub
+  ROLLING_TAG: mac-latest
+
+permissions:
+  contents: write
+
+jobs:
+  resolve-version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [[ -n "${{ github.event.inputs.version }}" ]]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            REF="${{ github.ref_name }}"   # e.g. v0.2.2-mac
+            VER="${REF#v}"; VER="${VER%-mac}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "resolved version: ${VER}"
+
+  build-mac:
+    name: Build (${{ matrix.name }})
+    needs: resolve-version
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - name: macos-aarch64
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macfast-${{ matrix.target }}
+
+      - name: Build hub + bridge
+        run: cargo build --target ${{ matrix.target }} --release --all-features --bin ilink-hub --bin ilink-hub-bridge
+
+      - name: Stage binaries
+        run: |
+          cp "target/${{ matrix.target }}/release/ilink-hub"        "ilink-hub-${{ matrix.name }}"
+          cp "target/${{ matrix.target }}/release/ilink-hub-bridge" "ilink-hub-bridge-${{ matrix.name }}"
+          chmod +x "ilink-hub-${{ matrix.name }}" "ilink-hub-bridge-${{ matrix.name }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macfast-${{ matrix.name }}
+          path: |
+            ilink-hub-${{ matrix.name }}
+            ilink-hub-bridge-${{ matrix.name }}
+          retention-days: 1
+
+  publish:
+    name: Publish rolling release + update tap
+    needs: [resolve-version, build-mac]
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Update rolling pre-release (mac-latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # 用固定 tag mac-latest 承载 macOS 产物；删旧资产再传，避免堆积。
+          if gh release view "$ROLLING_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$ROLLING_TAG" artifacts/* --repo "${{ github.repository }}" --clobber
+            gh release edit "$ROLLING_TAG" --repo "${{ github.repository }}" \
+              --title "macOS fast build (v${VERSION})" \
+              --notes "Rolling macOS-only build of ilink-hub + ilink-hub-bridge. Source version: v${VERSION}. Installed via \`brew upgrade jeffkit/tap/ilink-hub\`."
+          else
+            gh release create "$ROLLING_TAG" artifacts/* --repo "${{ github.repository }}" \
+              --prerelease --title "macOS fast build (v${VERSION})" \
+              --notes "Rolling macOS-only build of ilink-hub + ilink-hub-bridge. Source version: v${VERSION}."
+          fi
+
+      - name: Compute SHA256
+        id: sha
+        run: |
+          cd artifacts
+          echo "arm64=$(sha256sum ilink-hub-macos-aarch64        | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x86=$(sha256sum   ilink-hub-macos-x86_64         | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "arm64_bridge=$(sha256sum ilink-hub-bridge-macos-aarch64 | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "x86_bridge=$(sha256sum   ilink-hub-bridge-macos-x86_64  | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: jeffkit/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update Formula
+        env:
+          ARM64:        ${{ steps.sha.outputs.arm64 }}
+          X86:          ${{ steps.sha.outputs.x86 }}
+          ARM64_BRIDGE: ${{ steps.sha.outputs.arm64_bridge }}
+          X86_BRIDGE:   ${{ steps.sha.outputs.x86_bridge }}
+        run: |
+          BASE="https://github.com/${{ github.repository }}/releases/download/${ROLLING_TAG}"
+          FORMULA="homebrew-tap/Formula/ilink-hub.rb"
+          cat > "$FORMULA" <<RUBY
+          # typed: false
+          # frozen_string_literal: true
+
+          class IlinkHub < Formula
+            desc "iLink-compatible multiplexer hub for WeChat ClawBot — connect one WeChat account to multiple AI agent backends"
+            homepage "https://jeffkit.github.io/ilink-hub/"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "${BASE}/ilink-hub-macos-aarch64"
+                sha256 "${ARM64}"
+
+                resource "ilink_hub_bridge" do
+                  url "${BASE}/ilink-hub-bridge-macos-aarch64"
+                  sha256 "${ARM64_BRIDGE}"
+                end
+              else
+                url "${BASE}/ilink-hub-macos-x86_64"
+                sha256 "${X86}"
+
+                resource "ilink_hub_bridge" do
+                  url "${BASE}/ilink-hub-bridge-macos-x86_64"
+                  sha256 "${X86_BRIDGE}"
+                end
+              end
+            end
+
+            def install
+              if OS.mac? && Hardware::CPU.arm?
+                bin.install "ilink-hub-macos-aarch64" => "ilink-hub"
+                resource("ilink_hub_bridge").stage do
+                  bin.install "ilink-hub-bridge-macos-aarch64" => "ilink-hub-bridge"
+                end
+              elsif OS.mac?
+                bin.install "ilink-hub-macos-x86_64" => "ilink-hub"
+                resource("ilink_hub_bridge").stage do
+                  bin.install "ilink-hub-bridge-macos-x86_64" => "ilink-hub-bridge"
+                end
+              end
+            end
+
+            service do
+              run [opt_bin/"ilink-hub-bridge", "manager"]
+              keep_alive true
+              log_path var/"log/ilink-hub-bridge-manager.log"
+              error_log_path var/"log/ilink-hub-bridge-manager-error.log"
+              environment_variables(
+                RUST_LOG:        "info,ilink_hub_bridge=debug",
+                HOME:            Dir.home,
+                WEIXIN_BASE_URL: "http://your-hub-server:8765",
+                PATH:            "#{HOMEBREW_PREFIX}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+              )
+            end
+
+            test do
+              assert_match "ilink-hub", shell_output("#{bin}/ilink-hub --version")
+              assert_match "ilink-hub-bridge", shell_output("#{bin}/ilink-hub-bridge --version")
+            end
+          end
+          RUBY
+
+      - name: Commit and push
+        working-directory: homebrew-tap
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ilink-hub.rb
+          git diff --cached --quiet || git commit -m "chore: mac-fast bump ilink-hub to v${VERSION}"
+          git push

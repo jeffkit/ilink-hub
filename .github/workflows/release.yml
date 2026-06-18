@@ -126,6 +126,9 @@ jobs:
   build-desktop:
     name: Desktop (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    # Desktop (Tauri) installers are best-effort: a desktop build failure must NOT
+    # block the hub/bridge release or the Homebrew tap update (see create-release).
+    continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
@@ -332,7 +335,11 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build-native, publish-crates, build-desktop]
+    # Only require the native hub/bridge binaries + crates publish. The desktop
+    # (Tauri) build is best-effort and intentionally NOT a dependency, so a desktop
+    # failure can no longer skip the release and starve the Homebrew tap update
+    # (which is what kept brew stuck on an old version).
+    needs: [build-native, publish-crates]
     steps:
       - uses: actions/checkout@v4
 
