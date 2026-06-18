@@ -121,10 +121,9 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let shutdown_tx_clone = shutdown_tx.clone();
             tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    info!("Received Ctrl+C, shutting down");
-                    let _ = shutdown_tx_clone.send(true);
-                }
+                shutdown_on_signal().await;
+                info!("Received shutdown signal, shutting down");
+                let _ = shutdown_tx_clone.send(true);
             });
             drop(shutdown_tx);
             run_serve(
@@ -278,6 +277,32 @@ fn get_addr_default() -> String {
         }
     }
     "127.0.0.1:8765".to_string()
+}
+
+/// Wait for either Ctrl+C or SIGTERM (Unix only).
+/// On non-Unix platforms only Ctrl+C is listened to.
+async fn shutdown_on_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
 }
 
 fn get_hub_url_default() -> String {

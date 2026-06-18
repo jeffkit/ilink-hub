@@ -388,7 +388,7 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
         msg_type = msg.message_type.unwrap_or(0),
     )
 )]
-async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
+async fn dispatch_message(state: Arc<HubState>, msg: WeixinMessage) {
     // iLink does not echo bot-authored messages back through getupdates in practice, but
     // guard regardless: a bot copy (message_type == 2) must never be routed as a user message
     // (that would forward the Hub's own reply back into the backends).
@@ -452,197 +452,207 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             vtoken,
             session_override,
         } => {
-            let real_ctx = match msg.context_token.clone() {
-                Some(ctx) if !ctx.is_empty() => ctx,
-                _ => {
-                    warn!("message has no context_token, skipping dispatch");
-                    return;
-                }
-            };
-            let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
-            let group_id = msg.group_id.clone();
-
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &peer_user_id,
-                group_id.as_deref(),
-                None,
-            )
-            .await;
-
-            let store = state.store.clone();
-            let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
-            let metrics = state.metrics.clone();
-            let sem = state.persist_sem.clone();
-            tokio::spawn(async move {
-                let Ok(_permit) = sem.try_acquire() else {
-                    warn!("persist semaphore full, dropping context_token persist (forward)");
-                    metrics
-                        .persist_fire_and_forget_failures_forward
-                        .fetch_add(1, Ordering::Relaxed);
-                    return;
-                };
-                if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
-                    warn!(error = %e, "failed to persist context_token mapping");
-                    metrics
-                        .persist_fire_and_forget_failures_forward
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            });
-
-            let hub_ext =
-                build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
-
-            // Fire-and-forget: record user message to history.
-            if let Some(content) = msg.text().map(str::to_string) {
-                let session_name = hub_ext
-                    .as_ref()
-                    .and_then(|e| e.session_name.as_deref())
-                    .unwrap_or("default")
-                    .to_string();
-                let store = state.store.clone();
-                let (vctx3, vtoken3, peer3) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
-                let sem = state.persist_sem.clone();
-                tokio::spawn(async move {
-                    let Ok(_permit) = sem.try_acquire() else {
-                        return;
-                    };
-                    if let Err(e) = store
-                        .save_message(
-                            &vctx3,
-                            Some(&vtoken3),
-                            &session_name,
-                            &peer3,
-                            "user",
-                            &content,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to save user message to history");
-                    }
-                });
-            }
-
-            msg.context_token = Some(vctx);
-            msg.ilink_hub_ext = hub_ext;
-            push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg).await;
+            dispatch_forward(&state, msg, vtoken, session_override).await;
         }
         RoutingDecision::Broadcast => {
-            let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
-            let online = {
-                let registry = state.clients.registry.read().await;
-                registry
-                    .online_clients()
-                    .iter()
-                    .map(|c| c.vtoken.clone())
-                    .collect::<Vec<_>>()
-            };
-
-            if online.is_empty() {
-                warn!(from_user_id, "no online clients to dispatch to");
-                state
-                    .metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
-                    let to_uid = msg.from_user_id.as_deref().unwrap_or("");
-                    let reply_text = build_no_backend_reply(msg.text());
-                    debug!(to = %to_uid, "sending no-backend fallback reply");
-                    let reply = SendMessageRequest::reply(real_ctx, reply_text, to_uid);
-                    match state.ilink.upstream.send_message(reply).await {
-                        Err(e) => error!(error = %e, "failed to send no-clients reply"),
-                        Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
-                            warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected no-clients reply");
-                        }
-                        Ok(_) => {}
-                    }
-                } else {
-                    warn!(
-                        from_user_id,
-                        "no context_token in message, cannot send no-clients reply"
-                    );
-                }
-                return;
-            }
-
-            let real_ctx = match msg.context_token.clone() {
-                Some(ctx) if !ctx.is_empty() => ctx,
-                _ => {
-                    warn!("broadcast message has no context_token, skipping");
-                    return;
-                }
-            };
-            let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
-            let group_id = msg.group_id.clone();
-
-            // Shared vctx per conversation: sessions are isolated by (vctx, vtoken) so
-            // each backend stays independent, while routing-mode changes (broadcast → /use)
-            // don't break session continuity.
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &peer_user_id,
-                group_id.as_deref(),
-                None,
-            )
-            .await;
-            let vctx_by_vtoken: Vec<(String, String)> =
-                online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
-
-            // Batch-persist in one transaction (fire-and-forget).
-            {
-                let entries: Vec<(String, String, String)> = vctx_by_vtoken
-                    .iter()
-                    .map(|(_, vc)| (vc.clone(), real_ctx.clone(), peer_user_id.clone()))
-                    .collect();
-                let store = state.store.clone();
-                let metrics = state.metrics.clone();
-                let sem = state.persist_sem.clone();
-                tokio::spawn(async move {
-                    let Ok(_permit) = sem.try_acquire() else {
-                        warn!("persist semaphore full, dropping context_token batch-persist (broadcast)");
-                        metrics
-                            .persist_fire_and_forget_failures_broadcast
-                            .fetch_add(1, Ordering::Relaxed);
-                        return;
-                    };
-                    if let Err(e) = store.persist_context_tokens_batch(&entries).await {
-                        warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
-                        metrics
-                            .persist_fire_and_forget_failures_broadcast
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
-
-            // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
-            let pairs: Vec<(String, String)> = vctx_by_vtoken
-                .iter()
-                .map(|(vt, vc)| (vc.clone(), vt.clone()))
-                .collect();
-            let hub_ext_data = match state.store.get_hub_ext_batch(&pairs).await {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(error = %e, "get_hub_ext_batch failed; broadcast will proceed without HubExt");
-                    Default::default()
-                }
-            };
-
-            for (vtoken, vctx) in vctx_by_vtoken {
-                let hub_ext = hub_ext_data.get(&(vctx.clone(), vtoken.clone())).map(
-                    |(session_name, session_id)| HubExt {
-                        session_id: session_id.clone(),
-                        session_name: Some(session_name.clone()),
-                        cli_session_id: None,
-                    },
-                );
-                let mut msg_clone = msg.clone();
-                msg_clone.context_token = Some(vctx);
-                msg_clone.ilink_hub_ext = hub_ext;
-                push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg_clone).await;
-            }
+            dispatch_broadcast(state, msg).await;
         }
+    }
+}
+
+/// Route a single message to one specific backend vtoken.
+/// Handles vctx resolution, fire-and-forget context-token persistence,
+/// user-message history recording, and queue push.
+async fn dispatch_forward(
+    state: &Arc<HubState>,
+    mut msg: WeixinMessage,
+    vtoken: String,
+    session_override: Option<String>,
+) {
+    let real_ctx = match msg.context_token.clone() {
+        Some(ctx) if !ctx.is_empty() => ctx,
+        _ => {
+            warn!("message has no context_token, skipping dispatch");
+            return;
+        }
+    };
+    let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+    let group_id = msg.group_id.clone();
+
+    let vctx =
+        resolve_vctx_for_message(state, &real_ctx, &peer_user_id, group_id.as_deref(), None).await;
+
+    // Fire-and-forget: persist vctx → real_ctx mapping.
+    {
+        let store = state.store.clone();
+        let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
+        let metrics = state.metrics.clone();
+        let sem = state.persist_sem.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = sem.try_acquire() else {
+                warn!("persist semaphore full, dropping context_token persist (forward)");
+                metrics
+                    .persist_fire_and_forget_failures_forward
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
+                warn!(error = %e, "failed to persist context_token mapping");
+                metrics
+                    .persist_fire_and_forget_failures_forward
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    let hub_ext = build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
+
+    // Fire-and-forget: record user message to history.
+    if let Some(content) = msg.text().map(str::to_string) {
+        let session_name = hub_ext
+            .as_ref()
+            .and_then(|e| e.session_name.as_deref())
+            .unwrap_or("default")
+            .to_string();
+        let store = state.store.clone();
+        let (vctx3, vtoken3, peer3) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
+        let sem = state.persist_sem.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = sem.try_acquire() else {
+                return;
+            };
+            if let Err(e) = store
+                .save_message(
+                    &vctx3,
+                    Some(&vtoken3),
+                    &session_name,
+                    &peer3,
+                    "user",
+                    &content,
+                )
+                .await
+            {
+                warn!(error = %e, "failed to save user message to history");
+            }
+        });
+    }
+
+    msg.context_token = Some(vctx);
+    msg.ilink_hub_ext = hub_ext;
+    push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg).await;
+}
+
+/// Fan-out a message to all currently online backends.
+/// Handles the no-client fallback reply, vctx resolution, batch context-token persistence,
+/// batch HubExt lookup, and per-vtoken queue push.
+async fn dispatch_broadcast(state: Arc<HubState>, msg: WeixinMessage) {
+    let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
+    let online = {
+        let registry = state.clients.registry.read().await;
+        registry
+            .online_clients()
+            .iter()
+            .map(|c| c.vtoken.clone())
+            .collect::<Vec<_>>()
+    };
+
+    if online.is_empty() {
+        warn!(from_user_id, "no online clients to dispatch to");
+        state
+            .metrics
+            .messages_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
+            let to_uid = msg.from_user_id.as_deref().unwrap_or("");
+            let reply_text = build_no_backend_reply(msg.text());
+            debug!(to = %to_uid, "sending no-backend fallback reply");
+            let reply = SendMessageRequest::reply(real_ctx, reply_text, to_uid);
+            match state.ilink.upstream.send_message(reply).await {
+                Err(e) => error!(error = %e, "failed to send no-clients reply"),
+                Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
+                    warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected no-clients reply");
+                }
+                Ok(_) => {}
+            }
+        } else {
+            warn!(
+                from_user_id,
+                "no context_token in message, cannot send no-clients reply"
+            );
+        }
+        return;
+    }
+
+    let real_ctx = match msg.context_token.clone() {
+        Some(ctx) if !ctx.is_empty() => ctx,
+        _ => {
+            warn!("broadcast message has no context_token, skipping");
+            return;
+        }
+    };
+    let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+    let group_id = msg.group_id.clone();
+
+    // Shared vctx per conversation: sessions are isolated by (vctx, vtoken) so
+    // each backend stays independent, while routing-mode changes (broadcast → /use)
+    // don't break session continuity.
+    let vctx =
+        resolve_vctx_for_message(&state, &real_ctx, &peer_user_id, group_id.as_deref(), None).await;
+    let vctx_by_vtoken: Vec<(String, String)> =
+        online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
+
+    // Batch-persist in one transaction (fire-and-forget).
+    {
+        let entries: Vec<(String, String, String)> = vctx_by_vtoken
+            .iter()
+            .map(|(_, vc)| (vc.clone(), real_ctx.clone(), peer_user_id.clone()))
+            .collect();
+        let store = state.store.clone();
+        let metrics = state.metrics.clone();
+        let sem = state.persist_sem.clone();
+        tokio::spawn(async move {
+            let Ok(_permit) = sem.try_acquire() else {
+                warn!("persist semaphore full, dropping context_token batch-persist (broadcast)");
+                metrics
+                    .persist_fire_and_forget_failures_broadcast
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            };
+            if let Err(e) = store.persist_context_tokens_batch(&entries).await {
+                warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
+                metrics
+                    .persist_fire_and_forget_failures_broadcast
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
+    let pairs: Vec<(String, String)> = vctx_by_vtoken
+        .iter()
+        .map(|(vt, vc)| (vc.clone(), vt.clone()))
+        .collect();
+    let hub_ext_data = match state.store.get_hub_ext_batch(&pairs).await {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(error = %e, "get_hub_ext_batch failed; broadcast will proceed without HubExt");
+            Default::default()
+        }
+    };
+
+    for (vtoken, vctx) in vctx_by_vtoken {
+        let hub_ext =
+            hub_ext_data
+                .get(&(vctx.clone(), vtoken.clone()))
+                .map(|(session_name, session_id)| HubExt {
+                    session_id: session_id.clone(),
+                    session_name: Some(session_name.clone()),
+                    cli_session_id: None,
+                });
+        let mut msg_clone = msg.clone();
+        msg_clone.context_token = Some(vctx);
+        msg_clone.ilink_hub_ext = hub_ext;
+        push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg_clone).await;
     }
 }
 
@@ -1297,58 +1307,69 @@ async fn resolve_vctx_for_message(
 ///
 /// When `session_override` is provided (from a quote-reply), that session is used directly
 /// instead of the current active session, so the message is routed to the correct conversation.
+/// In the override case we still need one DB query to fetch the `backend_session_id`.
+/// Without an override we use `get_active_session_full` which resolves both the active
+/// session name and its backend_session_id in a single query.
 async fn build_hub_ext_for_vctx(
     store: &Store,
     vctx: &str,
     vtoken: &str,
     session_override: Option<String>,
 ) -> Option<HubExt> {
-    let session_name = match session_override {
-        Some(name) if !name.is_empty() => name,
-        _ => match tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            store.get_active_session_name(vctx, vtoken),
-        )
-        .await
-        {
-            Ok(Ok(name)) => name,
-            Ok(Err(e)) => {
-                warn!("Failed to get active session name from DB for {vctx}: {e}");
-                "default".to_string()
-            }
-            Err(_) => {
-                warn!("Timeout getting active session name from DB for {vctx}");
-                "default".to_string()
-            }
-        },
-    };
-
-    let session_id = match tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        store.get_backend_session(vctx, vtoken, &session_name),
-    )
-    .await
-    {
-        Ok(Ok(Some(s))) => {
-            let t = s.trim().to_string();
-            (!t.is_empty()).then_some(t)
+    match session_override {
+        // Quote-reply override: session is already known, only need the backend_session_id.
+        Some(name) if !name.is_empty() => {
+            let session_id = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.get_backend_session(vctx, vtoken, &name),
+            )
+            .await
+            {
+                Ok(Ok(Some(s))) => {
+                    let t = s.trim().to_string();
+                    (!t.is_empty()).then_some(t)
+                }
+                Ok(Ok(None)) => None,
+                Ok(Err(e)) => {
+                    warn!("Failed to get backend session from DB for {vctx}/{name}: {e}");
+                    None
+                }
+                Err(_) => {
+                    warn!("Timeout getting backend session from DB for {vctx}/{name}");
+                    None
+                }
+            };
+            Some(HubExt {
+                session_id,
+                session_name: Some(name),
+                cli_session_id: None,
+            })
         }
-        Ok(Ok(None)) => None,
-        Ok(Err(e)) => {
-            warn!("Failed to get backend session from DB for {vctx}/{session_name}: {e}");
-            None
+        // Normal path: resolve active session name and backend_session_id together.
+        _ => {
+            let (session_name, session_id) = match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                store.get_active_session_full(vctx, vtoken),
+            )
+            .await
+            {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    warn!("Failed to get active session from DB for {vctx}: {e}");
+                    ("default".to_string(), None)
+                }
+                Err(_) => {
+                    warn!("Timeout getting active session from DB for {vctx}");
+                    ("default".to_string(), None)
+                }
+            };
+            Some(HubExt {
+                session_id,
+                session_name: Some(session_name),
+                cli_session_id: None,
+            })
         }
-        Err(_) => {
-            warn!("Timeout getting backend session from DB for {vctx}/{session_name}");
-            None
-        }
-    };
-
-    Some(HubExt {
-        session_id,
-        session_name: Some(session_name),
-        cli_session_id: None,
-    })
+    }
 }
 
 // ─── Static responder helpers ─────────────────────────────────────────────────
