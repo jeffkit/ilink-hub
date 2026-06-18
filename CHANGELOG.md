@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Bridge — claude_code 多模态（图片）支持
+
+**新增**
+
+- **claude_code 内置 bridge 支持图片输入**：当 bridge 检测到 `ILINK_IMAGE_URL` 环境变量（由前面几层的 media env 注入产生），自动切换到 Claude Code CLI 的 `--input-format stream-json --output-format stream-json` 双向流模式，在 stdin 上写入一行 `SDKUserMessage`（与 TS SDK 内部协议一致），`content` 字段为 `[text block, image block]` 数组，image block 携带 base64 编码的图片。图片在发送前通过 reqwest 从微信 CDN 下载，遵循 Anthropic API 5MB 限制。Session 续接（`--resume`）通过 `SDKUserMessage.session_id` 字段保留。流式 output 解析（`ILINK_PARTIAL`、`ILINK_SESSION`）保持不变。
+
+**参考**：协议细节见 `fake-cc` 项目 `src/server/directConnectManager.ts:130` 和 `src/utils/teleport/api.ts:376`。
+
 ## [0.2.0] — 2026-06-17
 
 ### Bridge — B-01 session worker 指数退避

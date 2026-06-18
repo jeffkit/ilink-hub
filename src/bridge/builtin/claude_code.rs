@@ -17,7 +17,10 @@
 //! fresh session so the user gets a response rather than a bare error.
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
@@ -50,6 +53,11 @@ struct ClaudeContentBlock {
     block_type: Option<String>,
     text: Option<String>,
 }
+
+/// Anthropic API hard limit for a single image (~5MB). The Claude Code CLI
+/// forwards the base64 string verbatim to the API, so we enforce this client-side
+/// to avoid opaque upstream errors.
+const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 pub async fn run() -> Result<()> {
     let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
@@ -98,11 +106,28 @@ async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Resu
 /// All visible response text is streamed via ILINK_PARTIAL. When the model uses tools
 /// between turns, the final assistant reply may only appear in `result.result` (with no
 /// preceding `assistant` event); we emit it as an extra ILINK_PARTIAL in that case.
+///
+/// When the inbound message contains an image (`ILINK_IMAGE_URL` set by the bridge),
+/// switches to the bidirectional `stream-json` input/output mode and writes a single
+/// `SDKUserMessage` to stdin whose `content` is an array of text + image blocks. This
+/// is the same protocol the Claude Code TS SDK uses internally.
 async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>> {
+    let image_url = std::env::var("ILINK_IMAGE_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
+
+    if let Some(url) = image_url {
+        return stream_claude_with_image(message, session_id, &url).await;
+    }
+
     let mut args: Vec<String> = vec![
         "--output-format".into(),
         "stream-json".into(),
         "--dangerously-skip-permissions".into(),
+        // In -p (non-interactive) mode stdin is /dev/null, so AskUserQuestion would
+        // block the process forever with no visible prompt to the user.
+        "--disallowed-tools".into(),
+        "AskUserQuestion".into(),
     ];
 
     if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
@@ -223,6 +248,226 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     Ok(found_session_id)
 }
 
+/// Multimodal variant: download the image at `url`, base64-encode it, and feed Claude
+/// via the bidirectional `stream-json` protocol (a single `SDKUserMessage` written to
+/// stdin, with `content = [text block, image block]`).
+///
+/// `--input-format stream-json` requires `--output-format stream-json` and uses `--print`
+/// mode under the hood. Session continuity is provided by the `session_id` field of
+/// `SDKUserMessage` (empty string = new session, otherwise resume that UUID).
+async fn stream_claude_with_image(
+    message: &str,
+    session_id: &str,
+    image_url: &str,
+) -> Result<Option<String>> {
+    let (media_type, b64_data) = download_image_as_base64(image_url).await?;
+
+    let mut args: Vec<String> = vec![
+        "--input-format".into(),
+        "stream-json".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--dangerously-skip-permissions".into(),
+        "--disallowed-tools".into(),
+        "AskUserQuestion".into(),
+    ];
+
+    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
+        if !model.trim().is_empty() {
+            args.push("--model".into());
+            args.push(model.trim().to_string());
+        }
+    }
+
+    args.push("-p".into());
+
+    let mut cmd = Command::new("claude");
+    cmd.args(&args);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn `claude`; ensure it is installed and in PATH")?;
+
+    let mut child_stdin = child.stdin.take().context("stdin pipe missing")?;
+    let child_stdout = child.stdout.take().context("stdout pipe missing")?;
+    let child_stderr = child.stderr.take().context("stderr pipe missing")?;
+
+    // Drain stderr in background to prevent pipe buffer deadlock.
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        tokio::io::BufReader::new(child_stderr)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    // Build SDKUserMessage: {type:"user", message:{role:"user", content:[text, image]}, session_id, parent_tool_use_id:null}
+    // The protocol is line-delimited JSON on stdin, terminated by a newline.
+    // See fake-cc/src/server/directConnectManager.ts:130 and src/utils/teleport/api.ts:376.
+    let user_message = json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": [
+                { "type": "text", "text": message },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64_data,
+                    }
+                }
+            ]
+        },
+        "parent_tool_use_id": null,
+        "session_id": session_id,
+    });
+
+    let line = serde_json::to_string(&user_message)? + "\n";
+    use tokio::io::AsyncWriteExt;
+    child_stdin
+        .write_all(line.as_bytes())
+        .await
+        .context("write SDKUserMessage to claude stdin")?;
+    // Close stdin so the CLI knows no more user input is coming and can finalize the turn.
+    drop(child_stdin);
+
+    // Reuse the same output-parsing loop as the text-only path.
+    let mut reader = tokio::io::BufReader::new(child_stdout);
+    let mut out_line = String::new();
+    let mut found_session_id: Option<String> = None;
+    let mut last_partial: Option<String> = None;
+
+    loop {
+        out_line.clear();
+        let n = reader
+            .read_line(&mut out_line)
+            .await
+            .context("read claude stdout")?;
+        if n == 0 {
+            break;
+        }
+
+        let trimmed = out_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let Ok(event) = serde_json::from_str::<ClaudeStreamEvent>(trimmed) else {
+            continue;
+        };
+
+        match event.event_type.as_deref() {
+            Some("assistant") => {
+                if let Some(msg) = &event.message {
+                    if let Some(blocks) = &msg.content {
+                        let text: String = blocks
+                            .iter()
+                            .filter(|b| b.block_type.as_deref() == Some("text"))
+                            .filter_map(|b| b.text.as_deref())
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !text.is_empty() {
+                            println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
+                            std::io::Write::flush(&mut std::io::stdout()).ok();
+                            last_partial = Some(text);
+                        }
+                    }
+                }
+            }
+            Some("result") => {
+                found_session_id = event.session_id;
+                if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
+                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
+                    if !already_sent {
+                        println!("ILINK_PARTIAL:{}", serde_json::to_string(&result_text)?);
+                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await.context("wait for claude")?;
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if !status.success() && found_session_id.is_none() {
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else {
+            String::from("(no output)")
+        };
+        anyhow::bail!(
+            "claude exited with status {:?}\nstderr: {detail}",
+            status.code()
+        );
+    }
+
+    Ok(found_session_id)
+}
+
+/// Download an image at `url` and return `(media_type, base64_data)`. Enforces
+/// the 5MB Anthropic API limit to surface a clear error early.
+async fn download_image_as_base64(url: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("build reqwest client for image download")?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("download image from {url}"))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "image download failed: HTTP {} for {url}",
+            response.status()
+        );
+    }
+
+    // Trust the server's Content-Type for the media_type field; fall back to image/jpeg
+    // since that's the most common unlabelled image format. The downstream API tolerates
+    // any image/* media type as long as bytes match.
+    let media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .filter(|s| s.starts_with("image/"))
+        .unwrap_or_else(|| "image/jpeg".to_string());
+
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read image body chunk")?;
+        // Fail fast if we cross the limit during streaming so we don't keep downloading.
+        if buf.len() + chunk.len() > ANTHROPIC_MAX_IMAGE_BYTES {
+            anyhow::bail!(
+                "image too large: exceeds Anthropic limit ({} bytes)",
+                ANTHROPIC_MAX_IMAGE_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    if buf.is_empty() {
+        anyhow::bail!("image download returned empty body for {url}");
+    }
+
+    Ok((media_type, B64.encode(&buf)))
+}
+
 /// Call `claude --output-format json` (one-shot) and print the full reply text to stdout
 /// so the bridge captures it as the final response body.  No `ILINK_PARTIAL:` lines are
 /// emitted; the session ID is written as `ILINK_SESSION:<id>` on the first stdout line.
@@ -231,6 +476,8 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
         "--output-format".into(),
         "json".into(),
         "--dangerously-skip-permissions".into(),
+        "--disallowed-tools".into(),
+        "AskUserQuestion".into(),
     ];
 
     if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
@@ -399,5 +646,160 @@ mod tests {
             result_event.session_id.as_deref(),
             Some("7cd2894b-14b2-4f85-b5e8-6fb8bc571cf0")
         );
+    }
+
+    /// Verify the SDKUserMessage shape we write to stdin for multimodal input.
+    /// Mirrors the protocol in `fake-cc/src/server/directConnectManager.ts:130` and
+    /// `src/utils/teleport/api.ts:376` (the TS SDK's internal format).
+    #[test]
+    fn sdk_user_message_has_text_and_image_blocks() {
+        let message = "describe this image";
+        let session_id = "sess-123";
+        let media_type = "image/png";
+        let b64_data = "iVBORw0KGgo="; // tiny base64 placeholder
+
+        let user_message = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": message },
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": b64_data,
+                        }
+                    }
+                ]
+            },
+            "parent_tool_use_id": null,
+            "session_id": session_id,
+        });
+
+        let serialized = serde_json::to_string(&user_message).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(parsed["type"], "user");
+        assert_eq!(parsed["message"]["role"], "user");
+        assert_eq!(parsed["session_id"], "sess-123");
+        assert!(parsed["parent_tool_use_id"].is_null());
+
+        let blocks = parsed["message"]["content"].as_array().expect("content is array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "describe this image");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "iVBORw0KGgo=");
+    }
+
+    /// Empty session_id (new session) must serialize as `""`, NOT omitted, because
+    /// the Claude Code CLI distinguishes "new session" from "resume" by the value
+    /// of the session_id field. A missing field would default to undefined and break
+    /// the protocol.
+    #[test]
+    fn sdk_user_message_keeps_empty_session_id_for_new_session() {
+        let user_message = json!({
+            "type": "user",
+            "message": { "role": "user", "content": "hi" },
+            "parent_tool_use_id": null,
+            "session_id": "",
+        });
+        let serialized = serde_json::to_string(&user_message).unwrap();
+        assert!(
+            serialized.contains("\"session_id\":\"\""),
+            "session_id must be present even when empty: {serialized}"
+        );
+    }
+
+    /// Streaming output parser must accept assistant events whose content blocks
+    /// include non-text blocks (e.g. tool_use) and still extract the text correctly.
+    /// Multimodal replies can interleave text, tool_use, and image blocks.
+    #[test]
+    fn stream_event_with_mixed_content_blocks_extracts_text() {
+        let json = r#"{"type":"assistant","message":{"content":[
+            {"type":"text","text":"Looking at the image. "},
+            {"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"/etc/hosts"}},
+            {"type":"text","text":"Done."}
+        ]}}"#;
+        let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
+        let blocks = event.message.unwrap().content.unwrap();
+        let text: String = blocks
+            .iter()
+            .filter(|b| b.block_type.as_deref() == Some("text"))
+            .filter_map(|b| b.text.as_deref())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text, "Looking at the image. Done.");
+    }
+
+    /// End-to-end check of `download_image_as_base64` against a real localhost HTTP
+    /// server. Verifies the content-type is propagated, body is base64-encoded, and
+    /// the round-trip is byte-exact.
+    #[tokio::test]
+    async fn download_image_roundtrips_through_local_server() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        // 1x1 red PNG (67 bytes). Any well-formed image works — we only care about
+        // transport, not pixel content.
+        const PNG_BYTES: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xDE, 0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x5B, 0x9D, 0x84,
+            0x42, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+
+        async fn serve_png() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_BYTES.to_vec()))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/img.png", get(serve_png));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/img.png");
+        let (media_type, b64) = download_image_as_base64(&url).await.unwrap();
+        assert_eq!(media_type, "image/png");
+
+        // Decode and compare byte-for-byte to confirm end-to-end fidelity.
+        let decoded = B64.decode(&b64).unwrap();
+        assert_eq!(decoded, PNG_BYTES);
+    }
+
+    /// Server returning an HTTP error must surface a clear error message rather than
+    /// producing empty/garbage bytes.
+    #[tokio::test]
+    async fn download_image_fails_on_http_error() {
+        use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
+
+        async fn not_found() -> Response<Body> {
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        let app = Router::new().route("/missing.png", get(not_found));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/missing.png");
+        let result = download_image_as_base64(&url).await;
+        let err = result.expect_err("expected HTTP 404 to fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("404"), "error should mention HTTP status: {msg}");
     }
 }
