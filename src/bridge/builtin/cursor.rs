@@ -20,64 +20,27 @@
 //! fresh session so the user gets a response rather than a bare error.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-/// JSON shape of a single event line from `agent --output-format stream-json`.
-///
-/// The Cursor agent uses the same stream-json schema as the Claude CLI:
-/// `type == "assistant"` carries incremental text; `type == "result"` carries the
-/// final session_id and result text.
-#[derive(Debug, Deserialize)]
-struct CursorStreamEvent {
-    #[serde(rename = "type")]
-    event_type: Option<String>,
-    /// Session ID (present on `type == "result"` events).
-    session_id: Option<String>,
-    /// Final result text (present on `type == "result"` events).
-    result: Option<String>,
-    /// Present on `type == "assistant"` events.
-    message: Option<CursorMessage>,
-}
+use super::common;
 
-/// Nested message structure in `type == "assistant"` stream events.
-#[derive(Debug, Deserialize)]
-struct CursorMessage {
-    content: Option<Vec<CursorContentBlock>>,
-}
-
-/// A single content block within a `CursorMessage`.
-#[derive(Debug, Deserialize)]
-struct CursorContentBlock {
-    #[serde(rename = "type")]
-    block_type: Option<String>,
-    text: Option<String>,
-}
+/// The Cursor agent uses the same `stream-json` schema as the Claude CLI, so the
+/// shared [`common::StreamJsonEvent`] type parses its event lines too.
+type CursorStreamEvent = common::StreamJsonEvent;
 
 pub async fn run() -> Result<()> {
-    let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
+    let (message, session_id) = common::read_message_and_session();
 
-    let new_session_id = if !session_id.is_empty() {
-        match stream_cursor(&message, &session_id).await {
-            Ok(sid) => sid,
-            Err(e) => {
-                eprintln!("[cursor] --resume failed ({e:#}), retrying as new session");
-                stream_cursor(&message, "").await?
-            }
-        }
-    } else {
-        stream_cursor(&message, "").await?
-    };
+    let new_session_id =
+        common::with_session_resume_fallback("cursor", &message, &session_id, |m, s| async move {
+            stream_cursor(&m, &s).await
+        })
+        .await?;
 
     // P0 output: optional session line only.
     // All response text was already streamed via ILINK_PARTIAL during execution.
-    if let Some(sid) = &new_session_id {
-        if !sid.is_empty() {
-            println!("ILINK_SESSION:{sid}");
-        }
-    }
+    common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
@@ -133,15 +96,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
     // Drain stderr in background to prevent pipe buffer deadlock.
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        tokio::io::BufReader::new(child_stderr)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stderr_task = common::spawn_capped_drain(child_stderr);
 
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
@@ -171,25 +126,17 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
         match event.event_type.as_deref() {
             Some("assistant") => {
                 if let Some(msg) = &event.message {
-                    if let Some(blocks) = &msg.content {
-                        let text: String = blocks
-                            .iter()
-                            .filter(|b| b.block_type.as_deref() == Some("text"))
-                            .filter_map(|b| b.text.as_deref())
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            assistant_event_count += 1;
-                            assistant_total_chars += text.len();
-                            eprintln!(
-                                "[cursor] assistant#{} len={} total_so_far={}",
-                                assistant_event_count,
-                                text.len(),
-                                assistant_total_chars
-                            );
-                            println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
-                            std::io::Write::flush(&mut std::io::stdout()).ok();
-                        }
+                    let text = msg.text();
+                    if !text.is_empty() {
+                        assistant_event_count += 1;
+                        assistant_total_chars += text.len();
+                        eprintln!(
+                            "[cursor] assistant#{} len={} total_so_far={}",
+                            assistant_event_count,
+                            text.len(),
+                            assistant_total_chars
+                        );
+                        common::emit_partial(&text)?;
                     }
                 }
             }
@@ -215,17 +162,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let status = child.wait().await.context("wait for agent")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if !status.success() && found_session_id.is_none() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!(
-            "agent exited with status {:?}\nstderr: {detail}",
-            status.code()
-        );
-    }
+    common::ensure_success("agent", status, &stderr, found_session_id.is_some())?;
 
     Ok(found_session_id)
 }

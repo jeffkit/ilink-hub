@@ -20,28 +20,19 @@
 use anyhow::{Context, Result};
 use tokio::process::Command;
 
-pub async fn run() -> Result<()> {
-    let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
+use super::common;
 
-    let (response, new_session_id) = if !session_id.is_empty() {
-        match call_agy(&message, &session_id).await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("[agy] --conversation resume failed ({e:#}), retrying as new session");
-                call_agy(&message, "").await?
-            }
-        }
-    } else {
-        call_agy(&message, "").await?
-    };
+pub async fn run() -> Result<()> {
+    let (message, session_id) = common::read_message_and_session();
+
+    let (response, new_session_id) =
+        common::with_session_resume_fallback("agy", &message, &session_id, |m, s| async move {
+            call_agy(&m, &s).await
+        })
+        .await?;
 
     // P0 output: optional session line first, then response text.
-    if let Some(sid) = &new_session_id {
-        if !sid.is_empty() {
-            println!("ILINK_SESSION:{sid}");
-        }
-    }
+    common::emit_session_line(new_session_id.as_deref());
     print!("{response}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
 
@@ -96,30 +87,11 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     let child_stdout = child.stdout.take().context("stdout pipe missing")?;
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
-    // Drain stderr in background to prevent pipe buffer deadlock. Cap the
-    // capture so a child spewing output can't grow the buffer without bound.
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, BufReader};
-        let mut buf = Vec::new();
-        BufReader::new(child_stderr)
-            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-
+    // Drain both pipes in background to prevent pipe buffer deadlock; both are
+    // capped so a child spewing output can't grow the buffer without bound.
+    let stderr_task = common::spawn_capped_drain(child_stderr);
     // Collect full stdout (agy outputs plain text, no streaming events).
-    let stdout_task = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, BufReader};
-        let mut buf = Vec::new();
-        BufReader::new(child_stdout)
-            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stdout_task = common::spawn_capped_drain(child_stdout);
 
     let status = child.wait().await.context("wait for agy")?;
     let stderr = stderr_task.await.unwrap_or_default();
@@ -137,14 +109,7 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     // Clean up temp log file (best-effort).
     let _ = tokio::fs::remove_file(&log_path).await;
 
-    if !status.success() && stdout.trim().is_empty() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!("agy exited with status {:?}\n{detail}", status.code());
-    }
+    common::ensure_success("agy", status, &stderr, !stdout.trim().is_empty())?;
 
     Ok((stdout, new_conv_id))
 }

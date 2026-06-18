@@ -18,6 +18,7 @@
 mod agy;
 mod claude_code;
 mod codex;
+mod common;
 mod cursor;
 
 /// Dispatch to a built-in profile handler by type name.

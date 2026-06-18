@@ -27,6 +27,8 @@ use serde::Deserialize;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
+use super::common;
+
 /// Top-level event shape from `codex exec --json`.
 #[derive(Debug, Deserialize)]
 struct CodexEvent {
@@ -48,28 +50,17 @@ struct CodexItem {
 }
 
 pub async fn run() -> Result<()> {
-    let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
+    let (message, session_id) = common::read_message_and_session();
 
-    let new_thread_id = if !session_id.is_empty() {
-        match stream_codex(&message, &session_id).await {
-            Ok(tid) => tid,
-            Err(e) => {
-                eprintln!("[codex] exec resume failed ({e:#}), retrying as new session");
-                stream_codex(&message, "").await?
-            }
-        }
-    } else {
-        stream_codex(&message, "").await?
-    };
+    let new_thread_id =
+        common::with_session_resume_fallback("codex", &message, &session_id, |m, s| async move {
+            stream_codex(&m, &s).await
+        })
+        .await?;
 
     // P0 output: optional session line only.
     // All response text was already streamed via ILINK_PARTIAL during execution.
-    if let Some(tid) = &new_thread_id {
-        if !tid.is_empty() {
-            println!("ILINK_SESSION:{tid}");
-        }
-    }
+    common::emit_session_line(new_thread_id.as_deref());
 
     Ok(())
 }
@@ -107,15 +98,7 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
     // Drain stderr in background to prevent pipe buffer deadlock.
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        tokio::io::BufReader::new(child_stderr)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stderr_task = common::spawn_capped_drain(child_stderr);
 
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
@@ -149,8 +132,7 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
                     if item.item_type.as_deref() == Some("agent_message") {
                         if let Some(text) = &item.text {
                             if !text.is_empty() {
-                                println!("ILINK_PARTIAL:{}", serde_json::to_string(text)?);
-                                std::io::Write::flush(&mut std::io::stdout()).ok();
+                                common::emit_partial(text)?;
                             }
                         }
                     }
@@ -163,17 +145,7 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
     let status = child.wait().await.context("wait for codex")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if !status.success() && found_thread_id.is_none() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!(
-            "codex exited with status {:?}\nstderr: {detail}",
-            status.code()
-        );
-    }
+    common::ensure_success("codex", status, &stderr, found_thread_id.is_some())?;
 
     Ok(found_thread_id)
 }

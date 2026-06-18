@@ -19,40 +19,15 @@
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 
-/// JSON shape of a single event line from `claude --output-format stream-json`.
-#[derive(Debug, Deserialize)]
-struct ClaudeStreamEvent {
-    #[serde(rename = "type")]
-    event_type: Option<String>,
-    /// Final result text (present on `type == "result"` events).
-    result: Option<String>,
-    /// Session ID (present on `type == "result"` events).
-    session_id: Option<String>,
-    /// Present on `type == "result"` events (`"success"` or error subtype).
-    #[allow(dead_code)]
-    subtype: Option<String>,
-    /// Present on `type == "assistant"` events.
-    message: Option<ClaudeMessage>,
-}
+use super::common;
 
-/// Nested message structure in `type == "assistant"` stream events.
-#[derive(Debug, Deserialize)]
-struct ClaudeMessage {
-    content: Option<Vec<ClaudeContentBlock>>,
-}
-
-/// A single content block within a `ClaudeMessage`.
-#[derive(Debug, Deserialize)]
-struct ClaudeContentBlock {
-    #[serde(rename = "type")]
-    block_type: Option<String>,
-    text: Option<String>,
-}
+/// JSON event line from `claude --output-format stream-json`. The Claude CLI defines
+/// the canonical `stream-json` schema; the shared [`common::StreamJsonEvent`] models it.
+type ClaudeStreamEvent = common::StreamJsonEvent;
 
 /// Anthropic API hard limit for a single image (~5MB). The Claude Code CLI
 /// forwards the base64 string verbatim to the API, so we enforce this client-side
@@ -64,33 +39,24 @@ const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const ANTHROPIC_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn run() -> Result<()> {
-    let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
+    let (message, session_id) = common::read_message_and_session();
     // ILINK_STREAMING is injected by the bridge: "1" (default) = stream partials,
     // "0" = one-shot mode (emit full text to stdout at the end, no ILINK_PARTIAL lines).
     let streaming = std::env::var("ILINK_STREAMING")
         .map(|v| v.trim() != "0")
         .unwrap_or(true);
 
-    let new_session_id = if !session_id.is_empty() {
-        match invoke_claude(&message, &session_id, streaming).await {
-            Ok(sid) => sid,
-            Err(e) => {
-                eprintln!("[claude-code] --resume failed ({e:#}), retrying as new session");
-                invoke_claude(&message, "", streaming).await?
-            }
-        }
-    } else {
-        invoke_claude(&message, "", streaming).await?
-    };
+    let new_session_id = common::with_session_resume_fallback(
+        "claude-code",
+        &message,
+        &session_id,
+        |m, s| async move { invoke_claude(&m, &s, streaming).await },
+    )
+    .await?;
 
     // P0 output: optional session line only.
     // All response text was already streamed via ILINK_PARTIAL during execution.
-    if let Some(sid) = &new_session_id {
-        if !sid.is_empty() {
-            println!("ILINK_SESSION:{sid}");
-        }
-    }
+    common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
@@ -180,15 +146,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
     // Drain stderr in background to prevent pipe buffer deadlock.
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        tokio::io::BufReader::new(child_stderr)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stderr_task = common::spawn_capped_drain(child_stderr);
 
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
@@ -218,18 +176,10 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
         match event.event_type.as_deref() {
             Some("assistant") => {
                 if let Some(msg) = &event.message {
-                    if let Some(blocks) = &msg.content {
-                        let text: String = blocks
-                            .iter()
-                            .filter(|b| b.block_type.as_deref() == Some("text"))
-                            .filter_map(|b| b.text.as_deref())
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
-                            std::io::Write::flush(&mut std::io::stdout()).ok();
-                            last_partial = Some(text);
-                        }
+                    let text = msg.text();
+                    if !text.is_empty() {
+                        common::emit_partial(&text)?;
+                        last_partial = Some(text);
                     }
                 }
             }
@@ -241,8 +191,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
                     let already_sent = last_partial.as_deref() == Some(result_text.as_str());
                     if !already_sent {
-                        println!("ILINK_PARTIAL:{}", serde_json::to_string(&result_text)?);
-                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                        common::emit_partial(&result_text)?;
                     }
                 }
             }
@@ -253,17 +202,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let status = child.wait().await.context("wait for claude")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if !status.success() && found_session_id.is_none() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!(
-            "claude exited with status {:?}\nstderr: {detail}",
-            status.code()
-        );
-    }
+    common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
 
     Ok(found_session_id)
 }
@@ -339,15 +278,7 @@ async fn stream_claude_multimodal(
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
     // Drain stderr in background to prevent pipe buffer deadlock.
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        let mut buf = Vec::new();
-        tokio::io::BufReader::new(child_stderr)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stderr_task = common::spawn_capped_drain(child_stderr);
 
     // Build SDKUserMessage: {type:"user", message:{role:"user", content:[...]}, session_id, parent_tool_use_id:null}
     // The protocol is line-delimited JSON on stdin, terminated by a newline.
@@ -399,18 +330,10 @@ async fn stream_claude_multimodal(
         match event.event_type.as_deref() {
             Some("assistant") => {
                 if let Some(msg) = &event.message {
-                    if let Some(blocks) = &msg.content {
-                        let text: String = blocks
-                            .iter()
-                            .filter(|b| b.block_type.as_deref() == Some("text"))
-                            .filter_map(|b| b.text.as_deref())
-                            .collect::<Vec<_>>()
-                            .join("");
-                        if !text.is_empty() {
-                            println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
-                            std::io::Write::flush(&mut std::io::stdout()).ok();
-                            last_partial = Some(text);
-                        }
+                    let text = msg.text();
+                    if !text.is_empty() {
+                        common::emit_partial(&text)?;
+                        last_partial = Some(text);
                     }
                 }
             }
@@ -419,8 +342,7 @@ async fn stream_claude_multimodal(
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
                     let already_sent = last_partial.as_deref() == Some(result_text.as_str());
                     if !already_sent {
-                        println!("ILINK_PARTIAL:{}", serde_json::to_string(&result_text)?);
-                        std::io::Write::flush(&mut std::io::stdout()).ok();
+                        common::emit_partial(&result_text)?;
                     }
                 }
             }
@@ -431,17 +353,7 @@ async fn stream_claude_multimodal(
     let status = child.wait().await.context("wait for claude")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if !status.success() && found_session_id.is_none() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!(
-            "claude exited with status {:?}\nstderr: {detail}",
-            status.code()
-        );
-    }
+    common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
 
     Ok(found_session_id)
 }
@@ -617,26 +529,8 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
     // correct failure mode (better than OOM).
     let child_stdout = child.stdout.take().context("claude stdout pipe missing")?;
     let child_stderr = child.stderr.take().context("claude stderr pipe missing")?;
-    let stderr_task = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, BufReader};
-        let mut buf = Vec::new();
-        BufReader::new(child_stderr)
-            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let stdout_task = tokio::spawn(async move {
-        use tokio::io::{AsyncReadExt, BufReader};
-        let mut buf = Vec::new();
-        BufReader::new(child_stdout)
-            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
-            .read_to_end(&mut buf)
-            .await
-            .ok();
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let stderr_task = common::spawn_capped_drain(child_stderr);
+    let stdout_task = common::spawn_capped_drain(child_stdout);
     let status = child.wait().await.context("wait for claude")?;
     let stderr = stderr_task.await.unwrap_or_default();
     let stdout_str = stdout_task.await.unwrap_or_default();
@@ -663,17 +557,7 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
         }
     };
 
-    if !status.success() && event.session_id.is_none() {
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else {
-            String::from("(no output)")
-        };
-        anyhow::bail!(
-            "claude exited with status {:?}\nstderr: {detail}",
-            status.code()
-        );
-    }
+    common::ensure_success("claude", status, &stderr, event.session_id.is_some())?;
 
     let found_session_id = event.session_id.clone();
 
