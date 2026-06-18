@@ -65,9 +65,11 @@ Host myserver
 这样使用 `ssh -N -L 18765:localhost:8765 myserver` 即可连接。
 :::
 
-## 持久化运行 SSH 隧道和 Bridge（macOS，launchd）
+## 持久化运行 Bridge（macOS，launchd）
 
-在 macOS 上，推荐用 launchd 确保 SSH 隧道和 Bridge Manager 在登录后自动启动、异常退出后自动重启。
+在 macOS 上，推荐用 launchd 确保 Bridge Manager 在登录后自动启动、异常退出后自动重启。
+
+> **推荐：直连**。当 Hub 公网可达（方式一）时，Bridge Manager 直接连远程 `8765`，**只需一个服务**、无需 SSH 隧道。本节即按此方式编写；若 Hub 不对外开放，见文末 [可选：SSH 隧道持久化](#可选-ssh-隧道持久化)。
 
 ### 创建日志目录
 
@@ -75,7 +77,97 @@ Host myserver
 mkdir -p ~/ilink-logs
 ```
 
-### SSH 隧道 launchd 服务
+### Bridge Manager launchd 服务（直连）
+
+创建 `~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist`。程序路径用 **Homebrew 安装路径** `/opt/homebrew/bin/ilink-hub-bridge`（见 [发布与部署规范](../knowledge/ops/release-and-deploy.md)，本地部署一律经 brew，不要裸拷 `~/.local/bin`）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ilink-hub.bridge-manager</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/ilink-hub-bridge</string>
+        <string>manager</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/Users/你的用户名/ilink-logs/bridge-manager.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/你的用户名/ilink-logs/bridge-manager-error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key><string>info</string>
+        <key>HOME</key><string>/Users/你的用户名</string>
+        <!-- 直连远程 Hub：指向你的公网 Hub 地址（不再经 SSH 隧道） -->
+        <key>WEIXIN_BASE_URL</key><string>http://your-server:8765</string>
+        <!-- 包含 claude、node 等工具的完整 PATH -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/你的用户名/.cargo/bin:/Users/你的用户名/.local/bin</string>
+    </dict>
+</dict>
+</plist>
+```
+
+::: warning PATH 配置很重要
+launchd 服务不继承 shell 的 `PATH`，必须在 `EnvironmentVariables` 中显式列出所有工具的路径。常见路径：
+- Homebrew（Apple Silicon）：`/opt/homebrew/bin`
+- Homebrew（Intel Mac）：`/usr/local/bin`
+- Cargo：`~/.cargo/bin`
+- Claude Code：`/opt/homebrew/bin/claude`（通过 Homebrew 安装）
+:::
+
+### 加载服务
+
+```bash
+# 加载 Bridge Manager（直连远程 Hub，无需 SSH 隧道）
+launchctl load ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
+
+# 查看状态
+launchctl list | grep ilink-hub
+```
+
+> 升级 Bridge 后重载服务（`bootout` + `bootstrap` 会让 manager 及其子 Bridge 全部用新二进制重启）：
+>
+> ```bash
+> uid=$(id -u)
+> launchctl bootout  "gui/$uid/com.ilink-hub.bridge-manager"
+> launchctl bootstrap "gui/$uid" ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
+> ```
+
+### 常用管理命令
+
+```bash
+# 查看运行状态（有 PID 表示运行中，最后一列是上次退出码）
+launchctl list | grep ilink-hub
+
+# 查看 Bridge 日志
+tail -f ~/ilink-logs/bridge-manager.log
+
+# 手动停止 / 启动
+launchctl unload ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
+launchctl load  ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
+
+# 登录时自动启动（已包含在 plist 的 RunAtLoad=true）
+# 重启系统后 launchd 会自动拉起服务
+```
+
+### 验证 Bridge 在线
+
+```bash
+# 查看所有已注册客户端的在线状态（直连远程 Hub）
+curl http://your-server:8765/hub/clients
+```
+
+## 可选：SSH 隧道持久化
+
+仅当 Hub 的 `8765` **不对外开放**时才需要本节。此时额外再加一个 SSH 隧道服务，并把上面 Bridge Manager 的 `WEIXIN_BASE_URL` 改为 `http://localhost:18765`（去掉直连地址）。
 
 创建 `~/Library/LaunchAgents/com.ilink-hub.ssh-tunnel.plist`：
 
@@ -109,88 +201,12 @@ mkdir -p ~/ilink-logs
 </plist>
 ```
 
-### Bridge Manager launchd 服务
-
-创建 `~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist`：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.ilink-hub.bridge-manager</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/Users/你的用户名/.local/bin/ilink-hub-bridge</string>
-        <string>manager</string>
-        <string>--hub-url</string>
-        <string>http://localhost:18765</string>
-    </array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ThrottleInterval</key><integer>5</integer>
-    <key>StandardOutPath</key>
-    <string>/Users/你的用户名/ilink-logs/bridge-manager.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/你的用户名/ilink-logs/bridge-manager-error.log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>RUST_LOG</key><string>info</string>
-        <key>HOME</key><string>/Users/你的用户名</string>
-        <!-- 包含 claude、node 等工具的完整 PATH -->
-        <key>PATH</key>
-        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/你的用户名/.cargo/bin:/Users/你的用户名/.local/bin</string>
-    </dict>
-</dict>
-</plist>
-```
-
-::: warning PATH 配置很重要
-launchd 服务不继承 shell 的 `PATH`，必须在 `EnvironmentVariables` 中显式列出所有工具的路径。常见路径：
-- Homebrew（Apple Silicon）：`/opt/homebrew/bin`
-- Homebrew（Intel Mac）：`/usr/local/bin`
-- Cargo：`~/.cargo/bin`
-- Claude Code：`/opt/homebrew/bin/claude`（通过 Homebrew 安装）
-:::
-
-### 加载服务
+加载顺序：先隧道、再 Bridge Manager。
 
 ```bash
-# 加载 SSH 隧道
 launchctl load ~/Library/LaunchAgents/com.ilink-hub.ssh-tunnel.plist
-
-# 等 SSH 隧道建立后，再加载 Bridge Manager
-sleep 3
+sleep 3   # 等隧道建立
 launchctl load ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
-
-# 查看状态
-launchctl list | grep ilink-hub
-```
-
-### 常用管理命令
-
-```bash
-# 查看运行状态（有 PID 表示运行中，最后一列是上次退出码）
-launchctl list | grep ilink-hub
-
-# 查看 Bridge 日志
-tail -f ~/ilink-logs/bridge-manager.log
-
-# 手动停止 / 启动
-launchctl unload ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
-launchctl load  ~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist
-
-# 登录时自动启动（已包含在 plist 的 RunAtLoad=true）
-# 重启系统后 launchd 会自动拉起两个服务
-```
-
-### 验证 Bridge 在线
-
-```bash
-# 查看所有已注册客户端的在线状态
-curl http://localhost:18765/hub/clients
 ```
 
 ## 持久化运行（Linux，systemd）
@@ -225,10 +241,10 @@ sudo journalctl -u ilink-hub-bridge -f
 ## 排查连接问题
 
 ```bash
-# 确认 Hub 可达
-curl http://localhost:18765/health
+# 确认 Hub 可达（直连）
+curl http://your-server:8765/health
 
-# 检查 SSH 隧道是否建立
+# 仅 SSH 隧道方式才需要：检查隧道是否建立
 ss -tlnp | grep 18765      # Linux
 netstat -an | grep 18765   # macOS
 
