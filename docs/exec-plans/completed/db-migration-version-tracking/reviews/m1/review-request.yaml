@@ -1,0 +1,128 @@
+milestone: M1
+title: "schema_version 表与版本追踪原语"
+status: passed
+date: 2026-06-17
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: e53fc0d
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/db-migration-version-tracking/plan.md
+checkpoint: "M1 — schema_version 表与版本追踪原语"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# 在 run_migrations 启动时创建 schema_version 表，实现原子化 check-and-claim
+# 机制，关闭 TOCTOU 竞态窗口。包括 get_current_version、is_migration_run、
+# try_claim_migration、record_migration_run、try_claim_migration_in_tx。
+
+# ─── Source-of-truth changes for M1 ─────────────────────────────────────
+source_changes:
+  - file: src/store/mod.rs
+    symbols:
+      - "Store::get_current_version"
+      - "Store::is_migration_run"
+      - "Store::try_claim_migration"
+      - "Store::record_migration_run"
+      - "Store::try_claim_migration_in_tx"
+      - "Store::run_migrations"
+    change_summary: >-
+      schema_version 表初始化 (CREATE TABLE IF NOT EXISTS)，5 个版本追踪原语，
+      run_migrations 在单连接+事务内编排 v1-v5。并发连接测试加固（retry on SQLITE_BUSY）。
+
+# ─── Commands run (all required by plan.md M1 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "308 passed (235 lib + 73 integration/e2e), 0 failed"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
+    expected: "vite build success, exit 0"
+    actual: "vite v6.4.3 building for production... built in 110ms, exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+
+# ─── M1-required test inventory ───────────────────────────────────────────
+m1_test_inventory:
+  store_tests:
+    - test: store::store_tests::test_schema_version_tracking
+      covers: "schema_version 表创建、版本读取、is_migration_run 检查"
+      result: pass
+    - test: store::store_tests::test_migration_idempotency
+      covers: "幂等重新运行 run_migrations 不报错"
+      result: pass
+    - test: store::store_tests::test_migration_incremental_from_v2
+      covers: "从 v2 增量迁移到 v5"
+      result: pass
+    - test: store::store_tests::adversarial_concurrent_store_connect_succeeds_and_converges
+      covers: "2 并发 Store::connect 通过 tokio::join! 同时执行，try_claim_migration 原子性验证"
+      result: pass
+    - test: store::store_tests::adversarial_many_concurrent_connects_converge
+      covers: "10 并发 Store::connect 通过 tokio::spawn 同时执行，全部收敛到 v5"
+      result: pass
+      note: "添加了 retry-on-SQLITE_BUSY 逻辑（最多 5 次，300ms 间隔）应对文件锁竞争"
+
+# ─── Pass conditions vs. plan.md M1 ─────────────────────────────────────────
+pass_conditions:
+  - id: schema-version-table
+    plan_clause: "schema_version 表（version INTEGER PRIMARY KEY, migrated_at TEXT DEFAULT CURRENT_TIMESTAMP）"
+    observation: "CREATE TABLE IF NOT EXISTS schema_version 在 run_migrations 最前面执行，幂等安全"
+    result: pass
+  - id: get-current-version
+    plan_clause: "get_current_version() — 查询当前最高版本（排除并发哨兵行 i32::MAX）"
+    observation: "SELECT MAX(version) FROM schema_version WHERE version < i32::MAX，排除哨兵行"
+    result: pass
+  - id: is-migration-run
+    plan_clause: "is_migration_run(version) — 检查特定版本是否已运行"
+    observation: "SELECT 1 FROM schema_version WHERE version = $1，返回 bool"
+    result: pass
+  - id: try-claim-migration
+    plan_clause: "try_claim_migration(version) — 原子化 claim（SQLite/Postgres: ON CONFLICT DO NOTHING RETURNING；MySQL: INSERT IGNORE）"
+    observation: "驱动感知：SQLite/Postgres 用 ON CONFLICT DO NOTHING RETURNING，MySQL 用 INSERT IGNORE + rows_affected"
+    result: pass
+  - id: record-migration-run
+    plan_clause: "record_migration_run(version) — 幂等记录版本"
+    observation: "INSERT ... ON CONFLICT DO NOTHING / INSERT IGNORE，幂等安全"
+    result: pass
+  - id: try-claim-migration-in-tx
+    plan_clause: "try_claim_migration_in_tx(tx, version) — 事务内原子 claim（F-M3-02 修复）"
+    observation: "与 try_claim_migration 相同的 SQL，但在事务内执行，claim 行的可见性与事务绑定"
+    result: pass
+
+# ─── Fixes applied during this run ────────────────────────────────────────
+fixes:
+  - id: fix-flaky-concurrent-test
+    test: adversarial_many_concurrent_connects_converge
+    problem: "10 并发 Store::connect 在 SQLite 文件锁竞争下偶发 SQLITE_BUSY (code: 5)"
+    solution: "每个 spawned task 添加 retry 循环（最多 5 次，300ms 间隔），仅在 'database is locked' 时重试"
+
+# ─── Open follow-ups (none) ───────────────────────────────────────────────
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M2
+next_milestone_title: "将 run_migrations 拆分为 per-version migrate_to_vN"
+next_milestone_files:
+  - src/store/mod.rs

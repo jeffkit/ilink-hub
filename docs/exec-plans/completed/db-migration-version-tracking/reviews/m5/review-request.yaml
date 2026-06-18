@@ -1,0 +1,78 @@
+milestone: M5
+title: "深度 Review 修复与版本发布 — 验证结果"
+status: passed
+date: 2026-06-17
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: bde009c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── 验证命令 ─────────────────────────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 317 passed; 0 failed (244 lib + 73 integration/e2e)"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "vite build success, exit 0"
+    actual: "vite v6.4.3 building for production... built in 88ms, exit 0"
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished dev profile, exit 0"
+    actual: "Finished dev profile, exit 0"
+    result: pass
+
+# ─── M5 任务完成状态 ──────────────────────────────────────────────────────────
+tasks:
+  - id: B-01
+    title: "DB 超时 — SQLite busy_timeout 保持默认 5s"
+    status: RESOLVED
+    resolution: >-
+      保持 SQLite 默认 busy_timeout 5s，关机时迁移 runner 的 acquire
+      仍有机会排空。已验证 file_sqlite_serializes_concurrent_read_and_write_without_busy。
+
+  - id: SEC-002
+    title: "is_safe_identifier 校验 pragma_table_info 拼接"
+    status: RESOLVED
+    resolution: >-
+      column_exists 在拼接 PRAGMA table_info 查询前调用 is_safe_identifier
+      校验表名和列名，防止 SQL 注入。已验证 adversarial_column_exists_uses_pragma_on_sqlite。
+
+  - id: SEC-011
+    title: "Store::connect 确保 install_default_drivers()"
+    status: RESOLVED
+    resolution: >-
+      Store::connect 在创建连接池之前调用 sqlx::any::install_default_drivers()，
+      确保 SQLite/Postgres/MySQL 驱动已注册。
+
+  - id: TO-03
+    title: "spawn_blocking 调用带超时保护"
+    status: RESOLVED
+    resolution: >-
+      ensure_sqlite_file 的 spawn_blocking 调用包装在 tokio::time::timeout(10s) 中，
+      防止 spawn_blocking 永久阻塞导致迁移卡死。
+
+# ─── E2E Checkpoint ──────────────────────────────────────────────────────────
+e2e_checkpoint:
+  id: E2E-5
+  description: "构建 + 测试 + Clippy 全绿"
+  result: pass

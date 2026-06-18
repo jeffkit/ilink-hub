@@ -77,6 +77,10 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install sqlx drivers once at startup so every `Store::connect` call
+    // doesn't pay the (admittedly small) `Once::call_once` atomic check.
+    sqlx::any::install_default_drivers();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()

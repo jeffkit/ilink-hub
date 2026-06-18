@@ -1,0 +1,88 @@
+milestone: M4
+title: "M4 Adversarial Rust security & concurrency review findings"
+reviewer: "rust-sec-concurrency-specialist"
+date: 2026-06-17
+resolution_date: 2026-06-17
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: bde009c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+findings:
+  - id: SEC-ADV-M4-01
+    severity: HIGH
+    category: memory_safety
+    status: RESOLVED
+    title: "local_hostname 中 gethostname 缓冲区未强制空终止导致潜在内存越界读取"
+    file: src/bridge/connection.rs
+    lines: [232, 233, 234, 235]
+    description: >-
+      在 `local_hostname` 函数中，调用 `gethostname` 时传入了一个长度为 256 字节的局部数组 `buf`。
+      如果主机的实际 hostname 长度大于或等于 256 字节，`gethostname` 会将数据截断写入 `buf`，但在 macOS 和
+      某些 Linux 系统上并不保证在缓冲区末尾写入空字符（null-terminator `\0`）。
+      直接将此 `buf` 的指针传递给 `CStr::from_ptr` 会在没有找到 `\0` 时读取越界内存，从而导致未定义行为（Undefined Behavior），
+      例如进程崩溃（段错误）或敏感内存泄漏。
+    impact: >-
+      在主机名超过 255 字节的系统上运行时可能发生崩溃，或者导致未定义行为。这是一个典型的 C 接口交互内存安全隐患。
+    recommendation: >-
+      1. 增加定长数组的大小并在传入 gethostname 时预留一个字节，例如 `let mut buf = [0i8; 257];` 并在调用时传入 `buf.len() - 1` 作为大小。
+      2. 或者在调用 `CStr::from_ptr` 前手动将缓冲区的最后一位设为 `0`：`buf[buf.len() - 1] = 0;`。
+    resolution: >-
+      采用方案2：在 `CStr::from_ptr` 调用前强制 `buf[buf.len() - 1] = 0`，确保缓冲区始终以 null 终止。
+      添加了2个对抗性测试：`adversarial_local_hostname_never_panics` 验证函数不会崩溃；
+      `adversarial_gethostname_buffer_null_terminated` 模拟满缓冲区场景验证 null 终止防护。
+
+  - id: SEC-ADV-M4-02
+    severity: MEDIUM
+    category: tokio_async
+    title: "discover_profile_specs 异步函数在 Tokio 工作线程中执行同步文件 I/O 阻塞调用"
+    file: src/bridge/manager.rs
+    lines: [630, 699, 719, 742]
+    description: >-
+      在 `discover_profile_specs` 这个异步函数中，遍历并加载桥配置文件时，直接调用了同步的
+      `BridgeApp::load` 以及 `handler_mtimes` 函数。这些函数内部包含 `std::fs::read_to_string` 
+      和 `std::fs::metadata` 等阻塞的文件系统 I/O 操作。
+      如果在 Tokio 的异步工作线程（executor thread）上直接调用同步 I/O，可能会由于长时间的磁盘操作
+      （尤其是在网络挂载的文件系统或高负载 I/O 时）导致该 worker 线程被阻塞，引起运行时任务调度延迟甚至饥饿。
+    impact: >-
+      阻塞 Tokio 执行器线程，虽然在启动阶段或配置更新阶段影响有限，但属于异步编程中的不良反模式（Tokio Async Trap）。
+    recommendation: >-
+      使用 `tokio::fs` 的异步 API 进行文件读取，或在 `tokio::task::spawn_blocking` 中包裹这些同步调用。
+
+  - id: SEC-ADV-M4-03
+    severity: LOW
+    category: db_migration
+    title: "MySQL 单连接事务迁移在 DDL 失败时由于隐式提交可能遗留破损的版本记录"
+    file: src/store/mod.rs
+    lines: [333, 377, 400, 406]
+    description: >-
+      MySQL (InnoDB) 对数据定义语言（DDL，如 `CREATE TABLE` 或 `CREATE INDEX`）不支持真正的事务回滚。
+      当执行 DDL 时，MySQL 会强制隐式提交（implicit commit）当前活跃的事务。
+      在 `run_migrations` 中，虽然使用了 `conn.begin()` 开启了事务并在最后调用 `tx.commit()`，但是在 MySQL 驱动下，
+      每个 `migrate_to_vN_tx` 中的 DDL 语句在执行前和执行后都会自动提交事务。
+      如果某个迁移步骤（例如 v3）在写入了 `try_claim_migration_in_tx` 的声明行后，其后的 DDL 报错失败，
+      此时由于 DDL 触发的隐式提交，v3 的声明行已经被持久化到数据库中。后续重新启动时，迁移引擎会误认为 v3 已经成功执行而直接跳过，
+      从而使得数据库结构处于损坏或不完整的状态。
+    impact: >-
+      如果在 MySQL 环境下迁移过程中断（例如由于并发竞态导致的唯一索引创建失败等），数据库将处于半完成状态，
+      且由于 schema_version 记录了错误的版本成功标志，系统无法自动检测和重新应用该版本。
+    recommendation: >-
+      在每个迁移函数的 DDL 执行之后、事务提交之前再做 claim 记录写入，或者在遇到错误时能够回滚 claims。
+      或者，由于 MySQL 的 DDL 不支持事务，迁移应支持自动探测数据库表结构的实际状态，而非纯粹依赖 schema_version 标志。
+
+positive_findings:
+  - id: POS-M4-01
+    title: "SQL LIKE 查询使用参数化绑定和完整的通配符转义"
+    description: >-
+      `find_assistant_message_by_content` 在执行以 `content_prefix` 开头的模糊查询时，
+      不仅对百分号 `%`、下划线 `_` 和反斜杠 `\` 进行了精确的替换转义，而且使用了 sqlx 的参数化绑定（`$2`）
+      和 `ESCAPE '\\'` 子句。这完全消除了 SQL 注入的隐患，是一个非常标准和安全的设计模式。
+
+  - id: POS-M4-02
+    title: "并发 Store::connect 测试设计严密"
+    description: >-
+      测试中通过 `tokio::join!`、多线程 runtime 以及多任务并发锤击，能够非常逼真地复现 SQLite `SQLITE_BUSY` 和
+      并发连接竞争的场景，从而强力验证了 `try_claim_migration` 的隔离效果。
+
+verdict: PASS

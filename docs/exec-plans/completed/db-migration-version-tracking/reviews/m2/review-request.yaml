@@ -2,8 +2,8 @@ milestone: M2
 title: "重构 Store::run_migrations 并支持版本管理逻辑"
 status: passed
 date: 2026-06-17
-worktree: /Users/kongjie/projects/ilink-hub
-base_commit: 5ff7cc6cb9ae078e7f114d951574d5252b3a9a3b
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: 1c86adcfb834e8ea9fab66f3a0cb72e8af6846cc
 toolchain:
   rustc: "1.95.0 (59807616e 2026-04-14)"
   cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
@@ -54,7 +54,7 @@ commands:
   - id: test
     cmd: "cargo test"
     expected: "all tests pass, 0 failures"
-    actual: "all tests pass, 295 passed; 0 failed; 0 ignored"
+    actual: "all tests pass, 315 passed (242 lib + 73 integration/e2e); 0 failed; 1 ignored"
     result: pass
   - id: build
     cmd: "cargo build"
@@ -64,7 +64,7 @@ commands:
   - id: desktop-frontend
     cmd: "{ [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build"
     expected: "vite v6.4.3 building for production... built in <time>, exit 0"
-    actual: "vite v6.4.3 building for production... ✓ built in 113ms, exit 0"
+    actual: "vite v6.4.3 building for production... ✓ built in 91ms, exit 0"
     result: pass
   - id: desktop-tauri
     cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"

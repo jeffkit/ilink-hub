@@ -1,0 +1,227 @@
+milestone: M1
+review_type: adversarial-security-concurrency
+reviewer: "Rust 安全与并发专家 (Claude)"
+date: 2026-06-17
+verdict: PASS
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/db-migration-version-tracking
+base_commit: e53fc0d
+fix_commit: 4b76916
+
+scope:
+  - "src/store/mod.rs: Store::get_current_version"
+  - "src/store/mod.rs: Store::is_migration_run"
+  - "src/store/mod.rs: Store::try_claim_migration"
+  - "src/store/mod.rs: Store::record_migration_run"
+  - "src/store/mod.rs: Store::try_claim_migration_in_tx"
+  - "src/store/mod.rs: Store::run_migrations"
+  - "src/store/mod.rs: Store::ensure_sqlite_file"
+  - "src/store/mod.rs: Store::column_exists"
+  - "src/store/mod.rs: Store::migrate_to_v4_tx"
+  - "src/store/mod.rs: Store::connect"
+  - "src/store/mod.rs: Store::v5_create_messages_sql"
+  - "src/main.rs: main"
+
+# ─── Findings ────────────────────────────────────────────────────────────────
+findings:
+
+  # ─── HIGH ─────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-001
+    severity: high
+    cwe: CWE-367
+    category: "TOCTOU / 数据丢失"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 149-162
+    symbol: Store::ensure_sqlite_file
+    title: >
+      `ensure_sqlite_file` 在并发 `Store::connect` 场景下通过 `File::create` 截断
+      已有数据库文件，导致数据丢失
+    fix_applied: >
+      `File::create(path)` 替换为 `OpenOptions::new().create_new(true).write(true).open(path)`，
+      `create_new(true)` 对应 `O_CREAT | O_EXCL`，若文件已存在则返回 `ErrorKind::AlreadyExists`，
+      安全跳过创建步骤。
+
+    adversarial_tests:
+      - adversarial_ensure_sqlite_file_does_not_truncate_existing_db — 验证已有 DB 文件不被截断
+      - adversarial_ensure_sqlite_file_concurrent_threads_safe — 16 线程 × 50 次并发压测，确保无截断
+
+  # ─── MEDIUM ────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-002
+    severity: medium
+    cwe: CWE-754
+    category: "error_handling / 静默错误吞没"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 548-549
+    symbol: Store::migrate_to_v4_tx
+    title: >
+      `migrate_to_v4_tx` 在 SQLite 路径上对 `pragma_table_info` 查询使用
+      `.unwrap_or(None)` 静默吞没所有错误
+    fix_applied: >
+      line 549 的 `.unwrap_or(None)` 改为 `?` 直接错误传播，与 Postgres/MySQL
+      分支保持一致。非事务版本 `column_exists` 保留 `.unwrap_or(None)` 作为
+      有意设计（调用方将列视为不存在，让 DDL 暴露真实错误）。
+
+    adversarial_tests:
+      - adversarial_v4_tx_pragma_error_propagates — 验证 v4 tx 内 pragma 查询正确传播
+      - adversarial_column_exists_returns_false_on_nonexistent_table — 验证 column_exists 对不存在的表返回 Ok(false)
+      - adversarial_ddl_surfaces_error_after_column_exists_suppresses — 验证 DDL 在 column_exists 抑制后仍能暴露根因
+
+  - id: SEC-ADV-003
+    severity: medium
+    cwe: CWE-754
+    category: "silent_failure / 过度错误抑制"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 230-250
+    symbol: Store::try_claim_migration (MySQL 分支)
+    title: >
+      MySQL `INSERT IGNORE` 过度抑制所有错误类型，非重复键错误被静默丢弃
+    fix_applied: >
+      `try_claim_migration` 和 `try_claim_migration_in_tx` 的 MySQL 分支均添加
+      防御性 `SELECT` 验证：`INSERT IGNORE` 返回 `rows_affected() == 0` 后，
+      额外 SELECT 确认行确实存在；若行不存在则返回错误而非静默 `Ok(false)`。
+
+    adversarial_tests:
+      - adversarial_try_claim_in_tx_is_mutually_exclusive — 验证 in-tx claim 互斥性（两个并发事务仅一个获胜）
+
+  # ─── LOW ──────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-004
+    severity: low
+    cwe: CWE-1188
+    category: "defense_in_depth / 依赖隐式默认值"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 96-106
+    symbol: Store::connect
+    title: >
+      SQLite `busy_timeout` 依赖 sqlx 内部默认值，未显式配置，
+      版本升级可能改变行为
+    fix_applied: >
+      通过 `after_connect` 回调显式执行 `PRAGMA busy_timeout=5000`。
+
+    adversarial_tests:
+      - adversarial_sqlite_connect_configures_wal_and_busy_timeout — 验证连接后 busy_timeout=5000 + journal_mode=wal
+
+  - id: SEC-ADV-005
+    severity: low
+    cwe: CWE-754
+    category: "code_quality / 脆弱错误检测"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 2110-2118
+    symbol: "adversarial_many_concurrent_connects_converge (测试代码)"
+    title: >
+      并发连接测试中的重试逻辑依赖字符串匹配 `contains("database is locked")`，
+      跨 SQLite 版本/语言环境可能失效
+    fix_applied: >
+      替换为结构化错误码判断：`db_err.code().as_deref() == Some("5")`
+      (SQLITE_BUSY)，不依赖错误消息文本。
+
+    adversarial_tests:
+      - (内嵌于 adversarial_many_concurrent_connects_converge — 10 并发 connect 压测)
+
+  - id: SEC-ADV-006
+    severity: low
+    cwe: CWE-1188
+    category: "performance / 并发吞吐"
+    status: FIXED
+    file: src/store/mod.rs
+    line: 101-105
+    symbol: Store::connect
+    title: >
+      SQLite 未启用 WAL 模式，`max_connections(1)` 完全串行化读写，
+      多任务场景下吞吐量受限
+    fix_applied: >
+      通过 `after_connect` 回调执行 `PRAGMA journal_mode=WAL;`。
+      WAL 模式下写操作不阻塞读操作，提升 crash 安全性和写吞吐。
+
+    adversarial_tests:
+      - adversarial_sqlite_connect_configures_wal_and_busy_timeout — 验证 journal_mode=wal
+
+  # ─── INFO ─────────────────────────────────────────────────────────────────
+  - id: SEC-ADV-007
+    severity: info
+    cwe: CWE-1188
+    category: "observation / 冗余调用"
+    status: FIXED
+    file: src/main.rs
+    line: 80
+    symbol: main
+    title: >
+      `sqlx::any::install_default_drivers()` 每次 `connect` 都被调用，幂等但冗余
+    fix_applied: >
+      移到 `main` 函数中一次性调用；`Store::connect` 中不再调用。
+
+# ─── 已验证通过的 M1 关键条件 ───────────────────────────────────────────────
+verified_conditions:
+  - id: claim-atomicity
+    description: >
+      `try_claim_migration` 的 SQLite/Postgres 分支使用
+      `INSERT ... ON CONFLICT DO NOTHING RETURNING version` 实现了正确的原子操作。
+      并发测试 `adversarial_try_claim_is_mutually_exclusive_concurrent`
+      验证了两个 `tokio::join!` 并发 claim 的互斥性。**无问题。**
+  - id: cross-version-race
+    description: >
+      `run_migrations` 在单个连接+事务内编排 v1-v5，每个 per-version migrator
+      通过 `try_claim_migration_in_tx` 在当前事务内 claim。事务提交前 claim 行
+      对其他连接不可见（SQLite/Postgres），正确关闭了跨版本竞态窗口。**无问题。**
+  - id: sentinel-filter
+    description: >
+      `get_current_version` 正确排除 i32::MAX 哨兵行（`WHERE version < $1`），
+      外部调用方始终看到真实版本号。**无问题。**
+  - id: ddl-idempotency
+    description: >
+      所有 DDL 使用 `IF NOT EXISTS` 守卫或 `column_exists` 预检查，
+      幂等安全。v4 的预检查在事务内执行（`migrate_to_v4_tx`），
+      避免了 F-M3-04 的死锁问题。**无问题。**
+  - id: driver-dispatch
+    description: >
+      `DatabaseKind::from_url` 正确解析 URL scheme，`v5_create_messages_sql`
+      按驱动生成正确的 id 列语法。**无问题。**
+  - id: error-propagation
+    description: >
+      DDL 失败通过 `?` 传播到 `run_migrations` 调用方，事务回滚。
+      不会被静默吞没。**无问题。**
+  - id: sql-injection
+    description: >
+      `column_exists` 在 SQLite 路径使用 `is_safe_identifier` 白名单校验
+      （仅允许 `[a-zA-Z0-9_]`）后才将 table/column 名拼接到
+      `pragma_table_info` 查询。单引号不在白名单中，无法逃逸字符串上下文。**无问题。**
+  - id: timestamp-unification
+    description: >
+      所有 DDL 和 SQL 文件统一使用 `CURRENT_TIMESTAMP`，
+      无 `datetime('now')` 残留。**无问题。**
+  - id: wal-and-busy-timeout-explicit
+    description: >
+      `after_connect` 回调显式设置 `PRAGMA journal_mode=WAL` 和
+      `PRAGMA busy_timeout=5000`，不再依赖 sqlx 内部默认值。**无问题。**
+  - id: insert-ignore-defensive-check
+    description: >
+      MySQL `INSERT IGNORE` 路径添加防御性 SELECT 验证：
+      若 INSERT 返回 0 行但 SELECT 确认行不存在，则返回错误而非静默 `Ok(false)`。
+      `try_claim_migration` 和 `try_claim_migration_in_tx` 均已修复。**无问题。**
+
+# ─── Summary ─────────────────────────────────────────────────────────────────
+summary:
+  total_findings: 7
+  high: 1
+  medium: 2
+  low: 3
+  info: 1
+  fixed: 7
+  open: 0
+  blocking: 0
+  adversarial_tests_added: 9
+  adversarial_tests_detail: >
+    新增 9 个对抗性测试：
+    - adversarial_ensure_sqlite_file_does_not_truncate_existing_db (SEC-ADV-001)
+    - adversarial_ensure_sqlite_file_concurrent_threads_safe (SEC-ADV-001)
+    - adversarial_v4_tx_pragma_error_propagates (SEC-ADV-002)
+    - adversarial_column_exists_returns_false_on_nonexistent_table (SEC-ADV-002)
+    - adversarial_ddl_surfaces_error_after_column_exists_suppresses (SEC-ADV-002)
+    - adversarial_try_claim_in_tx_is_mutually_exclusive (SEC-ADV-003)
+    - adversarial_sqlite_connect_configures_wal_and_busy_timeout (SEC-ADV-004/006)
+    - adversarial_many_concurrent_connects_converge 内嵌结构化错误码检查 (SEC-ADV-005)
+    全部 315 测试通过（242 lib + 20 breaking + 10 e2e + 27 routing + 1 metrics + 15 queue），
+    clippy 零警告，build 成功。

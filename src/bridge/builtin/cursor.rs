@@ -146,8 +146,8 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_session_id: Option<String> = None;
-    // Track the last partial text sent so we can detect when result.result differs.
-    let mut last_partial: Option<String> = None;
+    let mut assistant_event_count: u32 = 0;
+    let mut assistant_total_chars: usize = 0;
 
     loop {
         line.clear();
@@ -179,24 +179,33 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                             .collect::<Vec<_>>()
                             .join("");
                         if !text.is_empty() {
+                            assistant_event_count += 1;
+                            assistant_total_chars += text.len();
+                            eprintln!(
+                                "[cursor] assistant#{} len={} total_so_far={}",
+                                assistant_event_count,
+                                text.len(),
+                                assistant_total_chars
+                            );
                             println!("ILINK_PARTIAL:{}", serde_json::to_string(&text)?);
                             std::io::Write::flush(&mut std::io::stdout()).ok();
-                            last_partial = Some(text);
                         }
                     }
                 }
             }
             Some("result") => {
                 found_session_id = event.session_id;
-                // When the model uses tools between turns, the final assistant reply text
-                // may only appear in result.result and have no corresponding assistant event.
-                // Send it as a partial if it differs from the last streamed chunk.
+                // Cursor agent's result.result = concat of all assistant texts.
+                // Since all assistant events are already streamed via ILINK_PARTIAL,
+                // sending result would duplicate the full content to the user.
+                // Disabled: only log for observability.
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
-                    if !already_sent {
-                        println!("ILINK_PARTIAL:{}", serde_json::to_string(&result_text)?);
-                        std::io::Write::flush(&mut std::io::stdout()).ok();
-                    }
+                    eprintln!(
+                        "[cursor] result len={} assistant_events={} assistant_chars={} (NOT sending)",
+                        result_text.len(),
+                        assistant_event_count,
+                        assistant_total_chars,
+                    );
                 }
             }
             _ => {}

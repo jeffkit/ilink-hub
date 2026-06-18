@@ -1,0 +1,224 @@
+milestone: M2
+title: "对抗性审查 — Rust 安全与并发（内存安全 / data race / tokio 异步陷阱 / OWASP）"
+review_date: 2026-06-17
+reviewer: adversarial-rust-sec
+verdict: PASS
+
+# ─── Review scope ─────────────────────────────────────────────────────────
+scope:
+  file: src/store/mod.rs
+  focus:
+    - memory_safety       # unsafe blocks, use-after-free, double-free, buffer overflow
+    - data_race           # Send/Sync, concurrent mutation, lock ordering
+    - tokio_async_pitfalls # deadlock, spawn_blocking misuse, cancellation safety
+    - owasp_top10         # injection, broken auth, sensitive data exposure, security misconfig
+  excluded:
+    - src/bridge/connection.rs  # unsafe gethostname FFI predates this changeset
+    - test-only code paths      # reviewed but not blocking
+
+# ─── Findings ─────────────────────────────────────────────────────────────
+findings:
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # SEC-LOW findings
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: SEC-ADV-M2-001
+    severity: LOW
+    cwe: CWE-754
+    category: error_handling
+    title: "column_exists SQLite 路径使用 unwrap_or(None) 吞没所有错误"
+    location: "src/store/mod.rs:888-894"
+    description: |
+      非事务版本的 `column_exists` 在 SQLite 分支（`pragma_table_info`）上
+      对查询结果调用了 `.unwrap_or(None)`，这会静默吞没所有 `Err` 变体（连接池
+      耗尽、数据库文件被删除、SQLite 内部错误等），并将其视为"列不存在"。
+
+      事务版本（`migrate_to_v4_tx` 中的内联 catalog 查询，第 548-549 行）正确
+      使用 `?` 传播错误，两者不一致。
+
+      实际风险：如果连接池出现问题，column_exists 返回 Ok(false)，调用者会尝试
+      ALTER TABLE ADD COLUMN，该语句也会因同样的连接问题而失败。最终错误仍然会
+      传播出去，只是错误信息不够精确。不会导致静默数据损坏。
+    recommendation: |
+      考虑在 SQLite 分支也使用 `?` 传播错误，与事务版本保持一致。或者在吞没错误
+      时记录 tracing::warn! 日志，以便生产环境排查。
+    acceptance: ACCEPTED_AS_IS
+    acceptance_reason: |
+      非事务版本仅用于测试代码。生产路径使用 migrate_to_vN_tx 事务变体，已正确
+      传播错误。即使错误被吞没，后续 DDL 也会因同样的连接问题而失败，不会导致
+      静默数据损坏。
+
+  - id: SEC-ADV-M2-002
+    severity: LOW
+    cwe: CWE-209
+    category: information_disclosure
+    title: "DDL 错误消息中嵌入完整 SQL 语句文本"
+    location: "src/store/mod.rs (多处 map_err 闭包，第 433, 444, 456, 468, 491, 505, 523, 565, 582, 604, 614, 624, 922 行)"
+    description: |
+      所有 DDL 错误通过 `anyhow::anyhow!("DDL failed: {完整SQL}\n  Error: {e}")`
+      包装，将数据库 schema 结构嵌入错误链。生产环境中（`main.rs:166` 和
+      `runtime/serve.rs:71`）这些错误会导致程序启动失败，仅输出到 stderr/日志，
+      不通过 API 暴露给客户端。但如果将来有人将这些错误暴露到 HTTP 响应中，会
+      泄露完整的数据库表结构。
+    recommendation: |
+      如果计划将 store 错误通过 API 返回给客户端，使用不含完整 SQL 的通配错误
+      消息。当前启动失败场景中完整 SQL 对调试有价值，风险可接受。
+    acceptance: ACCEPTED_AS_IS
+    acceptance_reason: |
+      错误仅在程序启动失败时输出到日志/stderr，不暴露给 API 消费者。完整 SQL
+      对生产环境排查问题至关重要。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # INFO — confirmed-safe design elements
+  # ═══════════════════════════════════════════════════════════════════════
+
+  - id: SEC-ADV-M2-003
+    severity: INFO
+    category: memory_safety
+    title: "内存安全审查通过 — 零 unsafe 代码"
+    location: "src/store/mod.rs 全文"
+    description: |
+      Store 模块不包含任何 `unsafe` 代码块。所有内存操作通过安全 Rust 抽象
+      （sqlx、tokio、std::fs）执行。`unsafe` 仅存在于 `bridge/connection.rs`
+      的 `gethostname` FFI 调用，不在本次变更范围。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-004
+    severity: INFO
+    category: sql_injection
+    title: "SQL 注入审查通过 — 全面参数化"
+    location: "src/store/mod.rs 全文"
+    description: |
+      对所有 SQL 查询路径进行了审查：
+      - 所有用户控制的值均使用 $1/$2 参数化绑定（sqlx 占位符自动适配驱动）
+      - v5_create_messages_sql 中的 format! 仅使用硬编码的 id_clause（match 分支）
+      - column_exists SQLite 路径的 format! 经过 is_safe_identifier 白名单验证
+        （仅允许 [a-zA-Z0-9_]）
+      - QueryBuilder::push_bind 在所有批次查询中使用参数化
+      - find_assistant_message_by_content 中的 LIKE 模式正确转义了 % _ 和 \
+      未发现任何 SQL 注入向量。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-005
+    severity: INFO
+    category: data_race
+    title: "数据竞争审查通过 — 迁移运行器正确序列化"
+    location: "src/store/mod.rs:333-408 (run_migrations), 99-113 (connect)"
+    description: |
+      并发模型审查结论：正确。
+      - SQLite：连接池固定 max_connections(1)，通过单一物理连接序列化所有访问
+      - 迁移过程在单个事务内运行（BEGIN IMMEDIATE 获取文件级写锁）
+      - try_claim_migration_in_tx 提供原子 check-and-claim（INSERT ... ON CONFLICT
+        DO NOTHING RETURNING），SQLite/Postgres 原生支持，MySQL 回退到
+        INSERT IGNORE + 防御性行存在检查
+      - Store 实现 Send + Sync（AnyPool 保证），Arc<Store> 安全共享
+      - 并发连接测试（adversarial_concurrent_store_connect_succeeds_and_converges、
+        adversarial_many_concurrent_connects_converge）验证无竞争
+      - map_context_token 的 insert-or-select 模式通过 ON CONFLICT DO NOTHING
+        实现了无竞争 upsert
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-006
+    severity: INFO
+    category: tokio_async
+    title: "Tokio 异步死锁审查通过 — 生产路径无风险"
+    location: "src/store/mod.rs:917-924 (ddl), 78-80 (spawn_blocking)"
+    description: |
+      - ddl() 辅助方法从连接池获取独立连接，在单连接 SQLite 上若持有事务时调用
+        会死锁。但生产路径使用 migrate_to_vN_tx 变体，所有 DDL 在同一个事务
+        连接上执行，不调用 ddl()。ddl() 仅由测试代码使用。
+      - spawn_blocking 双 ? 模式（第 80 行）：tokio::task::spawn_blocking(...)
+        .await.map_err(...)?? 正确拆解 JoinError 和内部 Result。确保文件系统
+        操作不阻塞异步运行时。
+      - 代码中明确注释了死锁风险（第 538-541 行，migrate_to_v4_tx），说明
+        开发者对此有意识。
+      - 没有发现 .await 在同步互斥锁持有期间的情况。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-007
+    severity: INFO
+    category: defense_in_depth
+    title: "MySQL INSERT IGNORE 防御性回退检查"
+    location: "src/store/mod.rs:228-251 (try_claim_migration MySQL 分支)"
+    description: |
+      MySQL 的 INSERT IGNORE 会抑制所有错误类型（不仅是重复键）。代码在
+      rows_affected() == 0 后执行防御性 SELECT 验证行确实存在。如果行不存在
+      （说明 INSERT IGNORE 吞没了一个非重复键错误），返回描述性 anyhow::Error。
+      这种防御性编程在 H2、MongoDB 等数据库的类似陷阱中尤为重要。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-008
+    severity: INFO
+    category: owasp_configuration
+    title: "SQLite 安全配置确认 — WAL + busy_timeout"
+    location: "src/store/mod.rs:99-113 (after_connect 回调)"
+    description: |
+      SQLite 连接池显式配置 PRAGMA journal_mode=WAL 和 PRAGMA busy_timeout=5000。
+      WAL 模式提供更好的崩溃安全性和读写并发；5000ms 超时对嵌入式场景足够。
+      测试 adversarial_sqlite_connect_configures_wal_and_busy_timeout 验证了
+      这些 pragma 在连接后确实生效。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-009
+    severity: INFO
+    category: owasp_input_validation
+    title: "is_safe_identifier 白名单验证正确"
+    location: "src/store/mod.rs:15-17, 877-878"
+    description: |
+      is_safe_identifier 实现字符级白名单（仅 [a-zA-Z0-9_]），拒绝空字符串。
+      在 column_exists 中用于验证拼接到 pragma_table_info('{table}') 的标识符。
+      严格的白名单比黑名单方法更安全，不接受可能破坏单引号分隔符的字符。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-010
+    severity: INFO
+    category: cancellation_safety
+    title: "任务取消安全性审查通过"
+    location: "src/store/mod.rs:333-408 (run_migrations)"
+    description: |
+      run_migrations 在单个事务内运行。如果 future 在 DDL 执行期间被取消
+      （drop），tokio 不会自动回滚 SQLite 事务——连接被丢弃，SQLite 在连接关闭
+      时回滚未提交的事务。因此取消不会导致部分迁移状态。唯一风险是单连接池的
+      连接泄漏，但 AnyPool 的 Drop 实现会归还连接。
+    acceptance: NOTED
+
+  - id: SEC-ADV-M2-011
+    severity: INFO
+    category: owasp_sensitive_data
+    title: "凭据存储审查 — 设计层面确认"
+    location: "src/store/mod.rs:1461-1477 (save_credentials)"
+    description: |
+      bot_credentials 表以明文形式存储 API token 和 base_url。这是 v1 schema
+      的设计选择，不属于本次变更范围。应用层负责通过文件系统权限保护 SQLite
+      数据库文件（~/.ilink-hub/ilink-hub.db，默认权限 600）。没有新增的敏感
+      数据暴露路径。
+    acceptance: NOTED
+
+# ─── Summary ──────────────────────────────────────────────────────────────
+summary:
+  total_findings: 11
+  by_severity:
+    CRITICAL: 0
+    HIGH: 0
+    MEDIUM: 0
+    LOW: 2
+    INFO: 9
+  blocking: 0
+  verdict: PASS
+  rationale: |
+    对 src/store/mod.rs 进行了全面的对抗性安全审查，重点覆盖：
+    1. 内存安全：零 unsafe 代码。所有内存操作通过安全抽象进行。
+    2. 数据竞争：迁移运行器的单连接+事务模型正确序列化并发访问。
+       try_claim_migration 的 ON CONFLICT DO NOTHING RETURNING 提供
+       原子性 check-and-claim。Arc<Store> 安全共享。
+    3. Tokio 异步：生产路径无死锁风险。spawn_blocking 用于文件 I/O
+       避免阻塞运行时。事务变体在单个连接上执行所有 DDL。
+    4. OWASP：所有 SQL 参数化。标识符拼接经过严格白名单验证。
+       SQLite 显式配置 WAL + busy_timeout。错误仅输出到日志。
+
+    两个 LOW 级别发现（column_exists 错误吞没不一致、错误消息嵌入 SQL）
+    均不会导致数据损坏或安全漏洞。九个 INFO 级别确认覆盖了内存安全、
+    注入防护、数据竞争、异步死锁、取消安全、输入验证和安全配置等维度。
+
+    未发现任何需要修复的 CRITICAL、HIGH 或 MEDIUM 级别问题。
