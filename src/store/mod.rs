@@ -406,6 +406,7 @@ impl Store {
         self.migrate_to_v3_tx(&mut tx).await?;
         self.migrate_to_v4_tx(&mut tx).await?;
         self.migrate_to_v5_tx(&mut tx).await?;
+        self.migrate_to_v6_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -632,6 +633,49 @@ impl Store {
         Ok(())
     }
 
+    /// v6: Normalize `peer_user_id` format on `context_token_map`.
+    ///
+    /// A pre-v6 code path stored `peer_user_id` as the bare WeChat peer ID
+    /// (e.g. `"o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat"`). The current
+    /// `find_or_create_vctx` writes a `conv_key` with a `peer:` / `group:`
+    /// prefix (e.g. `"peer:o9cq80_..."`) and queries by that prefixed value.
+    /// On a pre-v6 database, the query never matched the existing row, so
+    /// every new message minted a fresh vctx — orphaning the previous
+    /// conversation and all its backend sessions.
+    ///
+    /// This migration prepends `peer:` to any non-empty `peer_user_id`
+    /// that does not already start with `peer:` or `group:`. It is
+    /// idempotent (re-running matches no rows), and `find_or_create_vctx`
+    /// remains the single source of truth for the format going forward.
+    async fn migrate_to_v6_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 6).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE context_token_map
+             SET peer_user_id = 'peer:' || peer_user_id
+             WHERE peer_user_id != ''
+               AND peer_user_id NOT LIKE 'peer:%'
+               AND peer_user_id NOT LIKE 'group:%'",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "DDL failed: normalize peer_user_id format on context_token_map\n  Error: {e}"
+            )
+        })?;
+
+        tracing::info!(
+            version = 6,
+            "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
+        );
+        Ok(())
+    }
+
     // Non-transactional single-version migrators.
     // Called only from test code that exercises individual migrators in isolation.
     // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
@@ -823,6 +867,30 @@ impl Store {
         .await?;
 
         tracing::info!(version = 5, "migration applied: messages table + indexes");
+        Ok(())
+    }
+
+    /// v6: normalize `peer_user_id` format on `context_token_map` to the
+    /// canonical `peer:` / `group:` form. Idempotent (re-running matches
+    /// no rows). Used only by unit tests that exercise individual migrators
+    /// in isolation; production uses `migrate_to_v6_tx` via `run_migrations`.
+    #[allow(dead_code)]
+    async fn migrate_to_v6(&self) -> Result<()> {
+        if !self.try_claim_migration(6).await? {
+            return Ok(());
+        }
+        self.ddl(
+            "UPDATE context_token_map
+             SET peer_user_id = 'peer:' || peer_user_id
+             WHERE peer_user_id != ''
+               AND peer_user_id NOT LIKE 'peer:%'
+               AND peer_user_id NOT LIKE 'group:%'",
+        )
+        .await?;
+        tracing::info!(
+            version = 6,
+            "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
+        );
         Ok(())
     }
 
@@ -1821,17 +1889,17 @@ mod store_tests {
     async fn test_schema_version_tracking() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-        // All five migrations must be applied after a fresh connect.
+        // All six migrations must be applied after a fresh connect.
         let version = store
             .get_current_version()
             .await
             .expect("get_current_version");
         assert_eq!(
-            version, 5,
-            "expected all 5 migrations to be applied on a fresh DB"
+            version, 6,
+            "expected all 6 migrations to be applied on a fresh DB"
         );
 
-        for v in 1..=5 {
+        for v in 1..=6 {
             let applied = store.is_migration_run(v).await.expect("is_migration_run");
             assert!(applied, "migration v{v} should be marked as applied");
         }
@@ -1863,7 +1931,7 @@ mod store_tests {
             .get_current_version()
             .await
             .expect("get_current_version");
-        assert_eq!(version, 5, "version must remain 5 after idempotent re-run");
+        assert_eq!(version, 6, "version must remain 6 after idempotent re-run");
     }
 
     /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -1963,9 +2031,9 @@ mod store_tests {
         store.run_migrations().await.expect("incremental migration");
 
         let version = store.get_current_version().await.unwrap();
-        assert_eq!(version, 5, "must reach v5 after incremental migration");
+        assert_eq!(version, 6, "must reach v6 after incremental migration");
 
-        for v in 1..=5 {
+        for v in 1..=6 {
             assert!(
                 store.is_migration_run(v).await.unwrap(),
                 "v{v} must be marked applied"
@@ -1984,6 +2052,124 @@ mod store_tests {
             r.is_ok(),
             "find_or_create_vctx failed: {:?}",
             r.err()
+        );
+    }
+
+    /// v6: pre-v6 databases stored `peer_user_id` as the bare WeChat peer ID
+    /// (no `peer:` / `group:` prefix), but the current `find_or_create_vctx`
+    /// writes a prefixed `conv_key` and queries by that prefix. Running v6
+    /// must rewrite every non-empty, non-prefixed row to add the `peer:`
+    /// prefix — otherwise every new message mints a fresh vctx and the
+    /// existing conversation is orphaned.
+    ///
+    /// We pre-seed `context_token_map` with three rows:
+    ///   1. bare peer ID (must be prefixed)
+    ///   2. already-prefixed `peer:` row (must be left alone)
+    ///   3. already-prefixed `group:` row (must be left alone)
+    /// and assert post-migration values.
+    #[tokio::test]
+    async fn test_migration_v6_normalizes_peer_user_id_format() {
+        sqlx::any::install_default_drivers();
+        let store = {
+            let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
+                .await
+                .expect("pool");
+            let s = Store {
+                pool,
+                kind: DatabaseKind::Sqlite,
+            };
+
+            // Manually create the v1-v5 schema (we don't need the full DDL — we
+            // only care about context_token_map and the migration bookkeeping).
+            s.ddl(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+                )",
+            )
+            .await
+            .expect("schema_version");
+            s.ddl(
+                "CREATE TABLE IF NOT EXISTS context_token_map (
+                    vctx TEXT PRIMARY KEY,
+                    real_ctx TEXT NOT NULL,
+                    peer_user_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT
+                )",
+            )
+            .await
+            .expect("context_token_map");
+
+            // Mark v1-v5 as already applied so v6 is the only one that runs.
+            for v in 1..=5 {
+                s.record_migration_run(v).await.expect("mark v{v}");
+            }
+
+            // Pre-v6 data: row 1 has the old bare peer_user_id format;
+            // rows 2 and 3 are already in the new format and must be left alone.
+            s.ddl(
+                "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id) VALUES
+                    ('vctx-old-1', 'ctx-1', 'o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat'),
+                    ('vctx-new-2', 'ctx-2', 'peer:already@im.wechat'),
+                    ('vctx-grp-3', 'ctx-3', 'group:chatroom-123')",
+            )
+            .await
+            .expect("seed");
+
+            s
+        };
+
+        assert!(!store.is_migration_run(6).await.unwrap(), "v6 must not be marked yet");
+        store.run_migrations().await.expect("run_migrations");
+        let cur_ver = store.get_current_version().await.unwrap();
+        assert_eq!(cur_ver, 6, "current version must be 6, got {}", cur_ver);
+        assert!(store.is_migration_run(6).await.unwrap(), "v6 must be marked after run");
+
+        // Row 1: bare ID must now be prefixed.
+        let row1 = store
+            .resolve_context_token_full("vctx-old-1")
+            .await
+            .expect("resolve vctx-old-1")
+            .expect("vctx-old-1 must exist");
+        assert_eq!(
+            row1.1, "peer:o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat",
+            "bare peer_user_id must be prefixed with 'peer:'"
+        );
+
+        // Row 2: already-prefixed peer: row must be unchanged.
+        let row2 = store
+            .resolve_context_token_full("vctx-new-2")
+            .await
+            .expect("resolve vctx-new-2")
+            .expect("vctx-new-2 must exist");
+        assert_eq!(
+            row2.1, "peer:already@im.wechat",
+            "already-prefixed peer: row must be left alone"
+        );
+
+        // Row 3: already-prefixed group: row must be unchanged.
+        let row3 = store
+            .resolve_context_token_full("vctx-grp-3")
+            .await
+            .expect("resolve vctx-grp-3")
+            .expect("vctx-grp-3 must exist");
+        assert_eq!(
+            row3.1, "group:chatroom-123",
+            "already-prefixed group: row must be left alone"
+        );
+
+        // Re-running run_migrations must be a no-op for v6 (idempotent).
+        store.run_migrations().await.expect("second run_migrations");
+        let row1_again = store
+            .resolve_context_token_full("vctx-old-1")
+            .await
+            .expect("resolve vctx-old-1 again")
+            .expect("vctx-old-1 must exist");
+        assert_eq!(
+            row1_again.1, "peer:o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat",
+            "v6 must be idempotent on re-run"
         );
     }
 
@@ -2289,13 +2475,13 @@ mod store_tests {
         let s2 = s2.expect("connect #2 must succeed");
         assert_eq!(
             s1.get_current_version().await.unwrap(),
-            5,
-            "writer #1 must see all v1-v5 applied"
+            6,
+            "writer #1 must see all v1-v6 applied"
         );
         assert_eq!(
             s2.get_current_version().await.unwrap(),
-            5,
-            "writer #2 must see all v1-v5 applied"
+            6,
+            "writer #2 must see all v1-v6 applied"
         );
         // The whole schema must be usable from both writers — no half-applied
         // tables, no missing indexes.
@@ -2359,8 +2545,8 @@ mod store_tests {
         for (i, s) in stores.iter().enumerate() {
             assert_eq!(
                 s.get_current_version().await.unwrap(),
-                5,
-                "connect #{i} must see all v1-v5 applied"
+                6,
+                "connect #{i} must see all v1-v6 applied"
             );
         }
     }
@@ -2569,8 +2755,8 @@ mod store_tests {
         assert!(!store.is_migration_run(0).await.unwrap());
         // is_migration_run(-1): not applied, no error.
         assert!(!store.is_migration_run(-1).await.unwrap());
-        // get_current_version: 5 (the highest applied).
-        assert_eq!(store.get_current_version().await.unwrap(), 5);
+        // get_current_version: 6 (the highest applied).
+        assert_eq!(store.get_current_version().await.unwrap(), 6);
     }
 
     /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -2722,16 +2908,17 @@ mod store_tests {
     #[tokio::test]
     async fn m2_migrators_are_idempotent_per_step() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
-        // After connect, all 5 are applied. Re-running each must NOT fail
+        // After connect, all 6 are applied. Re-running each must NOT fail
         // and must NOT touch the schema_version table.
         store.migrate_to_v1().await.expect("v1 re-run");
         store.migrate_to_v2().await.expect("v2 re-run");
         store.migrate_to_v3().await.expect("v3 re-run");
         store.migrate_to_v4().await.expect("v4 re-run");
         store.migrate_to_v5().await.expect("v5 re-run");
+        store.migrate_to_v6().await.expect("v6 re-run");
 
-        // Still at v5.
-        assert_eq!(store.get_current_version().await.unwrap(), 5);
+        // Still at v6.
+        assert_eq!(store.get_current_version().await.unwrap(), 6);
     }
 
     /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -2897,15 +3084,15 @@ mod store_tests {
     #[tokio::test]
     async fn m2_run_migrations_records_all_versions_in_order() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
-        // All five versions are present.
-        for v in 1..=5 {
+        // All six versions are present.
+        for v in 1..=6 {
             assert!(
                 store.is_migration_run(v).await.unwrap(),
                 "v{v} must be recorded after run_migrations"
             );
         }
         // get_current_version returns the maximum.
-        assert_eq!(store.get_current_version().await.unwrap(), 5);
+        assert_eq!(store.get_current_version().await.unwrap(), 6);
     }
 
     /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -2916,8 +3103,8 @@ mod store_tests {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
         // Second call must succeed.
         store.run_migrations().await.expect("second run_migrations");
-        // Version stays at 5 (no ghost rows from a third call).
-        assert_eq!(store.get_current_version().await.unwrap(), 5);
+        // Version stays at 6 (no ghost rows from a third call).
+        assert_eq!(store.get_current_version().await.unwrap(), 6);
     }
 
     /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -3539,8 +3726,8 @@ mod store_tests {
         let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
         let v = rt.block_on(store2.get_current_version()).unwrap();
         assert_eq!(
-            v, 5,
-            "database must still be at v5 after ensure_sqlite_file"
+            v, 6,
+            "database must still be at v6 after ensure_sqlite_file"
         );
     }
 
@@ -3591,7 +3778,7 @@ mod store_tests {
                 .expect("reconnect after concurrent race")
         });
         let v = rt.block_on(store2.get_current_version()).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
     }
 
     /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
