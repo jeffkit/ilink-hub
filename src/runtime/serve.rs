@@ -316,7 +316,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                 if registry.get_by_vtoken(&vtoken).is_some() {
                     router.set_route(&from_user, vtoken);
                 } else {
-                    tracing::warn!(vtoken = %vtoken, from_user = %from_user, "skipping route loading for non-existent vtoken");
+                    tracing::warn!(vtoken = %crate::redact_token(&vtoken), from_user = %from_user, "skipping route loading for non-existent vtoken");
                 }
             }
             info!(count, "loaded routing state from database");
