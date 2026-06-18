@@ -170,7 +170,9 @@ async fn migration_creates_expected_schema_on_fresh_db() {
     let result = store.list_clients().await;
     assert!(result.is_ok(), "clients table should exist after migration");
 
-    let result = store.find_or_create_vctx("test-user", None, "real-ctx").await;
+    let result = store
+        .find_or_create_vctx("test-user", None, "real-ctx")
+        .await;
     assert!(
         result.is_ok(),
         "context_token_map table should exist after migration"
@@ -205,11 +207,7 @@ async fn find_or_create_vctx_creates_stable_entries() {
     // Create 5 distinct peer conversations.
     for i in 0..5 {
         store
-            .find_or_create_vctx(
-                &format!("user_{i}"),
-                None,
-                &format!("real_{i}"),
-            )
+            .find_or_create_vctx(&format!("user_{i}"), None, &format!("real_{i}"))
             .await
             .unwrap();
     }

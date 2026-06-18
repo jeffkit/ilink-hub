@@ -990,7 +990,7 @@ mod tests {
     /// Verifies the basic happy path for `download_document_as_base64`.
     #[tokio::test]
     async fn download_pdf_roundtrips_through_local_server() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         // 4-byte PDF magic ("%PDF") + minimal junk. Real PDFs have headers/trailers
         // but we only need byte-fidelity; the Claude API does the real validation.
@@ -1022,7 +1022,7 @@ mod tests {
     /// supports this media type alongside PDF; useful for `.txt` / `.md` forwards.
     #[tokio::test]
     async fn download_text_plain_document_roundtrips() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         const TEXT: &str = "hello from a wechat text file\n";
 
@@ -1043,7 +1043,10 @@ mod tests {
         let url = format!("http://{addr}/note.txt");
         let (media_type, b64) = download_document_as_base64(&url).await.unwrap();
         assert_eq!(media_type, "text/plain");
-        assert_eq!(String::from_utf8_lossy(&B64.decode(&b64).unwrap()).as_ref(), TEXT);
+        assert_eq!(
+            String::from_utf8_lossy(&B64.decode(&b64).unwrap()).as_ref(),
+            TEXT
+        );
     }
 
     /// Any non-PDF/non-text media type must be rejected with a clear error. This is
@@ -1051,7 +1054,7 @@ mod tests {
     /// runs before the CLI is spawned so we never waste a turn on a doomed request.
     #[tokio::test]
     async fn download_document_rejects_unsupported_media_type() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         async fn serve_mp4() -> Response<Body> {
             Response::builder()
@@ -1076,14 +1079,17 @@ mod tests {
             msg.contains("unsupported document media_type"),
             "error should name the constraint: {msg}"
         );
-        assert!(msg.contains("video/mp4"), "error should quote the type: {msg}");
+        assert!(
+            msg.contains("video/mp4"),
+            "error should quote the type: {msg}"
+        );
     }
 
     /// A zip / application/octet-stream file must also be rejected — the bridge
     /// must not silently forward arbitrary binaries to Claude as a "document".
     #[tokio::test]
     async fn download_document_rejects_zip() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         async fn serve_zip() -> Response<Body> {
             Response::builder()
@@ -1110,7 +1116,7 @@ mod tests {
     /// not download the full 100MB and then fail at the API.
     #[tokio::test]
     async fn download_document_rejects_oversize_pdf() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         // Emit one chunk that itself exceeds the limit so the streaming check trips
         // on the first iteration. We don't need to allocate a real 32MB+ buffer.

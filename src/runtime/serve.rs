@@ -325,7 +325,6 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
             tracing::warn!(error = %e, "failed to load routing state from DB");
         }
     }
-
 }
 
 /// Lower bound for `ILINK_MAX_QUEUE_SIZE`. Values below this clamp to [`MIN_MAX_QUEUE_SIZE`].
