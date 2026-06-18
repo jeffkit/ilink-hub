@@ -1,12 +1,26 @@
-//! Database schema migrations for the Store.
-//! Each `migrate_to_vN` method brings the schema up by exactly one version step.
+//! Schema version tracking and migrations.
+//!
+//! Split out of `mod.rs`. The canonical transactional migrators
+//! (`migrate_to_vN_tx`) run inside `run_migrations`; the non-`_tx`
+//! variants are exercised by the unit-test surface in isolation.
 
 use anyhow::Result;
 use sqlx::{Acquire, Row};
 
-use super::{is_safe_identifier, DatabaseKind, Store};
+use super::{DatabaseKind, Store};
+
+/// Whitelist check used by SQLite `pragma_table_info` splicing: the table
+/// and column names must contain only identifier characters, so the
+/// interpolated string cannot smuggle SQL.
+#[allow(dead_code)]
+fn is_safe_identifier(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 impl Store {
+    /// Returns the highest version recorded in `schema_version`, or 0 if the
+    /// table is empty. Decode errors are propagated — a DB that has rows but
+    /// fails to decode them is NOT the same as a fresh DB.
     pub async fn get_current_version(&self) -> Result<i32> {
         // Exclude the lock-sentinel row (i32::MAX) that the migration runner
         // inserts to prevent concurrent double-execution. External callers must
@@ -242,6 +256,7 @@ impl Store {
         self.migrate_to_v3_tx(&mut tx).await?;
         self.migrate_to_v4_tx(&mut tx).await?;
         self.migrate_to_v5_tx(&mut tx).await?;
+        self.migrate_to_v6_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -483,6 +498,49 @@ impl Store {
         Ok(())
     }
 
+    /// v6: Normalize `peer_user_id` format on `context_token_map`.
+    ///
+    /// A pre-v6 code path stored `peer_user_id` as the bare WeChat peer ID
+    /// (e.g. `"o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat"`). The current
+    /// `find_or_create_vctx` writes a `conv_key` with a `peer:` / `group:`
+    /// prefix (e.g. `"peer:o9cq80_..."`) and queries by that prefixed value.
+    /// On a pre-v6 database, the query never matched the existing row, so
+    /// every new message minted a fresh vctx — orphaning the previous
+    /// conversation and all its backend sessions.
+    ///
+    /// This migration prepends `peer:` to any non-empty `peer_user_id`
+    /// that does not already start with `peer:` or `group:`. It is
+    /// idempotent (re-running matches no rows), and `find_or_create_vctx`
+    /// remains the single source of truth for the format going forward.
+    pub(super) async fn migrate_to_v6_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 6).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "UPDATE context_token_map
+             SET peer_user_id = 'peer:' || peer_user_id
+             WHERE peer_user_id != ''
+               AND peer_user_id NOT LIKE 'peer:%'
+               AND peer_user_id NOT LIKE 'group:%'",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "DDL failed: normalize peer_user_id format on context_token_map\n  Error: {e}"
+            )
+        })?;
+
+        tracing::info!(
+            version = 6,
+            "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
+        );
+        Ok(())
+    }
+
     // Non-transactional single-version migrators.
     // Called only from test code that exercises individual migrators in isolation.
     // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
@@ -609,8 +667,8 @@ impl Store {
         // We add the column as nullable TEXT. All INSERT / UPDATE statements
         // that write to context_token_map explicitly supply CURRENT_TIMESTAMP
         // for created_at, so new rows always have a proper timestamp. Pre-v4
-        // rows (if any) get NULL, which list_recent_context_tokens handles
-        // via COALESCE.
+        // rows (if any) get NULL, which is acceptable since find_or_create_vctx
+        // does not rely on created_at for ordering.
         //
         // Pre-check: ask the catalog whether the column already exists. This
         // works on SQLite, Postgres, and MySQL (sqlx translates the SQL to
@@ -674,6 +732,30 @@ impl Store {
         .await?;
 
         tracing::info!(version = 5, "migration applied: messages table + indexes");
+        Ok(())
+    }
+
+    /// v6: normalize `peer_user_id` format on `context_token_map` to the
+    /// canonical `peer:` / `group:` form. Idempotent (re-running matches
+    /// no rows). Used only by unit tests that exercise individual migrators
+    /// in isolation; production uses `migrate_to_v6_tx` via `run_migrations`.
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v6(&self) -> Result<()> {
+        if !self.try_claim_migration(6).await? {
+            return Ok(());
+        }
+        self.ddl(
+            "UPDATE context_token_map
+             SET peer_user_id = 'peer:' || peer_user_id
+             WHERE peer_user_id != ''
+               AND peer_user_id NOT LIKE 'peer:%'
+               AND peer_user_id NOT LIKE 'group:%'",
+        )
+        .await?;
+        tracing::info!(
+            version = 6,
+            "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
+        );
         Ok(())
     }
 
@@ -777,6 +859,4 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
         Ok(())
     }
-
-    // ─── Clients ─────────────────────────────────────────────────────────────
 }

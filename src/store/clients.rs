@@ -1,19 +1,13 @@
-//! Client registry and routing state persistence.
+//! Client registry and routing-state persistence.
 
 use anyhow::Result;
 use sqlx::Row;
 
 use super::Store;
 
-#[derive(Debug, Clone)]
-pub struct ClientRow {
-    pub vtoken: String,
-    pub name: String,
-    pub label: Option<String>,
-    pub last_seen: Option<String>,
-}
-
 impl Store {
+    // ─── Clients ─────────────────────────────────────────────────────────────
+
     pub async fn upsert_client(&self, vtoken: &str, name: &str, label: Option<&str>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
@@ -164,4 +158,12 @@ impl Store {
         .await?;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientRow {
+    pub vtoken: String,
+    pub name: String,
+    pub label: Option<String>,
+    pub last_seen: Option<String>,
 }

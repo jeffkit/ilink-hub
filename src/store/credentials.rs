@@ -1,4 +1,4 @@
-//! Bot credentials persistence — iLink token and base URL.
+//! Bot credential persistence.
 
 use anyhow::Result;
 use sqlx::Row;

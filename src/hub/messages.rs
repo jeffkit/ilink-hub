@@ -273,8 +273,8 @@ mod tests {
         // strip "  └ [default] "
         let snippet = snippet_line
             .trim_start_matches("  └ ")
-            .splitn(2, "] ")
-            .nth(1)
+            .split_once("] ")
+            .map(|x| x.1)
             .unwrap_or(snippet_line);
         assert!(
             snippet.chars().count() <= 31,

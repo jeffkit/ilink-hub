@@ -1,25 +1,9 @@
-//! Backend session and active session name persistence.
+//! Backend session and active-session persistence.
 
 use anyhow::Result;
 use sqlx::Row;
 
 use super::Store;
-
-pub struct BackendSessionRow {
-    pub session_name: String,
-    pub backend_session_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionStatusEntry {
-    pub session_name: String,
-    pub last_user_content: Option<String>,
-    /// `true` when the last stored message is from the user (AI has not replied yet).
-    pub waiting_for_reply: bool,
-    /// ISO-8601 timestamp of the last user message — used to compute elapsed time
-    /// when `waiting_for_reply` is true. `None` when there are no user messages.
-    pub user_msg_created_at: Option<String>,
-}
 
 impl Store {
     // ─── Backend sessions (named sessions per virtual context + backend token) ──
@@ -238,30 +222,10 @@ impl Store {
         .await?;
         Ok(())
     }
+}
 
-    /// Retrieve the active session name and its backend session ID for `vctx`/`vtoken`
-    /// in a single SQL round-trip (replaces the previous two-query pattern).
-    ///
-    /// Returns `(session_name, Option<backend_session_id>)`.
-    pub async fn get_active_session_full(
-        &self,
-        vctx: &str,
-        vtoken: &str,
-    ) -> Result<(String, Option<String>)> {
-        let row = sqlx::query(
-            "SELECT                  COALESCE(a.session_name, 'default') AS session_name,                  b.backend_session_id              FROM (SELECT $1 AS vctx, $2 AS vtoken) x              LEFT JOIN active_sessions a ON a.vctx = x.vctx AND a.vtoken = x.vtoken              LEFT JOIN backend_sessions_v2 b                  ON b.vctx = x.vctx AND b.vtoken = x.vtoken                  AND b.session_name = COALESCE(a.session_name, 'default')",
-        )
-        .bind(vctx)
-        .bind(vtoken)
-        .fetch_one(&self.pool)
-        .await?;
-
-        let session_name: String = row.get("session_name");
-        let session_id: Option<String> = row
-            .try_get::<String, _>("backend_session_id")
-            .ok()
-            .filter(|s| !s.trim().is_empty());
-
-        Ok((session_name, session_id))
-    }
+#[derive(Debug, Clone)]
+pub struct BackendSessionRow {
+    pub session_name: String,
+    pub backend_session_id: String,
 }

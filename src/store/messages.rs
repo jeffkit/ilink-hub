@@ -1,10 +1,11 @@
-//! Message history persistence — per-session conversation records.
+//! Chat message history persistence.
 
 use anyhow::Result;
 use sqlx::Row;
 
-use super::{sessions::SessionStatusEntry, Store};
+use super::Store;
 
+#[derive(Debug, Clone)]
 pub struct MessageRow {
     pub id: i64,
     pub vctx: String,
@@ -14,6 +15,17 @@ pub struct MessageRow {
     pub role: String,
     pub content: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStatusEntry {
+    pub session_name: String,
+    pub last_user_content: Option<String>,
+    /// `true` when the last stored message is from the user (AI has not replied yet).
+    pub waiting_for_reply: bool,
+    /// ISO-8601 timestamp of the last user message — used to compute elapsed time
+    /// when `waiting_for_reply` is true. `None` when there are no user messages.
+    pub user_msg_created_at: Option<String>,
 }
 
 impl Store {
