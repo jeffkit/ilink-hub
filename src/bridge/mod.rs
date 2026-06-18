@@ -555,7 +555,7 @@ fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<
 /// stream unbounded output and OOM the Hub. This is purely a safety valve: the
 /// final reply is separately truncated to `max_reply_chars` (default 8000), so
 /// this cap is ~8000× any legitimate reply and never triggers in normal use.
-const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn run_cli(

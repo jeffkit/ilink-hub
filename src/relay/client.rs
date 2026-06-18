@@ -14,6 +14,10 @@ use super::protocol::RelayMessage;
 
 const RECONNECT_SECS: u64 = 5;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Upper bound on a forwarded response body buffered in memory. The local Hub's
+/// API responses are small, but cap defensively so a pathological body can't
+/// grow this `Vec` without bound. Bodies exceeding the cap are truncated.
+const MAX_RELAY_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum time to wait for the next WebSocket frame. If no frame arrives within
 /// this window the connection is considered half-open and the client reconnects.
 /// The relay server is expected to send at least a ping or a request within this
@@ -344,9 +348,40 @@ async fn forward_to_hub(
             resp_headers.insert(k.to_string(), s.to_string());
         }
     }
-    let body_text = resp.text().await.ok();
+    let body_text = read_body_capped(resp, MAX_RELAY_BODY_BYTES).await;
 
     Ok((status, resp_headers, body_text))
+}
+
+/// Read a response body into a `String`, stopping after `cap` bytes so a
+/// pathologically large body cannot exhaust memory.
+///
+/// Mirrors the prior `resp.text().await.ok()` semantics: a clean (even empty)
+/// body yields `Some(_)`, while a read error yields `None`. Bodies past `cap`
+/// are truncated and logged.
+async fn read_body_capped(resp: reqwest::Response, cap: usize) -> Option<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    let mut stream = resp.bytes_stream();
+    loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let remaining = cap.saturating_sub(buf.len());
+                let take = remaining.min(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    warn!(
+                        cap_bytes = cap,
+                        "relay response body exceeded cap; truncating"
+                    );
+                    break;
+                }
+            }
+            // Mirror `resp.text()`: any read error maps the whole body to None.
+            Some(Err(_)) => return None,
+            None => break,
+        }
+    }
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// `true` if `name` matches a header that must never be forwarded from the

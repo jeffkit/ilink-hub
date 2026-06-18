@@ -607,14 +607,39 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
     cmd.stderr(std::process::Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .context("failed to spawn `claude`; ensure it is installed and in PATH")?;
 
-    let output = child.wait_with_output().await.context("wait for claude")?;
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout).into_owned();
+    // Drain both pipes concurrently with a hard size cap instead of
+    // `wait_with_output`, so a runaway CLI can't buffer unbounded output in
+    // memory. A truncated body will fail JSON parsing below, which is the
+    // correct failure mode (better than OOM).
+    let child_stdout = child.stdout.take().context("claude stdout pipe missing")?;
+    let child_stderr = child.stderr.take().context("claude stderr pipe missing")?;
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, BufReader};
+        let mut buf = Vec::new();
+        BufReader::new(child_stderr)
+            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, BufReader};
+        let mut buf = Vec::new();
+        BufReader::new(child_stdout)
+            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
+            .read_to_end(&mut buf)
+            .await
+            .ok();
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let status = child.wait().await.context("wait for claude")?;
+    let stderr = stderr_task.await.unwrap_or_default();
+    let stdout_str = stdout_task.await.unwrap_or_default();
 
     // Parse `--output-format json` result.
     // Claude CLI ≥ 2.1.153 emits a JSON array of all events (system, assistant,
@@ -638,7 +663,7 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
         }
     };
 
-    if !output.status.success() && event.session_id.is_none() {
+    if !status.success() && event.session_id.is_none() {
         let detail = if !stderr.is_empty() {
             stderr
         } else {
@@ -646,7 +671,7 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
         };
         anyhow::bail!(
             "claude exited with status {:?}\nstderr: {detail}",
-            output.status.code()
+            status.code()
         );
     }
 

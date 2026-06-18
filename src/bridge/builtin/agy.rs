@@ -96,11 +96,13 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
     let child_stdout = child.stdout.take().context("stdout pipe missing")?;
     let child_stderr = child.stderr.take().context("stderr pipe missing")?;
 
-    // Drain stderr in background to prevent pipe buffer deadlock.
+    // Drain stderr in background to prevent pipe buffer deadlock. Cap the
+    // capture so a child spewing output can't grow the buffer without bound.
     let stderr_task = tokio::spawn(async move {
         use tokio::io::{AsyncReadExt, BufReader};
         let mut buf = Vec::new();
         BufReader::new(child_stderr)
+            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
             .read_to_end(&mut buf)
             .await
             .ok();
@@ -112,6 +114,7 @@ async fn call_agy(message: &str, session_id: &str) -> Result<(String, Option<Str
         use tokio::io::{AsyncReadExt, BufReader};
         let mut buf = Vec::new();
         BufReader::new(child_stdout)
+            .take(crate::bridge::MAX_CLI_CAPTURE_BYTES as u64)
             .read_to_end(&mut buf)
             .await
             .ok();

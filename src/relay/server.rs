@@ -31,6 +31,11 @@ use super::ratelimit::RateLimiter;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max requests buffered toward a single connected Hub before we shed load.
+/// Each entry is an in-flight request awaiting a `REQUEST_TIMEOUT` response, so
+/// this bounds memory if a Hub's WebSocket write stalls; excess requests get a
+/// 503 instead of growing an unbounded queue.
+const HUB_OUTBOUND_CAPACITY: usize = 256;
 
 // Per-IP: WS handshakes (Hub reconnects every ~5s → need headroom); pairing HTTP from phones.
 const WS_RATE_MAX: usize = 120;
@@ -49,7 +54,7 @@ pub struct RelayState {
 
 #[derive(Clone)]
 struct HubHandle {
-    tx: tokio::sync::mpsc::UnboundedSender<RelayMessage>,
+    tx: tokio::sync::mpsc::Sender<RelayMessage>,
 }
 
 pub fn build_relay_router() -> Router {
@@ -120,7 +125,7 @@ async fn accept_registration(
 
 async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
     let (mut write, mut read) = socket.split();
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<RelayMessage>();
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RelayMessage>(HUB_OUTBOUND_CAPACITY);
     let mut device_id: Option<String> = None;
 
     let register_deadline = tokio::time::sleep(REGISTER_TIMEOUT);
@@ -243,7 +248,9 @@ async fn forward_to_hub(
         body,
     };
 
-    if hub.tx.send(req).is_err() {
+    // Non-blocking send: if the Hub's outbound queue is full (slow WebSocket) or
+    // closed, shed load with 503 rather than buffering without bound.
+    if hub.tx.try_send(req).is_err() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
@@ -409,7 +416,7 @@ mod tests {
         };
 
         let device_id = "test-device".to_string();
-        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
         state
             .hubs
             .write()
