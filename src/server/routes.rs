@@ -1033,14 +1033,6 @@ pub async fn metrics(
     let upstream_polls_ok = state.ilink.upstream.polls_ok();
     let upstream_polls_err = state.ilink.upstream.polls_err();
     let relogin_attempts = state.ilink.upstream.relogin_attempts();
-    let persist_faf_failures_forward = state
-        .metrics
-        .persist_fire_and_forget_failures_forward
-        .load(Ordering::Relaxed);
-    let persist_faf_failures_broadcast = state
-        .metrics
-        .persist_fire_and_forget_failures_broadcast
-        .load(Ordering::Relaxed);
     let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
     let ctx_map_size = state.routing.ctx_map.len();
     let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
@@ -1131,17 +1123,6 @@ pub async fn metrics(
     out.push_str(&format!(
         "ilink_hub_relogin_attempts_total {}\n",
         relogin_attempts
-    ));
-
-    out.push_str("# HELP ilink_hub_persist_fire_and_forget_failures_total Fire-and-forget persist_context_token(s)_batch failures on the dispatch path; non-zero rate means context-token mappings were dropped on the floor\n");
-    out.push_str("# TYPE ilink_hub_persist_fire_and_forget_failures_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"forward_to\"}} {}\n",
-        persist_faf_failures_forward
-    ));
-    out.push_str(&format!(
-        "ilink_hub_persist_fire_and_forget_failures_total{{path=\"broadcast\"}} {}\n",
-        persist_faf_failures_broadcast
     ));
 
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");

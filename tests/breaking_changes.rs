@@ -206,10 +206,10 @@ async fn list_recent_context_tokens_returns_results_ordered_by_created_at() {
     // Seed some context token mappings.
     for i in 0..5 {
         store
-            .persist_context_token(
-                &format!("vctx_{i}"),
-                &format!("real_{i}"),
+            .find_or_create_vctx(
                 &format!("user_{i}"),
+                None,
+                &format!("real_{i}"),
             )
             .await
             .unwrap();

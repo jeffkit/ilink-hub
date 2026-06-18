@@ -90,7 +90,7 @@ impl Store {
         //
         // For file-type SQLite, the same single-connection pin is required to
         // avoid SQLITE_BUSY (5) errors: SQLite's file-level write lock means a
-        // long write transaction (e.g. `persist_context_tokens_batch`) and a
+        // long write transaction (e.g. `find_or_create_vctx`) and a
         // concurrent read (e.g. `get_active_session_name`) executed on two
         // different physical connections race on the same lock.
         //
@@ -1323,92 +1323,87 @@ impl Store {
         Ok(row.get("vctx"))
     }
 
-    /// Persist a known vctx→real_ctx mapping (upsert: refreshes real_ctx when vctx is reused).
-    pub async fn persist_context_token(
-        &self,
-        vctx: &str,
-        real_ctx: &str,
-        peer_user_id: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            r#"
-            INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at)
-            VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-            ON CONFLICT (vctx) DO UPDATE SET
-                real_ctx = excluded.real_ctx,
-                peer_user_id = excluded.peer_user_id
-            "#,
-        )
-        .bind(vctx)
-        .bind(real_ctx)
-        .bind(peer_user_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Persist multiple vctx→real_ctx mappings in a single transaction.
-    /// Used by the Broadcast dispatch path to avoid N separate round-trips.
+    /// Find or create a stable virtual context token for a conversation.
     ///
-    /// All entries are written in one transaction so a partial DB failure does not
-    /// leave some rows committed while others are dropped — that would generate
-    /// duplicate vctx tokens for the same conversation on the next broadcast.
-    pub async fn persist_context_tokens_batch(
+    /// Uses `conv_key` (computed from `peer_user_id` / `group_id`) as the stable identifier
+    /// stored in the `peer_user_id` column.  This avoids a schema change while letting group
+    /// conversations reuse the same vctx across messages.
+    ///
+    /// Lookup order:
+    /// 1. SELECT by conv_key → if found, UPDATE real_ctx and return existing vctx.
+    /// 2. Otherwise INSERT a fresh vctx (with `ON CONFLICT (vctx) DO NOTHING` for safety).
+    ///
+    /// Returns the stable `vctx` for the conversation.
+    pub async fn find_or_create_vctx(
         &self,
-        entries: &[(String, String, String)], // (vctx, real_ctx, peer_user_id)
-    ) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.pool.begin().await?;
-        for (vctx, real_ctx, peer_user_id) in entries {
-            sqlx::query(
-                r#"
-                INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at)
-                VALUES ($1, $2, $3, CURRENT_TIMESTAMP)
-                ON CONFLICT (vctx) DO UPDATE SET
-                    real_ctx = excluded.real_ctx,
-                    peer_user_id = excluded.peer_user_id
-                "#,
-            )
-            .bind(vctx)
-            .bind(real_ctx)
-            .bind(peer_user_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
-        Ok(())
-    }
+        peer_user_id: &str,
+        group_id: Option<&str>,
+        real_ctx: &str,
+    ) -> Result<String> {
+        // Compute the conversation key to use as the `peer_user_id` column value.
+        // group:<id> for group messages, peer:<id> for DMs, or "" when neither is known.
+        let conv_key: String = if let Some(g) = group_id.filter(|s| !s.is_empty()) {
+            format!("group:{g}")
+        } else if !peer_user_id.is_empty() {
+            format!("peer:{peer_user_id}")
+        } else {
+            String::new()
+        };
 
-    /// Find an existing virtual context token for a WeChat peer, preferring one that
-    /// already has a persisted backend session (for hub restart / cold cache warm-up).
-    pub async fn find_vctx_for_peer(&self, peer_user_id: &str) -> Result<Option<String>> {
-        if peer_user_id.is_empty() {
-            return Ok(None);
-        }
-        let row = sqlx::query(
-            r#"
-            SELECT c.vctx FROM context_token_map c
-            LEFT JOIN backend_sessions_v2 b
-              ON b.vctx = c.vctx AND b.session_name = 'default'
-            WHERE c.peer_user_id = $1
-              AND b.backend_session_id IS NOT NULL
-              AND b.backend_session_id != ''
-            LIMIT 1
-            "#,
-        )
-        .bind(peer_user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if let Some(row) = row {
-            return Ok(Some(row.get("vctx")));
-        }
-        let row = sqlx::query("SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1")
-            .bind(peer_user_id)
+        // If we have a conv_key, try to find an existing row first.
+        if !conv_key.is_empty() {
+            let existing = sqlx::query(
+                "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
+            )
+            .bind(&conv_key)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.get("vctx")))
+
+            if let Some(row) = existing {
+                let vctx: String = row.get("vctx");
+                // Update real_ctx to the latest value so sendmessage resolves correctly.
+                sqlx::query(
+                    "UPDATE context_token_map SET real_ctx = $1 WHERE vctx = $2",
+                )
+                .bind(real_ctx)
+                .bind(&vctx)
+                .execute(&self.pool)
+                .await?;
+                return Ok(vctx);
+            }
+        }
+
+        // No existing row — insert a new one.
+        let candidate = format!("vctx_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (vctx) DO NOTHING",
+        )
+        .bind(&candidate)
+        .bind(real_ctx)
+        .bind(&conv_key)
+        .execute(&self.pool)
+        .await?;
+
+        // In the (extremely unlikely) vctx collision case, fall back to SELECT.
+        let row = if !conv_key.is_empty() {
+            sqlx::query(
+                "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
+            )
+            .bind(&conv_key)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query("SELECT vctx FROM context_token_map WHERE vctx = $1")
+                .bind(&candidate)
+                .fetch_optional(&self.pool)
+                .await?
+        };
+
+        Ok(row
+            .map(|r| r.get::<String, _>("vctx"))
+            .unwrap_or(candidate))
     }
 
     pub async fn resolve_context_token(&self, vctx: &str) -> Result<Option<String>> {
@@ -2028,7 +2023,7 @@ mod store_tests {
     ///
     /// Before the fix, `AnyPool::connect(url)` for `sqlite:/path/to.db`
     /// defaulted to 10 connections. With multiple tasks issuing write
-    /// transactions (`persist_context_tokens_batch`,
+    /// transactions (`find_or_create_vctx`,
     /// `set_active_session_name`) and reads (`get_active_session_name`)
     /// concurrently, two physical connections would race on the
     /// file-level EXCLUSIVE write lock; once a writer's lock-hold time
@@ -2059,7 +2054,7 @@ mod store_tests {
 
         // Seed one row so the read path has a target.
         store
-            .persist_context_token("vctx-seed", "real-ctx-seed", "peer-seed")
+            .find_or_create_vctx("peer-seed", None, "real-ctx-seed")
             .await
             .expect("seed");
         store
@@ -2069,27 +2064,23 @@ mod store_tests {
 
         let mut handles = Vec::new();
 
-        // Batch-write task: hammer persist_context_tokens_batch with bulk
-        // entries to lengthen each transaction and increase the chance of a
-        // write/write race on the file lock. Each task runs 20 iterations of
-        // a 200-entry batch.
+        // Batch-write task: hammer find_or_create_vctx with many entries to exercise
+        // concurrent DB writes and increase the chance of a write/write race on the
+        // file lock. Each task runs 20 iterations with 10 entries each.
         for w in 0..8 {
             let store = std::sync::Arc::clone(&store);
             handles.push(tokio::spawn(async move {
                 for i in 0..20 {
-                    let entries: Vec<(String, String, String)> = (0..200)
-                        .map(|j| {
-                            (
-                                format!("vctx-w{w}-i{i}-j{j}"),
-                                format!("real-ctx-w{w}-i{i}-j{j}"),
-                                format!("peer-w{w}-i{i}-j{j}"),
+                    for j in 0..10 {
+                        store
+                            .find_or_create_vctx(
+                                &format!("peer-w{w}-i{i}-j{j}"),
+                                None,
+                                &format!("real-ctx-w{w}-i{i}-j{j}"),
                             )
-                        })
-                        .collect();
-                    store
-                        .persist_context_tokens_batch(&entries)
-                        .await
-                        .expect("batch write must not fail");
+                            .await
+                            .expect("find_or_create_vctx must not fail");
+                    }
                 }
             }));
         }
@@ -2205,22 +2196,18 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn test_db_02_persist_context_tokens_batch_large() {
+    async fn test_db_02_find_or_create_vctx_multiple_peers() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-        // Prepare 55 entries
-        let mut entries = Vec::new();
+        // Create 55 distinct peer conversations.
         for i in 0..55 {
-            entries.push((
-                format!("vctx-{}", i),
-                format!("real-{}", i),
-                format!("peer-{}", i),
-            ));
+            store
+                .find_or_create_vctx(&format!("peer-{i}"), None, &format!("real-{i}"))
+                .await
+                .unwrap();
         }
 
-        store.persist_context_tokens_batch(&entries).await.unwrap();
-
-        // Check if entries are saved
+        // All 55 entries must be persisted.
         let recent = store.list_recent_context_tokens(100).await.unwrap();
         assert_eq!(recent.len(), 55);
     }
@@ -3845,5 +3832,98 @@ mod store_tests {
             winners, 1,
             "exactly one tx must claim v99; r1={r1}, r2={r2}"
         );
+    }
+
+    // ─── find_or_create_vctx tests ────────────────────────────────────────────
+
+    /// Same peer_user_id twice → same vctx returned.
+    #[tokio::test]
+    async fn find_or_create_vctx_same_peer_returns_same_vctx() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let v1 = store
+            .find_or_create_vctx("user@wx", None, "ctx-1")
+            .await
+            .unwrap();
+        let v2 = store
+            .find_or_create_vctx("user@wx", None, "ctx-2")
+            .await
+            .unwrap();
+        assert_eq!(v1, v2, "same peer must always get the same vctx");
+    }
+
+    /// real_ctx is updated on the second call but vctx stays the same.
+    #[tokio::test]
+    async fn find_or_create_vctx_updates_real_ctx() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let vctx = store
+            .find_or_create_vctx("user@wx", None, "ctx-first")
+            .await
+            .unwrap();
+
+        // A second message with a different real_ctx must update the mapping.
+        let vctx2 = store
+            .find_or_create_vctx("user@wx", None, "ctx-second")
+            .await
+            .unwrap();
+        assert_eq!(vctx, vctx2);
+
+        // Verify that resolve_context_token_full now returns the new real_ctx.
+        let resolved = store.resolve_context_token_full(&vctx).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(("ctx-second".to_string(), "peer:user@wx".to_string())),
+        );
+    }
+
+    /// group_id path: same group always gets the same vctx.
+    #[tokio::test]
+    async fn find_or_create_vctx_group_returns_stable_vctx() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let v1 = store
+            .find_or_create_vctx("user1@wx", Some("group123"), "ctx-a")
+            .await
+            .unwrap();
+        // Different sender, same group.
+        let v2 = store
+            .find_or_create_vctx("user2@wx", Some("group123"), "ctx-b")
+            .await
+            .unwrap();
+        assert_eq!(v1, v2, "same group_id must map to the same vctx");
+    }
+
+    /// When both peer_user_id and group_id are empty, a fresh vctx is generated.
+    #[tokio::test]
+    async fn find_or_create_vctx_empty_ids_generate_new_vctx() {
+        let store = Store::connect("sqlite::memory:").await.expect("connect");
+        let v1 = store.find_or_create_vctx("", None, "ctx-x").await.unwrap();
+        let v2 = store.find_or_create_vctx("", None, "ctx-y").await.unwrap();
+        // Each call with empty ids should produce an independent vctx (no shared conv_key).
+        assert_ne!(v1, v2, "empty ids must not accidentally share a vctx");
+    }
+
+    /// Concurrent calls for the same peer must not produce duplicate vctx tokens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn find_or_create_vctx_concurrent_same_peer_no_duplicate() {
+        let store = std::sync::Arc::new(
+            Store::connect("sqlite::memory:").await.expect("connect"),
+        );
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.find_or_create_vctx("concurrent-user", None, &format!("ctx-{i}"))
+                    .await
+                    .expect("find_or_create_vctx")
+            }));
+        }
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.await.expect("task"));
+        }
+        // All concurrent calls must resolve to the same stable vctx.
+        let first = results[0].clone();
+        for v in &results {
+            assert_eq!(*v, first, "concurrent calls produced divergent vctx: {:?}", results);
+        }
     }
 }

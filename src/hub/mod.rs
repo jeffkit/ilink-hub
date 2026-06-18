@@ -69,17 +69,6 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
-    /// Failures of the fire-and-forget `persist_context_token` call on the per-message
-    /// (ForwardTo) dispatch path. Counts every background task that returned an error,
-    /// so a non-zero value means context-token mappings were dropped on the floor (we
-    /// keep delivering messages but lose durability of the real_ctx↔vctx mapping for
-    /// those rows). See `docs/exec-plans/active/todo-hub-2/plan.md` C-01.
-    pub persist_fire_and_forget_failures_forward: AtomicU64,
-    /// Failures of the fire-and-forget `persist_context_tokens_batch` call on the
-    /// broadcast / fan-out dispatch path. See `persist_fire_and_forget_failures_forward`
-    /// for semantics. Split from the per-message counter so operators can distinguish
-    /// single-row failures from per-broadcast batch failures.
-    pub persist_fire_and_forget_failures_broadcast: AtomicU64,
     /// Number of messages missed because the dispatcher lagged behind the broadcast channel.
     pub dispatcher_lagged: AtomicU64,
 }
@@ -93,8 +82,6 @@ impl Metrics {
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
-            persist_fire_and_forget_failures_forward: AtomicU64::new(0),
-            persist_fire_and_forget_failures_broadcast: AtomicU64::new(0),
             dispatcher_lagged: AtomicU64::new(0),
         }
     }
@@ -471,26 +458,6 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             )
             .await;
 
-            let store = state.store.clone();
-            let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
-            let metrics = state.metrics.clone();
-            let sem = state.persist_sem.clone();
-            tokio::spawn(async move {
-                let Ok(_permit) = sem.try_acquire() else {
-                    warn!("persist semaphore full, dropping context_token persist (forward)");
-                    metrics
-                        .persist_fire_and_forget_failures_forward
-                        .fetch_add(1, Ordering::Relaxed);
-                    return;
-                };
-                if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
-                    warn!(error = %e, "failed to persist context_token mapping");
-                    metrics
-                        .persist_fire_and_forget_failures_forward
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-            });
-
             let hub_ext =
                 build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
 
@@ -589,32 +556,6 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             .await;
             let vctx_by_vtoken: Vec<(String, String)> =
                 online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
-
-            // Batch-persist in one transaction (fire-and-forget).
-            {
-                let entries: Vec<(String, String, String)> = vctx_by_vtoken
-                    .iter()
-                    .map(|(_, vc)| (vc.clone(), real_ctx.clone(), peer_user_id.clone()))
-                    .collect();
-                let store = state.store.clone();
-                let metrics = state.metrics.clone();
-                let sem = state.persist_sem.clone();
-                tokio::spawn(async move {
-                    let Ok(_permit) = sem.try_acquire() else {
-                        warn!("persist semaphore full, dropping context_token batch-persist (broadcast)");
-                        metrics
-                            .persist_fire_and_forget_failures_broadcast
-                            .fetch_add(1, Ordering::Relaxed);
-                        return;
-                    };
-                    if let Err(e) = store.persist_context_tokens_batch(&entries).await {
-                        warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
-                        metrics
-                            .persist_fire_and_forget_failures_broadcast
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                });
-            }
 
             // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
             let pairs: Vec<(String, String)> = vctx_by_vtoken
@@ -766,29 +707,6 @@ async fn handle_at_mention(
         session = %session_name,
         "routing @mention to new session"
     );
-
-    // Persist the context_token mapping (fire-and-forget), mirroring the ForwardTo path.
-    {
-        let store = state.store.clone();
-        let (vctx2, real2, peer2) = (vctx.clone(), real_ctx.clone(), peer_user_id.clone());
-        let metrics = state.metrics.clone();
-        let sem = state.persist_sem.clone();
-        tokio::spawn(async move {
-            let Ok(_permit) = sem.try_acquire() else {
-                warn!("persist semaphore full, dropping context_token persist (@mention)");
-                metrics
-                    .persist_fire_and_forget_failures_forward
-                    .fetch_add(1, Ordering::Relaxed);
-                return;
-            };
-            if let Err(e) = store.persist_context_token(&vctx2, &real2, &peer2).await {
-                warn!(error = %e, "failed to persist context_token mapping (@mention)");
-                metrics
-                    .persist_fire_and_forget_failures_forward
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        });
-    }
 
     let hub_ext =
         build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, Some(session_name.clone())).await;
@@ -1227,67 +1145,41 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
 /// Reusing one vctx per peer/group keeps backend session IDs (Claude `--resume`, etc.)
 /// attached across turns.
 ///
-/// `client_scope` can pin the vctx to a specific backend (`Some(vtoken)`), but all current
-/// callers pass `None`: directed (`/use`) and broadcast share one conversation-stable vctx,
-/// and per-backend session isolation comes from the `(vctx, vtoken)` session key instead.
-/// Keeping the parameter leaves the door open for per-backend context scoping if ever needed.
+/// This implementation queries the DB directly (no fire-and-forget) and seeds the result
+/// into the in-memory `ctx_map` so that the `sendmessage` path can resolve quickly from
+/// memory on subsequent calls.
+///
+/// `client_scope` is kept for API compatibility but all current callers pass `None`.
 async fn resolve_vctx_for_message(
     state: &HubState,
     real_ctx: &str,
     peer_user_id: &str,
     group_id: Option<&str>,
-    client_scope: Option<&str>,
+    _client_scope: Option<&str>,
 ) -> String {
-    let conv_key = conversation_key(peer_user_id, group_id).map(|k| match client_scope {
-        Some(scope) => format!("{k}@{scope}"),
-        None => k,
-    });
-
-    // For unscoped DM routing only: check once under the lock whether we need a DB seed.
-    // Do the DB lookup outside the lock (it's async/slow), then re-acquire to seed+map
-    // atomically so no other task can race in between.
-    let db_vctx = if client_scope.is_none() {
-        let needs_seed = if let Some(ref key) = conv_key {
-            !state.routing.ctx_map.has_conversation(key)
-        } else {
-            false
-        };
-        if needs_seed
-            && conv_key
-                .as_deref()
-                .map(|k| k.starts_with("peer:"))
-                .unwrap_or(false)
-        {
+    match state
+        .store
+        .find_or_create_vctx(peer_user_id, group_id, real_ctx)
+        .await
+    {
+        Ok(vctx) => {
+            // Seed the result into the in-memory map so sendmessage resolves from cache.
             state
-                .store
-                .find_vctx_for_peer(peer_user_id)
-                .await
-                .ok()
-                .flatten()
-        } else {
-            None
+                .routing
+                .ctx_map
+                .seed_full(vctx.clone(), real_ctx.to_string(), peer_user_id.to_string());
+            vctx
         }
-    } else {
-        None
-    };
-
-    if let (Some(ref key), Some(vctx)) = (&conv_key, db_vctx) {
-        // Only seed if nothing else raced in while we did the DB lookup.
-        if !state.routing.ctx_map.has_conversation(key) {
-            state.routing.ctx_map.seed_conversation(
-                key.clone(),
-                vctx,
+        Err(e) => {
+            warn!(error = %e, "find_or_create_vctx failed, falling back to in-memory map");
+            // Fall back to pure in-memory mapping if DB is unavailable.
+            state.routing.ctx_map.map(
                 real_ctx.to_string(),
                 peer_user_id.to_string(),
-            );
+                group_id,
+            )
         }
     }
-    state.routing.ctx_map.map_scoped(
-        real_ctx.to_string(),
-        peer_user_id.to_string(),
-        group_id,
-        client_scope,
-    )
 }
 
 /// Build `HubExt` for an outbound message.
@@ -1590,82 +1482,6 @@ mod tests {
         let ext = hub_ext.unwrap();
         assert_eq!(ext.session_name, Some("override".to_string()));
         assert_eq!(ext.session_id, None);
-    }
-
-    /// `persist_fire_and_forget_failures_broadcast` increments on broadcast-path persist errors.
-    ///
-    /// Spawns a tokio task using the exact fire-and-forget shape from the broadcast
-    /// dispatch path (see `dispatch_message` `RoutingDecision::Broadcast`). We use a
-    /// SQLite in-memory pool with a held transaction to force the persist call to
-    /// block, then advance virtual time past the pool's default acquire timeout
-    /// so the inner call returns an error. The metric must then reflect >= 1 failure,
-    /// proving the C-01 counter is wired to the same code that runs in production.
-    #[tokio::test]
-    async fn persist_fire_and_forget_failure_increments_metric() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:")
-                .await
-                .expect("in-memory store"),
-        );
-        tokio::time::pause();
-
-        let metrics = Arc::new(Metrics::new());
-        assert_eq!(
-            metrics
-                .persist_fire_and_forget_failures_broadcast
-                .load(Ordering::Relaxed),
-            0,
-            "broadcast counter starts at zero"
-        );
-        assert_eq!(
-            metrics
-                .persist_fire_and_forget_failures_forward
-                .load(Ordering::Relaxed),
-            0,
-            "forward counter starts at zero"
-        );
-
-        // Hold the only pool connection so the background persist call cannot acquire
-        // a new one and the pool's acquire timeout will fire.
-        let _tx = store.pool().begin().await.unwrap();
-
-        let entries: Vec<(String, String, String)> = vec![(
-            "vctx-1".to_string(),
-            "real-1".to_string(),
-            "peer-1".to_string(),
-        )];
-
-        let store_clone = store.clone();
-        let metrics_clone = metrics.clone();
-        let task = tokio::spawn(async move {
-            // Same fire-and-forget shape used in dispatch_message::Broadcast.
-            if let Err(e) = store_clone.persist_context_tokens_batch(&entries).await {
-                warn!(error = %e, "failed to batch-persist context_token mappings (broadcast)");
-                metrics_clone
-                    .persist_fire_and_forget_failures_broadcast
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-        });
-
-        // Advance virtual time so the pool acquire timeout fires (sqlx default is
-        // 30 seconds; we give it a generous buffer).
-        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-        let _ = task.await;
-
-        assert!(
-            metrics
-                .persist_fire_and_forget_failures_broadcast
-                .load(Ordering::Relaxed)
-                >= 1,
-            "broadcast counter must have been incremented after persist failure"
-        );
-        assert_eq!(
-            metrics
-                .persist_fire_and_forget_failures_forward
-                .load(Ordering::Relaxed),
-            0,
-            "forward counter must NOT be touched by broadcast failure"
-        );
     }
 
     // ─── A-01: HubState sub-state composition ────────────────────────────────
