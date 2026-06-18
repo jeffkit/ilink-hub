@@ -37,7 +37,7 @@ iLink Hub is a **transparent iLink proxy**:
 - **Multi-backend routing** — route messages to different backends via WeChat commands
 - **Context-token mapping** — real context tokens never leak to clients; persisted across restarts
 - **QR code login** — scan once, token saved to DB
-- **Multi-database** — SQLite (default), PostgreSQL, MySQL via `DATABASE_URL`
+- **Multi-database** — SQLite (default) and PostgreSQL via `DATABASE_URL`
 - **Full persistence** — client registrations, routing state, and context mappings survive restarts
 - **Web admin panel** — manage clients and copy config at `/hub/ui`
 - **Admin auth** — protect `/hub/` endpoints with `ILINK_ADMIN_TOKEN` env var
@@ -132,11 +132,9 @@ DATABASE_URL=postgres://user:pass@localhost/ilink_hub ilink-hub serve
 ```
 
 > [!NOTE]
-> When compiling `ilink-hub` from source (e.g., `cargo install` or `cargo build`), only the `sqlite` driver is enabled by default to reduce binary size and compilation times. To enable PostgreSQL or MySQL support, you must compile with the corresponding feature flags:
+> When compiling `ilink-hub` from source (e.g., `cargo install` or `cargo build`), only the `sqlite` driver is enabled by default to reduce binary size and compilation times. To enable PostgreSQL support, compile with the corresponding feature flag:
 > ```bash
 > cargo build --release --features postgres
-> # or
-> cargo build --release --features mysql
 > ```
 > Pre-built binaries and official Docker images are compiled with all features enabled.
 
@@ -294,7 +292,7 @@ ilink-hub/
 │   ├── server/
 │   │   └── routes.rs     — iLink-compatible HTTP handlers
 │   ├── store/
-│   │   └── mod.rs        — sqlx database layer (SQLite/PostgreSQL/MySQL)
+│   │   └── mod.rs        — sqlx database layer (SQLite/PostgreSQL)
 │   └── main.rs           — CLI: serve / login / register / clients
 ├── Dockerfile             — Multi-stage build
 └── .github/workflows/ci.yml
