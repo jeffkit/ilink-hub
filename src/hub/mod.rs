@@ -956,7 +956,9 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                             .into_iter()
                             .find(|c| c.vtoken == vtoken)
                             .map(|c| c.name.clone())
-                            .unwrap_or_else(|| vtoken.clone())
+                            // Fall back to a redacted token, never the raw bearer
+                            // credential — this string is sent to the WeChat user.
+                            .unwrap_or_else(|| crate::redact_token(&vtoken))
                     };
                     let active = state
                         .store

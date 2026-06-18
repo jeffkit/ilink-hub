@@ -550,6 +550,13 @@ fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<
     (stdout.to_string(), None)
 }
 
+/// Hard upper bound on how many bytes of a child's stdout/stderr we buffer in
+/// memory before truncating. A misbehaving or malicious CLI could otherwise
+/// stream unbounded output and OOM the Hub. This is purely a safety valve: the
+/// final reply is separately truncated to `max_reply_chars` (default 8000), so
+/// this cap is ~8000× any legitimate reply and never triggers in normal use.
+const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
+
 #[allow(clippy::too_many_arguments)]
 async fn run_cli(
     cfg: &BridgeProfile,
@@ -631,7 +638,11 @@ async fn run_cli(
     let stderr_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut buf = Vec::new();
+        // Cap stderr capture so a child spewing errors can't grow this buffer
+        // without bound. stderr is only used for debug logging / error context,
+        // so truncating it is harmless.
         tokio::io::BufReader::new(child_stderr)
+            .take(MAX_CLI_CAPTURE_BYTES as u64)
             .read_to_end(&mut buf)
             .await
             .ok();
@@ -669,6 +680,7 @@ async fn run_cli(
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(child_stdout);
             let mut final_lines: Vec<String> = Vec::new();
+            let mut accumulated_bytes: usize = 0;
             let mut line = String::new();
             loop {
                 line.clear();
@@ -691,9 +703,21 @@ async fn run_cli(
                     // When streaming is disabled, discard ILINK_PARTIAL lines entirely.
                     // The built-in profile (claude_code.rs) will emit the full text via
                     // a non-ILINK_PARTIAL line (stdout) when ILINK_STREAMING=0.
-                } else {
+                } else if accumulated_bytes <= MAX_CLI_CAPTURE_BYTES {
+                    accumulated_bytes = accumulated_bytes.saturating_add(line.len());
                     final_lines.push(line.clone());
+                    if accumulated_bytes > MAX_CLI_CAPTURE_BYTES {
+                        // Runaway output: stop *accumulating* to protect Hub memory,
+                        // but keep draining stdout below so the child isn't blocked on
+                        // a full pipe and still exits cleanly. Whatever we kept is
+                        // truncated to max_reply_chars before being sent anyway.
+                        warn!(
+                            limit_bytes = MAX_CLI_CAPTURE_BYTES,
+                            "CLI stdout exceeded capture limit; truncating accumulated reply"
+                        );
+                    }
                 }
+                // Lines beyond the cap are read (to drain the pipe) but discarded.
             }
             // Drop partial_tx here so the forwarding task observes channel close after
             // all chunks have been sent (or immediately when streaming is disabled).
