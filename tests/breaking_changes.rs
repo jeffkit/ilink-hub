@@ -413,6 +413,75 @@ async fn sendtyping_error_propagation_test() {
     assert!(json["errmsg"].as_str().unwrap().contains("upstream error"));
 }
 
+/// Direct unit test for `UpstreamClient::send_typing` against a closed port.
+/// Covers the *network error* branch of the fix: send_typing must surface
+/// the transport error rather than silently returning `Ok(())` (the old
+/// `let _ =` bug masked both transport errors and HTTP non-2xx).
+#[tokio::test]
+async fn sendtyping_upstream_network_error_propagates() {
+    // Bind + immediately drop to obtain a port that is guaranteed to refuse
+    // connections — no flaky sleeps, no real network.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let base_url = format!("http://{}", addr);
+    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url));
+
+    let req = ilink_hub::ilink::SendTypingRequest {
+        status: Some(1),
+        ..Default::default()
+    };
+    let err = upstream
+        .send_typing(req)
+        .await
+        .expect_err("send_typing against a closed port must return Err, not Ok");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("error sending request")
+            || msg.contains("connection refused")
+            || msg.contains("Connection refused"),
+        "expected transport-level error, got: {msg}",
+    );
+}
+
+/// Direct unit test for `UpstreamClient::send_typing` against a mock that
+/// returns HTTP 500. Covers the *non-2xx status* branch: error_for_status
+/// must propagate, not be silently swallowed by `let _ =`.
+#[tokio::test]
+async fn sendtyping_upstream_http_500_propagates() {
+    use axum::routing::post;
+    use axum::Router;
+
+    let mock_app = Router::new().route(
+        "/ilink/bot/sendtyping",
+        post(|| async { (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "mock 500") }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{}", addr);
+
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url));
+    let req = ilink_hub::ilink::SendTypingRequest {
+        status: Some(1),
+        ..Default::default()
+    };
+    let err = upstream
+        .send_typing(req)
+        .await
+        .expect_err("send_typing against a 500 mock must return Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("500") || msg.to_lowercase().contains("server error"),
+        "expected HTTP 500 to surface in error chain, got: {msg}",
+    );
+}
+
 // ─── S-04: Default Listen Address & LAN Exposure (OBS-1) ──────────────────────
 //
 // Security fix: `serve` now defaults to `127.0.0.1:8765` instead of `0.0.0.0:8765`

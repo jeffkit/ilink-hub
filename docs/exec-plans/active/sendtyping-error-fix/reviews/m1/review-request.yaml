@@ -1,0 +1,86 @@
+milestone: m1
+title: sendtyping 错误传播二次漏洞修复
+branch: feat/sendtyping-error-fix
+base: main
+author: jeffkit
+date: 2026-06-18
+
+scope:
+  - 修复 src/ilink/upstream.rs::send_typing 的 `let _ =` 错误吞掉漏洞
+  - 引入显式 match 分支，对网络错误和 HTTP 非 2xx 状态都用 tracing::warn! 记录（对齐 sendmessage 风格）
+  - 补充两个直接面向 UpstreamClient::send_typing 的单元测试（HTTP 500 + 网络错误）
+
+not_in_scope:
+  - src/server/routes.rs:570-577（已有的 match Err → ret:500 处理是正确的）
+  - SendTypingRequest 结构定义
+  - tests/e2e_wechat_simulation.rs:85 mock 语义（永远返 Ok 符合 mock 语义）
+  - upstream.rs 其他 send_* 方法的重构
+
+diagnosis:
+  symptom: |
+    上游 iLink sendtyping HTTP 调用在网络错误或非 2xx 状态时本应报错，但 send_typing
+    通过 `let _ = self.client.post(...).send().await?.error_for_status()?;` 把整个
+    Result 丢弃，函数永远返回 Ok(())。routes.rs:570 的 `Err(e) → ret:500` 永远不会被命中。
+  root_cause: |
+    `let _ =` 让 `?` 的失败也被无声吞掉：先 `await?` 解开 `send().await` 的 Result，
+    然后 `error_for_status()?` 又开了一个 Result；最外层的 `let _ =` 把整条链都丢掉了。
+  blast_radius: |
+    typing 失败时 Hub 调试员完全无日志线索；routes 永远返 ret:0 让客户端误以为
+    "正在打字"，实际 typing 信号从未到达上游；`sendtyping_error_propagation_test`
+    之所以能通过，是因为 mock 了 500 后 routes 仍返 ret:500（但这是从 mock 自身
+    路径推断的，不是从 send_typing 错误传播来的——一旦修复 routes 的实现细节就
+    会暴露这个二次漏洞）。
+
+fix:
+  files:
+    - path: src/ilink/upstream.rs
+      change: |
+        把 `let _ = self.client...send().await?.error_for_status()?;` 拆成两步：
+        1) `let resp = self.client...send().await;` 显式 match 网络错误，warn! 后
+           return Err；
+        2) `if let Err(e) = resp.error_for_status()` 显式 match 非 2xx 状态，warn!
+           （含 status code）后 return Err。
+        对齐 sendmessage 的 warn! 风格：endpoint 名作为日志消息前缀，error 字段
+        携带 anyhow Error 的 Display，status 字段携带 HTTP code。
+    - path: tests/breaking_changes.rs
+      change: |
+        新增两个直接面向 UpstreamClient::send_typing 的单元测试：
+        1. sendtyping_upstream_network_error_propagates：bind 0 号端口后立即 drop，
+           拿到保证 connection refused 的地址，断言 send_typing 返回 Err 且错误链
+           含 "error sending request" / "connection refused"。
+        2. sendtyping_upstream_http_500_propagates：用 axum mock 一个返 500 的
+           /ilink/bot/sendtyping，断言 send_typing 返回 Err 且错误链含 "500"。
+
+verification:
+  cargo_fmt_check: PASS
+  cargo_clippy_D_warnings: PASS
+  cargo_test: PASS
+    breaking_changes: "22 passed, 0 failed (含原 sendtyping_error_propagation_test + 2 个新增)"
+    all_tests: "268 + 22 + 10 + 27 + 1 + 15 + 1 = 全绿"
+  cargo_build: PASS
+  desktop_frontend_build: PASS
+  desktop_tauri_cargo_check: |
+    FAIL — pre-existing 上游 breakage，**与本次修复无关**：
+    desktop/ilink-hub-desktop/src-tauri/src/lib.rs:605
+      调 `unregister_client_in_hub(state.as_ref(), &name)`
+      缺第 3 个参数 `force: bool`（main 分支 src/server/pairing.rs:327 的
+      `unregister_client_in_hub(state, name, force)` 已加新参数，desktop
+      侧未同步更新）。复现：在 main 分支 HEAD（bf6c6df 之前）同样的 checkout
+      也会失败。修复范围是 sendtyping 错误传播，不应在本里程碑修改 desktop
+      侧调用方；建议另开 issue/desktop 里程碑单独修复。
+
+risk:
+  - low: 改 send_typing 错误传播后，原本吞掉的错误现在会冒泡到 routes.rs 的
+    `Err(e) → ret:500`，可能让原本静默"成功"的 typing 调用在某些边界场景
+    返 500。这是修复目标本身，不是回归。回滚：单文件单函数改动，git revert
+    即可，影响面仅 src/ilink/upstream.rs。
+
+non_goals_confirmed:
+  - 不动 routes.rs:570 的 match Err → ret:500
+  - 不动 SendTypingRequest 结构
+  - 不动 tests/e2e_wechat_simulation.rs:85 mock 语义
+  - 不重构 upstream.rs 其他 send_* 方法
+
+followups:
+  - desktop-tauri 编译修复（unregister_client_in_hub 第三参数）建议另起 PR
+  - 可以考虑把 send_message 也按这个错误传播模式审计一遍（本次 M1 不动）

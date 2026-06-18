@@ -226,14 +226,28 @@ impl UpstreamClient {
 
     pub async fn send_typing(&self, req: SendTypingRequest) -> Result<()> {
         let url = format!("{}/ilink/bot/sendtyping", self.base_url);
-        let _ = self
+        let resp = self
             .client
             .post(&url)
             .headers(self.headers()?)
             .json(&req)
             .send()
-            .await?
-            .error_for_status()?;
+            .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "iLink sendtyping network error");
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = resp.error_for_status() {
+            warn!(
+                status = %e.status().unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+                error = %e,
+                "iLink sendtyping returned non-2xx status"
+            );
+            return Err(e.into());
+        }
         Ok(())
     }
 
