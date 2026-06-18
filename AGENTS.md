@@ -22,6 +22,7 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 环境变量 | `docs/knowledge/api/configuration.md` | DATABASE_URL 等配置 |
 | force-dev | `docs/knowledge/dev-workflow/force-dev.md` | 启动/续跑 feature 分支 |
 | 常用命令 | `docs/knowledge/dev-workflow/common-commands.md` | cargo 命令速查 |
+| 部署加固 | `docs/knowledge/ops/deployment-hardening.md` | 生产部署安全清单 |
 
 ## 活跃执行计划
 
