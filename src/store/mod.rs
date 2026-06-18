@@ -1682,7 +1682,9 @@ impl Store {
                 let vtoken: String = row.get("vtoken");
                 let content: String = row.get("content");
                 let created_at: String = row.get("created_at");
-                user_content_map.entry(vtoken).or_insert((content, created_at));
+                user_content_map
+                    .entry(vtoken)
+                    .or_insert((content, created_at));
             }
         }
 
@@ -3398,7 +3400,14 @@ mod store_tests {
     async fn session_status_waiting_when_last_message_is_user() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
         store
-            .save_message("vctx1", Some("vt1"), "default", "user1", "user", "帮我看看这个问题")
+            .save_message(
+                "vctx1",
+                Some("vt1"),
+                "default",
+                "user1",
+                "user",
+                "帮我看看这个问题",
+            )
             .await
             .expect("save user");
 
@@ -3408,23 +3417,37 @@ mod store_tests {
             .expect("query");
 
         let entry = result.get("vt1").expect("entry for vt1");
-        assert!(entry.waiting_for_reply, "last role is user → should be waiting");
-        assert_eq!(entry.session_name, "default");
-        assert_eq!(
-            entry.last_user_content.as_deref(),
-            Some("帮我看看这个问题")
+        assert!(
+            entry.waiting_for_reply,
+            "last role is user → should be waiting"
         );
+        assert_eq!(entry.session_name, "default");
+        assert_eq!(entry.last_user_content.as_deref(), Some("帮我看看这个问题"));
     }
 
     #[tokio::test]
     async fn session_status_not_waiting_when_last_message_is_assistant() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
         store
-            .save_message("vctx2", Some("vt2"), "work", "user2", "user", "请解释一下 Rust 的生命周期")
+            .save_message(
+                "vctx2",
+                Some("vt2"),
+                "work",
+                "user2",
+                "user",
+                "请解释一下 Rust 的生命周期",
+            )
             .await
             .expect("save user");
         store
-            .save_message("vctx2", Some("vt2"), "work", "user2", "assistant", "生命周期是…")
+            .save_message(
+                "vctx2",
+                Some("vt2"),
+                "work",
+                "user2",
+                "assistant",
+                "生命周期是…",
+            )
             .await
             .expect("save assistant");
 
@@ -3434,7 +3457,10 @@ mod store_tests {
             .expect("query");
 
         let entry = result.get("vt2").expect("entry for vt2");
-        assert!(!entry.waiting_for_reply, "last role is assistant → not waiting");
+        assert!(
+            !entry.waiting_for_reply,
+            "last role is assistant → not waiting"
+        );
         assert_eq!(entry.session_name, "work");
         assert_eq!(
             entry.last_user_content.as_deref(),
@@ -3456,7 +3482,14 @@ mod store_tests {
             .await
             .expect("save");
         store
-            .save_message("ctx-b", Some("vt-b"), "session-x", "pb", "assistant", "回答B")
+            .save_message(
+                "ctx-b",
+                Some("vt-b"),
+                "session-x",
+                "pb",
+                "assistant",
+                "回答B",
+            )
             .await
             .expect("save");
 
@@ -3484,15 +3517,15 @@ mod store_tests {
             .expect("save");
 
         let result = store
-            .get_session_status_per_vtoken(&[
-                "vt-known".to_string(),
-                "vt-missing".to_string(),
-            ])
+            .get_session_status_per_vtoken(&["vt-known".to_string(), "vt-missing".to_string()])
             .await
             .expect("query");
 
         assert!(result.contains_key("vt-known"));
-        assert!(!result.contains_key("vt-missing"), "unknown vtoken must not appear");
+        assert!(
+            !result.contains_key("vt-missing"),
+            "unknown vtoken must not appear"
+        );
     }
 
     // ─── Adversarial tests for M1 review findings ──────────────────────────

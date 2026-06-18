@@ -87,9 +87,7 @@ pub fn hub_status(
     total: usize,
     client_sessions: &[(String, Vec<crate::store::SessionStatusEntry>)],
 ) -> String {
-    let mut lines = vec![format!(
-        "iLink Hub 状态：{online}/{total} 个客户端在线"
-    )];
+    let mut lines = vec![format!("iLink Hub 状态：{online}/{total} 个客户端在线")];
     if !client_sessions.is_empty() {
         lines.push(String::new());
         lines.push("**会话列表：**".to_string());
@@ -100,7 +98,10 @@ pub fn hub_status(
                 lines.push(format!("🟢 `{name}`"));
                 for entry in sessions {
                     let session = &entry.session_name;
-                    let snippet = entry.last_user_content.as_deref().unwrap_or("（无消息记录）");
+                    let snippet = entry
+                        .last_user_content
+                        .as_deref()
+                        .unwrap_or("（无消息记录）");
                     let truncated = if snippet.chars().count() > 30 {
                         let s: String = snippet.chars().take(30).collect();
                         format!("{s}…")
@@ -119,9 +120,7 @@ pub fn hub_status(
                     } else {
                         String::new()
                     };
-                    lines.push(format!(
-                        "  └ [{session}]{status_tag} {truncated}"
-                    ));
+                    lines.push(format!("  └ [{session}]{status_tag} {truncated}"));
                 }
             }
         }
@@ -177,8 +176,14 @@ mod tests {
     #[test]
     fn hub_status_online_count_shows_correctly() {
         let client_sessions = vec![
-            ("claude".to_string(), vec![entry("feature-a", Some("帮我看看"), false, None)]),
-            ("cursor".to_string(), vec![entry("default", Some("另一个问题"), false, None)]),
+            (
+                "claude".to_string(),
+                vec![entry("feature-a", Some("帮我看看"), false, None)],
+            ),
+            (
+                "cursor".to_string(),
+                vec![entry("default", Some("另一个问题"), false, None)],
+            ),
         ];
         let out = hub_status(2, 3, &client_sessions);
         assert!(out.contains("2/3 个客户端在线"));
@@ -251,7 +256,8 @@ mod tests {
     #[test]
     fn hub_status_long_message_truncated() {
         // 31 Chinese characters — over the 30-char limit.
-        let long_msg = "这是一条超过三十个汉字用于测试截断逻辑是否正确的确不应该完整显示".to_string();
+        let long_msg =
+            "这是一条超过三十个汉字用于测试截断逻辑是否正确的确不应该完整显示".to_string();
         assert!(
             long_msg.chars().count() > 30,
             "test string must be > 30 chars, got {}",
@@ -279,10 +285,7 @@ mod tests {
 
     #[test]
     fn hub_status_no_message_record() {
-        let client_sessions = vec![(
-            "agy".to_string(),
-            vec![entry("default", None, false, None)],
-        )];
+        let client_sessions = vec![("agy".to_string(), vec![entry("default", None, false, None)])];
         let out = hub_status(1, 1, &client_sessions);
         assert!(out.contains("（无消息记录）"));
     }

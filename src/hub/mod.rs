@@ -998,8 +998,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                     .collect();
                 (online, total, online_clients)
             };
-            let vtokens: Vec<String> =
-                online_clients.iter().map(|(_, vt)| vt.clone()).collect();
+            let vtokens: Vec<String> = online_clients.iter().map(|(_, vt)| vt.clone()).collect();
             let all_sessions_map = tokio::time::timeout(
                 std::time::Duration::from_secs(3),
                 state.store.get_all_session_entries_per_vtoken(&vtokens),
@@ -1015,10 +1014,7 @@ async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage, cmd: HubCo
                 online_clients
                     .into_iter()
                     .map(|(name, vtoken)| {
-                        let sessions = all_sessions_map
-                            .get(&vtoken)
-                            .cloned()
-                            .unwrap_or_default();
+                        let sessions = all_sessions_map.get(&vtoken).cloned().unwrap_or_default();
                         (name, sessions)
                     })
                     .collect();

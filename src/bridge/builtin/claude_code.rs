@@ -17,8 +17,8 @@
 //! fresh session so the user gets a response rather than a bare error.
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
@@ -686,7 +686,9 @@ mod tests {
         assert_eq!(parsed["session_id"], "sess-123");
         assert!(parsed["parent_tool_use_id"].is_null());
 
-        let blocks = parsed["message"]["content"].as_array().expect("content is array");
+        let blocks = parsed["message"]["content"]
+            .as_array()
+            .expect("content is array");
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "text");
         assert_eq!(blocks[0]["text"], "describe this image");
@@ -741,7 +743,7 @@ mod tests {
     /// the round-trip is byte-exact.
     #[tokio::test]
     async fn download_image_roundtrips_through_local_server() {
-        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+        use axum::{body::Body, http::header, response::Response, routing::get, Router};
 
         // 1x1 red PNG (67 bytes). Any well-formed image works — we only care about
         // transport, not pixel content.
@@ -780,7 +782,7 @@ mod tests {
     /// producing empty/garbage bytes.
     #[tokio::test]
     async fn download_image_fails_on_http_error() {
-        use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
+        use axum::{body::Body, http::StatusCode, response::Response, routing::get, Router};
 
         async fn not_found() -> Response<Body> {
             Response::builder()
@@ -800,6 +802,9 @@ mod tests {
         let result = download_image_as_base64(&url).await;
         let err = result.expect_err("expected HTTP 404 to fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("404"), "error should mention HTTP status: {msg}");
+        assert!(
+            msg.contains("404"),
+            "error should mention HTTP status: {msg}"
+        );
     }
 }
