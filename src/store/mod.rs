@@ -100,7 +100,7 @@ impl Store {
         //
         // For file-type SQLite, the same single-connection pin is required to
         // avoid SQLITE_BUSY (5) errors: SQLite's file-level write lock means a
-        // long write transaction (e.g. `persist_context_tokens_batch`) and a
+        // long write transaction (e.g. `find_or_create_vctx`) and a
         // concurrent read (e.g. `get_active_session_name`) executed on two
         // different physical connections race on the same lock.
         //
@@ -361,7 +361,7 @@ mod store_tests {
     ///
     /// Before the fix, `AnyPool::connect(url)` for `sqlite:/path/to.db`
     /// defaulted to 10 connections. With multiple tasks issuing write
-    /// transactions (`persist_context_tokens_batch`,
+    /// transactions (`find_or_create_vctx`,
     /// `set_active_session_name`) and reads (`get_active_session_name`)
     /// concurrently, two physical connections would race on the
     /// file-level EXCLUSIVE write lock; once a writer's lock-hold time
@@ -392,7 +392,7 @@ mod store_tests {
 
         // Seed one row so the read path has a target.
         store
-            .persist_context_token("vctx-seed", "real-ctx-seed", "peer-seed")
+            .find_or_create_vctx("peer-seed", None, "real-ctx-seed")
             .await
             .expect("seed");
         store
@@ -402,27 +402,22 @@ mod store_tests {
 
         let mut handles = Vec::new();
 
-        // Batch-write task: hammer persist_context_tokens_batch with bulk
-        // entries to lengthen each transaction and increase the chance of a
-        // write/write race on the file lock. Each task runs 20 iterations of
-        // a 200-entry batch.
+        // Write task: hammer find_or_create_vctx with many unique peers to exercise
+        // concurrent writes and increase the chance of a write/write race on the file lock.
         for w in 0..8 {
             let store = std::sync::Arc::clone(&store);
             handles.push(tokio::spawn(async move {
                 for i in 0..20 {
-                    let entries: Vec<(String, String, String)> = (0..200)
-                        .map(|j| {
-                            (
-                                format!("vctx-w{w}-i{i}-j{j}"),
-                                format!("real-ctx-w{w}-i{i}-j{j}"),
-                                format!("peer-w{w}-i{i}-j{j}"),
+                    for j in 0..10 {
+                        store
+                            .find_or_create_vctx(
+                                &format!("peer-w{w}-i{i}-j{j}"),
+                                None,
+                                &format!("real-ctx-w{w}-i{i}-j{j}"),
                             )
-                        })
-                        .collect();
-                    store
-                        .persist_context_tokens_batch(&entries)
-                        .await
-                        .expect("batch write must not fail");
+                            .await
+                            .expect("find_or_create_vctx must not fail");
+                    }
                 }
             }));
         }
@@ -538,22 +533,16 @@ mod store_tests {
     }
 
     #[tokio::test]
-    async fn test_db_02_persist_context_tokens_batch_large() {
+    async fn test_db_02_find_or_create_vctx_multiple_peers() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-        // Prepare 55 entries
-        let mut entries = Vec::new();
         for i in 0..55 {
-            entries.push((
-                format!("vctx-{}", i),
-                format!("real-{}", i),
-                format!("peer-{}", i),
-            ));
+            store
+                .find_or_create_vctx(&format!("peer-{i}"), None, &format!("real-{i}"))
+                .await
+                .unwrap();
         }
 
-        store.persist_context_tokens_batch(&entries).await.unwrap();
-
-        // Check if entries are saved
         let recent = store.list_recent_context_tokens(100).await.unwrap();
         assert_eq!(recent.len(), 55);
     }
