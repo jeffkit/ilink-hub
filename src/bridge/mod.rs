@@ -1008,6 +1008,8 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
             "--output-format".into(),
             "json".into(),
             "--dangerously-skip-permissions".into(),
+            "--disallowed-tools".into(),
+            "AskUserQuestion".into(),
             "-p".into(),
             message.to_string(),
         ],

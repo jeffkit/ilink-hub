@@ -471,6 +471,44 @@ jobs:
               end
             end
 
+            # brew services start jeffkit/tap/ilink-hub
+            # Runs ilink-hub-bridge in manager mode; manages all bridge profiles automatically.
+            #
+            # Required after install:
+            #   Edit ~/Library/LaunchAgents/homebrew.mxcl.ilink-hub.plist and add:
+            #     WEIXIN_BASE_URL  → your Hub URL (e.g. http://your-server:8765)
+            #     ILINK_ADMIN_TOKEN → admin token from Hub config
+            service do
+              run [opt_bin/"ilink-hub-bridge", "manager"]
+              keep_alive true
+              log_path var/"log/ilink-hub-bridge-manager.log"
+              error_log_path var/"log/ilink-hub-bridge-manager-error.log"
+              environment_variables(
+                RUST_LOG:        "info,ilink_hub_bridge=debug",
+                HOME:            Dir.home,
+                WEIXIN_BASE_URL: "http://your-hub-server:8765",
+                PATH:            "#{HOMEBREW_PREFIX}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+              )
+            end
+
+            def caveats
+              <<~EOS
+                After starting the service, edit the LaunchAgent plist to set your Hub URL and admin token:
+                  #{Dir.home}/Library/LaunchAgents/homebrew.mxcl.ilink-hub.plist
+
+                Required environment variables:
+                  WEIXIN_BASE_URL   → your Hub URL (e.g. http://your-server:8765)
+                  ILINK_ADMIN_TOKEN → admin token from Hub config
+
+                Then restart the service:
+                  brew services restart jeffkit/tap/ilink-hub
+
+                Bridge profiles and credentials are stored in:
+                  ~/.ilink-hub-bridge/profiles/
+                  ~/.ilink-hub-bridge/credentials/
+              EOS
+            end
+
             test do
               assert_match "ilink-hub", shell_output("#{bin}/ilink-hub --version")
               assert_match "ilink-hub-bridge", shell_output("#{bin}/ilink-hub-bridge --version")
