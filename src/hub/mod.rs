@@ -409,13 +409,19 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
     let quoted = {
         let scope = msg.from_user_id.as_deref().unwrap_or_default();
-        let mut q = state.routing.quote_index.lock().await;
-        let from_index = q.resolve_user_quote(scope, &msg);
+        // Only the in-memory index lookup needs the `quote_index` lock. Release it
+        // BEFORE the DB/footer fallbacks: those await on the store and registry, and
+        // holding `quote_index` across them would serialise every quote-routed message
+        // and block the outbound index (sendmessage) and the periodic evictor.
+        let from_index = {
+            let mut q = state.routing.quote_index.lock().await;
+            q.resolve_user_quote(scope, &msg)
+        };
         if from_index.is_some() {
             from_index
         } else {
             // Cold index (e.g. after a Hub restart): first try DB lookup, then fall back to
-            // footer text parsing as last resort.
+            // footer text parsing as last resort. Neither helper touches `quote_index`.
             let from_db = resolve_quote_from_db(&state, &msg).await;
             if from_db.is_some() {
                 from_db

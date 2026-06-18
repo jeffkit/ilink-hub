@@ -375,7 +375,16 @@ impl UpstreamClient {
                                 has_item_list = msg.item_list.is_some(),
                                 "received upstream message"
                             );
-                            let _ = tx.send(msg);
+                            if let Err(e) = tx.send(msg) {
+                                // `broadcast::Sender::send` only errors when there are
+                                // zero receivers (the dispatcher task is gone). The
+                                // message is lost — surface it loudly instead of
+                                // dropping it silently.
+                                warn!(
+                                    from = e.0.from_user_id.as_deref().unwrap_or("?"),
+                                    "dropped upstream message: no dispatcher subscribed to broadcast channel"
+                                );
+                            }
                         }
                     }
                 }
