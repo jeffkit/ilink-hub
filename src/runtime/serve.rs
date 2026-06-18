@@ -326,21 +326,6 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
         }
     }
 
-    match store.list_recent_context_tokens(500).await {
-        Ok(entries) => {
-            let count = entries.len();
-            for (vctx, real_ctx, peer_user_id) in entries {
-                state
-                    .routing
-                    .ctx_map
-                    .seed_full(vctx, real_ctx, peer_user_id);
-            }
-            info!(count, "warmed context_token cache from database");
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load context_token cache from DB");
-        }
-    }
 }
 
 /// Lower bound for `ILINK_MAX_QUEUE_SIZE`. Values below this clamp to [`MIN_MAX_QUEUE_SIZE`].

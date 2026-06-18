@@ -349,42 +349,26 @@ pub async fn sendmessage(
 
     tracing::Span::current().record("vctx", &vctx);
 
-    // Translate virtual → real context token + get peer_user_id (memory first, DB fallback)
-    let (real_ctx, peer_user_id) = state
-        .routing
-        .ctx_map
-        .resolve_full(&vctx)
-        .unwrap_or_else(|| ("".to_string(), "".to_string()));
-
-    let (real_ctx, peer_user_id) = if real_ctx.is_empty() {
-        let db_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            state.store.resolve_context_token_full(&vctx),
-        )
-        .await
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("context_token DB lookup timed out")));
-        match db_result {
-            Ok(Some((r, p))) => {
-                state
-                    .routing
-                    .ctx_map
-                    .seed_full(vctx.clone(), r.clone(), p.clone());
-                (r, p)
-            }
-            Ok(None) => {
-                warn!(vctx = %vctx, "no mapping for virtual context token");
-                return Json(SendMessageResponse::err(400, "Unknown context_token"));
-            }
-            Err(e) => {
-                warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
-                return Json(SendMessageResponse::err(
-                    500,
-                    "context_token resolution error",
-                ));
-            }
+    // Translate virtual → real context token + get peer_user_id (direct DB lookup)
+    let (real_ctx, peer_user_id) = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.store.resolve_context_token_full(&vctx),
+    )
+    .await
+    .unwrap_or_else(|_| Err(anyhow::anyhow!("context_token DB lookup timed out")))
+    {
+        Ok(Some(pair)) => pair,
+        Ok(None) => {
+            warn!(vctx = %vctx, "no mapping for virtual context token");
+            return Json(SendMessageResponse::err(400, "Unknown context_token"));
         }
-    } else {
-        (real_ctx, peer_user_id)
+        Err(e) => {
+            warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
+            return Json(SendMessageResponse::err(
+                500,
+                "context_token resolution error",
+            ));
+        }
     };
 
     let mut active_session: Option<String> = None;
@@ -620,8 +604,7 @@ pub async fn getconfig(
 
     // Translate virtual context token if present
     if let Some(vctx) = &req.context_token.clone() {
-        let real_ctx = state.routing.ctx_map.resolve(vctx);
-        if let Some(real) = real_ctx {
+        if let Ok(Some(real)) = state.store.resolve_context_token(vctx).await {
             req.context_token = Some(real);
         }
     }
@@ -1034,7 +1017,6 @@ pub async fn metrics(
     let upstream_polls_err = state.ilink.upstream.polls_err();
     let relogin_attempts = state.ilink.upstream.relogin_attempts();
     let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let ctx_map_size = state.routing.ctx_map.len();
     let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
 
     let mut out = String::with_capacity(1024);
@@ -1128,12 +1110,6 @@ pub async fn metrics(
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
-
-    out.push_str(
-        "# HELP ilink_hub_ctx_map_size Number of virtual context token entries in memory cache\n",
-    );
-    out.push_str("# TYPE ilink_hub_ctx_map_size gauge\n");
-    out.push_str(&format!("ilink_hub_ctx_map_size {}\n", ctx_map_size));
 
     (StatusCode::OK, out)
 }

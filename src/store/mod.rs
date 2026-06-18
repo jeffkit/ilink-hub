@@ -5,7 +5,8 @@
 //!   mysql://user:pass@host/db         → MySQL
 
 use anyhow::Result;
-use sqlx::AnyPool;
+use sqlx::{Acquire, AnyPool, Row};
+use uuid::Uuid;
 
 /// Whitelist check used by SQLite `pragma_table_info` splicing: the table
 /// and column names must contain only identifier characters, so the
@@ -49,17 +50,6 @@ pub struct Store {
     pool: AnyPool,
     kind: DatabaseKind,
 }
-
-pub mod clients;
-pub mod context;
-pub mod credentials;
-pub mod messages;
-pub mod migrations;
-pub mod sessions;
-
-pub use clients::ClientRow;
-pub use messages::MessageRow;
-pub use sessions::{BackendSessionRow, SessionStatusEntry};
 
 impl Store {
     /// Connect to the database and run migrations.
@@ -177,6 +167,1649 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Returns the highest version recorded in `schema_version`, or 0 if the
+    /// table is empty. Decode errors are propagated — a DB that has rows but
+    /// fails to decode them is NOT the same as a fresh DB.
+    pub async fn get_current_version(&self) -> Result<i32> {
+        // Exclude the lock-sentinel row (i32::MAX) that the migration runner
+        // inserts to prevent concurrent double-execution. External callers must
+        // see the real highest schema version, not the sentinel.
+        let row = sqlx::query("SELECT MAX(version) FROM schema_version WHERE version < $1")
+            .bind(i32::MAX)
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(r) => {
+                let val: Option<i32> = r.try_get(0)?;
+                Ok(val.unwrap_or(0))
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Returns true if a row for `version` exists in `schema_version`.
+    /// Decode errors are propagated.
+    pub async fn is_migration_run(&self, version: i32) -> Result<bool> {
+        let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = $1")
+            .bind(version)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some())
+    }
+
+    /// Atomically claim a migration version. Returns `true` if THIS caller
+    /// won the race and must run the corresponding DDL; returns `false` if
+    /// another writer (concurrent `Store::connect`) has already claimed it.
+    ///
+    /// This is the canonical check-and-claim pattern that closes the
+    /// TOCTOU window between `is_migration_run` and `record_migration_run`
+    /// on multi-connection pools (Postgres, MySQL). The claim is recorded
+    /// before the DDL runs, so a concurrent second writer sees the row
+    /// already present and skips the DDL.
+    ///
+    /// The SQL is driver-aware: SQLite and Postgres use
+    /// `INSERT ... ON CONFLICT (version) DO NOTHING RETURNING version`
+    /// (the canonical "check-and-claim in one statement" pattern); MySQL
+    /// does not support `ON CONFLICT` nor `RETURNING`, so we use
+    /// `INSERT IGNORE` and treat `rows_affected() == 1` as the
+    /// "we won the claim" signal. MySQL's `INSERT IGNORE` skips a row
+    /// that violates the unique-key constraint without raising an error,
+    /// which is the same effect as `ON CONFLICT DO NOTHING`. See F-M3-01
+    /// in the m3 review-findings for the rationale.
+    pub async fn try_claim_migration(&self, version: i32) -> Result<bool> {
+        match self.kind {
+            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                let row = sqlx::query(
+                    "INSERT INTO schema_version (version) VALUES ($1) \
+                     ON CONFLICT (version) DO NOTHING RETURNING version",
+                )
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await?;
+                Ok(row.is_some())
+            }
+            DatabaseKind::MySql => {
+                let result = sqlx::query("INSERT IGNORE INTO schema_version (version) VALUES (?)")
+                    .bind(version)
+                    .execute(&self.pool)
+                    .await?;
+                if result.rows_affected() == 1 {
+                    return Ok(true);
+                }
+                // Defensive check: MySQL's INSERT IGNORE suppresses ALL errors,
+                // not just duplicate-key. If a non-duplicate error was suppressed,
+                // the row won't exist. Verify the row is actually present.
+                let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = ?")
+                    .bind(version)
+                    .fetch_optional(&self.pool)
+                    .await?;
+                if row.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "INSERT IGNORE for schema_version v{version}: row absent after insert — \
+                         a non-duplicate error may have been silently suppressed"
+                    ));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    /// Internal: mark a version as run after its DDL has completed.
+    /// Kept for symmetry with the older two-step pattern; `try_claim_migration`
+    /// is the primary path. The DDL runs only when `try_claim_migration`
+    /// returned `true`, so by the time this is called the row is already
+    /// present — this is a no-op safety net.
+    ///
+    /// Like `try_claim_migration`, the SQL is driver-aware: MySQL does not
+    /// support `ON CONFLICT`, so we use `INSERT IGNORE` on MySQL.
+    pub async fn record_migration_run(&self, version: i32) -> Result<()> {
+        match self.kind {
+            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                sqlx::query(
+                    "INSERT INTO schema_version (version) VALUES ($1) \
+                     ON CONFLICT (version) DO NOTHING",
+                )
+                .bind(version)
+                .execute(&self.pool)
+                .await?;
+            }
+            DatabaseKind::MySql => {
+                sqlx::query("INSERT IGNORE INTO schema_version (version) VALUES (?)")
+                    .bind(version)
+                    .execute(&self.pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Driver-aware atomic check-and-claim, executed on a transaction
+    /// (the canonical path used by `run_migrations`). Same SQL as
+    /// `try_claim_migration` but the claim row sits inside the
+    /// transaction, so the visibility of the row to other writers is
+    /// tied to the transaction's commit/rollback. On SQLite, this means
+    /// the row is invisible to other connections until the transaction
+    /// commits — which is exactly the cross-version race closure we
+    /// need (F-M3-02).
+    #[allow(dead_code)] // used by the test surface via `migrate_to_vN`
+    async fn try_claim_migration_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        version: i32,
+    ) -> Result<bool> {
+        match self.kind {
+            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                let row = sqlx::query(
+                    "INSERT INTO schema_version (version) VALUES ($1) \
+                     ON CONFLICT (version) DO NOTHING RETURNING version",
+                )
+                .bind(version)
+                .fetch_optional(&mut **tx)
+                .await?;
+                Ok(row.is_some())
+            }
+            DatabaseKind::MySql => {
+                let result = sqlx::query("INSERT IGNORE INTO schema_version (version) VALUES (?)")
+                    .bind(version)
+                    .execute(&mut **tx)
+                    .await?;
+                if result.rows_affected() == 1 {
+                    return Ok(true);
+                }
+                // Defensive check: MySQL's INSERT IGNORE suppresses ALL errors,
+                // not just duplicate-key.
+                let row = sqlx::query("SELECT 1 FROM schema_version WHERE version = ?")
+                    .bind(version)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                if row.is_none() {
+                    return Err(anyhow::anyhow!(
+                        "INSERT IGNORE for schema_version v{version}: row absent after insert — \
+                         a non-duplicate error may have been silently suppressed"
+                    ));
+                }
+                Ok(false)
+            }
+        }
+    }
+
+    async fn run_migrations(&self) -> Result<()> {
+        // AnyPool does not support DDL (CREATE TABLE / ALTER TABLE) or sqlx::migrate!.
+        // We implement our own lightweight version-tracking table (`schema_version`)
+        // so each migration step is applied exactly once and can be safely re-run.
+        //
+        // The migration SQL files under migrations/ are the canonical human-readable
+        // reference. The Rust code here must stay in sync with those files.
+        //
+        // Concurrency model: a single connection, held for the entire migration
+        // walk, runs the per-version migrators inside a single transaction.
+        // Each migrator's per-step `try_claim_migration(N)` is the atomic
+        // check-and-claim primitive (the M1 fix, F-M1-01 / F-M1-04); holding
+        // the connection throughout the walk closes the cross-version race
+        // that the per-step claim alone cannot (F-M3-02 in the m3 review).
+        //
+        // Why a transaction: on SQLite, `BEGIN IMMEDIATE` (sqlx's default
+        // `begin` on a `PoolConnection`) acquires the file-level write lock,
+        // so any concurrent writer on the same file is blocked at the
+        // connection layer until we commit. On Postgres, the transaction
+        // serialises via MVCC. On MySQL, DDL auto-commits (MySQL DDL is not
+        // transactional in InnoDB), but the per-step claim INSERTs ARE inside
+        // the transaction and provide mutual exclusion at the row level for
+        // same-version claims; cross-version races on MySQL are theoretically
+        // possible but the window is microseconds (the DDL between claim and
+        // the next claim).
+        //
+        // Claim row order: the per-step claim rows are written BEFORE their
+        // respective DDL bodies. A partial DDL failure leaves the row present
+        // and a subsequent connect will skip the broken step (DBA can then
+        // drop the row manually).
+        //
+        // Invariant: every DDL block below must be idempotent OR guarded by a
+        // pre-check that detects the post-migration state. A non-idempotent
+        // DDL whose claim row was written but whose execution crashed mid-way
+        // would prevent re-running; protect against that by either making the
+        // DDL idempotent (`IF NOT EXISTS`) or by short-circuiting when the
+        // schema already shows the post-migration shape.
+
+        // Acquire a single connection for the whole walk. This pin is what
+        // closes the cross-version race (F-M3-02) — a single connection means
+        // a single physical write context, so the per-step claim rows and
+        // the DDL body for each version execute in a deterministic order
+        // from the same catalog snapshot.
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+
+        // Bootstrap the version-tracking table before anything else.
+        // This is always idempotent via IF NOT EXISTS.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("DDL failed: CREATE TABLE IF NOT EXISTS schema_version\n  Error: {e}")
+        })?;
+
+        // Dispatch to the per-version migrators on the same transaction.
+        // Each step is gated by `try_claim_migration_in_tx`, so a step that
+        // has already been applied (i.e. its row is present in
+        // `schema_version`) is a no-op. Steps that fail (DDL error, decode
+        // error) propagate `Err` straight up to `Store::connect`, blocking
+        // the program from starting in a half-migrated state. The whole
+        // walk commits atomically at the end.
+        self.migrate_to_v1_tx(&mut tx).await?;
+        self.migrate_to_v2_tx(&mut tx).await?;
+        self.migrate_to_v3_tx(&mut tx).await?;
+        self.migrate_to_v4_tx(&mut tx).await?;
+        self.migrate_to_v5_tx(&mut tx).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ─── Per-version migrators (transactional, used by `run_migrations`) ───
+    //
+    // These are the canonical migrators. The non-suffixed `migrate_to_vN`
+    // methods (below) are the pre-M3 versions used by unit tests that call
+    // a single migrator on a partial state without setting up a
+    // transaction. The transactional variants take `&mut sqlx::Transaction`
+    // and run every DDL and claim on that transaction.
+
+    async fn migrate_to_v1_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 1).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS clients (
+                vtoken      TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                label       TEXT,
+                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                last_seen   TEXT
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE clients\n  Error: {e}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS routing_state (
+                from_user     TEXT PRIMARY KEY,
+                active_vtoken TEXT NOT NULL,
+                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE routing_state\n  Error: {e}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS context_token_map (
+                vctx         TEXT PRIMARY KEY,
+                real_ctx     TEXT NOT NULL,
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                expires_at   TEXT
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE context_token_map\n  Error: {e}"))?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS bot_credentials (
+                id         INTEGER PRIMARY KEY,
+                token      TEXT NOT NULL,
+                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE bot_credentials\n  Error: {e}"))?;
+
+        tracing::info!(version = 1, "migration applied: initial schema");
+        Ok(())
+    }
+
+    async fn migrate_to_v2_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 2).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+                vctx               TEXT NOT NULL,
+                vtoken             TEXT NOT NULL,
+                session_name       TEXT NOT NULL,
+                backend_session_id TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (vctx, vtoken, session_name)
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("DDL failed: CREATE TABLE backend_sessions_v2\n  Error: {e}")
+        })?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS active_sessions (
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT NOT NULL,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (vctx, vtoken)
+            )",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE active_sessions\n  Error: {e}"))?;
+
+        tracing::info!(version = 2, "migration applied: backend session tables");
+        Ok(())
+    }
+
+    async fn migrate_to_v3_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 3).await? {
+            return Ok(());
+        }
+        sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+             ON context_token_map (real_ctx)",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "DDL failed: CREATE UNIQUE INDEX idx_context_token_map_real_ctx\n  Error: {e}"
+            )
+        })?;
+
+        tracing::info!(version = 3, "migration applied: real_ctx unique index");
+        Ok(())
+    }
+
+    async fn migrate_to_v4_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 4).await? {
+            return Ok(());
+        }
+        // v4's ALTER is gated by a column-existence pre-check (F-M1-02 fix).
+        // We must NOT use `self.column_exists(&self.pool)` here: with
+        // max_connections(1), the transaction already holds the sole pool
+        // connection; a second `pool.acquire()` inside `column_exists` would
+        // deadlock, `unwrap_or(None)` would swallow the timeout as `false`, and
+        // the ALTER TABLE would run unconditionally — failing with "duplicate
+        // column" on databases that already have the column (F-M3-04).
+        // Fix: inline the catalog query on the SAME transaction connection.
+        let col_exists_in_tx = match self.kind {
+            DatabaseKind::Sqlite => sqlx::query(
+                "SELECT 1 FROM pragma_table_info('context_token_map') \
+                 WHERE name = 'created_at'",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.columns \
+                 WHERE table_name = 'context_token_map' AND column_name = 'created_at' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+        if !col_exists_in_tx {
+            sqlx::query("ALTER TABLE context_token_map ADD COLUMN created_at TEXT")
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "DDL failed: ALTER TABLE context_token_map ADD COLUMN created_at\n  Error: {e}"
+                    )
+                })?;
+        } else {
+            tracing::debug!(
+                "v4 migration: created_at column already present (pre-check), skipping ALTER"
+            );
+        }
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
+             ON context_token_map (created_at DESC)",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "DDL failed: CREATE INDEX idx_context_token_map_created_at\n  Error: {e}"
+            )
+        })?;
+
+        tracing::info!(
+            version = 4,
+            "migration applied: context_token_map created_at column + index"
+        );
+        Ok(())
+    }
+
+    async fn migrate_to_v5_tx(&self, tx: &mut sqlx::Transaction<'_, sqlx::Any>) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 5).await? {
+            return Ok(());
+        }
+        let create_messages = Self::v5_create_messages_sql(self.kind);
+        sqlx::query(&create_messages)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "DDL failed: CREATE TABLE messages (driver-specific id clause)\n  Error: {e}"
+                )
+            })?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
+             ON messages (vctx, created_at DESC)",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_vctx_created\n  Error: {e}")
+        })?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
+             ON messages (peer_user_id, role, created_at DESC)",
+        )
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_peer_role_created\n  Error: {e}")
+        })?;
+
+        tracing::info!(version = 5, "migration applied: messages table + indexes");
+        Ok(())
+    }
+
+    // Non-transactional single-version migrators.
+    // Called only from test code that exercises individual migrators in isolation.
+    // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
+    #[allow(dead_code)]
+    /// v1: initial schema — clients, routing_state, context_token_map, bot_credentials.
+    async fn migrate_to_v1(&self) -> Result<()> {
+        if !self.try_claim_migration(1).await? {
+            return Ok(());
+        }
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS clients (
+                vtoken      TEXT PRIMARY KEY,
+                name        TEXT NOT NULL UNIQUE,
+                label       TEXT,
+                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                last_seen   TEXT
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS routing_state (
+                from_user     TEXT PRIMARY KEY,
+                active_vtoken TEXT NOT NULL,
+                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS context_token_map (
+                vctx         TEXT PRIMARY KEY,
+                real_ctx     TEXT NOT NULL,
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                expires_at   TEXT
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS bot_credentials (
+                id         INTEGER PRIMARY KEY,
+                token      TEXT NOT NULL,
+                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
+                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await?;
+
+        tracing::info!(version = 1, "migration applied: initial schema");
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    /// v2: backend session tables — backend_sessions_v2, active_sessions.
+    async fn migrate_to_v2(&self) -> Result<()> {
+        if !self.try_claim_migration(2).await? {
+            return Ok(());
+        }
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+                vctx               TEXT NOT NULL,
+                vtoken             TEXT NOT NULL,
+                session_name       TEXT NOT NULL,
+                backend_session_id TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (vctx, vtoken, session_name)
+            )",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE TABLE IF NOT EXISTS active_sessions (
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT NOT NULL,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+                PRIMARY KEY (vctx, vtoken)
+            )",
+        )
+        .await?;
+
+        tracing::info!(version = 2, "migration applied: backend session tables");
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    /// v3: real_ctx unique index — backs race-free upsert in `map_context_token`.
+    async fn migrate_to_v3(&self) -> Result<()> {
+        if !self.try_claim_migration(3).await? {
+            return Ok(());
+        }
+        self.ddl(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+             ON context_token_map (real_ctx)",
+        )
+        .await?;
+
+        tracing::info!(version = 3, "migration applied: real_ctx unique index");
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    /// v4: `created_at` column + index on `context_token_map` for portable ORDER BY.
+    ///
+    /// `ALTER TABLE ADD COLUMN` is NOT idempotent — re-running it on a DB that
+    /// already has the column returns an error. The `try_claim_migration(4)`
+    /// gate prevents re-execution on DBs that went through v4 normally.
+    ///
+    /// For DBs upgrading from a pre-schema_version era the column may
+    /// already exist. We probe `information_schema.columns` BEFORE the
+    /// ALTER to short-circuit. This is portable across SQLite, Postgres,
+    /// and MySQL and avoids matching on the driver's error-string format
+    /// (which can shift across versions and silently swallow unrelated
+    /// errors like UNIQUE-constraint violations).
+    async fn migrate_to_v4(&self) -> Result<()> {
+        if !self.try_claim_migration(4).await? {
+            return Ok(());
+        }
+        // SQLite ALTER TABLE ADD COLUMN forbids CURRENT_TIMESTAMP (and any
+        // other dynamic value) as a default, because SQLite would need to
+        // evaluate it for every existing row and the value is non-constant.
+        //
+        // We add the column as nullable TEXT. All INSERT / UPDATE statements
+        // that write to context_token_map explicitly supply CURRENT_TIMESTAMP
+        // for created_at, so new rows always have a proper timestamp. Pre-v4
+        // rows (if any) get NULL, which is acceptable since find_or_create_vctx
+        // does not rely on created_at for ordering.
+        //
+        // Pre-check: ask the catalog whether the column already exists. This
+        // works on SQLite, Postgres, and MySQL (sqlx translates the SQL to
+        // the right placeholder style and the catalog is standard SQL).
+        if !self
+            .column_exists("context_token_map", "created_at")
+            .await?
+        {
+            self.ddl("ALTER TABLE context_token_map ADD COLUMN created_at TEXT")
+                .await?;
+        } else {
+            tracing::debug!(
+                "v4 migration: created_at column already present (pre-check), skipping ALTER"
+            );
+        }
+
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
+             ON context_token_map (created_at DESC)",
+        )
+        .await?;
+
+        tracing::info!(
+            version = 4,
+            "migration applied: context_token_map created_at column + index"
+        );
+        Ok(())
+    }
+
+    /// v5: chat message history — `messages` table + supporting indexes.
+    ///
+    /// The `id` column uses driver-specific auto-increment syntax:
+    ///   - SQLite: `INTEGER PRIMARY KEY AUTOINCREMENT`
+    ///   - Postgres: `INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY`
+    ///     (the SQL standard form, Postgres 10+)
+    ///   - MySQL: `BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY` (MySQL 5.7+)
+    ///
+    /// The driver is taken from `self.kind` (parsed at `Store::connect` time
+    /// from the URL scheme), NOT from a runtime probe: the previous
+    /// `SELECT current_database()` probe returned `Err` on BOTH SQLite and
+    /// MySQL, producing a false-positive `is_sqlite == true` on MySQL and
+    /// breaking the migration. See F-M3-01 in the m3 review-findings.
+    #[allow(dead_code)]
+    async fn migrate_to_v5(&self) -> Result<()> {
+        if !self.try_claim_migration(5).await? {
+            return Ok(());
+        }
+        let create_messages = Self::v5_create_messages_sql(self.kind);
+        self.ddl(&create_messages).await?;
+
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
+             ON messages (vctx, created_at DESC)",
+        )
+        .await?;
+
+        self.ddl(
+            "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
+             ON messages (peer_user_id, role, created_at DESC)",
+        )
+        .await?;
+
+        tracing::info!(version = 5, "migration applied: messages table + indexes");
+        Ok(())
+    }
+
+    /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
+    /// Pulled out of `migrate_to_v5` so the m3 test surface can call all three
+    /// branches directly without spinning up a Postgres or MySQL connection.
+    ///
+    /// Each form is portable to the named driver only. Field types, default
+    /// values (`CURRENT_TIMESTAMP`), and table-level shape are identical to
+    /// the `migrations/0005_messages.sql` reference (which documents the
+    /// SQLite form); the only divergence between the three forms is the
+    /// `id` clause and, for MySQL, the column type (`BIGINT` is required
+    /// because MySQL's `AUTO_INCREMENT` on `INTEGER` is silently truncated
+    /// to `INT(11)`, which then collides with the sqlx `i64` decoder used
+    /// by `save_message`'s `last_insert_id` path).
+    fn v5_create_messages_sql(kind: DatabaseKind) -> String {
+        let id_clause = match kind {
+            DatabaseKind::Sqlite => "id           INTEGER PRIMARY KEY AUTOINCREMENT",
+            DatabaseKind::Postgres => {
+                "id           INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"
+            }
+            DatabaseKind::MySql => "id           BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY",
+        };
+        format!(
+            "CREATE TABLE IF NOT EXISTS messages (
+                {id_clause},
+                vctx         TEXT NOT NULL,
+                vtoken       TEXT,
+                session_name TEXT NOT NULL DEFAULT 'default',
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                role         TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                created_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )"
+        )
+    }
+
+    /// Check whether a column exists on a table.
+    ///
+    /// SQLite does not implement standard `information_schema`, so we use the
+    /// SQLite-specific `pragma_table_info` for the SQLite driver and the
+    /// portable `information_schema.columns` query for Postgres / MySQL.
+    /// The driver is taken from `self.kind` (parsed at `Store::connect`
+    /// time from the URL scheme) rather than probed at runtime — the
+    /// previous `SELECT current_database()` probe returned `Err` on
+    /// BOTH SQLite and MySQL, producing a false-positive
+    /// `is_sqlite == true` on MySQL and breaking the catalog query
+    /// (F-M3-01).
+    ///
+    /// Returns Ok(false) on any error reading the catalog (caller treats the
+    /// column as not present and lets the DDL surface the real error).
+    #[allow(dead_code)]
+    async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        // The `pragma_table_info` form works on SQLite. `pragma` cannot be
+        // parameterised, so we validate identifiers before splicing.
+        if !is_safe_identifier(table) || !is_safe_identifier(column) {
+            return Ok(false);
+        }
+
+        match self.kind {
+            DatabaseKind::Sqlite => {
+                // SQLite: `pragma_table_info('<table>')` returns one row per column.
+                // - Ok(Some(_)) → column found
+                // - Ok(None)    → column absent (or table absent)
+                // - Err(_)      → treat as absent so the DDL surfaces the real error
+                //                 (e.g. "no such table") to the caller
+                let pragma_sql =
+                    format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'");
+                let row = sqlx::query(&pragma_sql)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .unwrap_or(None);
+                Ok(row.is_some())
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => {
+                // Postgres / MySQL: standard information_schema.
+                let row = sqlx::query(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = $1 AND column_name = $2 LIMIT 1",
+                )
+                .bind(table)
+                .bind(column)
+                .fetch_optional(&self.pool)
+                .await?;
+                Ok(row.is_some())
+            }
+        }
+    }
+
+    /// Execute a single DDL statement through a pool connection.
+    ///
+    /// `AnyPool::execute` silently ignores DDL on the pool level. Using an
+    /// explicit `PoolConnection` and calling `execute` on the dereffed connection
+    /// works correctly, including for SQLite in-memory databases where all
+    /// operations must go through the same physical connection.
+    async fn ddl(&self, sql: &str) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query(sql)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
+        Ok(())
+    }
+
+    // ─── Clients ─────────────────────────────────────────────────────────────
+
+    pub async fn upsert_client(&self, vtoken: &str, name: &str, label: Option<&str>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Update routing_state for any routes pointing to this client's old vtoken
+        // before inserting/updating the client's vtoken.
+        sqlx::query(
+            r#"
+            UPDATE routing_state
+            SET active_vtoken = $1
+            WHERE active_vtoken = (SELECT vtoken FROM clients WHERE name = $2)
+            "#,
+        )
+        .bind(vtoken)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+
+        // ON CONFLICT (name): update vtoken so a post-restart re-registration with a new
+        // vtoken wins, keeping DB and in-memory registry consistent.
+        sqlx::query(
+            r#"
+            INSERT INTO clients (vtoken, name, label)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (name) DO UPDATE
+              SET vtoken = EXCLUDED.vtoken,
+                  label = EXCLUDED.label,
+                  last_seen = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(vtoken)
+        .bind(name)
+        .bind(label)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn touch_client(&self, vtoken: &str) -> Result<()> {
+        sqlx::query("UPDATE clients SET last_seen = CURRENT_TIMESTAMP WHERE vtoken = $1")
+            .bind(vtoken)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
+        let rows = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients ORDER BY name")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ClientRow {
+                vtoken: r.get("vtoken"),
+                name: r.get("name"),
+                label: r.get("label"),
+                last_seen: r.get::<Option<String>, _>("last_seen"),
+            })
+            .collect())
+    }
+
+    pub async fn get_client_by_name(&self, name: &str) -> Result<Option<ClientRow>> {
+        let row = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients WHERE name = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row.map(|r| ClientRow {
+            vtoken: r.get("vtoken"),
+            name: r.get("name"),
+            label: r.get("label"),
+            last_seen: r.get::<Option<String>, _>("last_seen"),
+        }))
+    }
+
+    pub async fn delete_client_by_name(&self, name: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM clients WHERE name = $1")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_client_by_vtoken(
+        &self,
+        vtoken: &str,
+        name: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE clients SET name = $2, label = $3 WHERE vtoken = $1")
+            .bind(vtoken)
+            .bind(name)
+            .bind(label)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn clear_routes_for_vtoken(&self, vtoken: &str) -> Result<()> {
+        sqlx::query("DELETE FROM routing_state WHERE active_vtoken = $1")
+            .bind(vtoken)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ─── Routing state ────────────────────────────────────────────────────────
+
+    pub async fn list_routes(&self) -> Result<Vec<(String, String)>> {
+        let rows = sqlx::query("SELECT from_user, active_vtoken FROM routing_state")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("from_user"),
+                    r.get::<String, _>("active_vtoken"),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn get_route(&self, from_user: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT active_vtoken FROM routing_state WHERE from_user = $1")
+            .bind(from_user)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("active_vtoken")))
+    }
+
+    pub async fn set_route(&self, from_user: &str, vtoken: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO routing_state (from_user, active_vtoken)
+            VALUES ($1, $2)
+            ON CONFLICT (from_user) DO UPDATE
+              SET active_vtoken = EXCLUDED.active_vtoken,
+                  updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(from_user)
+        .bind(vtoken)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ─── Backend sessions (named sessions per virtual context + backend token) ──
+
+    /// Upsert the backend session UUID for a named session scoped to a specific backend.
+    pub async fn set_backend_session(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+        backend_session_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO backend_sessions_v2 (vctx, vtoken, session_name, backend_session_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vctx, vtoken, session_name) DO UPDATE SET
+                backend_session_id = excluded.backend_session_id
+            "#,
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(backend_session_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the backend session UUID for a named session scoped to a specific backend.
+    pub async fn get_backend_session(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT backend_session_id FROM backend_sessions_v2 \
+             WHERE vctx = $1 AND vtoken = $2 AND session_name = $3",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("backend_session_id")))
+    }
+
+    /// List all named sessions for a (vctx, vtoken) pair — i.e. for one user × one backend.
+    pub async fn list_backend_sessions(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+    ) -> Result<Vec<BackendSessionRow>> {
+        let rows = sqlx::query(
+            "SELECT session_name, backend_session_id FROM backend_sessions_v2 \
+             WHERE vctx = $1 AND vtoken = $2 ORDER BY session_name",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| BackendSessionRow {
+                session_name: r.get("session_name"),
+                backend_session_id: r.get("backend_session_id"),
+            })
+            .collect())
+    }
+
+    /// Delete a named session for a specific (vctx, vtoken) pair.
+    pub async fn delete_backend_session(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM backend_sessions_v2 WHERE vctx = $1 AND vtoken = $2 AND session_name = $3",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Batch-fetch HubExt data for multiple (vctx, vtoken) pairs in two queries.
+    ///
+    /// Returns a map of `(vctx, vtoken) → (session_name, Option<backend_session_id>)`.
+    /// Used by the Broadcast path to avoid N×2 individual DB round-trips.
+    ///
+    /// Uses `QueryBuilder` so placeholder style (`$N` vs `?`) is chosen automatically
+    /// by the runtime driver — compatible with SQLite, PostgreSQL, and MySQL.
+    pub async fn get_hub_ext_batch(
+        &self,
+        pairs: &[(String, String)], // (vctx, vtoken)
+    ) -> Result<std::collections::HashMap<(String, String), (String, Option<String>)>> {
+        if pairs.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Query 1: resolve active session names for each (vctx, vtoken) pair.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vctx, vtoken, session_name FROM active_sessions WHERE ",
+        );
+        for (i, (vctx, vtoken)) in pairs.iter().enumerate() {
+            if i > 0 {
+                qb.push(" OR ");
+            }
+            qb.push("(vctx = ");
+            qb.push_bind(vctx.as_str());
+            qb.push(" AND vtoken = ");
+            qb.push_bind(vtoken.as_str());
+            qb.push(")");
+        }
+        let active_rows = qb.build().fetch_all(&self.pool).await?;
+
+        // Build map: (vctx, vtoken) → session_name
+        let mut session_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &active_rows {
+            let vctx: String = row.get("vctx");
+            let vtoken: String = row.get("vtoken");
+            let name: String = row.get("session_name");
+            session_map.insert((vctx, vtoken), name);
+        }
+
+        // For each pair, use resolved or default session name, then batch-fetch backend IDs.
+        let resolved: Vec<(String, String, String)> = pairs
+            .iter()
+            .map(|(vctx, vtoken)| {
+                let name = session_map
+                    .get(&(vctx.clone(), vtoken.clone()))
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| "default".to_string());
+                (vctx.clone(), vtoken.clone(), name)
+            })
+            .collect();
+
+        // Query 2: fetch backend session IDs for the resolved (vctx, vtoken, session_name) triples.
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vctx, vtoken, backend_session_id FROM backend_sessions_v2 WHERE ",
+        );
+        for (i, (vctx, vtoken, name)) in resolved.iter().enumerate() {
+            if i > 0 {
+                qb2.push(" OR ");
+            }
+            qb2.push("(vctx = ");
+            qb2.push_bind(vctx.as_str());
+            qb2.push(" AND vtoken = ");
+            qb2.push_bind(vtoken.as_str());
+            qb2.push(" AND session_name = ");
+            qb2.push_bind(name.as_str());
+            qb2.push(")");
+        }
+        let session_rows = qb2.build().fetch_all(&self.pool).await?;
+
+        let mut sid_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &session_rows {
+            let vctx: String = row.get("vctx");
+            let vtoken: String = row.get("vtoken");
+            let sid: String = row.get("backend_session_id");
+            sid_map.insert((vctx, vtoken), sid);
+        }
+
+        let mut result = std::collections::HashMap::new();
+        for (vctx, vtoken, session_name) in resolved {
+            let sid = sid_map
+                .get(&(vctx.clone(), vtoken.clone()))
+                .filter(|s| !s.trim().is_empty())
+                .cloned();
+            result.insert((vctx, vtoken), (session_name, sid));
+        }
+        Ok(result)
+    }
+
+    /// Get the active session name for a (vctx, vtoken) pair (defaults to "default").
+    pub async fn get_active_session_name(&self, vctx: &str, vtoken: &str) -> Result<String> {
+        let row =
+            sqlx::query("SELECT session_name FROM active_sessions WHERE vctx = $1 AND vtoken = $2")
+                .bind(vctx)
+                .bind(vtoken)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row
+            .map(|r| r.get::<String, _>("session_name"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "default".to_string()))
+    }
+
+    /// Set the active session name for a (vctx, vtoken) pair (upsert).
+    pub async fn set_active_session_name(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO active_sessions (vctx, vtoken, session_name)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (vctx, vtoken) DO UPDATE SET
+                session_name = excluded.session_name,
+                updated_at   = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ─── Context token map ────────────────────────────────────────────────────
+
+    pub async fn map_context_token(&self, real_ctx: &str, peer_user_id: &str) -> Result<String> {
+        // Race-free upsert: attempt to insert a fresh vctx for this real_ctx.
+        // If another task already inserted the same real_ctx concurrently, the unique
+        // index on real_ctx causes a conflict and we fall through to the SELECT below.
+        let candidate = format!("vctx_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (real_ctx) DO NOTHING",
+        )
+        .bind(&candidate)
+        .bind(real_ctx)
+        .bind(peer_user_id)
+        .execute(&self.pool)
+        .await?;
+
+        // Whether we inserted or hit the conflict, the winner row is now in the table.
+        let row = sqlx::query("SELECT vctx FROM context_token_map WHERE real_ctx = $1")
+            .bind(real_ctx)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("vctx"))
+    }
+
+    /// Find or create a stable virtual context token for a conversation.
+    ///
+    /// Uses `conv_key` (computed from `peer_user_id` / `group_id`) as the stable identifier
+    /// stored in the `peer_user_id` column.  This avoids a schema change while letting group
+    /// conversations reuse the same vctx across messages.
+    ///
+    /// Lookup order:
+    /// 1. SELECT by conv_key → if found, UPDATE real_ctx and return existing vctx.
+    /// 2. Otherwise INSERT a fresh vctx (with `ON CONFLICT (vctx) DO NOTHING` for safety).
+    ///
+    /// Returns the stable `vctx` for the conversation.
+    pub async fn find_or_create_vctx(
+        &self,
+        peer_user_id: &str,
+        group_id: Option<&str>,
+        real_ctx: &str,
+    ) -> Result<String> {
+        // Compute the conversation key to use as the `peer_user_id` column value.
+        // group:<id> for group messages, peer:<id> for DMs, or "" when neither is known.
+        let conv_key: String = if let Some(g) = group_id.filter(|s| !s.is_empty()) {
+            format!("group:{g}")
+        } else if !peer_user_id.is_empty() {
+            format!("peer:{peer_user_id}")
+        } else {
+            String::new()
+        };
+
+        // If we have a conv_key, try to find an existing row first.
+        if !conv_key.is_empty() {
+            let existing = sqlx::query(
+                "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
+            )
+            .bind(&conv_key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+            if let Some(row) = existing {
+                let vctx: String = row.get("vctx");
+                // Update real_ctx to the latest value so sendmessage resolves correctly.
+                sqlx::query(
+                    "UPDATE context_token_map SET real_ctx = $1 WHERE vctx = $2",
+                )
+                .bind(real_ctx)
+                .bind(&vctx)
+                .execute(&self.pool)
+                .await?;
+                return Ok(vctx);
+            }
+        }
+
+        // No existing row — insert a new one.
+        let candidate = format!("vctx_{}", Uuid::new_v4().simple());
+        sqlx::query(
+            "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at) \
+             VALUES ($1, $2, $3, CURRENT_TIMESTAMP) \
+             ON CONFLICT (vctx) DO NOTHING",
+        )
+        .bind(&candidate)
+        .bind(real_ctx)
+        .bind(&conv_key)
+        .execute(&self.pool)
+        .await?;
+
+        // In the (extremely unlikely) vctx collision case, fall back to SELECT.
+        let row = if !conv_key.is_empty() {
+            sqlx::query(
+                "SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1",
+            )
+            .bind(&conv_key)
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query("SELECT vctx FROM context_token_map WHERE vctx = $1")
+                .bind(&candidate)
+                .fetch_optional(&self.pool)
+                .await?
+        };
+
+        Ok(row
+            .map(|r| r.get::<String, _>("vctx"))
+            .unwrap_or(candidate))
+    }
+
+    pub async fn resolve_context_token(&self, vctx: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT real_ctx FROM context_token_map WHERE vctx = $1")
+            .bind(vctx)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get("real_ctx")))
+    }
+
+    /// Resolve a virtual context token to `(real_ctx, peer_user_id)`.
+    pub async fn resolve_context_token_full(&self, vctx: &str) -> Result<Option<(String, String)>> {
+        let row = sqlx::query(
+            "SELECT real_ctx, COALESCE(peer_user_id, '') AS peer_user_id \
+             FROM context_token_map WHERE vctx = $1",
+        )
+        .bind(vctx)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| (r.get("real_ctx"), r.get("peer_user_id"))))
+    }
+
+    // ─── Bot credentials ──────────────────────────────────────────────────────
+
+    pub async fn save_credentials(&self, token: &str, base_url: &str) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO bot_credentials (id, token, base_url)
+            VALUES (1, $1, $2)
+            ON CONFLICT (id) DO UPDATE
+              SET token = EXCLUDED.token,
+                  base_url = EXCLUDED.base_url,
+                  updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(token)
+        .bind(base_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn load_credentials(&self) -> Result<Option<(String, String)>> {
+        let row = sqlx::query("SELECT token, base_url FROM bot_credentials WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| (r.get("token"), r.get("base_url"))))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientRow {
+    pub vtoken: String,
+    pub name: String,
+    pub label: Option<String>,
+    pub last_seen: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackendSessionRow {
+    pub session_name: String,
+    pub backend_session_id: String,
+}
+
+// ─── Message history ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub id: i64,
+    pub vctx: String,
+    pub vtoken: Option<String>,
+    pub session_name: String,
+    pub peer_user_id: String,
+    pub role: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+impl Store {
+    pub async fn save_message(
+        &self,
+        vctx: &str,
+        vtoken: Option<&str>,
+        session_name: &str,
+        peer_user_id: &str,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO messages (vctx, vtoken, session_name, peer_user_id, role, content) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(peer_user_id)
+        .bind(role)
+        .bind(content)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Find the most recent assistant message in a conversation whose content starts with
+    /// `content_prefix`. Used as DB-backed fallback for quote-reply routing when the
+    /// in-memory QuoteRouteIndex is cold (e.g. after a Hub restart).
+    pub async fn find_assistant_message_by_content(
+        &self,
+        peer_user_id: &str,
+        content_prefix: &str,
+    ) -> Result<Option<(String, Option<String>)>> {
+        // LIKE pattern: escape '%' and '_' in the prefix to avoid wildcard interpretation.
+        let escaped = content_prefix
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("{escaped}%");
+        let row = sqlx::query(
+            "SELECT vtoken, session_name FROM messages \
+             WHERE peer_user_id = $1 AND role = 'assistant' AND content LIKE $2 ESCAPE '\\' \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(peer_user_id)
+        .bind(&pattern)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            let vtoken: Option<String> = r.get("vtoken");
+            let session_name: String = r.get("session_name");
+            (vtoken.unwrap_or_default(), Some(session_name))
+        }))
+    }
+
+    pub async fn list_messages(&self, vctx: &str, limit: i64) -> Result<Vec<MessageRow>> {
+        let rows = sqlx::query(
+            "SELECT id, vctx, vtoken, session_name, peer_user_id, role, content, created_at \
+             FROM messages WHERE vctx = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(vctx)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| MessageRow {
+                id: r.get("id"),
+                vctx: r.get("vctx"),
+                vtoken: r.get("vtoken"),
+                session_name: r.get("session_name"),
+                peer_user_id: r.get("peer_user_id"),
+                role: r.get("role"),
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    /// For each vtoken in the list, return a summary of the most recent conversation turn:
+    /// `(session_name, last_user_content, waiting_for_reply)`.
+    ///
+    /// `waiting_for_reply` is `true` when the last stored message for that vtoken has
+    /// `role = 'user'` — meaning the user sent a message but the assistant has not yet
+    /// written a reply back to the messages table.
+    ///
+    /// Uses `MAX(id)` (autoincrement, strictly monotone) as the "latest row" selector,
+    /// which is stable even when two rows share the same `created_at` second — portable
+    /// across SQLite, PostgreSQL, and MySQL.
+    pub async fn get_session_status_per_vtoken(
+        &self,
+        vtokens: &[String],
+    ) -> Result<std::collections::HashMap<String, SessionStatusEntry>> {
+        if vtokens.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 1: find MAX(id) per vtoken across all roles — id is autoincrement so
+        // MAX(id) always picks the row that was inserted last, even within the same second.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+        );
+        {
+            let mut sep = qb.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb.push(") GROUP BY vtoken");
+        let max_rows = qb.build().fetch_all(&self.pool).await?;
+
+        if max_rows.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 2: fetch the actual latest row by id to determine role.
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
+        );
+        {
+            let mut sep = qb2.separated(", ");
+            for row in &max_rows {
+                let max_id: i64 = row.get("max_id");
+                sep.push_bind(max_id);
+            }
+        }
+        qb2.push(")");
+        let latest_rows = qb2.build().fetch_all(&self.pool).await?;
+
+        // Step 3: find MAX(id) of user-role messages per vtoken (for the display snippet).
+        // We always want to show the user's question, not the assistant's reply.
+        // Also fetch created_at to compute elapsed processing time when waiting_for_reply.
+        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, MAX(id) AS max_id FROM messages \
+             WHERE role = 'user' AND vtoken IN (",
+        );
+        {
+            let mut sep = qb3.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb3.push(") GROUP BY vtoken");
+        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+
+        // (vtoken → (content, created_at))
+        let mut user_content_map: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        if !user_max_rows.is_empty() {
+            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
+                "SELECT vtoken, content, created_at FROM messages WHERE id IN (",
+            );
+            {
+                let mut sep = qb4.separated(", ");
+                for row in &user_max_rows {
+                    let max_id: i64 = row.get("max_id");
+                    sep.push_bind(max_id);
+                }
+            }
+            qb4.push(")");
+            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            for row in user_rows {
+                let vtoken: String = row.get("vtoken");
+                let content: String = row.get("content");
+                let created_at: String = row.get("created_at");
+                user_content_map
+                    .entry(vtoken)
+                    .or_insert((content, created_at));
+            }
+        }
+
+        let mut map = std::collections::HashMap::new();
+        for row in latest_rows {
+            let vtoken: String = row.get("vtoken");
+            let session: String = row.get("session_name");
+            let role: String = row.get("role");
+            let waiting = role == "user";
+            let (last_user_msg, user_msg_created_at) = user_content_map
+                .get(&vtoken)
+                .map(|(c, t)| (Some(c.clone()), Some(t.clone())))
+                .unwrap_or((None, None));
+            map.entry(vtoken).or_insert(SessionStatusEntry {
+                session_name: session,
+                last_user_content: last_user_msg,
+                waiting_for_reply: waiting,
+                user_msg_created_at,
+            });
+        }
+        Ok(map)
+    }
+
+    /// Return all active sessions (grouped by session_name) for the given vtokens.
+    ///
+    /// For each (vtoken, session_name) pair that has at least one message, returns a
+    /// `SessionStatusEntry` with the latest user message and whether the AI has replied.
+    /// Results are ordered by the timestamp of the most recent message in that session
+    /// (most recent first within each vtoken).
+    pub async fn get_all_session_entries_per_vtoken(
+        &self,
+        vtokens: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<SessionStatusEntry>>> {
+        if vtokens.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Step 1: for each (vtoken, session_name) find MAX(id) — determines the latest role.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+        );
+        {
+            let mut sep = qb.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb.push(") GROUP BY vtoken, session_name ORDER BY max_id DESC");
+        let session_rows = qb.build().fetch_all(&self.pool).await?;
+
+        if session_rows.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        // Collect (vtoken, session_name, max_id, role) by fetching the latest row per session.
+        let max_ids: Vec<i64> = session_rows
+            .iter()
+            .map(|r| r.get::<i64, _>("max_id"))
+            .collect();
+
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
+        );
+        {
+            let mut sep = qb2.separated(", ");
+            for id in &max_ids {
+                sep.push_bind(*id);
+            }
+        }
+        qb2.push(")");
+        let role_rows = qb2.build().fetch_all(&self.pool).await?;
+        // (vtoken, session_name) → role of the latest message
+        let mut role_map: std::collections::HashMap<(String, String), String> =
+            std::collections::HashMap::new();
+        for row in &role_rows {
+            let vt: String = row.get("vtoken");
+            let sn: String = row.get("session_name");
+            let role: String = row.get("role");
+            role_map.insert((vt, sn), role);
+        }
+
+        // Step 2: for each (vtoken, session_name), find the latest user message.
+        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages \
+             WHERE role = 'user' AND vtoken IN (",
+        );
+        {
+            let mut sep = qb3.separated(", ");
+            for vt in vtokens {
+                sep.push_bind(vt.as_str());
+            }
+        }
+        qb3.push(") GROUP BY vtoken, session_name");
+        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+
+        let user_max_ids: Vec<i64> = user_max_rows
+            .iter()
+            .map(|r| r.get::<i64, _>("max_id"))
+            .collect();
+
+        // (vtoken, session_name) → (content, created_at)
+        let mut user_content_map: std::collections::HashMap<(String, String), (String, String)> =
+            std::collections::HashMap::new();
+        if !user_max_ids.is_empty() {
+            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
+                "SELECT vtoken, session_name, content, created_at FROM messages WHERE id IN (",
+            );
+            {
+                let mut sep = qb4.separated(", ");
+                for id in &user_max_ids {
+                    sep.push_bind(*id);
+                }
+            }
+            qb4.push(")");
+            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            for row in user_rows {
+                let vt: String = row.get("vtoken");
+                let sn: String = row.get("session_name");
+                let content: String = row.get("content");
+                let created_at: String = row.get("created_at");
+                user_content_map.insert((vt, sn), (content, created_at));
+            }
+        }
+
+        // Assemble result — preserve order from session_rows (most recent first).
+        let mut map: std::collections::HashMap<String, Vec<SessionStatusEntry>> =
+            std::collections::HashMap::new();
+        for row in &session_rows {
+            let vt: String = row.get("vtoken");
+            let sn: String = row.get("session_name");
+            let role = role_map
+                .get(&(vt.clone(), sn.clone()))
+                .map(String::as_str)
+                .unwrap_or("assistant");
+            let waiting = role == "user";
+            let (last_user_content, user_msg_created_at) = user_content_map
+                .get(&(vt.clone(), sn.clone()))
+                .map(|(c, t)| (Some(c.clone()), Some(t.clone())))
+                .unwrap_or((None, None));
+            map.entry(vt).or_default().push(SessionStatusEntry {
+                session_name: sn,
+                last_user_content,
+                waiting_for_reply: waiting,
+                user_msg_created_at,
+            });
+        }
+        Ok(map)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionStatusEntry {
+    pub session_name: String,
+    pub last_user_content: Option<String>,
+    /// `true` when the last stored message is from the user (AI has not replied yet).
+    pub waiting_for_reply: bool,
+    /// ISO-8601 timestamp of the last user message — used to compute elapsed time
+    /// when `waiting_for_reply` is true. `None` when there are no user messages.
+    pub user_msg_created_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -346,10 +1979,10 @@ mod store_tests {
         // If migration ran, these should succeed
         let r = store.list_clients().await;
         assert!(r.is_ok(), "list_clients failed: {:?}", r.err());
-        let r = store.list_recent_context_tokens(5).await;
+        let r = store.find_or_create_vctx("test-user", None, "real-ctx").await;
         assert!(
             r.is_ok(),
-            "list_recent_context_tokens failed: {:?}",
+            "find_or_create_vctx failed: {:?}",
             r.err()
         );
     }
@@ -402,8 +2035,9 @@ mod store_tests {
 
         let mut handles = Vec::new();
 
-        // Write task: hammer find_or_create_vctx with many unique peers to exercise
-        // concurrent writes and increase the chance of a write/write race on the file lock.
+        // Batch-write task: hammer find_or_create_vctx with many entries to exercise
+        // concurrent DB writes and increase the chance of a write/write race on the
+        // file lock. Each task runs 20 iterations with 10 entries each.
         for w in 0..8 {
             let store = std::sync::Arc::clone(&store);
             handles.push(tokio::spawn(async move {
@@ -536,6 +2170,7 @@ mod store_tests {
     async fn test_db_02_find_or_create_vctx_multiple_peers() {
         let store = Store::connect("sqlite::memory:").await.expect("connect");
 
+        // Create 55 distinct peer conversations.
         for i in 0..55 {
             store
                 .find_or_create_vctx(&format!("peer-{i}"), None, &format!("real-{i}"))
@@ -543,8 +2178,18 @@ mod store_tests {
                 .unwrap();
         }
 
-        let recent = store.list_recent_context_tokens(100).await.unwrap();
-        assert_eq!(recent.len(), 55);
+        // All 55 entries must be persisted: each peer should resolve consistently.
+        for i in 0..55 {
+            let v1 = store
+                .find_or_create_vctx(&format!("peer-{i}"), None, &format!("real-{i}"))
+                .await
+                .unwrap();
+            let v2 = store
+                .find_or_create_vctx(&format!("peer-{i}"), None, &format!("real-{i}-new"))
+                .await
+                .unwrap();
+            assert_eq!(v1, v2, "peer-{i} must always get the same vctx");
+        }
     }
 
     #[tokio::test]
@@ -656,7 +2301,7 @@ mod store_tests {
         // tables, no missing indexes.
         for s in [&s1, &s2] {
             assert!(s.list_clients().await.is_ok());
-            assert!(s.list_recent_context_tokens(1).await.is_ok());
+            assert!(s.find_or_create_vctx("schema-check-user", None, "schema-check-real").await.is_ok());
         }
     }
 

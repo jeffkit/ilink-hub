@@ -170,10 +170,10 @@ async fn migration_creates_expected_schema_on_fresh_db() {
     let result = store.list_clients().await;
     assert!(result.is_ok(), "clients table should exist after migration");
 
-    let result = store.list_recent_context_tokens(10).await;
+    let result = store.find_or_create_vctx("test-user", None, "real-ctx").await;
     assert!(
         result.is_ok(),
-        "context_token_map with created_at column should exist after migration"
+        "context_token_map table should exist after migration"
     );
 }
 
@@ -195,15 +195,14 @@ async fn migration_is_safe_to_run_twice() {
         .expect("second connect on same DB should succeed (idempotent migrations)");
 }
 
-/// The created_at column added in migration 0004 allows ORDER BY created_at
-/// to work correctly (previously used non-portable rowid).
+/// Each distinct peer gets a stable vctx via find_or_create_vctx.
 #[tokio::test]
-async fn list_recent_context_tokens_returns_results_ordered_by_created_at() {
+async fn find_or_create_vctx_creates_stable_entries() {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
 
-    // Seed some context token mappings.
+    // Create 5 distinct peer conversations.
     for i in 0..5 {
         store
             .find_or_create_vctx(
@@ -215,10 +214,18 @@ async fn list_recent_context_tokens_returns_results_ordered_by_created_at() {
             .unwrap();
     }
 
-    let recent = store.list_recent_context_tokens(10).await.unwrap();
-    // Should return all 5 without error (ordering may not be guaranteed for
-    // same-millisecond inserts, but the query should not panic or fail).
-    assert_eq!(recent.len(), 5);
+    // Each peer should resolve to a consistent vctx.
+    for i in 0..5 {
+        let v1 = store
+            .find_or_create_vctx(&format!("user_{i}"), None, &format!("real_{i}"))
+            .await
+            .unwrap();
+        let v2 = store
+            .find_or_create_vctx(&format!("user_{i}"), None, &format!("real_{i}_new"))
+            .await
+            .unwrap();
+        assert_eq!(v1, v2, "same peer should always get the same vctx");
+    }
 }
 
 // ─── R-03: Queue backend fail-fast ───────────────────────────────────────────
