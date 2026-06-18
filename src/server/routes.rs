@@ -931,6 +931,31 @@ pub async fn admin_ilink_relogin(
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
 
+/// Mint a single-use, short-lived ticket for opening the QR SSE stream.
+///
+/// Authenticated the normal way (Bearer header), so the long-lived admin token
+/// never has to travel in a URL. The browser redeems the returned ticket via
+/// `GET /hub/ilink/qr-stream?ticket=<ticket>`.
+pub async fn admin_ilink_qr_stream_ticket(
+    State(state): State<Arc<HubState>>,
+    headers: HeaderMap,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !check_admin_auth(&headers) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        );
+    }
+    let ticket = state.ilink.qr_ticket.issue();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ticket": ticket,
+            "expires_in_secs": crate::server::sse_ticket::TICKET_TTL.as_secs(),
+        })),
+    )
+}
+
 pub async fn admin_ilink_qr_stream(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
@@ -939,16 +964,16 @@ pub async fn admin_ilink_qr_stream(
     Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>>,
     StatusCode,
 > {
-    // EventSource can't set custom headers — accept token via ?token= query param as fallback.
-    // Trade-off: the full URL (including the token) appears in reverse-proxy access logs and
-    // browser history. Operators should configure their proxy to redact or omit the ?token=
-    // query parameter from access logs for this endpoint.
+    // `EventSource` cannot attach an Authorization header, so the browser opens
+    // this stream with a single-use `?ticket=` minted by the (header-authed)
+    // `/hub/ilink/qr-stream-ticket` endpoint. The ticket is high-entropy,
+    // expires in seconds and is consumed on first use, so leaking it via proxy
+    // logs / history is harmless — unlike the raw admin token. Non-browser
+    // callers can still authenticate directly with a Bearer header.
     let authed = check_admin_auth(&headers)
-        || admin_token().map_or(insecure_no_auth(), |required| {
-            use subtle::ConstantTimeEq;
-            let provided = params.get("token").map(String::as_str).unwrap_or("");
-            provided.as_bytes().ct_eq(required.as_bytes()).unwrap_u8() == 1
-        });
+        || params
+            .get("ticket")
+            .is_some_and(|t| state.ilink.qr_ticket.consume(t));
     if !authed {
         return Err(StatusCode::UNAUTHORIZED);
     }

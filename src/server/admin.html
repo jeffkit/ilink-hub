@@ -735,11 +735,29 @@ function setIlinkBadge(status) {
   }
 }
 
-function startQrStream() {
+async function startQrStream() {
   if (qrEventSource) return;
-  const url = adminToken
-    ? `/hub/ilink/qr-stream?token=${encodeURIComponent(adminToken)}`
-    : `/hub/ilink/qr-stream`;
+  // EventSource can't send an Authorization header, so mint a single-use,
+  // short-lived ticket via the header-authenticated endpoint and pass that in
+  // the URL instead of the long-lived admin token.
+  let url = '/hub/ilink/qr-stream';
+  if (adminToken) {
+    try {
+      const r = await fetch('/hub/ilink/qr-stream-ticket', {
+        method: 'POST',
+        headers: authHeaders(),
+      });
+      if (!r.ok) { stopQrStream(); return; }
+      const d = await r.json();
+      if (!d.ticket) { stopQrStream(); return; }
+      url = `/hub/ilink/qr-stream?ticket=${encodeURIComponent(d.ticket)}`;
+    } catch (err) {
+      stopQrStream();
+      return;
+    }
+  }
+  // Guard against a concurrent start() that already opened the stream.
+  if (qrEventSource) return;
   qrEventSource = new EventSource(url);
   qrEventSource.onmessage = (e) => {
     try {

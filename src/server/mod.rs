@@ -1,12 +1,15 @@
 pub mod pairing;
 pub mod routes;
+pub mod sse_ticket;
 
 use axum::{
     extract::DefaultBodyLimit,
     routing::{get, patch, post},
     Router,
 };
-use routes::{admin_ilink_qr_stream, admin_ilink_relogin, admin_ilink_status};
+use routes::{
+    admin_ilink_qr_stream, admin_ilink_qr_stream_ticket, admin_ilink_relogin, admin_ilink_status,
+};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -52,6 +55,10 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         // iLink upstream management
         .route("/hub/ilink/status", get(admin_ilink_status))
         .route("/hub/ilink/relogin", post(admin_ilink_relogin))
+        .route(
+            "/hub/ilink/qr-stream-ticket",
+            post(admin_ilink_qr_stream_ticket),
+        )
         .route("/hub/ilink/qr-stream", get(admin_ilink_qr_stream))
         // Observability
         .route("/metrics", get(metrics))

@@ -194,6 +194,9 @@ pub struct IlinkConnState {
     pub qr_last_ready: Arc<Mutex<Option<QrLoginUiEvent>>>,
     /// Signals the polling loop to initiate a fresh QR re-login.
     pub relogin_tx: broadcast::Sender<()>,
+    /// Single-use, short-lived tickets that authenticate the QR SSE stream
+    /// without putting the admin token in the URL. See [`SseTicketStore`].
+    pub qr_ticket: crate::server::sse_ticket::SseTicketStore,
 }
 
 impl IlinkConnState {
@@ -207,6 +210,7 @@ impl IlinkConnState {
             qr_tx,
             qr_last_ready: Arc::new(Mutex::new(None)),
             relogin_tx,
+            qr_ticket: crate::server::sse_ticket::SseTicketStore::new(),
         }
     }
 }
