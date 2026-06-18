@@ -59,6 +59,10 @@ struct ClaudeContentBlock {
 /// to avoid opaque upstream errors.
 const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+/// Anthropic API hard limit for a single document (PDF) — 32 MB per the
+/// [PDF support docs](https://platform.claude.com/docs/en/build-with-claude/pdf-support).
+const ANTHROPIC_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+
 pub async fn run() -> Result<()> {
     let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
     let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
@@ -107,17 +111,33 @@ async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Resu
 /// between turns, the final assistant reply may only appear in `result.result` (with no
 /// preceding `assistant` event); we emit it as an extra ILINK_PARTIAL in that case.
 ///
-/// When the inbound message contains an image (`ILINK_IMAGE_URL` set by the bridge),
-/// switches to the bidirectional `stream-json` input/output mode and writes a single
-/// `SDKUserMessage` to stdin whose `content` is an array of text + image blocks. This
-/// is the same protocol the Claude Code TS SDK uses internally.
+/// When the inbound message carries an image or file (URLs set by the bridge in
+/// `ILINK_IMAGE_URL` / `ILINK_FILE_URL`), switches to the bidirectional `stream-json`
+/// input/output mode and writes a single `SDKUserMessage` to stdin whose `content` is
+/// an array of `[text, image/document]` blocks. This is the same protocol the Claude
+/// Code TS SDK uses internally.
+///
+/// Limitations on the Claude side (verified against the Anthropic Messages API docs):
+/// - **Image**: JPEG/PNG/GIF/WebP, ≤5 MB base64 (per-request cap; 10 MB on direct API).
+/// - **Document**: PDF or plain text only via `document` content block, ≤32 MB.
+///   Other file types are NOT supported through this path (no `video` block, no generic
+///   file block). Non-matching files surface a clear error before the CLI is spawned.
 async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>> {
     let image_url = std::env::var("ILINK_IMAGE_URL")
         .ok()
         .filter(|s| !s.is_empty());
+    let file_url = std::env::var("ILINK_FILE_URL")
+        .ok()
+        .filter(|s| !s.is_empty());
 
-    if let Some(url) = image_url {
-        return stream_claude_with_image(message, session_id, &url).await;
+    if image_url.is_some() || file_url.is_some() {
+        return stream_claude_multimodal(
+            message,
+            session_id,
+            image_url.as_deref(),
+            file_url.as_deref(),
+        )
+        .await;
     }
 
     let mut args: Vec<String> = vec![
@@ -248,19 +268,41 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     Ok(found_session_id)
 }
 
-/// Multimodal variant: download the image at `url`, base64-encode it, and feed Claude
-/// via the bidirectional `stream-json` protocol (a single `SDKUserMessage` written to
-/// stdin, with `content = [text block, image block]`).
+/// Multimodal variant: download any inbound image and/or file, base64-encode them,
+/// and feed Claude via the bidirectional `stream-json` protocol (a single
+/// `SDKUserMessage` written to stdin, with `content = [text, image?, document?]`).
 ///
 /// `--input-format stream-json` requires `--output-format stream-json` and uses `--print`
 /// mode under the hood. Session continuity is provided by the `session_id` field of
 /// `SDKUserMessage` (empty string = new session, otherwise resume that UUID).
-async fn stream_claude_with_image(
+///
+/// Only **PDF** and **plain text** are accepted as files — see `download_document_as_base64`.
+/// All other file types fail before the CLI is spawned, with a clear error explaining
+/// the limitation (no `video` block, no generic file block on the Anthropic side).
+async fn stream_claude_multimodal(
     message: &str,
     session_id: &str,
-    image_url: &str,
+    image_url: Option<&str>,
+    file_url: Option<&str>,
 ) -> Result<Option<String>> {
-    let (media_type, b64_data) = download_image_as_base64(image_url).await?;
+    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+    content_blocks.push(json!({ "type": "text", "text": message }));
+
+    if let Some(url) = image_url {
+        let (media_type, b64_data) = download_image_as_base64(url).await?;
+        content_blocks.push(json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+        }));
+    }
+
+    if let Some(url) = file_url {
+        let (media_type, b64_data) = download_document_as_base64(url).await?;
+        content_blocks.push(json!({
+            "type": "document",
+            "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+        }));
+    }
 
     let mut args: Vec<String> = vec![
         "--input-format".into(),
@@ -307,24 +349,14 @@ async fn stream_claude_with_image(
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    // Build SDKUserMessage: {type:"user", message:{role:"user", content:[text, image]}, session_id, parent_tool_use_id:null}
+    // Build SDKUserMessage: {type:"user", message:{role:"user", content:[...]}, session_id, parent_tool_use_id:null}
     // The protocol is line-delimited JSON on stdin, terminated by a newline.
     // See fake-cc/src/server/directConnectManager.ts:130 and src/utils/teleport/api.ts:376.
     let user_message = json!({
         "type": "user",
         "message": {
             "role": "user",
-            "content": [
-                { "type": "text", "text": message },
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": media_type,
-                        "data": b64_data,
-                    }
-                }
-            ]
+            "content": content_blocks,
         },
         "parent_tool_use_id": null,
         "session_id": session_id,
@@ -463,6 +495,79 @@ async fn download_image_as_base64(url: &str) -> Result<(String, String)> {
 
     if buf.is_empty() {
         anyhow::bail!("image download returned empty body for {url}");
+    }
+
+    Ok((media_type, B64.encode(&buf)))
+}
+
+/// Download a document at `url` and return `(media_type, base64_data)`. Only PDF and
+/// plain text are accepted (Anthropic Messages API `document` block constraint). Any
+/// other content type fails fast with a clear message — the user will see the error
+/// in the bridge log and the original WeChat message will be silently dropped.
+///
+/// Why reject non-PDF/text? The Anthropic `document` content block only supports
+/// `application/pdf` and `text/plain` (see [PDF support docs]). The Files API *can*
+/// host other types but requires a separate upload step and explicit `file_id`
+/// reference, which is out of scope for this streaming bridge.
+///
+/// Limit: 32 MB per the [PDF support docs](https://platform.claude.com/docs/en/build-with-claude/pdf-support).
+async fn download_document_as_base64(url: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .context("build reqwest client for document download")?;
+
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("download document from {url}"))?;
+
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "document download failed: HTTP {} for {url}",
+            response.status()
+        );
+    }
+
+    // Resolve the media_type from the response. We only accept the two types the
+    // Anthropic `document` block actually supports; everything else is rejected here
+    // so the user gets a useful error rather than a confusing API failure downstream.
+    let raw_media_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_string())
+        .unwrap_or_default();
+
+    let media_type = match raw_media_type.as_str() {
+        "application/pdf" => "application/pdf".to_string(),
+        "text/plain" => "text/plain".to_string(),
+        other => {
+            anyhow::bail!(
+                "unsupported document media_type: {other:?} (only application/pdf and \
+                 text/plain are accepted by the Anthropic document block; video and \
+                 other file types are not supported). url: {url}"
+            );
+        }
+    };
+
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    use futures_util::StreamExt;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("read document body chunk")?;
+        if buf.len() + chunk.len() > ANTHROPIC_MAX_DOCUMENT_BYTES {
+            anyhow::bail!(
+                "document too large: exceeds Anthropic limit ({} bytes)",
+                ANTHROPIC_MAX_DOCUMENT_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    if buf.is_empty() {
+        anyhow::bail!("document download returned empty body for {url}");
     }
 
     Ok((media_type, B64.encode(&buf)))
@@ -805,6 +910,234 @@ mod tests {
         assert!(
             msg.contains("404"),
             "error should mention HTTP status: {msg}"
+        );
+    }
+
+    /// Verify the SDKUserMessage shape when a PDF is attached. The content array must
+    /// contain a `document` block (not `image`) with a `base64` source — this is the
+    /// shape the Anthropic Messages API expects for PDF inputs.
+    #[test]
+    fn sdk_user_message_with_pdf_uses_document_block() {
+        let message = "summarize this PDF";
+        let user_message = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": message },
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": "JVBERi0xLjQK",
+                        }
+                    }
+                ]
+            },
+            "parent_tool_use_id": null,
+            "session_id": "",
+        });
+
+        let serialized = serde_json::to_string(&user_message).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+
+        let blocks = parsed["message"]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "document");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "application/pdf");
+    }
+
+    /// Mixed image + document in a single SDKUserMessage: both blocks must be present
+    /// in order, each with the correct `type`. This is the combined path the bridge
+    /// takes when both ILINK_IMAGE_URL and ILINK_FILE_URL are set.
+    #[test]
+    fn sdk_user_message_with_image_and_document() {
+        let user_message = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "compare these" },
+                    {
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": "image/png", "data": "AAAA" }
+                    },
+                    {
+                        "type": "document",
+                        "source": { "type": "base64", "media_type": "application/pdf", "data": "BBBB" }
+                    }
+                ]
+            },
+            "parent_tool_use_id": null,
+            "session_id": "",
+        });
+
+        let parsed: serde_json::Value = serde_json::to_string(&user_message)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap();
+
+        let blocks = parsed["message"]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[2]["type"], "document");
+    }
+
+    /// A PDF served with application/pdf must download and round-trip cleanly.
+    /// Verifies the basic happy path for `download_document_as_base64`.
+    #[tokio::test]
+    async fn download_pdf_roundtrips_through_local_server() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        // 4-byte PDF magic ("%PDF") + minimal junk. Real PDFs have headers/trailers
+        // but we only need byte-fidelity; the Claude API does the real validation.
+        const PDF_BYTES: &[u8] = b"%PDF-1.4\n%\xE2\xE3\xCF\xD3\n";
+
+        async fn serve_pdf() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/pdf")
+                .body(Body::from(PDF_BYTES.to_vec()))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/file.pdf", get(serve_pdf));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/file.pdf");
+        let (media_type, b64) = download_document_as_base64(&url).await.unwrap();
+        assert_eq!(media_type, "application/pdf");
+
+        let decoded = B64.decode(&b64).unwrap();
+        assert_eq!(decoded, PDF_BYTES);
+    }
+
+    /// Plain text files are accepted (`text/plain`). The Anthropic document block
+    /// supports this media type alongside PDF; useful for `.txt` / `.md` forwards.
+    #[tokio::test]
+    async fn download_text_plain_document_roundtrips() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        const TEXT: &str = "hello from a wechat text file\n";
+
+        async fn serve_text() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from(TEXT.as_bytes().to_vec()))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/note.txt", get(serve_text));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/note.txt");
+        let (media_type, b64) = download_document_as_base64(&url).await.unwrap();
+        assert_eq!(media_type, "text/plain");
+        assert_eq!(String::from_utf8_lossy(&B64.decode(&b64).unwrap()).as_ref(), TEXT);
+    }
+
+    /// Any non-PDF/non-text media type must be rejected with a clear error. This is
+    /// the "video, zip, exe, etc. → user sees a clear error" guarantee. The check
+    /// runs before the CLI is spawned so we never waste a turn on a doomed request.
+    #[tokio::test]
+    async fn download_document_rejects_unsupported_media_type() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        async fn serve_mp4() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "video/mp4")
+                .body(Body::from(b"fake-mp4-bytes".to_vec()))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/video.mp4", get(serve_mp4));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/video.mp4");
+        let err = download_document_as_base64(&url)
+            .await
+            .expect_err("video/mp4 must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported document media_type"),
+            "error should name the constraint: {msg}"
+        );
+        assert!(msg.contains("video/mp4"), "error should quote the type: {msg}");
+    }
+
+    /// A zip / application/octet-stream file must also be rejected — the bridge
+    /// must not silently forward arbitrary binaries to Claude as a "document".
+    #[tokio::test]
+    async fn download_document_rejects_zip() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        async fn serve_zip() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/zip")
+                .body(Body::from(b"PK\x03\x04fake-zip".to_vec()))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/a.zip", get(serve_zip));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/a.zip");
+        let err = download_document_as_base64(&url)
+            .await
+            .expect_err("application/zip must be rejected");
+        assert!(format!("{err:#}").contains("application/zip"));
+    }
+
+    /// An oversize PDF (>32MB) must fail fast during streaming — the bridge should
+    /// not download the full 100MB and then fail at the API.
+    #[tokio::test]
+    async fn download_document_rejects_oversize_pdf() {
+        use axum::{Router, body::Body, http::header, response::Response, routing::get};
+
+        // Emit one chunk that itself exceeds the limit so the streaming check trips
+        // on the first iteration. We don't need to allocate a real 32MB+ buffer.
+        const BIG_CHUNK: usize = ANTHROPIC_MAX_DOCUMENT_BYTES + 1;
+
+        async fn serve_big_pdf() -> Response<Body> {
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/pdf")
+                .body(Body::from(vec![b'x'; BIG_CHUNK]))
+                .unwrap()
+        }
+
+        let app = Router::new().route("/big.pdf", get(serve_big_pdf));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let url = format!("http://{addr}/big.pdf");
+        let err = download_document_as_base64(&url)
+            .await
+            .expect_err("oversize PDF must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("too large"),
+            "error should name the size constraint: {msg}"
         );
     }
 }

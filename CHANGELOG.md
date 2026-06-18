@@ -4,11 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Bridge — claude_code 多模态（图片）支持
+### Bridge — claude_code 多模态（图片 + PDF/文本文件）支持
 
 **新增**
 
 - **claude_code 内置 bridge 支持图片输入**：当 bridge 检测到 `ILINK_IMAGE_URL` 环境变量（由前面几层的 media env 注入产生），自动切换到 Claude Code CLI 的 `--input-format stream-json --output-format stream-json` 双向流模式，在 stdin 上写入一行 `SDKUserMessage`（与 TS SDK 内部协议一致），`content` 字段为 `[text block, image block]` 数组，image block 携带 base64 编码的图片。图片在发送前通过 reqwest 从微信 CDN 下载，遵循 Anthropic API 5MB 限制。Session 续接（`--resume`）通过 `SDKUserMessage.session_id` 字段保留。流式 output 解析（`ILINK_PARTIAL`、`ILINK_SESSION`）保持不变。
+- **claude_code 内置 bridge 支持 PDF / 纯文本文件输入**：当 bridge 检测到 `ILINK_FILE_URL` 环境变量时，把下载后的文件以 Anthropic `document` content block 写入 `SDKUserMessage.content`（`type: "document"`，`source.type: "base64"`，`media_type: application/pdf` 或 `text/plain`）。下载时强制 32MB 上限（Anthropic 文档块硬限制），并对非 PDF / 纯文本的 media type 提前拒绝（视频、zip、exe 等会立即在 bridge 日志中给出明确错误，不浪费一次 CLI 调用）。
+- **图片与文件可同时下发**：当 `ILINK_IMAGE_URL` 与 `ILINK_FILE_URL` 都存在时，`content` 数组依次为 `[text, image, document]`，对应 Anthropic 协议里多模态拼接的合法形态。
+
+**已知限制**
+
+- **视频不支持**：Anthropic Messages API 没有 `video` content block，整个 ilink-hub 在用户→AI 这一步都不可能支持视频输入。微信收到的视频会落到「无法路由」日志里，bridge 不会尝试下载或转发。
+- **非 PDF / 非纯文本文件不支持**：`document` 块只接受 `application/pdf` 和 `text/plain`。其他类型（CSV / Excel / Word / 压缩包 / 可执行文件等）需要走 Anthropic Files API 流程，超出 stream-json 协议范围。
+- **CLI 协议层行为未实测**：`SDKUserMessage.content` 接受 `document` 块是 Anthropic SDK 的协议规定，fake-cc 的 TS SDK 内部也使用，但 Claude Code CLI 的 `--input-format stream-json` 模式对 `document` 块的具体行为未在生产实测。如有问题会回退到「下载到本地、告诉 Claude 文件路径、用 Read 工具读」的备选方案。
 
 **参考**：协议细节见 `fake-cc` 项目 `src/server/directConnectManager.ts:130` 和 `src/utils/teleport/api.ts:376`。
 
