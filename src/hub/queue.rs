@@ -16,53 +16,6 @@ use crate::ilink::types::WeixinMessage;
 
 /// Default maximum number of messages buffered per client.
 pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
-#[allow(dead_code)]
-const MAX_QUEUE_SIZE: usize = DEFAULT_MAX_QUEUE_SIZE;
-
-// ─── Client queue ─────────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct ClientQueue {
-    pub(crate) pending: VecDeque<WeixinMessage>,
-    pub(crate) notify: Arc<Notify>,
-}
-
-#[allow(dead_code)]
-impl ClientQueue {
-    pub(crate) fn new() -> Self {
-        Self {
-            pending: VecDeque::new(),
-            notify: Arc::new(Notify::new()),
-        }
-    }
-
-    pub(crate) fn push(&mut self, msg: WeixinMessage) -> bool {
-        let dropped = if self.pending.len() >= MAX_QUEUE_SIZE {
-            self.pending.pop_front();
-            warn!(
-                max = MAX_QUEUE_SIZE,
-                "client queue full, dropping oldest message"
-            );
-            true
-        } else {
-            false
-        };
-        self.pending.push_back(msg);
-        self.notify.notify_one();
-        dropped
-    }
-
-    pub(crate) fn drain(&mut self) -> Vec<WeixinMessage> {
-        self.pending.drain(..).collect()
-    }
-}
-
-impl Default for ClientQueue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ─── MessageQueue trait ───────────────────────────────────────────────────────
 

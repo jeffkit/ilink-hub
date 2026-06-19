@@ -88,16 +88,14 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
                 let vtoken = client.vtoken.clone();
                 drop(registry);
 
-                {
-                    let mut router = state.routing.router.lock().await;
-                    router.set_route(&from_user_id, vtoken.clone());
-                }
-
                 if let Err(e) = state.store.set_route(&from_user_id, &vtoken).await {
                     warn!(error = %e, "failed to persist route to DB");
+                    format!("⚠️ 切换到 `{}` 失败（数据库写入错误），请重试", name)
+                } else {
+                    let mut router = state.routing.router.lock().await;
+                    router.set_route(&from_user_id, vtoken.clone());
+                    format!("✅ 已切换到 `{}`", name)
                 }
-
-                format!("✅ 已切换到 `{}`", name)
             } else {
                 format!(
                     "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。",

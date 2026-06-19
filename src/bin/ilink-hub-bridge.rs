@@ -274,6 +274,11 @@ async fn main() -> Result<()> {
                                 let _ = tokio::fs::remove_file(&cred_path).await;
                                 continue 'reconnect;
                             }
+                            Ok(BridgeStop::FatalCliError(reason)) => {
+                                anyhow::bail!(
+                                    "CLI 认证失败，需要用户处理后重启 bridge：{reason}"
+                                );
+                            }
                             Err(e) => {
                                 return Err(e).context("bridge task panicked or failed");
                             }
