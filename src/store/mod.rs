@@ -57,7 +57,10 @@ impl DatabaseKind {
 }
 
 pub struct Store {
+    /// Write pool — always `max_connections(1)` for SQLite to serialise writes.
     pool: AnyPool,
+    /// Read pool — multiple connections on SQLite WAL, same as `pool` for PG/MySQL.
+    rpool: AnyPool,
     kind: DatabaseKind,
 }
 
@@ -94,24 +97,30 @@ impl Store {
             .map_err(|e| anyhow::anyhow!("spawn_blocking failed: {e}"))??;
         }
 
-        // For SQLite :memory: databases each new physical connection gets its own
-        // fresh (empty) database. To ensure DDL and DML share the same in-memory
-        // instance we pin the pool to a single connection.
+        // SQLite connection pool strategy:
         //
-        // For file-type SQLite, the same single-connection pin is required to
-        // avoid SQLITE_BUSY (5) errors: SQLite's file-level write lock means a
-        // long write transaction (e.g. `find_or_create_vctx`) and a
-        // concurrent read (e.g. `get_active_session_name`) executed on two
-        // different physical connections race on the same lock.
+        // Write pool (max_connections=1): serialises all writes and DDL.  A single
+        // writer is required because SQLite's file-level write lock means concurrent
+        // writers from separate connections will see SQLITE_BUSY; WAL mode reduces
+        // but does not eliminate this for concurrent writers.
         //
-        // We explicitly set `busy_timeout = 5000` (5s) and `journal_mode = WAL`
-        // via an `after_connect` callback so the behaviour is explicit rather
-        // than relying on sqlx internal defaults that may change across
-        // versions. WAL mode improves crash safety and write throughput
-        // (writes do not block reads); on :memory: databases both PRAGMAs
-        // are accepted but have no effect.
-        let pool = if is_sqlite {
-            sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        // Read pool (max_connections=4): WAL mode allows multiple concurrent readers
+        // without blocking the writer — each reader snapshots the WAL at its own
+        // read mark.  For :memory: databases reads and writes share the single write
+        // connection (the read pool is set to the same pool) because each physical
+        // connection to ":memory:" creates an independent empty database.
+        //
+        // Non-SQLite (Postgres, MySQL): both pools point to the same AnyPool;
+        // those engines handle their own concurrency.
+        //
+        // We set `journal_mode=WAL` and `busy_timeout=5000` on every connection
+        // so behaviour is explicit rather than relying on sqlx defaults.
+        // For :memory: SQLite, reads and writes share the single write connection —
+        // separate physical connections each see an independent empty database.
+        let is_memory_sqlite = is_sqlite && (url.contains(":memory:") || url.ends_with("sqlite:"));
+
+        let (pool, rpool) = if is_sqlite {
+            let wpool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
                 .max_connections(1)
                 .after_connect(|conn, _meta| {
                     Box::pin(async move {
@@ -122,11 +131,30 @@ impl Store {
                     })
                 })
                 .connect(url)
-                .await?
+                .await?;
+            let rpool = if is_memory_sqlite {
+                wpool.clone()
+            } else {
+                sqlx::pool::PoolOptions::<sqlx::Any>::new()
+                    .max_connections(4)
+                    .after_connect(|conn, _meta| {
+                        Box::pin(async move {
+                            sqlx::query("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
+                                .execute(&mut *conn)
+                                .await?;
+                            Ok(())
+                        })
+                    })
+                    .connect(url)
+                    .await?
+            };
+            (wpool, rpool)
         } else {
-            AnyPool::connect(url).await?
+            let pool = AnyPool::connect(url).await?;
+            (pool.clone(), pool)
         };
-        let store = Self { pool, kind };
+
+        let store = Self { pool, rpool, kind };
         store.run_migrations().await?;
         Ok(store)
     }

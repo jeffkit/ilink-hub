@@ -28,7 +28,7 @@ impl Store {
 
     pub async fn load_credentials(&self) -> Result<Option<(String, String)>> {
         let row = sqlx::query("SELECT token, base_url FROM bot_credentials WHERE id = 1")
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.rpool)
             .await?;
         Ok(row.map(|r| (r.get("token"), r.get("base_url"))))
     }

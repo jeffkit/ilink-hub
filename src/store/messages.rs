@@ -74,7 +74,7 @@ impl Store {
         )
         .bind(peer_user_id)
         .bind(&pattern)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.rpool)
         .await?;
         Ok(row.map(|r| {
             let vtoken: Option<String> = r.get("vtoken");
@@ -90,7 +90,7 @@ impl Store {
         )
         .bind(vctx)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.rpool)
         .await?;
 
         Ok(rows
@@ -138,7 +138,7 @@ impl Store {
             }
         }
         qb.push(") GROUP BY vtoken");
-        let max_rows = qb.build().fetch_all(&self.pool).await?;
+        let max_rows = qb.build().fetch_all(&self.rpool).await?;
 
         if max_rows.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -156,7 +156,7 @@ impl Store {
             }
         }
         qb2.push(")");
-        let latest_rows = qb2.build().fetch_all(&self.pool).await?;
+        let latest_rows = qb2.build().fetch_all(&self.rpool).await?;
 
         // Step 3: find MAX(id) of user-role messages per vtoken (for the display snippet).
         // We always want to show the user's question, not the assistant's reply.
@@ -172,7 +172,7 @@ impl Store {
             }
         }
         qb3.push(") GROUP BY vtoken");
-        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+        let user_max_rows = qb3.build().fetch_all(&self.rpool).await?;
 
         // (vtoken → (content, created_at))
         let mut user_content_map: std::collections::HashMap<String, (String, String)> =
@@ -189,7 +189,7 @@ impl Store {
                 }
             }
             qb4.push(")");
-            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            let user_rows = qb4.build().fetch_all(&self.rpool).await?;
             for row in user_rows {
                 let vtoken: String = row.get("vtoken");
                 let content: String = row.get("content");
@@ -245,7 +245,7 @@ impl Store {
             }
         }
         qb.push(") GROUP BY vtoken, session_name ORDER BY max_id DESC");
-        let session_rows = qb.build().fetch_all(&self.pool).await?;
+        let session_rows = qb.build().fetch_all(&self.rpool).await?;
 
         if session_rows.is_empty() {
             return Ok(std::collections::HashMap::new());
@@ -267,7 +267,7 @@ impl Store {
             }
         }
         qb2.push(")");
-        let role_rows = qb2.build().fetch_all(&self.pool).await?;
+        let role_rows = qb2.build().fetch_all(&self.rpool).await?;
         // (vtoken, session_name) → role of the latest message
         let mut role_map: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();
@@ -290,7 +290,7 @@ impl Store {
             }
         }
         qb3.push(") GROUP BY vtoken, session_name");
-        let user_max_rows = qb3.build().fetch_all(&self.pool).await?;
+        let user_max_rows = qb3.build().fetch_all(&self.rpool).await?;
 
         let user_max_ids: Vec<i64> = user_max_rows
             .iter()
@@ -311,7 +311,7 @@ impl Store {
                 }
             }
             qb4.push(")");
-            let user_rows = qb4.build().fetch_all(&self.pool).await?;
+            let user_rows = qb4.build().fetch_all(&self.rpool).await?;
             for row in user_rows {
                 let vt: String = row.get("vtoken");
                 let sn: String = row.get("session_name");

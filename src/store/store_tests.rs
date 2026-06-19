@@ -11,11 +11,11 @@ async fn test_schema_version_tracking() {
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 6,
-        "expected all 6 migrations to be applied on a fresh DB"
+        version, 7,
+        "expected all 7 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=6 {
+    for v in 1..=7 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -47,7 +47,7 @@ async fn test_migration_idempotency() {
         .get_current_version()
         .await
         .expect("get_current_version");
-    assert_eq!(version, 6, "version must remain 6 after idempotent re-run");
+    assert_eq!(version, 7, "version must remain 7 after idempotent re-run");
 }
 
 /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -62,7 +62,7 @@ async fn test_migration_incremental_from_v2() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store {
+        let s = Store { rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -147,9 +147,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 6, "must reach v6 after incremental migration");
+    assert_eq!(version, 7, "must reach v7 after incremental migration");
 
-    for v in 1..=6 {
+    for v in 1..=7 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -190,7 +190,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store {
+        let s = Store { rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -241,7 +241,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 6, "current version must be 6, got {}", cur_ver);
+    assert_eq!(cur_ver, 7, "current version must be 7, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -595,13 +595,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        6,
-        "writer #1 must see all v1-v6 applied"
+        7,
+        "writer #1 must see all v1-v7 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        6,
-        "writer #2 must see all v1-v6 applied"
+        7,
+        "writer #2 must see all v1-v7 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -668,8 +668,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            6,
-            "connect #{i} must see all v1-v6 applied"
+            7,
+            "connect #{i} must see all v1-v7 applied"
         );
     }
 }
@@ -688,7 +688,7 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -813,7 +813,7 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -877,8 +877,8 @@ async fn adversarial_version_api_boundaries() {
     assert!(!store.is_migration_run(0).await.unwrap());
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
-    // get_current_version: 6 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 6);
+    // get_current_version: 7 (the highest applied).
+    assert_eq!(store.get_current_version().await.unwrap(), 7);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -973,7 +973,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1030,7 +1030,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 6 are applied. Re-running each must NOT fail
+    // After connect, all 7 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1038,9 +1038,10 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v4().await.expect("v4 re-run");
     store.migrate_to_v5().await.expect("v5 re-run");
     store.migrate_to_v6().await.expect("v6 re-run");
+    store.migrate_to_v7().await.expect("v7 re-run");
 
-    // Still at v6.
-    assert_eq!(store.get_current_version().await.unwrap(), 6);
+    // Still at v7.
+    assert_eq!(store.get_current_version().await.unwrap(), 7);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1057,7 +1058,7 @@ async fn m2_ddl_error_propagates_through_migrator() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1151,7 +1152,7 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1206,15 +1207,15 @@ async fn m2_v4_alone_with_minimal_preconditions() {
 #[tokio::test]
 async fn m2_run_migrations_records_all_versions_in_order() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // All six versions are present.
-    for v in 1..=6 {
+    // All seven versions are present.
+    for v in 1..=7 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be recorded after run_migrations"
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 6);
+    assert_eq!(store.get_current_version().await.unwrap(), 7);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1225,8 +1226,8 @@ async fn m2_run_migrations_idempotent_double_call() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
-    // Version stays at 6 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 6);
+    // Version stays at 7 (no ghost rows from a third call).
+    assert_eq!(store.get_current_version().await.unwrap(), 7);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1504,7 +1505,7 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1848,8 +1849,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 6,
-        "database must still be at v6 after ensure_sqlite_file"
+        v, 7,
+        "database must still be at v7 after ensure_sqlite_file"
     );
 }
 
@@ -1900,7 +1901,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 6);
+    assert_eq!(v, 7);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -1919,7 +1920,7 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1976,7 +1977,7 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2006,7 +2007,7 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2081,7 +2082,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         .connect(&db_url)
         .await
         .expect("pool");
-    let store = Store {
+    let store = Store { rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
     };
@@ -2098,7 +2099,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
 
     // Both transactions race for v99. Only one tx's claim can succeed.
     let pool2 = pool.clone();
-    let store2 = Store {
+    let store2 = Store { rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
     };

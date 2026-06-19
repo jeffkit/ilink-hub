@@ -47,7 +47,7 @@ impl Store {
         .bind(vctx)
         .bind(vtoken)
         .bind(session_name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.rpool)
         .await?;
         Ok(row.map(|r| r.get::<String, _>("backend_session_id")))
     }
@@ -64,7 +64,7 @@ impl Store {
         )
         .bind(vctx)
         .bind(vtoken)
-        .fetch_all(&self.pool)
+        .fetch_all(&self.rpool)
         .await?;
         Ok(rows
             .into_iter()
@@ -122,7 +122,7 @@ impl Store {
             qb.push_bind(vtoken.as_str());
             qb.push(")");
         }
-        let active_rows = qb.build().fetch_all(&self.pool).await?;
+        let active_rows = qb.build().fetch_all(&self.rpool).await?;
 
         // Build map: (vctx, vtoken) → session_name
         let mut session_map: std::collections::HashMap<(String, String), String> =
@@ -163,7 +163,7 @@ impl Store {
             qb2.push_bind(name.as_str());
             qb2.push(")");
         }
-        let session_rows = qb2.build().fetch_all(&self.pool).await?;
+        let session_rows = qb2.build().fetch_all(&self.rpool).await?;
 
         let mut sid_map: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();
@@ -191,7 +191,7 @@ impl Store {
             sqlx::query("SELECT session_name FROM active_sessions WHERE vctx = $1 AND vtoken = $2")
                 .bind(vctx)
                 .bind(vtoken)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&self.rpool)
                 .await?;
         Ok(row
             .map(|r| r.get::<String, _>("session_name"))

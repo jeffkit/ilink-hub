@@ -57,7 +57,7 @@ impl Store {
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
         let rows = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients ORDER BY name")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.rpool)
             .await?;
 
         Ok(rows
@@ -74,7 +74,7 @@ impl Store {
     pub async fn get_client_by_name(&self, name: &str) -> Result<Option<ClientRow>> {
         let row = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients WHERE name = $1")
             .bind(name)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.rpool)
             .await?;
 
         Ok(row.map(|r| ClientRow {
@@ -120,7 +120,7 @@ impl Store {
 
     pub async fn list_routes(&self) -> Result<Vec<(String, String)>> {
         let rows = sqlx::query("SELECT from_user, active_vtoken FROM routing_state")
-            .fetch_all(&self.pool)
+            .fetch_all(&self.rpool)
             .await?;
 
         Ok(rows
@@ -137,7 +137,7 @@ impl Store {
     pub async fn get_route(&self, from_user: &str) -> Result<Option<String>> {
         let row = sqlx::query("SELECT active_vtoken FROM routing_state WHERE from_user = $1")
             .bind(from_user)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&self.rpool)
             .await?;
         Ok(row.map(|r| r.get("active_vtoken")))
     }

@@ -257,6 +257,7 @@ impl Store {
         self.migrate_to_v4_tx(&mut tx).await?;
         self.migrate_to_v5_tx(&mut tx).await?;
         self.migrate_to_v6_tx(&mut tx).await?;
+        self.migrate_to_v7_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -511,6 +512,93 @@ impl Store {
         Ok(())
     }
 
+    /// v7: Unique index on non-empty `peer_user_id` in `context_token_map`.
+    ///
+    /// This makes `find_or_create_vctx` race-free on multi-connection pools
+    /// (PostgreSQL, MySQL) by allowing a single-statement
+    /// `INSERT ... ON CONFLICT (peer_user_id) DO UPDATE` upsert instead of
+    /// the two-step SELECT + INSERT that had a TOCTOU window.
+    ///
+    /// SQLite and PostgreSQL support a partial WHERE clause on the index
+    /// (`WHERE peer_user_id != ''`) so that multiple empty-string rows are
+    /// still allowed (conversations with no known peer_user_id).
+    ///
+    /// MySQL does not support partial indexes; we skip the migration there
+    /// and fall back to the existing SELECT + INSERT path (which is safe on
+    /// MySQL because the single-connection write pool serialises concurrent
+    /// writers at the pool level).
+    pub(super) async fn migrate_to_v7_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 7).await? {
+            return Ok(());
+        }
+        match self.kind {
+            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                // De-duplicate any rows with the same non-empty peer_user_id before
+                // creating the unique index. Historical data anomalies (race conditions
+                // on pre-v7 schemas) may have produced duplicate conv_keys.
+                let dedup_sql = match self.kind {
+                    DatabaseKind::Sqlite => V7_DEDUP_PEER_USER_ID_SQLITE,
+                    _ => V7_DEDUP_PEER_USER_ID_POSTGRES,
+                };
+                sqlx::query(dedup_sql)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: de-duplicate peer_user_id\n  Error: {e}")
+                    })?;
+                sqlx::query(V7_UNIQUE_IDX_PEER_USER_ID)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V7_UNIQUE_IDX_PEER_USER_ID}\n  Error: {e}")
+                    })?;
+                tracing::info!(
+                    version = 7,
+                    "migration applied: de-dup + unique index on non-empty peer_user_id"
+                );
+            }
+            DatabaseKind::MySql => {
+                tracing::info!(
+                    version = 7,
+                    "migration skipped on MySQL: partial unique indexes are not supported; \
+                     find_or_create_vctx uses serialised pool instead"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v7(&self) -> Result<()> {
+        if !self.try_claim_migration(7).await? {
+            return Ok(());
+        }
+        match self.kind {
+            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
+                let dedup_sql = match self.kind {
+                    DatabaseKind::Sqlite => V7_DEDUP_PEER_USER_ID_SQLITE,
+                    _ => V7_DEDUP_PEER_USER_ID_POSTGRES,
+                };
+                self.ddl(dedup_sql).await?;
+                self.ddl(V7_UNIQUE_IDX_PEER_USER_ID).await?;
+                tracing::info!(
+                    version = 7,
+                    "migration applied: de-dup + unique index on non-empty peer_user_id"
+                );
+            }
+            DatabaseKind::MySql => {
+                tracing::info!(
+                    version = 7,
+                    "migration skipped on MySQL: partial unique indexes are not supported"
+                );
+            }
+        }
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -689,3 +777,32 @@ const V6_NORMALIZE_PEER_USER_ID: &str =
      WHERE peer_user_id != ''
        AND peer_user_id NOT LIKE 'peer:%'
        AND peer_user_id NOT LIKE 'group:%'";
+
+/// SQLite-specific: remove duplicate non-empty peer_user_id rows before creating
+/// the unique index. Keeps the row with the highest rowid per conv_key.
+/// Safe to re-run: if no duplicates exist the DELETE is a no-op.
+const V7_DEDUP_PEER_USER_ID_SQLITE: &str =
+    "DELETE FROM context_token_map \
+     WHERE peer_user_id != '' \
+       AND rowid NOT IN ( \
+           SELECT MAX(rowid) FROM context_token_map \
+           WHERE peer_user_id != '' \
+           GROUP BY peer_user_id \
+       )";
+
+/// PostgreSQL-specific: same de-dup using ctid instead of rowid.
+const V7_DEDUP_PEER_USER_ID_POSTGRES: &str =
+    "DELETE FROM context_token_map \
+     WHERE peer_user_id != '' \
+       AND ctid NOT IN ( \
+           SELECT MIN(ctid) FROM context_token_map \
+           WHERE peer_user_id != '' \
+           GROUP BY peer_user_id \
+       )";
+
+/// Partial unique index on `context_token_map.peer_user_id` (non-empty rows only).
+/// SQLite and PostgreSQL only — MySQL does not support partial indexes.
+const V7_UNIQUE_IDX_PEER_USER_ID: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_peer_user_id \
+     ON context_token_map (peer_user_id) \
+     WHERE peer_user_id != ''";
