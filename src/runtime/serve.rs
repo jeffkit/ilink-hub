@@ -22,6 +22,55 @@ use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
 use crate::store::Store;
 
+/// Runtime tuning knobs read from environment variables at startup.
+///
+/// All values are validated eagerly in [`RuntimeConfig::from_env`] so misconfiguration
+/// surfaces immediately at launch rather than silently using a wrong default at runtime.
+#[derive(Debug)]
+pub struct RuntimeConfig {
+    /// Capacity of the broadcast channel between the upstream polling loop and the
+    /// dispatcher task. Overflow causes silent message drops. Default: 1024.
+    pub dispatch_channel_size: usize,
+    /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
+    pub shutdown_drain_secs: u64,
+}
+
+impl RuntimeConfig {
+    pub fn from_env() -> Result<Self> {
+        let dispatch_channel_size = parse_env_usize("ILINK_DISPATCH_CHANNEL_SIZE", 1024)?;
+        if dispatch_channel_size == 0 {
+            anyhow::bail!("ILINK_DISPATCH_CHANNEL_SIZE must be > 0");
+        }
+
+        let shutdown_drain_secs = parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
+
+        Ok(Self {
+            dispatch_channel_size,
+            shutdown_drain_secs,
+        })
+    }
+}
+
+fn parse_env_usize(name: &str, default: usize) -> Result<usize> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(v) if v.trim().is_empty() => Ok(default),
+        Ok(v) => v.trim().parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("{name}={v:?} is not a valid positive integer")
+        }),
+    }
+}
+
+fn parse_env_u64(name: &str, default: u64) -> Result<u64> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(v) if v.trim().is_empty() => Ok(default),
+        Ok(v) => v.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")
+        }),
+    }
+}
+
 /// Arguments for [`run_serve`], matching the `ilink-hub serve` CLI flags.
 pub struct ServeOptions {
     pub token: Option<String>,
@@ -66,6 +115,11 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         on_hub_state,
     } = opts;
 
+    // Validate all env-var tuning knobs before doing any async work so that
+    // misconfiguration is surfaced immediately at launch.
+    let runtime_cfg = RuntimeConfig::from_env()?;
+    // Queue backend validation also happens eagerly (it calls build_queue_backend below).
+
     info!(%addr, %database_url, "iLink Hub starting");
 
     let store = Arc::new(Store::connect(&database_url).await?);
@@ -93,15 +147,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    // Dispatcher broadcast channel: capacity bounds how many messages can be buffered
-    // between the upstream polling loop and the dispatcher task. A burst exceeding
-    // this limit causes a Lagged error and drops the oldest messages silently.
-    // Tune via ILINK_DISPATCH_CHANNEL_SIZE (default 1024).
-    let dispatch_channel_size: usize = std::env::var("ILINK_DISPATCH_CHANNEL_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024);
-    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(dispatch_channel_size);
+    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
@@ -196,11 +242,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         }
         // Wait for pending message queues to drain before closing connections.
         // This gives bridge clients already in-flight time to poll remaining messages.
-        let drain_secs = std::env::var("ILINK_SHUTDOWN_DRAIN_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SHUTDOWN_DRAIN_SECS);
-        drain_queues_before_shutdown(&state_for_drain, drain_secs).await;
+        drain_queues_before_shutdown(&state_for_drain, runtime_cfg.shutdown_drain_secs).await;
     })
     .await?;
 

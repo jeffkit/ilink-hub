@@ -3,20 +3,48 @@ pub mod routes;
 pub mod sse_ticket;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{ConnectInfo, DefaultBodyLimit, Request},
+    middleware::{self, Next},
+    response::Response,
     routing::{get, patch, post},
     Router,
 };
 use routes::{
     admin_ilink_qr_stream, admin_ilink_qr_stream_ticket, admin_ilink_relogin, admin_ilink_status,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
+use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::hub::HubState;
 use pairing::*;
 use routes::*;
+
+/// Maximum simultaneous in-flight `sendmessage` requests across all clients.
+/// Prevents a single burst of outbound messages from exhausting Hub worker threads.
+const SENDMESSAGE_MAX_CONCURRENCY: usize = 64;
+
+/// Middleware that logs every mutating admin API call with caller IP, method and path.
+async fn admin_audit_log(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    // Log before forwarding so the entry is written even if the handler panics.
+    if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
+        tracing::info!(
+            ip = %addr.ip(),
+            %method,
+            %path,
+            "admin API call"
+        );
+    }
+    next.run(req).await
+}
 
 pub fn build_router(state: Arc<HubState>) -> Router {
     // CORS is only required for the iLink-compatible bot API so that browser-based
@@ -34,7 +62,11 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         .route("/ilink/bot/getupdates", post(getupdates))
         .route(
             "/ilink/bot/sendmessage",
-            post(sendmessage).layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+            post(sendmessage).layer(
+                tower::ServiceBuilder::new()
+                    .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+                    .layer(ConcurrencyLimitLayer::new(SENDMESSAGE_MAX_CONCURRENCY)),
+            ),
         )
         .route("/ilink/bot/sendtyping", post(sendtyping))
         .route("/ilink/bot/getconfig", post(getconfig))
@@ -62,7 +94,8 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         .route("/hub/ilink/qr-stream", get(admin_ilink_qr_stream))
         // Observability
         .route("/metrics", get(metrics))
-        .route("/health", get(|| async { "ok" }));
+        .route("/health", get(|| async { "ok" }))
+        .layer(middleware::from_fn(admin_audit_log));
 
     Router::new()
         .merge(bot_api)
