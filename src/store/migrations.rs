@@ -277,54 +277,12 @@ impl Store {
         if !self.try_claim_migration_in_tx(tx, 1).await? {
             return Ok(());
         }
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS clients (
-                vtoken      TEXT PRIMARY KEY,
-                name        TEXT NOT NULL UNIQUE,
-                label       TEXT,
-                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                last_seen   TEXT
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE clients\n  Error: {e}"))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS routing_state (
-                from_user     TEXT PRIMARY KEY,
-                active_vtoken TEXT NOT NULL,
-                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE routing_state\n  Error: {e}"))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS context_token_map (
-                vctx         TEXT PRIMARY KEY,
-                real_ctx     TEXT NOT NULL,
-                peer_user_id TEXT NOT NULL DEFAULT '',
-                expires_at   TEXT
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE context_token_map\n  Error: {e}"))?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS bot_credentials (
-                id         INTEGER PRIMARY KEY,
-                token      TEXT NOT NULL,
-                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE bot_credentials\n  Error: {e}"))?;
-
+        for sql in V1_DDLS {
+            sqlx::query(sql)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
+        }
         tracing::info!(version = 1, "migration applied: initial schema");
         Ok(())
     }
@@ -336,35 +294,12 @@ impl Store {
         if !self.try_claim_migration_in_tx(tx, 2).await? {
             return Ok(());
         }
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
-                vctx               TEXT NOT NULL,
-                vtoken             TEXT NOT NULL,
-                session_name       TEXT NOT NULL,
-                backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken, session_name)
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE TABLE backend_sessions_v2\n  Error: {e}")
-        })?;
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS active_sessions (
-                vctx         TEXT NOT NULL,
-                vtoken       TEXT NOT NULL,
-                session_name TEXT NOT NULL DEFAULT 'default',
-                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken)
-            )",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| anyhow::anyhow!("DDL failed: CREATE TABLE active_sessions\n  Error: {e}"))?;
-
+        for sql in V2_DDLS {
+            sqlx::query(sql)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
+        }
         tracing::info!(version = 2, "migration applied: backend session tables");
         Ok(())
     }
@@ -376,18 +311,10 @@ impl Store {
         if !self.try_claim_migration_in_tx(tx, 3).await? {
             return Ok(());
         }
-        sqlx::query(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
-             ON context_token_map (real_ctx)",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "DDL failed: CREATE UNIQUE INDEX idx_context_token_map_real_ctx\n  Error: {e}"
-            )
-        })?;
-
+        sqlx::query(V3_CREATE_IDX)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("DDL failed: {V3_CREATE_IDX}\n  Error: {e}"))?;
         tracing::info!(version = 3, "migration applied: real_ctx unique index");
         Ok(())
     }
@@ -424,32 +351,19 @@ impl Store {
             .is_some(),
         };
         if !col_exists_in_tx {
-            sqlx::query("ALTER TABLE context_token_map ADD COLUMN created_at TEXT")
+            sqlx::query(V4_ALTER_ADD_CREATED_AT)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "DDL failed: ALTER TABLE context_token_map ADD COLUMN created_at\n  Error: {e}"
-                    )
-                })?;
+                .map_err(|e| anyhow::anyhow!("DDL failed: {V4_ALTER_ADD_CREATED_AT}\n  Error: {e}"))?;
         } else {
             tracing::debug!(
                 "v4 migration: created_at column already present (pre-check), skipping ALTER"
             );
         }
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
-             ON context_token_map (created_at DESC)",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "DDL failed: CREATE INDEX idx_context_token_map_created_at\n  Error: {e}"
-            )
-        })?;
-
+        sqlx::query(V4_CREATE_IDX)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("DDL failed: {V4_CREATE_IDX}\n  Error: {e}"))?;
         tracing::info!(
             version = 4,
             "migration applied: context_token_map created_at column + index"
@@ -468,32 +382,13 @@ impl Store {
         sqlx::query(&create_messages)
             .execute(&mut **tx)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "DDL failed: CREATE TABLE messages (driver-specific id clause)\n  Error: {e}"
-                )
-            })?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
-             ON messages (vctx, created_at DESC)",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_vctx_created\n  Error: {e}")
-        })?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
-             ON messages (peer_user_id, role, created_at DESC)",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!("DDL failed: CREATE INDEX idx_messages_peer_role_created\n  Error: {e}")
-        })?;
-
+            .map_err(|e| anyhow::anyhow!("DDL failed (CREATE TABLE messages): {e}"))?;
+        for sql in V5_INDEXES {
+            sqlx::query(sql)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("DDL failed: {sql}\n  Error: {e}"))?;
+        }
         tracing::info!(version = 5, "migration applied: messages table + indexes");
         Ok(())
     }
@@ -519,21 +414,10 @@ impl Store {
         if !self.try_claim_migration_in_tx(tx, 6).await? {
             return Ok(());
         }
-        sqlx::query(
-            "UPDATE context_token_map
-             SET peer_user_id = 'peer:' || peer_user_id
-             WHERE peer_user_id != ''
-               AND peer_user_id NOT LIKE 'peer:%'
-               AND peer_user_id NOT LIKE 'group:%'",
-        )
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "DDL failed: normalize peer_user_id format on context_token_map\n  Error: {e}"
-            )
-        })?;
-
+        sqlx::query(V6_NORMALIZE_PEER_USER_ID)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("DDL failed: {V6_NORMALIZE_PEER_USER_ID}\n  Error: {e}"))?;
         tracing::info!(
             version = 6,
             "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
@@ -544,153 +428,55 @@ impl Store {
     // Non-transactional single-version migrators.
     // Called only from test code that exercises individual migrators in isolation.
     // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
+    // Each method reuses the SQL constants defined below to avoid drift between the two paths.
+
     #[allow(dead_code)]
-    /// v1: initial schema — clients, routing_state, context_token_map, bot_credentials.
     pub(super) async fn migrate_to_v1(&self) -> Result<()> {
         if !self.try_claim_migration(1).await? {
             return Ok(());
         }
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS clients (
-                vtoken      TEXT PRIMARY KEY,
-                name        TEXT NOT NULL UNIQUE,
-                label       TEXT,
-                created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                last_seen   TEXT
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS routing_state (
-                from_user     TEXT PRIMARY KEY,
-                active_vtoken TEXT NOT NULL,
-                updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS context_token_map (
-                vctx         TEXT PRIMARY KEY,
-                real_ctx     TEXT NOT NULL,
-                peer_user_id TEXT NOT NULL DEFAULT '',
-                expires_at   TEXT
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS bot_credentials (
-                id         INTEGER PRIMARY KEY,
-                token      TEXT NOT NULL,
-                base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-                updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-            )",
-        )
-        .await?;
-
+        for sql in V1_DDLS {
+            self.ddl(sql).await?;
+        }
         tracing::info!(version = 1, "migration applied: initial schema");
         Ok(())
     }
 
     #[allow(dead_code)]
-    /// v2: backend session tables — backend_sessions_v2, active_sessions.
     pub(super) async fn migrate_to_v2(&self) -> Result<()> {
         if !self.try_claim_migration(2).await? {
             return Ok(());
         }
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
-                vctx               TEXT NOT NULL,
-                vtoken             TEXT NOT NULL,
-                session_name       TEXT NOT NULL,
-                backend_session_id TEXT NOT NULL DEFAULT '',
-                created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken, session_name)
-            )",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE TABLE IF NOT EXISTS active_sessions (
-                vctx         TEXT NOT NULL,
-                vtoken       TEXT NOT NULL,
-                session_name TEXT NOT NULL DEFAULT 'default',
-                updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-                PRIMARY KEY (vctx, vtoken)
-            )",
-        )
-        .await?;
-
+        for sql in V2_DDLS {
+            self.ddl(sql).await?;
+        }
         tracing::info!(version = 2, "migration applied: backend session tables");
         Ok(())
     }
 
     #[allow(dead_code)]
-    /// v3: real_ctx unique index — backs race-free upsert in `map_context_token`.
     pub(super) async fn migrate_to_v3(&self) -> Result<()> {
         if !self.try_claim_migration(3).await? {
             return Ok(());
         }
-        self.ddl(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
-             ON context_token_map (real_ctx)",
-        )
-        .await?;
-
+        self.ddl(V3_CREATE_IDX).await?;
         tracing::info!(version = 3, "migration applied: real_ctx unique index");
         Ok(())
     }
 
     #[allow(dead_code)]
-    /// v4: `created_at` column + index on `context_token_map` for portable ORDER BY.
-    ///
-    /// `ALTER TABLE ADD COLUMN` is NOT idempotent — re-running it on a DB that
-    /// already has the column returns an error. The `try_claim_migration(4)`
-    /// gate prevents re-execution on DBs that went through v4 normally.
-    ///
-    /// For DBs upgrading from a pre-schema_version era the column may
-    /// already exist. We probe `information_schema.columns` BEFORE the
-    /// ALTER to short-circuit. This is portable across SQLite, Postgres,
-    /// and MySQL and avoids matching on the driver's error-string format
-    /// (which can shift across versions and silently swallow unrelated
-    /// errors like UNIQUE-constraint violations).
     pub(super) async fn migrate_to_v4(&self) -> Result<()> {
         if !self.try_claim_migration(4).await? {
             return Ok(());
         }
-        // SQLite ALTER TABLE ADD COLUMN forbids CURRENT_TIMESTAMP (and any
-        // other dynamic value) as a default, because SQLite would need to
-        // evaluate it for every existing row and the value is non-constant.
-        //
-        // We add the column as nullable TEXT. All INSERT / UPDATE statements
-        // that write to context_token_map explicitly supply CURRENT_TIMESTAMP
-        // for created_at, so new rows always have a proper timestamp. Pre-v4
-        // rows (if any) get NULL, which is acceptable since find_or_create_vctx
-        // does not rely on created_at for ordering.
-        //
-        // Pre-check: ask the catalog whether the column already exists. This
-        // works on SQLite, Postgres, and MySQL (sqlx translates the SQL to
-        // the right placeholder style and the catalog is standard SQL).
-        if !self
-            .column_exists("context_token_map", "created_at")
-            .await?
-        {
-            self.ddl("ALTER TABLE context_token_map ADD COLUMN created_at TEXT")
-                .await?;
+        if !self.column_exists("context_token_map", "created_at").await? {
+            self.ddl(V4_ALTER_ADD_CREATED_AT).await?;
         } else {
             tracing::debug!(
                 "v4 migration: created_at column already present (pre-check), skipping ALTER"
             );
         }
-
-        self.ddl(
-            "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
-             ON context_token_map (created_at DESC)",
-        )
-        .await?;
-
+        self.ddl(V4_CREATE_IDX).await?;
         tracing::info!(
             version = 4,
             "migration applied: context_token_map created_at column + index"
@@ -698,19 +484,6 @@ impl Store {
         Ok(())
     }
 
-    /// v5: chat message history — `messages` table + supporting indexes.
-    ///
-    /// The `id` column uses driver-specific auto-increment syntax:
-    ///   - SQLite: `INTEGER PRIMARY KEY AUTOINCREMENT`
-    ///   - Postgres: `INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY`
-    ///     (the SQL standard form, Postgres 10+)
-    ///   - MySQL: `BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY` (MySQL 5.7+)
-    ///
-    /// The driver is taken from `self.kind` (parsed at `Store::connect` time
-    /// from the URL scheme), NOT from a runtime probe: the previous
-    /// `SELECT current_database()` probe returned `Err` on BOTH SQLite and
-    /// MySQL, producing a false-positive `is_sqlite == true` on MySQL and
-    /// breaking the migration. See F-M3-01 in the m3 review-findings.
     #[allow(dead_code)]
     pub(super) async fn migrate_to_v5(&self) -> Result<()> {
         if !self.try_claim_migration(5).await? {
@@ -718,46 +491,27 @@ impl Store {
         }
         let create_messages = Self::v5_create_messages_sql(self.kind);
         self.ddl(&create_messages).await?;
-
-        self.ddl(
-            "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
-             ON messages (vctx, created_at DESC)",
-        )
-        .await?;
-
-        self.ddl(
-            "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
-             ON messages (peer_user_id, role, created_at DESC)",
-        )
-        .await?;
-
+        for sql in V5_INDEXES {
+            self.ddl(sql).await?;
+        }
         tracing::info!(version = 5, "migration applied: messages table + indexes");
         Ok(())
     }
 
-    /// v6: normalize `peer_user_id` format on `context_token_map` to the
-    /// canonical `peer:` / `group:` form. Idempotent (re-running matches
-    /// no rows). Used only by unit tests that exercise individual migrators
-    /// in isolation; production uses `migrate_to_v6_tx` via `run_migrations`.
     #[allow(dead_code)]
     pub(super) async fn migrate_to_v6(&self) -> Result<()> {
         if !self.try_claim_migration(6).await? {
             return Ok(());
         }
-        self.ddl(
-            "UPDATE context_token_map
-             SET peer_user_id = 'peer:' || peer_user_id
-             WHERE peer_user_id != ''
-               AND peer_user_id NOT LIKE 'peer:%'
-               AND peer_user_id NOT LIKE 'group:%'",
-        )
-        .await?;
+        self.ddl(V6_NORMALIZE_PEER_USER_ID).await?;
         tracing::info!(
             version = 6,
             "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
         );
         Ok(())
     }
+
+    // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
     /// Pulled out of `migrate_to_v5` so the m3 test surface can call all three
@@ -860,3 +614,78 @@ impl Store {
         Ok(())
     }
 }
+
+// ─── Migration SQL constants ───────────────────────────────────────────────────
+//
+// Shared between the transactional (`migrate_to_vN_tx`) and non-transactional
+// (`migrate_to_vN`) paths so the two execution routes can never drift apart.
+
+const V1_DDLS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS clients (
+        vtoken      TEXT PRIMARY KEY,
+        name        TEXT NOT NULL UNIQUE,
+        label       TEXT,
+        created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        last_seen   TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS routing_state (
+        from_user     TEXT PRIMARY KEY,
+        active_vtoken TEXT NOT NULL,
+        updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+    )",
+    "CREATE TABLE IF NOT EXISTS context_token_map (
+        vctx         TEXT PRIMARY KEY,
+        real_ctx     TEXT NOT NULL,
+        peer_user_id TEXT NOT NULL DEFAULT '',
+        expires_at   TEXT
+    )",
+    "CREATE TABLE IF NOT EXISTS bot_credentials (
+        id         INTEGER PRIMARY KEY,
+        token      TEXT NOT NULL,
+        base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
+        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+    )",
+];
+
+const V2_DDLS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
+        vctx               TEXT NOT NULL,
+        vtoken             TEXT NOT NULL,
+        session_name       TEXT NOT NULL,
+        backend_session_id TEXT NOT NULL DEFAULT '',
+        created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        PRIMARY KEY (vctx, vtoken, session_name)
+    )",
+    "CREATE TABLE IF NOT EXISTS active_sessions (
+        vctx         TEXT NOT NULL,
+        vtoken       TEXT NOT NULL,
+        session_name TEXT NOT NULL DEFAULT 'default',
+        updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+        PRIMARY KEY (vctx, vtoken)
+    )",
+];
+
+const V3_CREATE_IDX: &str =
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+     ON context_token_map (real_ctx)";
+
+const V4_ALTER_ADD_CREATED_AT: &str =
+    "ALTER TABLE context_token_map ADD COLUMN created_at TEXT";
+
+const V4_CREATE_IDX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
+     ON context_token_map (created_at DESC)";
+
+const V5_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_messages_vctx_created \
+     ON messages (vctx, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_messages_peer_role_created \
+     ON messages (peer_user_id, role, created_at DESC)",
+];
+
+const V6_NORMALIZE_PEER_USER_ID: &str =
+    "UPDATE context_token_map
+     SET peer_user_id = 'peer:' || peer_user_id
+     WHERE peer_user_id != ''
+       AND peer_user_id NOT LIKE 'peer:%'
+       AND peer_user_id NOT LIKE 'group:%'";

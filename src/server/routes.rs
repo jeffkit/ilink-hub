@@ -76,12 +76,8 @@ fn insecure_no_auth() -> bool {
             .ok()
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
-        if enabled {
-            tracing::warn!(
-                "ILINK_ADMIN_INSECURE_NO_AUTH is set — admin endpoints have NO authentication. \
-                 Never expose this server to the public internet."
-            );
-        }
+        // Startup-time warning is emitted by RuntimeConfig::warn_if_insecure in serve.rs
+        // (with the actual bind address). This OnceLock only caches the flag value.
         enabled
     })
 }

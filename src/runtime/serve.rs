@@ -33,6 +33,9 @@ pub struct RuntimeConfig {
     pub dispatch_channel_size: usize,
     /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
     pub shutdown_drain_secs: u64,
+    /// Whether admin auth is deliberately disabled via ILINK_ADMIN_INSECURE_NO_AUTH.
+    /// Stored here so run_serve can emit a startup-time warning with the actual bind address.
+    pub insecure_no_auth: bool,
 }
 
 impl RuntimeConfig {
@@ -44,10 +47,53 @@ impl RuntimeConfig {
 
         let shutdown_drain_secs = parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
 
+        let insecure_no_auth = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
+            .ok()
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        // Validate that admin security is not silently disabled.
+        let admin_token_set = std::env::var("ILINK_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .is_some();
+
+        if insecure_no_auth && admin_token_set {
+            // ILINK_ADMIN_TOKEN takes precedence; the insecure flag is redundant but harmless.
+            tracing::warn!(
+                "Both ILINK_ADMIN_TOKEN and ILINK_ADMIN_INSECURE_NO_AUTH are set. \
+                 ILINK_ADMIN_TOKEN takes effect — the insecure flag is ignored."
+            );
+        }
+
         Ok(Self {
             dispatch_channel_size,
             shutdown_drain_secs,
+            insecure_no_auth,
         })
+    }
+
+    /// Emit a startup warning if admin auth is disabled, scaled to the actual risk level.
+    /// Called after the listen address is known so the message can be actionable.
+    pub fn warn_if_insecure(&self, bind_addr: &str) {
+        if !self.insecure_no_auth {
+            return;
+        }
+        let is_public = bind_addr.starts_with("0.0.0.0");
+        if is_public {
+            tracing::error!(
+                addr = %bind_addr,
+                "⚠️  SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
+                 0.0.0.0 (all interfaces). Admin endpoints are accessible with NO authentication. \
+                 Set ILINK_ADMIN_TOKEN or restrict the listen address to 127.0.0.1."
+            );
+        } else {
+            tracing::warn!(
+                addr = %bind_addr,
+                "ILINK_ADMIN_INSECURE_NO_AUTH is set — admin endpoints have no authentication. \
+                 Acceptable only on loopback; never expose this port externally."
+            );
+        }
     }
 }
 
@@ -229,6 +275,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         let _ = tx.send(local_display);
     }
     info!(%addr, "iLink Hub listening");
+    runtime_cfg.warn_if_insecure(&addr);
 
     axum::serve(
         listener,
