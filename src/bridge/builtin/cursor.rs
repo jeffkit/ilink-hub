@@ -72,8 +72,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
         args.push(session_id.to_string());
     }
 
-    let agent_exe = crate::bridge::paths::find_tool_with_extra_paths("agent");
-    let mut cmd = Command::new(&agent_exe);
+    let mut cmd = Command::new("agent");
     cmd.args(&args);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());

@@ -72,33 +72,6 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Find a tool executable, falling back to common user-local install paths when the
-/// tool is not found in the current `PATH`.
-///
-/// When the bridge manager is started via `launchctl` / LaunchAgent the inherited
-/// `PATH` is the minimal system PATH and does not include user-local dirs such as
-/// `~/.local/bin` where tools like the Cursor `agent` CLI are installed.
-///
-/// Search order:
-/// 1. Current `PATH` (fast path — works in normal terminal sessions)
-/// 2. `$HOME/.local/bin` (most common user-local install on macOS/Linux)
-/// 3. `$HOME/bin`
-/// 4. Falls back to the bare name so the OS error message is descriptive.
-pub(crate) fn find_tool_with_extra_paths(name: &str) -> PathBuf {
-    if let Some(p) = find_in_path(name) {
-        return p;
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        for subdir in &[".local/bin", "bin"] {
-            let candidate = PathBuf::from(&home).join(subdir).join(name);
-            if candidate.is_file() {
-                return candidate;
-            }
-        }
-    }
-    PathBuf::from(name)
-}
-
 /// Resolve the executable for built-in self-invocation (`ilink-hub-bridge profile …`).
 pub(super) fn resolve_spawn_command(command: &str) -> String {
     if command == "ilink-hub-bridge" {
