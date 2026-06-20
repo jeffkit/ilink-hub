@@ -355,7 +355,9 @@ impl Store {
             sqlx::query(V4_ALTER_ADD_CREATED_AT)
                 .execute(&mut **tx)
                 .await
-                .map_err(|e| anyhow::anyhow!("DDL failed: {V4_ALTER_ADD_CREATED_AT}\n  Error: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("DDL failed: {V4_ALTER_ADD_CREATED_AT}\n  Error: {e}")
+                })?;
         } else {
             tracing::debug!(
                 "v4 migration: created_at column already present (pre-check), skipping ALTER"
@@ -418,7 +420,9 @@ impl Store {
         sqlx::query(V6_NORMALIZE_PEER_USER_ID)
             .execute(&mut **tx)
             .await
-            .map_err(|e| anyhow::anyhow!("DDL failed: {V6_NORMALIZE_PEER_USER_ID}\n  Error: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("DDL failed: {V6_NORMALIZE_PEER_USER_ID}\n  Error: {e}")
+            })?;
         tracing::info!(
             version = 6,
             "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
@@ -470,7 +474,10 @@ impl Store {
         if !self.try_claim_migration(4).await? {
             return Ok(());
         }
-        if !self.column_exists("context_token_map", "created_at").await? {
+        if !self
+            .column_exists("context_token_map", "created_at")
+            .await?
+        {
             self.ddl(V4_ALTER_ADD_CREATED_AT).await?;
         } else {
             tracing::debug!(
@@ -753,15 +760,12 @@ const V2_DDLS: &[&str] = &[
     )",
 ];
 
-const V3_CREATE_IDX: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
+const V3_CREATE_IDX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
      ON context_token_map (real_ctx)";
 
-const V4_ALTER_ADD_CREATED_AT: &str =
-    "ALTER TABLE context_token_map ADD COLUMN created_at TEXT";
+const V4_ALTER_ADD_CREATED_AT: &str = "ALTER TABLE context_token_map ADD COLUMN created_at TEXT";
 
-const V4_CREATE_IDX: &str =
-    "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
+const V4_CREATE_IDX: &str = "CREATE INDEX IF NOT EXISTS idx_context_token_map_created_at \
      ON context_token_map (created_at DESC)";
 
 const V5_INDEXES: &[&str] = &[
@@ -771,8 +775,7 @@ const V5_INDEXES: &[&str] = &[
      ON messages (peer_user_id, role, created_at DESC)",
 ];
 
-const V6_NORMALIZE_PEER_USER_ID: &str =
-    "UPDATE context_token_map
+const V6_NORMALIZE_PEER_USER_ID: &str = "UPDATE context_token_map
      SET peer_user_id = 'peer:' || peer_user_id
      WHERE peer_user_id != ''
        AND peer_user_id NOT LIKE 'peer:%'
@@ -781,8 +784,7 @@ const V6_NORMALIZE_PEER_USER_ID: &str =
 /// SQLite-specific: remove duplicate non-empty peer_user_id rows before creating
 /// the unique index. Keeps the row with the highest rowid per conv_key.
 /// Safe to re-run: if no duplicates exist the DELETE is a no-op.
-const V7_DEDUP_PEER_USER_ID_SQLITE: &str =
-    "DELETE FROM context_token_map \
+const V7_DEDUP_PEER_USER_ID_SQLITE: &str = "DELETE FROM context_token_map \
      WHERE peer_user_id != '' \
        AND rowid NOT IN ( \
            SELECT MAX(rowid) FROM context_token_map \
@@ -791,8 +793,7 @@ const V7_DEDUP_PEER_USER_ID_SQLITE: &str =
        )";
 
 /// PostgreSQL-specific: same de-dup using ctid instead of rowid.
-const V7_DEDUP_PEER_USER_ID_POSTGRES: &str =
-    "DELETE FROM context_token_map \
+const V7_DEDUP_PEER_USER_ID_POSTGRES: &str = "DELETE FROM context_token_map \
      WHERE peer_user_id != '' \
        AND ctid NOT IN ( \
            SELECT MIN(ctid) FROM context_token_map \

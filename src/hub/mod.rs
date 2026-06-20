@@ -46,8 +46,9 @@ pub use quote_route::{merge_routing_with_quote, QuoteOrigin, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 pub use state::{
-    ClientState, HubState, IlinkConnState, Metrics, PollGuard, PollTracker, RoutingState,
-    MAX_CONCURRENT_POLLS_PER_VTOKEN,
+    ClientState, EnterOutcome, HubState, IlinkConnState, LatencyHistogram, Metrics, PollGuard,
+    PollTracker, RoutingState, HISTOGRAM_BUCKETS_MS, MAX_CONCURRENT_POLLS_PER_VTOKEN,
+    MAX_HUB_POLLS_DEFAULT,
 };
 
 pub use ilink_status as IlinkStatus;

@@ -166,6 +166,9 @@ pub async fn getupdates(
     headers: HeaderMap,
     Json(req): Json<GetUpdatesRequest>,
 ) -> (StatusCode, Json<GetUpdatesResponse>) {
+    // RAII guard: records latency on every return path (success, 401, 429,
+    // 503, drain-empty). The guard is dropped as the function returns.
+    let _histo = HistoGuard::new(&state.metrics.getupdates_latency_ms);
     let Some(vtoken) = extract_vtoken(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -180,12 +183,51 @@ pub async fn getupdates(
     };
 
     // SEC-003: gate concurrent long-polls per vtoken BEFORE doing any
-    // registry work. The tracker increments the count and returns a guard;
-    // dropping the guard decrements (via Drop) regardless of whether we
-    // ultimately serve the long-poll or bail with 429. A poisoned counts
-    // mutex returns count=0 (F-M2-2) — we then fall through to the
-    // 429-without-guard path which is always safe.
-    let (concurrent_polls, poll_guard) = state.clients.poll_tracker.enter(&vtoken);
+    // registry work. The tracker first enforces a Hub-wide cap (so a single
+    // misbehaving vtoken cannot starve the rest of the fleet), then a
+    // per-vtoken cap. The Hub-wide cap is lock-free (AtomicUsize fetch_add);
+    // the per-vtoken cap uses a StdMutex (poison-safe per F-M2-2).
+    let enter = state.clients.poll_tracker.enter(&vtoken);
+    let (concurrent_polls, poll_guard) = match enter {
+        crate::hub::EnterOutcome::HubLimitReached { total, cap } => {
+            // Hub-wide cap reached. Reject with 503 (Service Unavailable) —
+            // distinct from the 429 we use for the per-vtoken cap so operators
+            // can tell "I'm one of too many clients" (503) from "this single
+            // vtoken is double-polling itself" (429).
+            warn!(
+                vtoken = %redact_token(&vtoken),
+                total,
+                cap,
+                "getupdates rejected: Hub-wide concurrent long-poll cap reached"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(GetUpdatesResponse {
+                    ret: Some(503),
+                    errcode: None,
+                    errmsg: Some(format!(
+                        "Hub is at capacity ({total}/{cap} concurrent long-polls). Retry later."
+                    )),
+                    msgs: None,
+                    get_updates_buf: None,
+                }),
+            );
+        }
+        crate::hub::EnterOutcome::Poisoned { guard } => {
+            // Per-vtoken mutex is poisoned; the counts map is unreliable. We
+            // still hold a guard that decrements the Hub-wide total on drop,
+            // but we have no usable per-vtoken count. The safest behaviour is
+            // to fall through with a sentinel count of 0 (F-M2-2): the
+            // per-vtoken 429 gate won't trip, but the Hub-wide gate already
+            // passed and the registry check below is still authoritative.
+            warn!(
+                vtoken = %redact_token(&vtoken),
+                "getupdates: per-vtoken poll counter is poisoned; serving without split-brain detection"
+            );
+            (0usize, guard)
+        }
+        crate::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+    };
     if concurrent_polls > MAX_CONCURRENT_POLLS_PER_VTOKEN {
         // Over the per-vtoken cap — drop the guard so the count returns to
         // MAX, then reject.  We do NOT proceed to mark_seen / wait_notify:
@@ -536,7 +578,17 @@ pub async fn sendmessage(
         req.base_info = Some(BaseInfo::default());
     }
 
-    match state.ilink.upstream.send_message(req).await {
+    // Histogram the *upstream* round-trip only — the Hub-internal work
+    // (context translation, footer append, HubExt) is excluded by placing
+    // the guard at the call site, not the handler entry.
+    let upstream_start = std::time::Instant::now();
+    let result = state.ilink.upstream.send_message(req).await;
+    state
+        .metrics
+        .sendmessage_upstream_latency_ms
+        .observe(upstream_start.elapsed().as_millis() as u64);
+
+    match result {
         Ok(resp) => Json(resp),
         Err(e) => Json(SendMessageResponse::err(
             500,
@@ -1132,7 +1184,81 @@ pub async fn metrics(
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
 
+    // Histograms. We render them in Prometheus text format (cumulative
+    // bucket counts, plus `_count` and `_sum` siblings). The bucket layout
+    // is defined in [`crate::hub::HISTOGRAM_BUCKETS_MS`].
+    render_histogram(
+        &mut out,
+        "ilink_hub_getupdates_latency_ms",
+        "Latency of getupdates long-polls (handler entry to drain), in milliseconds",
+        &state.metrics.getupdates_latency_ms,
+    );
+    render_histogram(
+        &mut out,
+        "ilink_hub_sendmessage_upstream_latency_ms",
+        "Latency of upstream sendmessage HTTP round-trip, in milliseconds",
+        &state.metrics.sendmessage_upstream_latency_ms,
+    );
+    render_histogram(
+        &mut out,
+        "ilink_hub_dispatch_latency_ms",
+        "Latency of inbound dispatch pipeline (synchronous portion), in milliseconds",
+        &state.metrics.dispatch_latency_ms,
+    );
+
     (StatusCode::OK, out)
+}
+
+/// RAII guard that records a latency observation when dropped. Use at
+/// the entry of a hot-path handler so every return path (including
+/// early-return 4xx/5xx) is observed. The drop handler is `#[inline]`
+/// and lock-free, so the per-request cost is a single `Instant::elapsed`
+/// + the histogram's 8-bucket linear scan.
+struct HistoGuard<'a> {
+    start: std::time::Instant,
+    h: &'a crate::hub::LatencyHistogram,
+}
+
+impl<'a> HistoGuard<'a> {
+    fn new(h: &'a crate::hub::LatencyHistogram) -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            h,
+        }
+    }
+}
+
+impl Drop for HistoGuard<'_> {
+    fn drop(&mut self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.h.observe(ms);
+    }
+}
+
+/// Render a single `LatencyHistogram` as a Prometheus text-format block.
+/// Emits:
+/// - `<name>_bucket{le="N"} <cumulative_count>` for each boundary + `+Inf`
+/// - `<name>_count` total observations
+/// - `<name>_sum` total observed milliseconds
+fn render_histogram(out: &mut String, name: &str, help: &str, h: &crate::hub::LatencyHistogram) {
+    use crate::hub::HISTOGRAM_BUCKETS_MS;
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
+    let mut cumulative: u64 = 0;
+    for (i, boundary) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
+        let count = h.buckets[i].load(Ordering::Relaxed);
+        cumulative = cumulative.saturating_add(count);
+        out.push_str(&format!(
+            "{name}_bucket{{le=\"{boundary}\"}} {cumulative}\n"
+        ));
+    }
+    let overflow = h.buckets[HISTOGRAM_BUCKETS_MS.len()].load(Ordering::Relaxed);
+    cumulative = cumulative.saturating_add(overflow);
+    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
+    let total = h.count.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_count {total}\n"));
+    let sum = h.sum_ms.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_sum {sum}\n"));
 }
 
 /// Wait for a queue notification or hub shutdown, whichever comes first.

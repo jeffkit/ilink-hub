@@ -239,17 +239,7 @@ async fn list_clients(hub_url: &str) -> Result<()> {
 }
 
 fn extract_host_port(s: &str) -> Option<String> {
-    let s = s.trim();
-    if let Ok(url) = reqwest::Url::parse(s) {
-        if let Some(host) = url.host_str() {
-            let port = url.port().unwrap_or(8765);
-            return Some(format!("{}:{}", host, port));
-        }
-    }
-    if s.contains(':') {
-        return Some(s.to_string());
-    }
-    None
+    ilink_hub::paths::parse_host_port(s)
 }
 
 fn get_addr_default() -> String {

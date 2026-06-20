@@ -2,7 +2,7 @@
 //! with its `IlinkConnState` / `RoutingState` / `ClientState` sub-states.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
@@ -30,7 +30,75 @@ use super::*;
 /// problem worth surfacing in the operator logs.
 pub const MAX_CONCURRENT_POLLS_PER_VTOKEN: usize = 3;
 
+/// Maximum number of concurrent `getupdates` long-polls allowed Hub-wide,
+/// across all vtokens. Each long-poll holds an idle await, a DashMap shard
+/// entry, and a `mpsc`/`Notify` channel; 8192 well-behaved clients are
+/// already a lot, and any number beyond that strongly suggests either
+/// runaway retry storms or a misbehaving bridge. The cap is enforced
+/// *before* the per-vtoken gate so a single misconfigured vtoken cannot
+/// starve the rest of the fleet.
+pub const MAX_HUB_POLLS_DEFAULT: usize = 8192;
+
 // ─── Metrics ──────────────────────────────────────────────────────────────────
+
+/// Bucketed-latency histogram. Uses a fixed log-scale bucket layout to
+/// answer "what is the P50 / P95 / P99 of X" without pulling in the full
+/// `prometheus-client` crate (which would add a transitive dependency tree
+/// of its own). The bucket layout is chosen for sub-second HTTP and CLI
+/// latencies; for sub-millisecond paths it's coarse, for multi-second
+/// paths it covers the long tail.
+///
+/// Bucket boundaries in milliseconds. The layout is `[1, 5, 25, 100, 500, 2_500, 10_000, +Inf]`
+/// — 8 buckets plus overflow. Suitable for the metrics we currently
+/// care about (HTTP round-trips, upstream long-poll cadence, CLI exec).
+pub const HISTOGRAM_BUCKETS_MS: &[u64] = &[1, 5, 25, 100, 500, 2_500, 10_000];
+
+/// Latency histogram observation. One per metric name; `observe` is hot
+/// path (single fetch_add per bucket, no allocation), `snapshot` is the
+/// Prometheus-scrape path (called every 15s, not hot).
+#[derive(Debug, Default)]
+pub struct LatencyHistogram {
+    /// Cumulative count of observations.
+    pub count: AtomicU64,
+    /// Sum of all observed latencies in milliseconds (saturating; tracked
+    /// as f64 bits to keep the field an `AtomicU64` for lock-free updates).
+    pub sum_ms: AtomicU64,
+    /// Bucket counts. The last entry counts observations strictly greater
+    /// than the last explicit bucket boundary (i.e. the `+Inf` overflow).
+    pub buckets: Vec<AtomicU64>,
+}
+
+impl LatencyHistogram {
+    pub fn new(buckets_ms: &[u64]) -> Self {
+        // N explicit boundaries + 1 overflow bucket.
+        let mut buckets = Vec::with_capacity(buckets_ms.len() + 1);
+        for _ in 0..=buckets_ms.len() {
+            buckets.push(AtomicU64::new(0));
+        }
+        Self {
+            count: AtomicU64::new(0),
+            sum_ms: AtomicU64::new(0),
+            buckets,
+        }
+    }
+
+    /// Record a single observation in milliseconds. `ms` is saturated to
+    /// `u64::MAX` if the caller passes a negative value (a clock skew);
+    /// we do not panic.
+    pub fn observe(&self, ms: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+        // Linear scan is O(8) — fine for our small fixed layout.
+        for (i, boundary) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
+            if ms <= *boundary {
+                self.buckets[i].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+        // Overflow bucket.
+        self.buckets[HISTOGRAM_BUCKETS_MS.len()].fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 pub struct Metrics {
     pub messages_dispatched: AtomicU64,
@@ -46,6 +114,18 @@ pub struct Metrics {
     pub relogin_attempts: AtomicU64,
     /// Number of messages missed because the dispatcher lagged behind the broadcast channel.
     pub dispatcher_lagged: AtomicU64,
+    /// Latency of `getupdates` long-polls, measured from handler entry to
+    /// handler exit (covers both the wakeup wait and the drain). Includes
+    /// the time spent holding the registry write lock.
+    pub getupdates_latency_ms: LatencyHistogram,
+    /// Latency of upstream `sendmessage` HTTP round-trips. Excludes Hub
+    /// internal bookkeeping (context translation, footer append, etc.).
+    pub sendmessage_upstream_latency_ms: LatencyHistogram,
+    /// Latency of the inbound dispatch pipeline (in-memory only — no DB
+    /// I/O). Excludes `tokio::spawn` wall-clock time; this is the
+    /// synchronous time from `dispatch_message` entry to its first
+    /// `push_to_queue` call.
+    pub dispatch_latency_ms: LatencyHistogram,
 }
 
 impl Metrics {
@@ -58,6 +138,9 @@ impl Metrics {
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
             dispatcher_lagged: AtomicU64::new(0),
+            getupdates_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
+            sendmessage_upstream_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
+            dispatch_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
         }
     }
 }
@@ -77,51 +160,122 @@ impl Default for Metrics {
 /// credential/token and are competing for the same per-vtoken message queue (`drain` is a
 /// destructive read), so inbound messages get stolen non-deterministically. This tracker
 /// lets the Hub surface that misconfiguration instead of failing silently.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct PollTracker {
     /// Per-vtoken concurrent poll counter. Public for test-only access so
     /// integration tests can poison the mutex to verify the let-Ok
     /// panic-safety path (F-M2-2); production code should only call
     /// `enter` / rely on `Drop`.
     pub counts: StdMutex<HashMap<String, usize>>,
+    /// Hub-wide total of in-flight long-polls. Guarded by an AtomicUsize
+    /// (lock-free fast path) so the per-request cost of the global gate is
+    /// a single fetch_add — orders of magnitude cheaper than the
+    /// per-vtoken `StdMutex` we already pay.
+    total: AtomicUsize,
+    /// Operator-configured Hub-wide cap. Defaults to [`MAX_HUB_POLLS_DEFAULT`].
+    hub_cap: AtomicUsize,
 }
 
 impl PollTracker {
-    /// Register a new active poll for `vtoken`. Returns the number of polls now concurrently
-    /// active for that vtoken (always >= 1) and a guard that decrements the count on drop.
+    /// Set the Hub-wide cap. Must be called once at startup before the Hub
+    /// serves any traffic; subsequent changes are not thread-safe w.r.t.
+    /// in-flight `enter` calls (they observe either the old or the new cap).
+    pub fn set_hub_cap(&self, cap: usize) {
+        self.hub_cap.store(cap, Ordering::Relaxed);
+    }
+
+    /// Current Hub-wide total of in-flight polls. For metrics / tests.
+    pub fn total_polls(&self) -> usize {
+        self.total.load(Ordering::Relaxed)
+    }
+
+    /// Register a new active poll for `vtoken`. Returns the per-vtoken count
+    /// (always >= 1 on the success path, 0 when the per-vtoken mutex is poisoned)
+    /// and a guard that decrements *both* the per-vtoken count and the Hub-wide
+    /// total on drop.
     ///
-    /// F-M2-2: never panic on mutex poisoning. If the counts mutex is poisoned, the
-    /// guard is still produced but the count is reported as 0 (which means the 429
-    /// gate won't trip on this vtoken) and the drop handler becomes a best-effort
-    /// no-op. A poisoned `counts` map is a process-wide bug, but it must not take
-    /// the Tokio worker down on every subsequent long-poll.
-    pub fn enter(self: &Arc<Self>, vtoken: &str) -> (usize, PollGuard) {
+    /// The Hub-wide gate runs *before* the per-vtoken gate so a single
+    /// misbehaving vtoken cannot starve the rest of the fleet: even if all
+    /// per-vtoken slots are full, the Hub still serves polls from other vtokens
+    /// up to the global cap.
+    ///
+    /// F-M2-2: never panic on mutex poisoning. If the per-vtoken `counts` mutex
+    /// is poisoned, the guard is still produced but the count is reported as
+    /// 0 (so the per-vtoken 429 gate won't trip) and the drop handler becomes
+    /// a best-effort no-op. A poisoned `counts` map is a process-wide bug, but
+    /// it must not take the Tokio worker down on every subsequent long-poll.
+    /// The Hub-wide counter is lock-free AtomicUsize, so it cannot poison.
+    pub fn enter(self: &Arc<Self>, vtoken: &str) -> EnterOutcome {
+        // Hub-wide gate first. fetch_add returns the previous value; we then
+        // check the new total against the cap. If we're over, decrement back
+        // and refuse. The decrement is safe because we just incremented — the
+        // counter cannot have wrapped in between on any platform usize can
+        // represent.
+        let cap = self.hub_cap.load(Ordering::Relaxed);
+        let prev_total = self.total.fetch_add(1, Ordering::AcqRel);
+        if prev_total >= cap {
+            self.total.fetch_sub(1, Ordering::AcqRel);
+            return EnterOutcome::HubLimitReached {
+                total: prev_total,
+                cap,
+            };
+        }
+
         let count = {
             let Ok(mut counts) = self.counts.lock() else {
-                return (
-                    0,
-                    PollGuard {
+                // Do NOT roll back the Hub-wide increment here. The guard
+                // we return is responsible for decrementing `total` on drop,
+                // keeping the counter accurate for the duration of the
+                // (poisoned) request. Rolling back here and then letting the
+                // guard decrement again would cause an underflow.
+                return EnterOutcome::Poisoned {
+                    guard: PollGuard {
                         tracker: Arc::clone(self),
                         vtoken: vtoken.to_string(),
                     },
-                );
+                };
             };
             let c = counts.entry(vtoken.to_string()).or_insert(0);
             *c += 1;
             *c
         };
-        (
-            count,
-            PollGuard {
+        EnterOutcome::Ok {
+            per_vtoken: count,
+            guard: PollGuard {
                 tracker: Arc::clone(self),
                 vtoken: vtoken.to_string(),
             },
-        )
+        }
     }
 }
 
-/// RAII guard returned by [`PollTracker::enter`]; decrements the per-vtoken poll count when
-/// the long-poll handler returns (success, timeout, shutdown, or client disconnect).
+/// Result of [`PollTracker::enter`]. The caller inspects the variant and
+/// either serves the long-poll (Ok), rejects it as 503 (HubLimitReached),
+/// or treats the per-vtoken count as advisory and serves anyway (Poisoned).
+#[derive(Debug)]
+pub enum EnterOutcome {
+    Ok { per_vtoken: usize, guard: PollGuard },
+    HubLimitReached { total: usize, cap: usize },
+    Poisoned { guard: PollGuard },
+}
+
+impl EnterOutcome {
+    /// Convenience: extract the guard, regardless of variant. `HubLimitReached`
+    /// has no guard (the Hub-wide increment was rolled back); callers must
+    /// surface the rejection *before* calling this.
+    #[allow(dead_code)]
+    pub fn guard(self) -> Option<PollGuard> {
+        match self {
+            EnterOutcome::Ok { guard, .. } | EnterOutcome::Poisoned { guard } => Some(guard),
+            EnterOutcome::HubLimitReached { .. } => None,
+        }
+    }
+}
+
+/// RAII guard returned by [`PollTracker::enter`]; decrements the per-vtoken poll count
+/// and the Hub-wide total when the long-poll handler returns (success, timeout, shutdown,
+/// or client disconnect).
+#[derive(Debug)]
 pub struct PollGuard {
     tracker: Arc<PollTracker>,
     vtoken: String,
@@ -131,6 +285,10 @@ impl Drop for PollGuard {
     fn drop(&mut self) {
         // F-M2-2: best-effort decrement; a poisoned mutex here would otherwise
         // propagate a panic into the Tokio worker that called the handler.
+        // The Hub-wide counter cannot be poisoned (it's an AtomicUsize), so
+        // we always decrement it. saturating_sub guards against the
+        // (theoretically impossible) underflow.
+        self.tracker.total.fetch_sub(1, Ordering::AcqRel);
         let Ok(mut counts) = self.tracker.counts.lock() else {
             return;
         };
@@ -223,12 +381,16 @@ pub struct ClientState {
 
 impl ClientState {
     pub(crate) fn new(queue: Arc<dyn MessageQueue>) -> Self {
+        let poll_tracker = Arc::new(PollTracker::default());
+        // Initialize the Hub-wide cap to the default. Operators can override
+        // via `ILINK_MAX_HUB_POLLS`; see [`crate::runtime::serve::RuntimeConfig`].
+        poll_tracker.set_hub_cap(MAX_HUB_POLLS_DEFAULT);
         Self {
             registry: RwLock::new(ClientRegistry::new()),
             pairing: RwLock::new(PairingRegistry::new()),
             pairing_notify: Arc::new(tokio::sync::Notify::new()),
             queue,
-            poll_tracker: Arc::new(PollTracker::default()),
+            poll_tracker,
         }
     }
 }
@@ -271,19 +433,19 @@ pub struct HubState {
 }
 
 impl HubState {
+    /// Build a new [`HubState`]. The `relay_secret` must be supplied by the
+    /// caller; use [`crate::paths::load_or_create_relay_secret`] for the
+    /// standard "load from disk, else generate and persist" path. We pass
+    /// it in rather than computing it here so the constructor stays sync
+    /// (callers from async contexts can `await` the I/O themselves) and so
+    /// tests can pin a deterministic value.
     pub fn new(
         upstream: Arc<dyn UpstreamSink>,
         store: Arc<Store>,
         queue: Arc<dyn MessageQueue>,
         shutdown: watch::Receiver<bool>,
+        relay_secret: String,
     ) -> Arc<Self> {
-        use rand::distributions::Alphanumeric;
-        use rand::Rng;
-        let relay_secret: String = rand::thread_rng()
-            .sample_iter(&Alphanumeric)
-            .take(32)
-            .map(char::from)
-            .collect();
         Arc::new(Self {
             ilink: IlinkConnState::new(upstream, shutdown),
             routing: RoutingState::new(),

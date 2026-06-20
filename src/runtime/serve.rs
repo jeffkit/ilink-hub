@@ -36,6 +36,10 @@ pub struct RuntimeConfig {
     /// Whether admin auth is deliberately disabled via ILINK_ADMIN_INSECURE_NO_AUTH.
     /// Stored here so run_serve can emit a startup-time warning with the actual bind address.
     pub insecure_no_auth: bool,
+    /// Hub-wide cap on concurrent `getupdates` long-polls. Defaults to
+    /// [`crate::hub::state::MAX_HUB_POLLS_DEFAULT`] (8192). Operators can
+    /// raise this via `ILINK_MAX_HUB_POLLS`.
+    pub max_hub_polls: usize,
 }
 
 impl RuntimeConfig {
@@ -45,7 +49,14 @@ impl RuntimeConfig {
             anyhow::bail!("ILINK_DISPATCH_CHANNEL_SIZE must be > 0");
         }
 
-        let shutdown_drain_secs = parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
+        let shutdown_drain_secs =
+            parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
+
+        let max_hub_polls =
+            parse_env_usize("ILINK_MAX_HUB_POLLS", crate::hub::MAX_HUB_POLLS_DEFAULT)?;
+        if max_hub_polls == 0 {
+            anyhow::bail!("ILINK_MAX_HUB_POLLS must be > 0");
+        }
 
         let insecure_no_auth = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
             .ok()
@@ -70,6 +81,7 @@ impl RuntimeConfig {
             dispatch_channel_size,
             shutdown_drain_secs,
             insecure_no_auth,
+            max_hub_polls,
         })
     }
 
@@ -101,9 +113,10 @@ fn parse_env_usize(name: &str, default: usize) -> Result<usize> {
     match std::env::var(name) {
         Err(_) => Ok(default),
         Ok(v) if v.trim().is_empty() => Ok(default),
-        Ok(v) => v.trim().parse::<usize>().map_err(|_| {
-            anyhow::anyhow!("{name}={v:?} is not a valid positive integer")
-        }),
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid positive integer")),
     }
 }
 
@@ -111,9 +124,10 @@ fn parse_env_u64(name: &str, default: u64) -> Result<u64> {
     match std::env::var(name) {
         Err(_) => Ok(default),
         Ok(v) if v.trim().is_empty() => Ok(default),
-        Ok(v) => v.trim().parse::<u64>().map_err(|_| {
-            anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")
-        }),
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")),
     }
 }
 
@@ -180,11 +194,29 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend()?;
+    // Load or persist the relay secret BEFORE building HubState. I/O is
+    // small (one 32-char file) and synchronous std::fs is acceptable on the
+    // startup path; spawning a blocking task for a single file read is more
+    // ceremony than it's worth.
+    let relay_secret = crate::paths::load_or_create_relay_secret();
     let state = HubState::new(
         upstream.clone() as Arc<dyn crate::ilink::UpstreamSink>,
         store.clone(),
         queue,
         shutdown_rx.clone(),
+        relay_secret,
+    );
+    // Apply operator-tuned Hub-wide poll cap. ClientState::new defaults this to
+    // MAX_HUB_POLLS_DEFAULT; we override only if the operator set a custom value.
+    if runtime_cfg.max_hub_polls != crate::hub::MAX_HUB_POLLS_DEFAULT {
+        state
+            .clients
+            .poll_tracker
+            .set_hub_cap(runtime_cfg.max_hub_polls);
+    }
+    info!(
+        max_hub_polls = runtime_cfg.max_hub_polls,
+        "hub poll cap installed"
     );
 
     if let Some(tx) = on_hub_state {
@@ -193,7 +225,8 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
+    let (tx, rx) =
+        broadcast::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
@@ -834,7 +867,7 @@ mod drain_tests {
         let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        HubState::new(upstream, store, queue, rx)
+        HubState::new(upstream, store, queue, rx, "test-relay-secret".to_string())
     }
 
     #[tokio::test]
@@ -899,15 +932,5 @@ mod drain_tests {
 }
 
 fn extract_host_port(s: &str) -> Option<String> {
-    let s = s.trim();
-    if let Ok(url) = reqwest::Url::parse(s) {
-        if let Some(host) = url.host_str() {
-            let port = url.port().unwrap_or(8765);
-            return Some(format!("{}:{}", host, port));
-        }
-    }
-    if s.contains(':') {
-        return Some(s.to_string());
-    }
-    None
+    crate::paths::parse_host_port(s)
 }

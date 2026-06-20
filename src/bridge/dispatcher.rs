@@ -444,10 +444,7 @@ async fn handle_one_message(
                 let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                 hub_ext.session_name = Some(session_name_for_cli.clone());
             }
-            client
-                .sendmessage(req)
-                .await
-                .context("sendmessage reply")?;
+            client.sendmessage(req).await.context("sendmessage reply")?;
         }
         Err(e) => {
             if app.send_error_reply {
@@ -462,9 +459,7 @@ async fn handle_one_message(
                 || err_str.contains("not found")
                 || err_str.contains("no such file")
             {
-                return Err(HandleError::Fatal(BridgeStop::FatalCliError(
-                    e.to_string(),
-                )));
+                return Err(HandleError::Fatal(BridgeStop::FatalCliError(e.to_string())));
             }
             return Err(HandleError::Transient(e));
         }
@@ -561,8 +556,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn same_key_reuses_single_sender() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         let msg = make_msg("ctx-a", "default");
         disp.dispatch(msg.clone()).await;
         disp.dispatch(msg.clone()).await;
@@ -571,8 +565,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn different_ctx_tokens_get_separate_senders() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         disp.dispatch(make_msg("ctx-a", "default")).await;
         disp.dispatch(make_msg("ctx-b", "default")).await;
         assert_eq!(
@@ -583,8 +576,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn different_session_names_get_separate_senders() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         disp.dispatch(make_msg("ctx-a", "feature-x")).await;
         disp.dispatch(make_msg("ctx-a", "feature-y")).await;
         assert_eq!(
@@ -595,8 +587,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn three_distinct_sessions_create_three_senders() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         disp.dispatch(make_msg("ctx-1", "default")).await;
         disp.dispatch(make_msg("ctx-2", "default")).await;
         disp.dispatch(make_msg("ctx-1", "feature-a")).await;
@@ -608,8 +599,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn repeated_same_key_does_not_grow_sender_map() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         let msg = make_msg("ctx-x", "s1");
         for _ in 0..5 {
             disp.dispatch(msg.clone()).await;
@@ -619,8 +609,7 @@ timeout_secs: 5
 
     #[tokio::test]
     async fn dead_sender_triggers_new_worker_on_next_dispatch() {
-        let disp =
-            SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
+        let disp = SessionDispatcher::new(fake_client(), Arc::new(make_fast_app()), make_stop_tx());
         let msg = make_msg("ctx-z", "default");
 
         disp.dispatch(msg.clone()).await;

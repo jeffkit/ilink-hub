@@ -62,7 +62,8 @@ async fn test_migration_incremental_from_v2() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store { rpool: pool.clone(),
+        let s = Store {
+            rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -190,7 +191,8 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store { rpool: pool.clone(),
+        let s = Store {
+            rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -688,7 +690,8 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -813,7 +816,8 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -973,7 +977,8 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1058,7 +1063,8 @@ async fn m2_ddl_error_propagates_through_migrator() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1152,7 +1158,8 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1505,7 +1512,8 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1920,7 +1928,8 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1977,7 +1986,8 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2007,7 +2017,8 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2082,7 +2093,8 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         .connect(&db_url)
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
     };
@@ -2099,7 +2111,8 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
 
     // Both transactions race for v99. Only one tx's claim can succeed.
     let pool2 = pool.clone();
-    let store2 = Store { rpool: pool.clone(),
+    let store2 = Store {
+        rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
     };

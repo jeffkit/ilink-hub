@@ -68,6 +68,29 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
     )
 )]
 async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
+    // RAII guard records dispatch latency on every return path — including
+    // early returns for bot copies, @-mention shortcuts, and missing context_token.
+    // The `tokio::spawn` persist task below is excluded because the guard drops
+    // when *this* async frame returns, before the spawned task runs.
+    // We clone the Arc<Metrics> so the guard owns an independent reference and
+    // doesn't borrow `state` — `state` is moved into `handle_at_mention` on the
+    // @-mention early-return path, which would otherwise conflict with the borrow.
+    struct DispatchLatencyGuard {
+        start: std::time::Instant,
+        metrics: Arc<crate::hub::Metrics>,
+    }
+    impl Drop for DispatchLatencyGuard {
+        fn drop(&mut self) {
+            self.metrics
+                .dispatch_latency_ms
+                .observe(self.start.elapsed().as_millis() as u64);
+        }
+    }
+    let _latency_guard = DispatchLatencyGuard {
+        start: std::time::Instant::now(),
+        metrics: Arc::clone(&state.metrics),
+    };
+
     // iLink does not echo bot-authored messages back through getupdates in practice, but
     // guard regardless: a bot copy (message_type == 2) must never be routed as a user message
     // (that would forward the Hub's own reply back into the backends).
@@ -131,7 +154,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
 
     match routing {
         RoutingDecision::HubInternal(cmd) => {
-            super::commands::handle_hub_command(state, msg, cmd).await;
+            super::commands::handle_hub_command(Arc::clone(&state), msg, cmd).await;
         }
         RoutingDecision::ForwardTo {
             vtoken,

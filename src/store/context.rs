@@ -65,7 +65,9 @@ impl Store {
         // On SQLite/Postgres with a non-empty conv_key: attempt a single-statement race-free
         // upsert. Requires the v7 partial unique index on peer_user_id. If the index does not
         // exist yet (pre-v7 schema or mid-migration state), fall through to the two-step path.
-        if !conv_key.is_empty() && matches!(self.kind, DatabaseKind::Sqlite | DatabaseKind::Postgres) {
+        if !conv_key.is_empty()
+            && matches!(self.kind, DatabaseKind::Sqlite | DatabaseKind::Postgres)
+        {
             let candidate = format!("vctx_{}", Uuid::new_v4().simple());
             let result = sqlx::query(
                 "INSERT INTO context_token_map (vctx, real_ctx, peer_user_id, created_at) \
@@ -85,12 +87,19 @@ impl Store {
                 Err(e) => {
                     // If the v7 index does not exist yet, the ON CONFLICT clause has no matching
                     // constraint and the DB returns an error. Fall through to the two-step path.
-                    let is_no_constraint = e.to_string().to_lowercase().contains("conflict clause does not match")
-                        || e.to_string().to_lowercase().contains("no unique or exclusion constraint");
+                    let is_no_constraint = e
+                        .to_string()
+                        .to_lowercase()
+                        .contains("conflict clause does not match")
+                        || e.to_string()
+                            .to_lowercase()
+                            .contains("no unique or exclusion constraint");
                     if !is_no_constraint {
                         return Err(e.into());
                     }
-                    tracing::debug!("v7 index absent, falling back to two-step find_or_create_vctx");
+                    tracing::debug!(
+                        "v7 index absent, falling back to two-step find_or_create_vctx"
+                    );
                 }
             }
         }

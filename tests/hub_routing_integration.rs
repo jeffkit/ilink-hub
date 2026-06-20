@@ -28,7 +28,13 @@ async fn make_state() -> Arc<HubState> {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    )
 }
 
 fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
@@ -676,6 +682,9 @@ async fn poll_tracker_poisoned_mutex_does_not_panic() {
     use std::sync::Arc;
 
     let tracker = Arc::new(PollTracker::default());
+    // Without an explicit set_hub_cap the default is MAX_HUB_POLLS_DEFAULT (8192),
+    // which lets the poisoned-mutex path be reached before the Hub-wide cap fires.
+    tracker.set_hub_cap(ilink_hub::hub::MAX_HUB_POLLS_DEFAULT);
 
     // Poison the counts mutex by panicking while holding it.
     let t2 = Arc::clone(&tracker);
@@ -687,10 +696,14 @@ async fn poll_tracker_poisoned_mutex_does_not_panic() {
 
     // enter() must not panic; it reports count=0 in the poisoned case and
     // still produces a guard.
-    let (count, guard) = tracker.enter("vtoken-1");
-    assert_eq!(count, 0, "poisoned mutex reports count=0");
-    // Dropping the guard must not panic either.
-    drop(guard);
+    let guard = match tracker.enter("vtoken-1") {
+        ilink_hub::hub::EnterOutcome::Poisoned { guard } => {
+            drop(guard);
+            0
+        }
+        other => panic!("expected Poisoned, got {other:?}"),
+    };
+    assert_eq!(guard, 0, "poisoned mutex reports count=0");
 }
 
 /// SEC-003 / M2: when a single vtoken is long-polled more than
@@ -726,7 +739,13 @@ async fn getupdates_returns_429_when_polls_exceed_cap() {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+    let state = HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    );
     let _shutdown_tx_keepalive = shutdown_tx; // pin for test lifetime
 
     let vtoken = register(&state, "claude").await;

@@ -138,6 +138,7 @@ async fn boot() -> Harness {
         store,
         queue,
         shutdown_rx,
+        "test-relay-secret".to_string(),
     );
 
     let router = server::build_router(state.clone());
@@ -153,7 +154,12 @@ async fn boot() -> Harness {
 
     let state_for_server = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("axum serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
         drop(state_for_server);
     });
 
@@ -185,6 +191,7 @@ async fn boot_without_default() -> Harness {
         store,
         queue,
         shutdown_rx,
+        "test-relay-secret".to_string(),
     );
 
     // Override the default route to None — HubState::new starts with None,
@@ -204,7 +211,12 @@ async fn boot_without_default() -> Harness {
 
     let state_for_server = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("axum serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
         drop(state_for_server);
     });
 
@@ -811,13 +823,23 @@ async fn over_cap_concurrent_polls_get_429() {
     let tracker = h.state.clients.poll_tracker.clone();
     let vtoken_for_inproc = vtoken.clone();
     let inproc = std::thread::spawn(move || {
-        let c1 = tracker.enter(&vtoken_for_inproc).0;
-        let g1 = tracker.enter(&vtoken_for_inproc).1;
-        let c2 = tracker.enter(&vtoken_for_inproc).0;
-        let g2 = tracker.enter(&vtoken_for_inproc).1;
-        let c3 = tracker.enter(&vtoken_for_inproc).0;
-        let g3 = tracker.enter(&vtoken_for_inproc).1;
-        let c4 = tracker.enter(&vtoken_for_inproc).0;
+        let tracker = tracker; // shadow to satisfy clippy after capture
+        let (c1, g1) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c2, g2) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c3, g3) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c4, _g4) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
         drop(g3);
         drop(g2);
         drop(g1);

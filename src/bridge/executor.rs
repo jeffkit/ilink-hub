@@ -33,7 +33,10 @@ pub(super) fn apply_placeholders(
 /// If the first line of `stdout` starts with `prefix`, the remainder of that line is the CLI session id
 /// (returned as `Some`); the rest of `stdout` (following lines) is the reply body. If `prefix` is empty
 /// or the first line does not match, returns `(stdout, None)`.
-pub(super) fn split_cli_session_from_stdout(prefix: &str, stdout: &str) -> (String, Option<String>) {
+pub(super) fn split_cli_session_from_stdout(
+    prefix: &str,
+    stdout: &str,
+) -> (String, Option<String>) {
     if prefix.is_empty() {
         return (stdout.to_string(), None);
     }

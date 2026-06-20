@@ -26,7 +26,13 @@ async fn make_state() -> Arc<HubState> {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    )
 }
 
 #[tokio::test]

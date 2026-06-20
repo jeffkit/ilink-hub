@@ -16,7 +16,7 @@ All notable changes to this project will be documented in this file.
 
 - **视频不支持**：Anthropic Messages API 没有 `video` content block，整个 ilink-hub 在用户→AI 这一步都不可能支持视频输入。微信收到的视频会落到「无法路由」日志里，bridge 不会尝试下载或转发。
 - **非 PDF / 非纯文本文件不支持**：`document` 块只接受 `application/pdf` 和 `text/plain`。其他类型（CSV / Excel / Word / 压缩包 / 可执行文件等）需要走 Anthropic Files API 流程，超出 stream-json 协议范围。
-- **CLI 协议层行为未实测**：`SDKUserMessage.content` 接受 `document` 块是 Anthropic SDK 的协议规定，fake-cc 的 TS SDK 内部也使用，但 Claude Code CLI 的 `--input-format stream-json` 模式对 `document` 块的具体行为未在生产实测。如有问题会回退到「下载到本地、告诉 Claude 文件路径、用 Read 工具读」的备选方案。
+- **CLI 实测通过（2026-06-18）**：本地 Claude Code CLI `2.1.177` + 模型 `MiniMax-M3` 上用 `--input-format stream-json --output-format stream-json --verbose --model MiniMax-M3` 跑通：128×128 PNG image block 正确识别图片为 grayscale，612 字节测试 PDF document block 正确读出文本内容，session 续接 / 流式 partial 输出 / `ILINK_SESSION` 行均按预期工作。注：极小（67 字节 1×1 透明 PNG）的图会被 API 路径拒绝（`400 invalid params (2013)`），属于 API 侧对图片最小尺寸的隐含要求，不是协议问题——实际微信图片通常远大于此。
 
 **参考**：协议细节见 `fake-cc` 项目 `src/server/directConnectManager.ts:130` 和 `src/utils/teleport/api.ts:376`。
 

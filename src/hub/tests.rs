@@ -6,22 +6,33 @@ use crate::store::Store;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+/// Helper: extract `(per_vtoken, guard)` from a fresh `EnterOutcome`.
+/// Test code paths only deal with the `Ok` variant; the test helper
+/// makes the call sites match the production handler's destructure.
+fn ok_count(enter: EnterOutcome) -> (usize, PollGuard) {
+    match enter {
+        EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+        other => panic!("expected EnterOutcome::Ok, got {other:?}"),
+    }
+}
+
 #[test]
 fn poll_tracker_counts_concurrent_polls_and_releases_on_drop() {
     let tracker = Arc::new(PollTracker::default());
+    tracker.set_hub_cap(MAX_HUB_POLLS_DEFAULT);
 
-    let (c1, g1) = tracker.enter("vt-a");
+    let (c1, g1) = ok_count(tracker.enter("vt-a"));
     assert_eq!(c1, 1, "first poll is alone");
 
-    let (c2, g2) = tracker.enter("vt-a");
+    let (c2, g2) = ok_count(tracker.enter("vt-a"));
     assert_eq!(c2, 2, "second concurrent poll on same vtoken detected");
 
     // A different vtoken is tracked independently.
-    let (c_other, _g_other) = tracker.enter("vt-b");
+    let (c_other, _g_other) = ok_count(tracker.enter("vt-b"));
     assert_eq!(c_other, 1);
 
     drop(g2);
-    let (c3, _g3) = tracker.enter("vt-a");
+    let (c3, _g3) = ok_count(tracker.enter("vt-a"));
     assert_eq!(
         c3, 2,
         "count drops when a guard is released, then rises again"
@@ -30,7 +41,7 @@ fn poll_tracker_counts_concurrent_polls_and_releases_on_drop() {
     drop(g1);
     drop(_g3);
     // All vt-a guards released → entry removed; a fresh poll starts back at 1.
-    let (c4, _g4) = tracker.enter("vt-a");
+    let (c4, _g4) = ok_count(tracker.enter("vt-a"));
     assert_eq!(c4, 1);
 }
 
@@ -42,11 +53,12 @@ fn poll_tracker_counts_concurrent_polls_and_releases_on_drop() {
 #[test]
 fn poll_tracker_caps_concurrent() {
     let tracker = Arc::new(PollTracker::default());
+    tracker.set_hub_cap(MAX_HUB_POLLS_DEFAULT);
     // Hold MAX guards so the (MAX+1)th enter must observe a count
     // strictly greater than MAX.
     let mut guards = Vec::with_capacity(MAX_CONCURRENT_POLLS_PER_VTOKEN);
     for expected in 1..=MAX_CONCURRENT_POLLS_PER_VTOKEN {
-        let (c, g) = tracker.enter("vt-cap");
+        let (c, g) = ok_count(tracker.enter("vt-cap"));
         assert_eq!(
             c, expected,
             "enter #{expected} must report {expected} active polls"
@@ -55,7 +67,7 @@ fn poll_tracker_caps_concurrent() {
     }
     // The (MAX+1)th enter must see count == MAX+1 > MAX — this is the
     // signal the handler uses to return 429.
-    let (over, g_over) = tracker.enter("vt-cap");
+    let (over, g_over) = ok_count(tracker.enter("vt-cap"));
     assert_eq!(
         over,
         MAX_CONCURRENT_POLLS_PER_VTOKEN + 1,
@@ -69,7 +81,7 @@ fn poll_tracker_caps_concurrent() {
     // After dropping the over-cap guard, count returns to MAX and a
     // fresh enter must NOT cross the boundary — this is the recovery
     // path that lets a legitimate client reconnect after a burst.
-    let (back_to_max, g_back_to_max) = tracker.enter("vt-cap");
+    let (back_to_max, g_back_to_max) = ok_count(tracker.enter("vt-cap"));
     assert_eq!(
         back_to_max,
         MAX_CONCURRENT_POLLS_PER_VTOKEN + 1,
@@ -77,6 +89,41 @@ fn poll_tracker_caps_concurrent() {
     );
     drop(g_back_to_max);
     drop(guards);
+}
+
+/// The Hub-wide cap (separate from the per-vtoken cap) is enforced FIRST.
+/// A tracker with hub_cap=2 must reject the third concurrent poll from any
+/// vtoken, even though each individual vtoken is still well under
+/// `MAX_CONCURRENT_POLLS_PER_VTOKEN`.
+#[test]
+fn poll_tracker_enforces_hub_wide_cap() {
+    let tracker = Arc::new(PollTracker::default());
+    tracker.set_hub_cap(2);
+
+    // Two polls, two distinct vtokens — well under the per-vtoken cap (3),
+    // and right at the Hub-wide cap (2). Both must be accepted.
+    let (_c1, g1) = ok_count(tracker.enter("vt-a"));
+    let (_c2, g2) = ok_count(tracker.enter("vt-b"));
+    assert_eq!(tracker.total_polls(), 2);
+
+    // Third poll: Hub-wide cap reached. Must be rejected with HubLimitReached.
+    match tracker.enter("vt-c") {
+        EnterOutcome::HubLimitReached { total, cap } => {
+            assert_eq!(total, 2);
+            assert_eq!(cap, 2);
+        }
+        other => panic!("expected HubLimitReached, got {other:?}"),
+    }
+    // The rejection must not have leaked an increment into the counter.
+    assert_eq!(tracker.total_polls(), 2);
+
+    // Drop one guard, the next enter succeeds and the counter rises to 2 again.
+    drop(g1);
+    assert_eq!(tracker.total_polls(), 1);
+    let (_c3, g3) = ok_count(tracker.enter("vt-c"));
+    assert_eq!(tracker.total_polls(), 2);
+    drop(g2);
+    drop(g3);
 }
 /// Verify that concurrent calls to register_client_in_hub (registry → router lock order)
 /// never deadlock against each other or against route-reading.
@@ -90,7 +137,13 @@ async fn concurrent_register_and_route_does_not_deadlock() {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+    let state = HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    );
 
     let mut handles = vec![];
 
@@ -200,7 +253,13 @@ async fn make_state() -> Arc<HubState> {
     );
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, store, queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        store,
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    )
 }
 
 #[tokio::test]

@@ -23,7 +23,13 @@ async fn make_state() -> Arc<HubState> {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    )
 }
 
 // ─── S-01: Admin endpoint auth ───────────────────────────────────────────────
@@ -349,7 +355,13 @@ async fn sendtyping_error_propagation_test() {
     ));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+    let state = HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+    );
 
     let (vtoken, _) =
         ilink_hub::server::pairing::register_client_in_hub(&state, "test-client".to_string(), None)
@@ -399,11 +411,22 @@ async fn sendtyping_error_propagation_test() {
 /// Verify that the CLI help lists the secure loopback address as the default.
 #[test]
 fn test_cli_default_listen_address_is_loopback() {
+    // Strip all env vars that `serve`'s `get_addr_default()` reads so the
+    // --help output is the "clean" default. Without this, an outer shell
+    // exporting e.g. `WEIXIN_BASE_URL=https://my-hub.example.com` would
+    // shadow the documented default and break this test. This is
+    // backwards-compatible (the env vars were already optional) and
+    // forward-compatible (any new env-driven default would surface here
+    // instead of silently changing the displayed value).
+    //
+    // We do this by running `env -i ... ilink-hub serve --help` so the
+    // child process sees a fully empty environment.
     let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub")
         .unwrap_or_else(|_| "./target/release/ilink-hub".to_string());
     let output = std::process::Command::new(bin_path)
         .arg("serve")
         .arg("--help")
+        .env_clear()
         .output()
         .expect("failed to execute ilink-hub binary");
     let stdout = String::from_utf8_lossy(&output.stdout);

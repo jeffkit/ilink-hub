@@ -5,7 +5,6 @@ use crate::bridge::paths::find_in_path;
 use crate::bridge::AUTH_ERROR_KEYWORDS;
 use crate::paths::expand_user_path;
 
-
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone, thiserror::Error)]
 #[serde(rename_all = "camelCase")]
 pub enum ProbeError {
