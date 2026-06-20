@@ -479,7 +479,7 @@ pub async fn sendmessage(
         //
         // Media messages (image/file/video) have no text but do have content — allow them through.
         let is_text_empty = msg.text().map(|t| t.trim().is_empty()).unwrap_or(true);
-        if is_text_empty && !msg.has_content() {
+        if is_text_empty && !msg.has_media_content() {
             return Json(SendMessageResponse::default());
         }
 
@@ -535,7 +535,11 @@ pub async fn sendmessage(
         .as_ref()
         .map(|m| !m.text().unwrap_or("").trim().is_empty())
         .unwrap_or(false);
-    let has_media = req.msg.as_ref().map(|m| m.has_content()).unwrap_or(false);
+    let has_media = req
+        .msg
+        .as_ref()
+        .map(|m| m.has_media_content())
+        .unwrap_or(false);
     if !has_text && !has_media {
         return Json(SendMessageResponse::default());
     }
