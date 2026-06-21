@@ -52,7 +52,13 @@ impl DatabaseKind {
         if url.starts_with("postgres:") || url.starts_with("postgresql:") {
             Ok(DatabaseKind::Postgres)
         } else if url.starts_with("mysql:") || url.starts_with("mariadb:") {
-            Ok(DatabaseKind::MySql)
+            #[cfg(feature = "mysql")]
+            return Ok(DatabaseKind::MySql);
+            #[cfg(not(feature = "mysql"))]
+            anyhow::bail!(
+                "MySQL support requires the `mysql` feature flag to be enabled at compile time; \
+                 rebuild with `--features mysql`"
+            );
         } else if url.starts_with("sqlite:") || url.is_empty() {
             Ok(DatabaseKind::Sqlite)
         } else {
@@ -81,6 +87,19 @@ impl Store {
     /// For SQLite URLs, the database file is created automatically if it does
     /// not exist yet (equivalent to `create_if_missing(true)`).
     pub async fn connect(url: &str) -> Result<Self> {
+        #[cfg(test)]
+        {
+            static TEST_INIT_KEY: std::sync::Once = std::sync::Once::new();
+            TEST_INIT_KEY.call_once(|| {
+                if std::env::var("ILINK_HUB_MASTER_KEY").is_err() {
+                    std::env::set_var(
+                        "ILINK_HUB_MASTER_KEY",
+                        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    );
+                }
+            });
+        }
+
         sqlx::any::install_default_drivers();
 
         // Parse the driver from the URL scheme prefix BEFORE opening the

@@ -1,4 +1,7 @@
 use super::*;
+use sqlx::Row;
+
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// After `Store::connect`, all v1-v5 migrations must have been applied.
 #[tokio::test]
@@ -11,11 +14,11 @@ async fn test_schema_version_tracking() {
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 7,
-        "expected all 7 migrations to be applied on a fresh DB"
+        version, 8,
+        "expected all 8 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=7 {
+    for v in 1..=8 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -47,7 +50,7 @@ async fn test_migration_idempotency() {
         .get_current_version()
         .await
         .expect("get_current_version");
-    assert_eq!(version, 7, "version must remain 7 after idempotent re-run");
+    assert_eq!(version, 8, "version must remain 8 after idempotent re-run");
 }
 
 /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -149,9 +152,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 7, "must reach v7 after incremental migration");
+    assert_eq!(version, 8, "must reach v8 after incremental migration");
 
-    for v in 1..=7 {
+    for v in 1..=8 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -245,7 +248,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 7, "current version must be 7, got {}", cur_ver);
+    assert_eq!(cur_ver, 8, "current version must be 8, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -599,13 +602,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        7,
-        "writer #1 must see all v1-v7 applied"
+        8,
+        "writer #1 must see all v1-v8 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        7,
-        "writer #2 must see all v1-v7 applied"
+        8,
+        "writer #2 must see all v1-v8 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -672,8 +675,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            7,
-            "connect #{i} must see all v1-v7 applied"
+            8,
+            "connect #{i} must see all v1-v8 applied"
         );
     }
 }
@@ -885,8 +888,8 @@ async fn adversarial_version_api_boundaries() {
     assert!(!store.is_migration_run(0).await.unwrap());
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
-    // get_current_version: 7 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // get_current_version: 8 (the highest applied).
+    assert_eq!(store.get_current_version().await.unwrap(), 8);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -1040,7 +1043,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 7 are applied. Re-running each must NOT fail
+    // After connect, all 8 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1049,9 +1052,10 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v5().await.expect("v5 re-run");
     store.migrate_to_v6().await.expect("v6 re-run");
     store.migrate_to_v7().await.expect("v7 re-run");
+    store.migrate_to_v8().await.expect("v8 re-run");
 
-    // Still at v7.
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // Still at v8.
+    assert_eq!(store.get_current_version().await.unwrap(), 8);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1217,21 +1221,21 @@ async fn m2_v4_alone_with_minimal_preconditions() {
     );
 }
 
-/// F-M2-06: full `run_migrations` walks all five steps in order and
-/// records v1..=v5 in `schema_version`. This is the headline M2
+/// F-M2-06: full `run_migrations` walks all steps in order and
+/// records v1..=v8 in `schema_version`. This is the headline M2
 /// invariant: any DDL error along the way aborts the walk.
 #[tokio::test]
 async fn m2_run_migrations_records_all_versions_in_order() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // All seven versions are present.
-    for v in 1..=7 {
+    // All eight versions are present.
+    for v in 1..=8 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be recorded after run_migrations"
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    assert_eq!(store.get_current_version().await.unwrap(), 8);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1242,8 +1246,8 @@ async fn m2_run_migrations_idempotent_double_call() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
-    // Version stays at 7 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // Version stays at 8 (no ghost rows from a third call).
+    assert_eq!(store.get_current_version().await.unwrap(), 8);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1439,14 +1443,29 @@ fn adversarial_database_kind_from_url() {
         DatabaseKind::from_url("postgresql://u:p@h:5432/db").unwrap(),
         DatabaseKind::Postgres
     );
-    assert_eq!(
-        DatabaseKind::from_url("mysql://u:p@h:3306/db").unwrap(),
-        DatabaseKind::MySql
-    );
-    assert_eq!(
-        DatabaseKind::from_url("mariadb://u:p@h:3306/db").unwrap(),
-        DatabaseKind::MySql
-    );
+    // MySQL support is gated behind the `mysql` feature flag.
+    #[cfg(feature = "mysql")]
+    {
+        assert_eq!(
+            DatabaseKind::from_url("mysql://u:p@h:3306/db").unwrap(),
+            DatabaseKind::MySql
+        );
+        assert_eq!(
+            DatabaseKind::from_url("mariadb://u:p@h:3306/db").unwrap(),
+            DatabaseKind::MySql
+        );
+    }
+    #[cfg(not(feature = "mysql"))]
+    {
+        assert!(
+            DatabaseKind::from_url("mysql://u:p@h:3306/db").is_err(),
+            "mysql:// must return Err when `mysql` feature is disabled"
+        );
+        assert!(
+            DatabaseKind::from_url("mariadb://u:p@h:3306/db").is_err(),
+            "mariadb:// must return Err when `mysql` feature is disabled"
+        );
+    }
     // Empty URL defaults to SQLite (the iLink Hub desktop default path).
     assert_eq!(DatabaseKind::from_url("").unwrap(), DatabaseKind::Sqlite);
     // Unknown schemes now return Err — a typo should not silently become SQLite.
@@ -1867,8 +1886,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 7,
-        "database must still be at v7 after ensure_sqlite_file"
+        v, 8,
+        "database must still be at v8 after ensure_sqlite_file"
     );
 }
 
@@ -1919,7 +1938,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 7);
+    assert_eq!(v, 8);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -2357,6 +2376,7 @@ async fn test_bot_credentials_encryption_decryption() {
 
 #[test]
 fn test_load_or_derive_master_key_scenarios() {
+    let _guard = ENV_MUTEX.lock().unwrap();
     // Save current env var to restore it later
     let old_val = std::env::var("ILINK_HUB_MASTER_KEY");
 
@@ -2669,7 +2689,7 @@ async fn m3_warmup_round_trip_through_quote_index() {
     let rows = store.recent_outbound_messages(500).await.unwrap();
     assert_eq!(rows.len(), 2);
 
-    let items: Vec<WarmItem> = rows.iter().map(warm_item_from_recent_row).collect();
+    let items: Vec<WarmItem> = rows.iter().filter_map(warm_item_from_recent_row).collect();
     let mut idx = QuoteRouteIndex::default();
     let n = idx.warm_from_history(&items);
     assert_eq!(n, 2);
@@ -2734,4 +2754,181 @@ async fn m3_warmup_round_trip_through_quote_index() {
         }
         _ => panic!("expected Client origin"),
     }
+}
+
+#[tokio::test]
+async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    let plain_vtoken = "plain_vtoken_12345";
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind(plain_vtoken)
+        .bind("client_1")
+        .bind(Some("My Client"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO routing_state (from_user, active_vtoken) VALUES ($1, $2)")
+        .bind("user_1")
+        .bind(plain_vtoken)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO messages (vctx, vtoken, session_name, role, content) VALUES ($1, $2, $3, $4, $5)")
+        .bind("vctx_1")
+        .bind(plain_vtoken)
+        .bind("default")
+        .bind("user")
+        .bind("hello")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let plain_bot_token = "plain_bot_token_secret_value";
+    sqlx::query("INSERT INTO bot_credentials (id, token, base_url) VALUES (1, $1, $2)")
+        .bind(plain_bot_token)
+        .bind("https://dummy.url")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    let temp_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", temp_key);
+
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 should succeed");
+
+    // Derive the key from temp_key BEFORE restoring the original env var, so
+    // decryption below uses the same key that was active during migration.
+    let migration_key = crate::runtime::crypto::load_or_derive_master_key()
+        .expect("master key must be loadable while temp_key is still set");
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
+
+    let hashed_vtoken = crate::hub::hash_vtoken(plain_vtoken);
+    let client_vtoken_db: String =
+        sqlx::query_scalar("SELECT vtoken FROM clients WHERE name = 'client_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(client_vtoken_db, hashed_vtoken);
+
+    let route_vtoken_db: String =
+        sqlx::query_scalar("SELECT active_vtoken FROM routing_state WHERE from_user = 'user_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(route_vtoken_db, hashed_vtoken);
+
+    let msg_vtoken_db: String =
+        sqlx::query_scalar("SELECT vtoken FROM messages WHERE vctx = 'vctx_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(msg_vtoken_db, hashed_vtoken);
+
+    let cred_token_db: String =
+        sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_ne!(cred_token_db, plain_bot_token);
+
+    let decrypted = crate::runtime::crypto::decrypt_token(&cred_token_db, &migration_key).unwrap();
+    assert_eq!(decrypted, plain_bot_token);
+}
+
+#[tokio::test]
+async fn test_migration_v8_missing_master_key_fails() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind("plain_token")
+        .bind("client_1")
+        .bind(Some("Client"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    std::env::remove_var("ILINK_HUB_MASTER_KEY");
+
+    let res = store.migrate_to_v8().await;
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
+
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ILINK_HUB_MASTER_KEY is required"));
 }

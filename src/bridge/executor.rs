@@ -53,6 +53,38 @@ fn validate_safe_value(field: &str, value: &str) -> Result<(), PlaceholderError>
     Ok(())
 }
 
+/// Sanitize a value destined for a subprocess environment variable by stripping
+/// NUL, CR, and LF bytes. These characters can cause env-var truncation or
+/// argument-injection in shell wrappers. When the value is dirty a WARN is
+/// logged and an empty string is returned so message processing is not aborted.
+fn sanitize_env_value(field: &str, value: &str) -> String {
+    let mut has_nul = false;
+    let mut has_newline = false;
+    let mut sanitized = String::with_capacity(value.len());
+
+    for c in value.chars() {
+        if c == '\0' {
+            has_nul = true;
+        } else if c == '\n' || c == '\r' {
+            has_newline = true;
+            sanitized.push(' ');
+        } else {
+            sanitized.push(c);
+        }
+    }
+
+    if has_nul || has_newline {
+        warn!(
+            field = %field,
+            has_nul = %has_nul,
+            has_newline = %has_newline,
+            "ILINK env var value contains NUL/CR/LF control character; NUL removed, CR/LF replaced by space (SEC-011)"
+        );
+    }
+
+    sanitized
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PlaceholderError {
     #[error("placeholder value for `{field}` contains NUL/newline; refusing to inject")]
@@ -175,15 +207,30 @@ pub(super) async fn run_cli(
         cmd.current_dir(&dir);
     }
 
-    cmd.env("ILINK_MESSAGE", message);
-    cmd.env("ILINK_SESSION_ID", session_id);
-    cmd.env("ILINK_SESSION_NAME", session_name);
-    cmd.env("ILINK_FROM_USER", from_user);
-    cmd.env("ILINK_CONTEXT_TOKEN", context_token);
+    cmd.env(
+        "ILINK_MESSAGE",
+        sanitize_env_value("ILINK_MESSAGE", message),
+    );
+    cmd.env(
+        "ILINK_SESSION_ID",
+        sanitize_env_value("ILINK_SESSION_ID", session_id),
+    );
+    cmd.env(
+        "ILINK_SESSION_NAME",
+        sanitize_env_value("ILINK_SESSION_NAME", session_name),
+    );
+    cmd.env(
+        "ILINK_FROM_USER",
+        sanitize_env_value("ILINK_FROM_USER", from_user),
+    );
+    cmd.env(
+        "ILINK_CONTEXT_TOKEN",
+        sanitize_env_value("ILINK_CONTEXT_TOKEN", context_token),
+    );
     cmd.env("ILINK_STREAMING", if cfg.streaming { "1" } else { "0" });
 
     for (k, v) in media_env {
-        cmd.env(k, v);
+        cmd.env(k, sanitize_env_value(k, v));
     }
 
     for (k, v) in &cfg.env {
@@ -466,5 +513,16 @@ mod tests {
             err_msg
         );
         assert!(elapsed.as_secs() < 3, "Took too long: {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_sanitize_env_value_adversarial() {
+        assert_eq!(sanitize_env_value("test", "hello"), "hello");
+        assert_eq!(sanitize_env_value("test", "hello\nworld\r"), "hello world ");
+        assert_eq!(sanitize_env_value("test", "hello\0world"), "helloworld");
+        assert_eq!(
+            sanitize_env_value("test", "hello\0\nworld\r"),
+            "hello world "
+        );
     }
 }

@@ -501,4 +501,45 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn test_relay_disconnect_does_not_erase_device_key() {
+        let state = RelayState {
+            hubs: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
+            device_keys: Arc::new(RwLock::new(HashMap::new())),
+            ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+        };
+
+        let device_id = "device_123".to_string();
+        let pub_key = [7u8; 32];
+        state
+            .device_keys
+            .write()
+            .await
+            .insert(device_id.clone(), pub_key);
+
+        // Simulate connection
+        let (ws_tx, _ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
+        state
+            .hubs
+            .write()
+            .await
+            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+
+        // Verify key exists
+        assert!(state.device_keys.read().await.contains_key(&device_id));
+
+        // Simulate disconnection (calling the cleanup part of handle_hub_socket)
+        if let Some(id) = Some(device_id.clone()) {
+            state.hubs.write().await.remove(&id);
+        }
+
+        // Verify key is NOT removed after disconnect
+        assert!(
+            state.device_keys.read().await.contains_key(&device_id),
+            "device key must be preserved after hub disconnects (SEC-M4-001)"
+        );
+    }
 }

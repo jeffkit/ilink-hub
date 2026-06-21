@@ -252,6 +252,7 @@ impl Store {
         self.migrate_to_v5_tx(&mut tx).await?;
         self.migrate_to_v6_tx(&mut tx).await?;
         self.migrate_to_v7_tx(&mut tx).await?;
+        self.migrate_to_v8_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -454,6 +455,232 @@ impl Store {
         Ok(())
     }
 
+    pub(super) async fn migrate_to_v8_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 8).await? {
+            return Ok(());
+        }
+
+        // Detection logic: check if the first client vtoken (if any) is already a 64-char hex.
+        // If so, we assume the migration has already run and skip. We also guard against
+        // the `clients` table being absent (e.g. test environments that exercise isolated
+        // migration steps on a partial schema); if the table doesn't exist, treat it as
+        // "nothing to migrate".
+        let first_vtoken_row = sqlx::query("SELECT vtoken FROM clients LIMIT 1")
+            .fetch_optional(&mut **tx)
+            .await
+            .or_else(|e| {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("doesn't exist") {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })?;
+
+        if let Some(row) = first_vtoken_row {
+            let vtoken: String = row.try_get(0)?;
+            if crate::hub::is_vtoken_hash(&vtoken) {
+                tracing::debug!(
+                    "v8 migration: first client vtoken is already hashed, skipping data conversion"
+                );
+                return Ok(());
+            }
+        } else {
+            // No clients exist yet — nothing to hash or encrypt. Still execute the
+            // no-op DDL wrapper so the migration version is recorded consistently,
+            // but skip the master-key requirement (the key is only needed when
+            // actual plain-text credentials must be transformed).
+            sqlx::query(V8_DDL)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| anyhow::anyhow!("DDL failed: {V8_DDL}\n  Error: {e}"))?;
+            return Ok(());
+        }
+
+        // Since we are going to migrate, the master key must be present/valid.
+        let local_key: Option<crate::runtime::crypto::Key>;
+        let master_key: &ring::aead::LessSafeKey = if let Some(k) = self.master_key() {
+            k.as_ref()
+        } else {
+            match crate::runtime::crypto::load_or_derive_master_key() {
+                Ok(k) => {
+                    local_key = Some(k);
+                    local_key.as_ref().unwrap()
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Migration v8 failed: ILINK_HUB_MASTER_KEY is required to encrypt bot credentials, but could not be loaded: {e}"
+                    ));
+                }
+            }
+        };
+
+        // Run the no-op SQL wrapper for record keeping/schema integrity.
+        sqlx::query(V8_DDL)
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("DDL failed: {V8_DDL}\n  Error: {e}"))?;
+
+        // 1. Migrate vtokens in clients, routing_state, and messages tables
+        let mut vtokens_to_hash = std::collections::HashSet::new();
+
+        // Collect from clients
+        let clients_exist = match sqlx::query("SELECT vtoken FROM clients")
+            .fetch_all(&mut **tx)
+            .await
+        {
+            Ok(rows) => {
+                for r in rows {
+                    let vt: String = r.try_get(0)?;
+                    if !crate::hub::is_vtoken_hash(&vt) {
+                        vtokens_to_hash.insert(vt);
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("doesn't exist") {
+                    false
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        // Collect from routing_state
+        if clients_exist {
+            match sqlx::query("SELECT active_vtoken FROM routing_state")
+                .fetch_all(&mut **tx)
+                .await
+            {
+                Ok(rows) => {
+                    for r in rows {
+                        let vt: String = r.try_get(0)?;
+                        if !crate::hub::is_vtoken_hash(&vt) {
+                            vtokens_to_hash.insert(vt);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("no such table") && !msg.contains("doesn't exist") {
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            // Collect from messages
+            match sqlx::query("SELECT DISTINCT vtoken FROM messages WHERE vtoken IS NOT NULL")
+                .fetch_all(&mut **tx)
+                .await
+            {
+                Ok(rows) => {
+                    for r in rows {
+                        let vt: String = r.try_get(0)?;
+                        if !crate::hub::is_vtoken_hash(&vt) {
+                            vtokens_to_hash.insert(vt);
+                        }
+                    }
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    if !msg.contains("no such table") && !msg.contains("doesn't exist") {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+
+        for old_vtoken in vtokens_to_hash {
+            let new_vtoken = crate::hub::hash_vtoken(&old_vtoken);
+
+            if clients_exist {
+                let _ = sqlx::query("UPDATE clients SET vtoken = $1 WHERE vtoken = $2")
+                    .bind(&new_vtoken)
+                    .bind(&old_vtoken)
+                    .execute(&mut **tx)
+                    .await;
+
+                match sqlx::query(
+                    "UPDATE routing_state SET active_vtoken = $1 WHERE active_vtoken = $2",
+                )
+                .bind(&new_vtoken)
+                .bind(&old_vtoken)
+                .execute(&mut **tx)
+                .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("no such table") && !msg.contains("doesn't exist") {
+                            return Err(e.into());
+                        }
+                    }
+                }
+
+                match sqlx::query("UPDATE messages SET vtoken = $1 WHERE vtoken = $2")
+                    .bind(&new_vtoken)
+                    .bind(&old_vtoken)
+                    .execute(&mut **tx)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if !msg.contains("no such table") && !msg.contains("doesn't exist") {
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Migrate bot_credentials table
+        let cred_rows = match sqlx::query("SELECT id, token FROM bot_credentials")
+            .fetch_all(&mut **tx)
+            .await
+        {
+            Ok(rows) => Some(rows),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("no such table") || msg.contains("doesn't exist") {
+                    None
+                } else {
+                    return Err(e.into());
+                }
+            }
+        };
+
+        if let Some(rows) = cred_rows {
+            for row in rows {
+                let id: i64 = row.try_get(0)?;
+                let token: String = row.try_get(1)?;
+                // Check if the token can be decrypted with the master key.
+                // If it can, it is already correctly encrypted. If not, we treat it as plaintext and encrypt.
+                let is_encrypted =
+                    crate::runtime::crypto::decrypt_token(&token, master_key).is_ok();
+                if !is_encrypted {
+                    let encrypted = crate::runtime::crypto::encrypt_token(&token, master_key);
+                    sqlx::query("UPDATE bot_credentials SET token = $1 WHERE id = $2")
+                        .bind(encrypted)
+                        .bind(id)
+                        .execute(&mut **tx)
+                        .await?;
+                }
+            }
+        }
+
+        tracing::info!(
+            version = 8,
+            "migration applied: vtoken hashed and bot_credentials encrypted"
+        );
+        Ok(())
+    }
+
     // ─── Non-transactional single-version migrators (test surface only) ───
     //
     // These open their own transaction and delegate to the `_tx` variants,
@@ -518,6 +745,15 @@ impl Store {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin().await?;
         self.migrate_to_v7_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v8(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v8_tx(&mut tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -651,3 +887,5 @@ const V7_DEDUP_PEER_USER_ID_POSTGRES: &str = "DELETE FROM context_token_map \
 
 const V7_UNIQUE_IDX_PEER_USER_ID: &str =
     include_str!("../../migrations/0007_peer_user_id_unique_index.sql");
+
+const V8_DDL: &str = include_str!("../../migrations/0008_vtoken_and_bot_token_hash.sql");

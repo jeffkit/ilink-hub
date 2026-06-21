@@ -104,3 +104,4 @@ tower = { version = "0.5", features = ["util"] }
 default = ["sqlite"]
 sqlite = ["sqlx/sqlite"]
 postgres = ["sqlx/postgres"]
+mysql = ["sqlx/mysql"]

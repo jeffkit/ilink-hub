@@ -480,7 +480,7 @@ async fn warm_quote_index_from_db(state: Arc<HubState>, store: Arc<Store>, limit
             let total = rows.len();
             let warm_items: Vec<crate::hub::quote_route::WarmItem> = rows
                 .iter()
-                .map(crate::hub::quote_route::warm_item_from_recent_row)
+                .filter_map(crate::hub::quote_route::warm_item_from_recent_row)
                 .collect();
             let mut idx = state.routing.quote_index.lock().await;
             let indexed = idx.warm_from_history(&warm_items);

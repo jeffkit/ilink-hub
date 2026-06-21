@@ -384,11 +384,15 @@ pub fn parse_footer_from_quoted_text(text: &str) -> Option<(String, Option<Strin
 /// `name` field) which the `messages` table does not store directly — it is only
 /// embedded in the rendered text footer. We re-parse the footer with
 /// [`parse_footer_from_quoted_text`]; rows whose footer is missing or unrecognised
-/// fall back to a [`QuoteOrigin::Hub`] variant with a synthetic `HubCommand::Help`
-/// marker so the index still records *something* — the alternative (silently
-/// dropping the row) would let a real outbound message become un-quoteable for
-/// the rest of the process lifetime, which is worse than an over-broad match.
-pub fn warm_item_from_recent_row(row: &crate::store::RecentOutboundRow) -> WarmItem {
+/// fall back to a [`QuoteOrigin::Client`] with a synthetic `<warmup>` name so at
+/// least the vtoken (the load-bearing routing field) is preserved.
+///
+/// Rows without a `vtoken` (legacy / migration / system messages) return `None`
+/// and are skipped by the caller. Indexing them as `HubCommand::Help` would
+/// cause a quote-reply on such messages to incorrectly trigger `/help`, which is
+/// worse than the correct DB-fallback path that fires when no in-memory entry
+/// is found.
+pub fn warm_item_from_recent_row(row: &crate::store::RecentOutboundRow) -> Option<WarmItem> {
     let origin = match (
         row.vtoken.as_deref(),
         parse_footer_from_quoted_text(&row.text),
@@ -412,19 +416,16 @@ pub fn warm_item_from_recent_row(row: &crate::store::RecentOutboundRow) -> WarmI
             }
         }
         (None, _) => {
-            // No vtoken at all (legacy / migration / system message). The
-            // quote index needs *some* origin to record; we pick Hub so it
-            // can't accidentally route to a non-existent client.
-            QuoteOrigin::Hub {
-                cmd: HubCommand::Help,
-            }
+            // No vtoken: skip warmup indexing. A quote-reply will fall back to the
+            // DB resolver rather than incorrectly routing to HubCommand::Help.
+            return None;
         }
     };
-    WarmItem {
+    Some(WarmItem {
         scope: row.from_user.clone(),
         text: row.text.clone(),
         origin,
-    }
+    })
 }
 
 /// Pull the quoted text and its (second-granularity) `create_time_ms` from a user message's
@@ -1011,7 +1012,7 @@ mod tests {
             session_name: "session-20260611-1".into(),
             created_at: "2026-06-11 12:00:00".into(),
         };
-        let item = warm_item_from_recent_row(&row);
+        let item = warm_item_from_recent_row(&row).expect("expected Some(WarmItem)");
         assert_eq!(item.scope, "user@x");
         assert_eq!(item.text, row.text);
         match item.origin {
@@ -1029,10 +1030,10 @@ mod tests {
         }
     }
 
-    /// Footer present but vtoken missing → Hub origin (we don't want to
-    /// route to a non-existent client).
+    /// Footer present but vtoken missing → None (skip warmup indexing to avoid
+    /// incorrectly routing a quote-reply to HubCommand::Help).
     #[test]
-    fn warm_item_from_recent_row_missing_vtoken_falls_back_to_hub() {
+    fn warm_item_from_recent_row_missing_vtoken_returns_none() {
         let row = crate::store::RecentOutboundRow {
             from_user: "user@x".into(),
             text: "list\n\n---\nhub".into(),
@@ -1040,8 +1041,7 @@ mod tests {
             session_name: "default".into(),
             created_at: "2026-06-11 12:00:00".into(),
         };
-        let item = warm_item_from_recent_row(&row);
-        assert!(matches!(item.origin, QuoteOrigin::Hub { .. }));
+        assert!(warm_item_from_recent_row(&row).is_none());
     }
 
     /// Footer missing but vtoken present → Client origin with a `<warmup>`
@@ -1057,7 +1057,7 @@ mod tests {
             session_name: "session-20260611-1".into(),
             created_at: "2026-06-11 12:00:00".into(),
         };
-        let item = warm_item_from_recent_row(&row);
+        let item = warm_item_from_recent_row(&row).expect("expected Some(WarmItem)");
         match item.origin {
             QuoteOrigin::Client {
                 vtoken,
