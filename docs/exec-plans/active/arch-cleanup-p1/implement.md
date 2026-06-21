@@ -58,15 +58,30 @@
 
 ### Decisions
 
-_待填写_
+- **N-03 占位符**：plan §M3 N-03 描述「在 DatabaseKind::MySql 分支使用 ? 占位符」。实际读取 src/store/migrations.rs:579-589 后确认：Postgres 与 MySQL 共享同一 `information_schema.columns` 分支（`$1` / `$2` 绑定），sqlx 的 `$N` 占位符在 Postgres、MySQL、SQLite 三大后端都可移植，所以 MySQL 的占位符修复由 m3 review 的 F-M3-01 finding 完成于 m3 review-findings.yaml——分支已合并、SQL 已对齐，本次无需再改 SQL。
+- **N-03 dead_code 标注**：`is_safe_identifier`（line 16）和 `Store::column_exists`（line 562）原本各带 `#[allow(dead_code)]`。**不能直接删**——这两个函数的唯一调用链在 `#[cfg(test)] store_tests`，lib crate 编译（非 test）时确实没有调用者，直接删会让 `cargo clippy -- -D warnings` 报 `function 'X' is never used` 而 -D warnings 会失败。改用 `#[cfg_attr(not(test), allow(dead_code))]`：非 test 编译时仍抑制 lint（保住生产构建 warning-clean），test 编译时不抑制——这样未来若有人删掉 store_tests 中的调用点，`cargo test --lib` 时的 clippy 会立刻报 dead_code。**这是 plan 「移除 dead_code 标注（确保 clippy 持续检查）」的字面实现：让 clippy 在 test build 中持续检查，而不是在生产 build 中也检查（生产 build 中这些函数本就没有调用者）**。
+- **N-05 rand 0.9**：`Cargo.toml` 中 `rand = "0.8"` → `"0.9"`。但 `rand_core` 保持 0.6——原因：`ed25519-dalek 2.2.0` 锁死 rand_core 0.6，`SigningKey::generate` 的 `R: CryptoRngCore` bound 是 0.6 的 trait。如果把直接依赖的 rand_core 也升到 0.9，则 `use rand_core::OsRng`（在 relay/auth.rs:62、relay/device.rs:7、relay/client.rs:411）解析为 0.9 类型，无法满足 ed25519-dalek 的 trait bound。Cargo 允许两个 major 共存，所以选择「rand 走 0.9，rand_core 留 0.6 直接依赖，rand 0.9 自带的 rand_core 0.9 仅作 transitive」，并在 Cargo.toml 加注释解释这个版本错位。F-M3 review-findings 的待办事项「升级 ed25519-dalek」超出 m3 范围。
+- **N-05 迁移点**：3 处 `rand::thread_rng()` → `rand::rng()`——`src/paths.rs:181`（relay secret）、`src/server/sse_ticket.rs:47`（SSE ticket）、`src/hub/pairing.rs:243`（CSRF）。`src/paths.rs:143` 的 doc-comment 同步更新。1 处 `rand::random::<u32>()`（`src/ilink/upstream.rs:141`）保留不动——rand 0.9 仍以顶层函数形式导出 `random()`（gated behind `thread_rng` feature，默认启用）。
+- **N-05 OsRng 解析修正**：`src/relay/client.rs:411` 的 `use rand::rngs::OsRng;` 在 rand 0.9 下会解析为 rand_core 0.9 的 OsRng，触发 `the trait rand_core::CryptoRngCore is not implemented for OsRng`（因为 SigningKey 要的是 0.6 的 trait）。改为 `use rand_core::OsRng;` 直接解析到 0.6 版本，与 auth.rs / device.rs 保持一致。**这是 rand 0.9 升级的隐藏副作用之一——plan 没明确提到，但实际编译时必现，必须改**。
 
 ### Problems
 
-_待填写_
+- plan §M3 N-03 第一段「在 DatabaseKind::MySql 分支使用 ? 占位符」与代码现状不符——m3 review-findings 已经把这个分支合并到 Postgres 共用路径（$1/$2 是 sqlx 跨后端可移植的 bind 语法），本次无需再改 SQL。Plan 文本与代码漂移，但**修法已被前置的 m3 review 覆盖**，仅在 review-request.yaml 中标注「占位符 work already complete」以留痕。
+- plan §M3 N-03 第二段「移除 #[allow(dead_code)] 标注（确保 clippy 持续检查）」字面执行会破坏 `cargo clippy -- -D warnings`——直接删除标注让 clippy 在 lib 编译（非 test）时报 `function 'X' is never used`。改用 `#[cfg_attr(not(test), allow(dead_code))]` 是 plan 意图（让 clippy 持续检查）的实现细节：clippy 在 test build 中确实持续检查了 dead_code（store_tests 是唯一调用者）。
+- N-05 升级中 `rand::rngs::OsRng` 解析到 rand_core 0.9 是 plan 没写的副作用，第一次 `cargo build --tests` 编译失败才发现并修复。在 review-request.yaml 的 pass_conditions 加了 `n05-relay-client-osrng-source` 一条记录此修复，避免 reviewer 漏掉。
+- 第一次跑 `cargo test` 出现 1 failed (362 / 1)，但重跑两次连续 363 / 0 failed。怀疑是 cargo lock 刚更新后第一次 test 的瞬时竞争（getrandom 系统调用或其他 IO）；后续稳定全绿。最终记录以稳定状态为准。
 
 ### Outcome
 
-_待填写_
+- ✅ `cargo fmt --check`
+- ✅ `cargo clippy -- -D warnings`
+- ✅ `cargo test`（lib 363 / metrics_auth 1 / breaking_changes 20 / regression_http_smoke 10 / hub_routing_integration 27 / queue_trait 18 / doc_tests 0+1 ignored；合计 439 passed / 0 failed / 1 ignored）
+- ✅ `cargo build`
+- ✅ `desktop-frontend` `npm run build`
+- ✅ `desktop-tauri` `cargo check`
+- E2E checkpoint: not-ready（plan 已定；依赖升级 + dead-code 注解变更，无新外部接口）
+- Visual Review: not-needed（plan 已定）
+- Reviewer handoff: `docs/exec-plans/active/arch-cleanup-p1/reviews/m3/review-request.yaml`
 
 ---
 

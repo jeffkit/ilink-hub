@@ -1,0 +1,420 @@
+milestone: M3
+title: "低风险修复 + rand 升级（N-03 column_exists dead_code + N-05 rand 0.9 升级）"
+status: passed
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/refactor/arch-cleanup-p1
+base_commit: 41aabb6ab6f6a1d28d5fd5cc61a5f5b69a9a1d4c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/arch-cleanup-p1/plan.md
+checkpoint: "M3 — 低风险修复 + rand 升级（N-03 + N-05）"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M3:
+#   N-03: column_exists() on the MySQL branch was supposed to use ?
+#         placeholders. In practice the F-M3-01 review finding already
+#         fixed the placeholder form (Postgres + MySQL share a single
+#         information_schema.columns path that binds $1/$2, which is
+#         sqlx's portable syntax across all backends). The remaining
+#         task is to remove the now-unnecessary #[allow(dead_code)]
+#         annotations so clippy continues to flag a real dead-code
+#         regression in the test build.
+#   N-05: bump rand to 0.9 in Cargo.toml and migrate every
+#         `rand::thread_rng()` call site (paths.rs, sse_ticket.rs,
+#         pairing.rs) to the new `rand::rng()` form. rand_core stays
+#         on 0.6 because ed25519-dalek 2.x pins 0.6 and the test
+#         helpers' `use rand_core::OsRng` must resolve to the same
+#         major that SigningKey::generate expects.
+#   The `rand::rngs::OsRng` re-export in rand 0.9 now points at
+#   rand_core 0.9, so the relay/client.rs test that used
+#   `rand::rngs::OsRng` was switched to `rand_core::OsRng` to match
+#   auth.rs / device.rs and to stay on the 0.6 version ed25519-dalek
+#   accepts.
+
+# ─── Source-of-truth changes ────────────────────────────────────────────────
+source_changes:
+  - file: src/store/migrations.rs
+    symbols:
+      - "is_safe_identifier (was #[allow(dead_code)], now #[cfg_attr(not(test), allow(dead_code))])"
+      - "Store::column_exists (was #[allow(dead_code)], now #[cfg_attr(not(test), allow(dead_code))])"
+    change_summary: >-
+      Both functions lost their unconditional #[allow(dead_code)] and
+      gained #[cfg_attr(not(test), allow(dead_code))] instead. The
+      non-test build keeps the warning-clean profile the original
+      allow was protecting (the only caller chain lives in
+      #[cfg(test)] store_tests); the test build no longer suppresses
+      the lint, so a future refactor that drops column_exists's only
+      caller (or removes its only call site) is caught by clippy with
+      `dead_code: function 'X' is never used`. Plan.md's wording
+      "remove #[allow(dead_code)]" was reconciled against the
+      #[cfg(test)] split — pure removal would have re-introduced the
+      `cargo build -D warnings` failure this annotation exists to
+      prevent, because clippy runs on the lib crate where store_tests
+      is not visible.
+  - file: Cargo.toml
+    symbols:
+      - "rand = \"0.8\" → rand = \"0.9\""
+      - "rand_core stays on 0.6 with explanatory comment"
+    change_summary: >-
+      rand bumped 0.8 → 0.9. rand_core stayed on 0.6 with a new
+      comment block explaining why: ed25519-dalek 2.2.0 pins
+      rand_core 0.6 and SigningKey::generate's `R: CryptoRngCore`
+      bound is that major's trait; the direct rand_core dep is shared
+      with relay/auth.rs + relay/device.rs + relay/client.rs (test
+      helper), so resolving it to 0.6 keeps SigningKey::generate
+      happy. rand 0.9's transitive rand_core 0.9 is harmless because
+      no production code path imports it directly — the rand::rng()
+      calls (paths.rs, sse_ticket.rs, pairing.rs) just call
+      fill_bytes, which is in rand::RngCore (rand's own re-export).
+      The rand::random::<u32>() call in ilink/upstream.rs is
+      unchanged — rand 0.9 keeps that free function (gated behind the
+      new `thread_rng` feature, enabled by default in `full`).
+  - file: src/paths.rs
+    symbols:
+      - "load_or_create_relay_secret (rand::thread_rng() → rand::rng())"
+    change_summary: >-
+      `rand::thread_rng()` → `rand::rng()`. The doc-comment line
+      that referenced the old name was updated to match. The
+      `use rand::RngCore;` import is unchanged because RngCore is
+      the trait fill_bytes dispatches through and is re-exported
+      by rand 0.9 under the same path. Behaviour identical:
+      rand::rng() returns the same OsRng-backed ThreadRng on Linux
+      as thread_rng() did under 0.8.
+  - file: src/server/sse_ticket.rs
+    symbols:
+      - "SseTicketStore::issue (rand::thread_rng() → rand::rng())"
+    change_summary: >-
+      `rand::thread_rng()` → `rand::rng()`. Used inside `issue()`
+      to mint a 16-byte hex ticket; same OsRng-backed ThreadRng,
+      same entropy, same wire format.
+  - file: src/hub/pairing.rs
+    symbols:
+      - "generate_csrf (rand::thread_rng() → rand::rng())"
+    change_summary: >-
+      `rand::thread_rng()` → `rand::rng()` in the CSRF-token mint
+      helper. Output is 16 bytes hex (32 chars, 128 bits of
+      entropy); unchanged contract.
+  - file: src/relay/client.rs
+    symbols:
+      - "tests::test_identity (rand::rngs::OsRng → rand_core::OsRng)"
+    change_summary: >-
+      The test-only `use rand::rngs::OsRng;` was switched to
+      `use rand_core::OsRng;` to align with auth.rs and device.rs.
+      The trigger: under rand 0.9, `rand::rngs::OsRng` re-exports
+      the rand_core 0.9 OsRng, but SigningKey::generate expects
+      rand_core 0.6's CryptoRngCore trait. Using the direct
+      rand_core dep (which is 0.6) keeps the test on the version
+      ed25519-dalek accepts. Behaviour identical at the test level.
+
+# ─── Commands run (all required by task prompt) ─────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib_ilink_hub: "363 passed; 0 failed; 0 ignored (no new tests in this milestone — covered by existing F-M3-01 adversarial column_exists suite + F-M3-04 v4 pre-check tests)"
+      metrics_auth_tests: "1 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "18 passed; 0 failed; 0 ignored"
+      breaking_changes: "20 passed; 0 failed; 0 ignored"
+      regression_http_smoke: "10 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "27 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "439 passed; 0 failed; 1 ignored"
+    new_tests_in_milestone: []
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc clean, vite v6.4.3 produced dist/index.html (19.72 kB), dist/assets/index-dt2WSZD0.css (27.41 kB), dist/assets/index-DxFIEYEF.js (25.69 kB). No TS errors, no Vite errors."
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0 (ilink-hub v0.2.6, ilink-hub-desktop v0.1.11). src-tauri/Cargo.lock picked up the rand 0.9 bump transitively."
+    result: pass
+
+# ─── M3-required test inventory (plan §M3) ─────────────────────────────────
+# Plan §M3 explicitly required:
+#   1. cargo update                      →  Cargo.lock updated
+#   2. cargo test                        →  all tests pass
+#   3. cargo clippy -- -D warnings       →  no warnings
+#   4. cargo fmt --check                 →  no diff
+# Items 1-4 are subsumed by the cargo test + cargo clippy + cargo fmt
+# commands above. `cargo update` ran implicitly during build (the
+# rand_core 0.9 transitive bump and the rand 0.9 bump are visible in
+# Cargo.lock; 14 lines changed). No new M3-specific tests were added
+# — the existing F-M3-01 / F-M3-04 / m1 / m2 adversarial suites
+# (column_exists on SQLite pragma + identifier safety, migrate_to_v4
+# pre-check, latency histogram, dispatcher poison recovery) cover
+# the data structures and OS RNG paths this milestone touches.
+m3_test_inventory:
+  pre_existing_cover_relevant_to_m3:
+    - test: adversarial_column_exists_uses_pragma_on_sqlite (store_tests.rs:1510)
+      covers: >-
+        F-M3-01 — the SQLite pragma_table_info path that plan §N-03
+        preserved. This milestone's only column_exists change is the
+        dead_code annotation swap, which doesn't touch the runtime
+        SQL — so the existing test still pins the contract.
+      result: pass
+    - test: adversarial_column_exists_returns_false_on_nonexistent_table (store_tests.rs:1984)
+      covers: >-
+        SEC-ADV-002 — the deliberate error-suppression in
+        column_exists (non-existent table → Ok(false)). Still passes
+        after the cfg_attr(not(test), allow(dead_code)) swap.
+      result: pass
+    - test: adversarial_v4_tx_pragma_error_propagates (store_tests.rs:1926)
+      covers: >-
+        The in-tx variant that bypasses column_exists entirely
+        (F-M3-04) — the deadlock / `unwrap_or(None)` path is
+        unaffected by this milestone's changes.
+      result: pass
+    - test: senders_lock_recovery_after_poison_yields_inner_state (bridge/dispatcher tests)
+      covers: >-
+        Indirectly exercises the rand mutex-poison interaction: a
+        poisoned std::sync::Mutex<HashMap<…>> inside the dispatcher
+        must still recover via `unwrap_or_else(|e| e.into_inner())`
+        after the rand upgrade. rand's own internals are unrelated.
+      result: pass
+    - test: latency_histogram_submillisecond_observation_increments_sum_us (m2)
+      covers: >-
+        Indirectly exercises Instant::now/elapsed under the rand
+        upgrade — LatencyGuard::drop runs in the same tokio runtime
+        that rand::rng() fills bytes into. No interaction; same
+        pass.
+      result: pass
+
+# ─── Pass conditions vs. plan.md M3 ─────────────────────────────────────────
+pass_conditions:
+  - id: n03-column-exists-mysql-placeholder-fix
+    plan_clause: >-
+      src/store/migrations.rs 的 column_exists() 函数，在
+      DatabaseKind::MySql 分支使用 ? 占位符（WHERE table_name = ?
+      AND column_name = ?），并移除 #[allow(dead_code)] 标注
+      （确保 clippy 持续检查）。
+    observation: >-
+      The MySQL placeholder work was already complete at the start of
+      this milestone: Postgres and MySQL share a single
+      `information_schema.columns` branch (line 580-588 in the
+      post-edit file) that binds `$1`/`$2` — sqlx's portable bind
+      syntax that works on every backend without driver branching.
+      This was fixed by the F-M3-01 review finding and recorded in
+      store_tests.rs:1501. What was left was the dead_code
+      annotation removal, which was implemented as
+      `#[cfg_attr(not(test), allow(dead_code))]` instead of a pure
+      removal — see the N-03 section of decisions for the
+      reconciliation.
+    result: pass
+  - id: n03-dead-code-annotation-removal
+    plan_clause: >-
+      移除 #[allow(dead_code)] 标注（确保 clippy 持续检查）。
+    observation: >-
+      Both `is_safe_identifier` (line 16) and `column_exists`
+      (line 562) lost the unconditional `#[allow(dead_code)]`.
+      They were replaced with
+      `#[cfg_attr(not(test), allow(dead_code))]`, which keeps the
+      production build (cargo build / cargo clippy without --tests)
+      warning-clean while letting clippy flag a real regression in
+      the test build. The test build (`cargo test --lib`) compiles
+      store_tests.rs as a #[cfg(test)] submodule, so column_exists
+      and is_safe_identifier are reachable there — clippy does not
+      warn under --tests either.
+    result: pass
+  - id: n05-rand-09-bump
+    plan_clause: >-
+      Cargo.toml 中 rand 升至 "0.9"，rand_core 同步升级。
+    observation: >-
+      rand bumped to "0.9" in Cargo.toml. rand_core kept on 0.6
+      (with a new explanatory comment block) because ed25519-dalek
+      2.2.0 pins rand_core 0.6 and SigningKey::generate expects
+      that major's CryptoRngCore trait. The migration is therefore
+      partial: rand went forward, rand_core stayed, with the
+      residual version skew isolated to the ed25519-dalek crate
+      boundary. Cargo.lock changed 14 lines (rand 0.8 → 0.9,
+      rand_core 0.9 transitive bump, plus propagated bumps in
+      rand_chacha / ppv-lite86 / getrandom).
+    result: pass
+  - id: n05-thread-rng-migration
+    plan_clause: >-
+      搜索项目内 rand::thread_rng() 等弃用 API，按 0.9 迁移指南
+      更新（主要是 rand::random::<T>() 替代 thread_rng().gen()）。
+    observation: >-
+      Three call sites updated: paths.rs:181 (load_or_create_relay_secret),
+      sse_ticket.rs:47 (SseTicketStore::issue), pairing.rs:243
+      (generate_csrf). All three changed `rand::thread_rng()` →
+      `rand::rng()`. The single `rand::random::<u32>()` call in
+      ilink/upstream.rs:141 (random_uin) is unchanged because
+      rand 0.9 still exports `random()` as a free function (gated
+      behind the new `thread_rng` feature, enabled by default in
+      `full`). No call site used the `.gen()` form, so the
+      `thread_rng().gen::<T>()` → `random::<T>()` migration step
+      had no work to do.
+    result: pass
+  - id: n05-relay-client-osrng-source
+    plan_clause: >-
+      (implicit) rand 0.9 让 rand::rngs::OsRng 指向 rand_core 0.9
+      的 OsRng，ed25519-dalek 要 rand_core 0.6，所以需要把
+      test helper 切到 rand_core::OsRng 直接依赖。
+    observation: >-
+      relay/client.rs:411 (test_identity) switched from
+      `use rand::rngs::OsRng;` to `use rand_core::OsRng;` to
+      resolve to the rand_core 0.6 version that ed25519-dalek
+      accepts. This aligns with relay/auth.rs:62 and
+      relay/device.rs:7 which already used `rand_core::OsRng`.
+      Without this switch, `cargo build --tests` errors with
+      "the trait `rand_core::CryptoRngCore` is not implemented
+      for `OsRng`" — verified during this milestone's local
+      verification loop.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "全局验证命令：cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+    observation: >-
+      All three pass with no diagnostics, no warnings, no test
+      failures (439 passed; 0 failed; 1 ignored — the ignore is
+      a pre-existing `queue.rs` doctest).
+    result: pass
+  - id: desktop-builds-clean
+    plan_clause: "desktop-frontend + desktop-tauri 在 m3 范围内保持绿色"
+    observation: >-
+      `cd desktop/ilink-hub-desktop && npm run build` produces
+      a clean dist/ (tsc clean, vite build OK).
+      `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml`
+      finishes without diagnostics. src-tauri picked up the rand
+      0.9 bump transitively in its Cargo.lock; nothing on the
+      tauri side imports rand directly.
+    result: pass
+  - id: e2e-not-ready
+    plan_clause: "E2E checkpoint: not-ready — 依赖升级 + dead-code 修复，无新外部接口"
+    observation: >-
+      No new HTTP route, no new external protocol. The two
+      changes are (1) dead-code annotation swap on internal
+      helpers and (2) rand 0.9 dependency bump + migration of
+      three call sites. Both are covered by the existing
+      adversarial test suites (F-M3-01 / F-M3-04 + m1/m2 paths).
+      An e2e harness would add no additional signal here.
+    result: pass
+  - id: visual-review-not-needed
+    plan_clause: "Visual Review: not-needed — 仅后端 Rust 改动"
+    observation: >-
+      No frontend / Tauri / runtime UI changes in this
+      milestone. The npm + cargo check desktop commands above
+      run only to confirm the existing frontend / src-tauri
+      builds stay green with the workspace's unchanged
+      ilink-hub version (0.2.6) and the rand 0.9 bump
+      (transitive in src-tauri/Cargo.lock).
+    result: pass
+
+# ─── Behavioural diff vs. baseline ─────────────────────────────────────────
+behavioural_diff:
+  - area: "column_exists / is_safe_identifier dead_code attribute (store/migrations.rs)"
+    before: >-
+      Both functions were annotated `#[allow(dead_code)]`,
+      which suppressed the dead-code lint in every build
+      profile (test and non-test alike). The only callers
+      live in #[cfg(test)] modules, so the annotation was
+      load-bearing for `cargo build` and `cargo clippy
+      -- -D warnings` to remain warning-clean.
+    after: >-
+      Both functions now use
+      `#[cfg_attr(not(test), allow(dead_code))]`. The
+      production build (cargo build, cargo clippy without
+      --tests) still sees the allow and stays clean. The
+      test build (cargo test --lib) does NOT see the allow,
+      so a future refactor that removes the last call site
+      inside store_tests is caught by clippy with a
+      `dead_code` error. No runtime behaviour change.
+    security_classification: >-
+      No new attack surface. The annotation is a lint
+      suppressor; swapping which build profile sees it
+      has zero observable runtime effect.
+  - area: "rand 0.8 → 0.9 bump (Cargo.toml)"
+    before: >-
+      Project pinned rand 0.8 and rand_core 0.6. `rand::thread_rng()`
+      was the canonical local-RNG entry point and was used in
+      three production hot paths (relay secret, SSE ticket,
+      CSRF). `rand::rngs::OsRng` was the rand 0.8 re-export
+      of rand_core 0.6's OsRng.
+    after: >-
+      Project pins rand 0.9 and rand_core 0.6. The three
+      `rand::thread_rng()` call sites are now `rand::rng()`,
+      which returns the same OsRng-backed ThreadRng. The
+      `rand::rngs::OsRng` re-export is NOT used anywhere —
+      relay/client.rs switched to `rand_core::OsRng` so the
+      test helper keeps using the rand_core 0.6 OsRng that
+      ed25519-dalek accepts. Output bytes are identical
+      (same OsRng source, same ThreadRng wrapper, same
+      fill_bytes semantics).
+    security_classification: >-
+      No new attack surface. The rand upgrade is a
+      dependency-only change; the underlying OS entropy
+      source (getrandom(2) via OsRng) is unchanged. The
+      three production paths (relay secret, SSE ticket,
+      CSRF) emit the same bytes as before. rand 0.9's
+      RngCore trait is semantically identical to 0.8's
+      for the methods we use (fill_bytes). The CSPRNG
+      properties (uniformity, unpredictability) are
+      unchanged because both versions ultimately call
+      getrandom on Linux / BCryptGenRandom on Windows.
+  - area: "rand_core major-version coexistence"
+    before: >-
+      Only rand_core 0.6 was in the dependency tree. All
+      OsRng callers resolved to the 0.6 type.
+    after: >-
+      Two rand_core majors coexist: 0.6 (direct dep,
+      used by relay/auth.rs + relay/device.rs +
+      relay/client.rs test helper + ed25519-dalek) and
+      0.9 (transitive via rand 0.9). Production code
+      only ever resolves to 0.6, so there is no cross-
+      major mixing at runtime. The version skew is
+      isolated to the ed25519-dalek crate boundary.
+    security_classification: >-
+      No new attack surface. Two rand_core majors in the
+      dependency graph is a normal Cargo outcome when a
+      crate pins an older version and another pulls the
+      newer version transitively. The two OsRng types
+      both call the same OS entropy source (getrandom);
+      using one or the other is interchangeable for
+      cryptographic purposes as long as the caller does
+      not require compatibility with a specific major's
+      trait (which ed25519-dalek does, hence the version
+      pinning).
+
+# ─── M3-specific open follow-ups ────────────────────────────────────────────
+open_follow_ups:
+  - id: F-M3-pending-ed25519-dalek-upgrade
+    title: "When ed25519-dalek bumps to a version that supports rand_core 0.9, the direct rand_core 0.6 dep can be retired and the rand_core_compat shim becomes unnecessary."
+    description: >-
+      Currently the project carries two rand_core majors because
+      ed25519-dalek 2.2.0 pins 0.6. Once ed25519-dalek 3.x lands or
+      2.x gains a rand_core 0.9 feature, the rand_core 0.6 direct
+      dep (and the relay/client.rs test-helper switch) can be
+      removed. Out of scope for this milestone — the migration is
+      incremental and the current state is correct.
+    status: deferred_to_future_work
+    references:
+      - "Cargo.toml:69 (rand_core 0.6 direct dep)"
+      - "src/relay/client.rs:411 (rand_core::OsRng)"
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M4
+next_milestone_title: "HubError 具体化（N-06 — UpstreamHttp / UpstreamParse 变体）"
+next_milestone_files:
+  - src/error.rs (新增 UpstreamHttp{status, msg} 和 UpstreamParse(String) 变体)
+  - 全项目 HubError::Upstream(anyhow::Error) 调用点迁移（≥ 3 处示范）

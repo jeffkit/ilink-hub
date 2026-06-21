@@ -13,7 +13,12 @@ use super::{DatabaseKind, Store};
 /// Whitelist check used by SQLite `pragma_table_info` splicing: the table
 /// and column names must contain only identifier characters, so the
 /// interpolated string cannot smuggle SQL.
-#[allow(dead_code)]
+///
+/// Allowed in non-test builds because the only caller (`column_exists`)
+/// is itself a test-only helper; the `cfg_attr(not(test), allow(...))`
+/// keeps the production build warning-clean while still letting clippy
+/// flag a real dead-code regression in the test build.
+#[cfg_attr(not(test), allow(dead_code))]
 fn is_safe_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -899,7 +904,12 @@ impl Store {
     /// SQLite does not implement standard `information_schema`, so we use the
     /// SQLite-specific `pragma_table_info` for the SQLite driver and the
     /// portable `information_schema.columns` query for Postgres / MySQL.
-    #[allow(dead_code)]
+    ///
+    /// Allowed in non-test builds because the only callers live in
+    /// `store_tests`; the `cfg_attr(not(test), allow(...))` keeps the
+    /// production build warning-clean while still letting clippy flag a
+    /// real dead-code regression in the test build.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
         if !is_safe_identifier(table) || !is_safe_identifier(column) {
             return Ok(false);

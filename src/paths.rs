@@ -140,7 +140,7 @@ pub fn relay_secret_path() -> PathBuf {
 /// Load a previously-persisted relay secret, or generate a fresh one and
 /// persist it. Returns the secret as a 32-char base64url string.
 ///
-/// The generated secret uses `rand::thread_rng()` (OsRng-backed), so it has
+/// The generated secret uses `rand::rng()` (OsRng-backed), so it has
 /// the full 32 * 6 = 192 bits of entropy — collision-resistant for any
 /// practical deployment.
 ///
@@ -178,7 +178,7 @@ pub fn load_or_create_relay_secret() -> String {
     }
 
     let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let encoded = URL_SAFE_NO_PAD.encode(bytes);
 
     // Best-effort persist. Create the parent dir if needed; chmod 0600 on Unix.
