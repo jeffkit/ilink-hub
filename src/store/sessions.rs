@@ -108,6 +108,29 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
+        // SQLite's SQLITE_MAX_VARIABLE_NUMBER defaults to 999. Query 1 binds 2 params per pair
+        // and query 2 binds 3 params per pair, so chunk at 200 pairs (600 params max) to stay
+        // safely under both limits across all drivers.
+        if pairs.len() > 200 {
+            let mut merged = std::collections::HashMap::new();
+            for chunk in pairs.chunks(200) {
+                // Call the non-recursive inner query directly to avoid async recursion.
+                let partial = self.get_hub_ext_batch_inner(chunk).await?;
+                merged.extend(partial);
+            }
+            return Ok(merged);
+        }
+
+        self.get_hub_ext_batch_inner(pairs).await
+    }
+
+    async fn get_hub_ext_batch_inner(
+        &self,
+        pairs: &[(String, String)], // (vctx, vtoken), len must be <= 200
+    ) -> Result<std::collections::HashMap<(String, String), (String, Option<String>)>> {
+        debug_assert!(!pairs.is_empty());
+        debug_assert!(pairs.len() <= 200);
+
         // Query 1: resolve active session names for each (vctx, vtoken) pair.
         let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
             "SELECT vctx, vtoken, session_name FROM active_sessions WHERE ",
@@ -183,6 +206,56 @@ impl Store {
             result.insert((vctx, vtoken), (session_name, sid));
         }
         Ok(result)
+    }
+
+    /// Get active session name AND its backend_session_id in a single query.
+    ///
+    /// Replaces the two-step `get_active_session_name` + `get_backend_session` pattern used
+    /// in `build_hub_ext_for_vctx`. A single query eliminates the TOCTOU window where
+    /// `/session use` could switch sessions between the two calls, and halves the DB
+    /// round-trips on the hot inbound-message path.
+    ///
+    /// Strategy: resolve the active session name first (defaulting to "default" when absent),
+    /// then fetch the backend session ID for that name — all in one CTE / subquery so the
+    /// two values come from a consistent snapshot.
+    ///
+    /// Returns `(session_name, Option<backend_session_id>)`.
+    pub async fn get_hub_ext_single(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+    ) -> Result<(String, Option<String>)> {
+        // Use a CTE to resolve the session name once and reuse it in the JOIN condition.
+        // COALESCE handles the common case where no active_sessions row exists yet
+        // (first message in a conversation) and falls back to 'default'.
+        let row = sqlx::query(
+            "WITH resolved AS ( \
+               SELECT COALESCE( \
+                 (SELECT session_name FROM active_sessions \
+                  WHERE vctx = $1 AND vtoken = $2 LIMIT 1), \
+                 'default' \
+               ) AS session_name \
+             ) \
+             SELECT r.session_name, b.backend_session_id \
+             FROM resolved r \
+             LEFT JOIN backend_sessions_v2 b \
+               ON b.vctx = $1 AND b.vtoken = $2 AND b.session_name = r.session_name",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .fetch_optional(&self.rpool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let name: String = r.get("session_name");
+                let sid: Option<String> = r.try_get("backend_session_id").ok().flatten();
+                let sid = sid.filter(|s| !s.trim().is_empty());
+                Ok((name, sid))
+            }
+            // CTE always returns one row, so None here means a DB error — fall back to default.
+            None => Ok(("default".to_string(), None)),
+        }
     }
 
     /// Get the active session name for a (vctx, vtoken) pair (defaults to "default").

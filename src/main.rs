@@ -121,7 +121,9 @@ async fn main() -> Result<()> {
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
             let shutdown_tx_clone = shutdown_tx.clone();
             tokio::spawn(async move {
-                shutdown_on_signal().await;
+                if let Err(e) = shutdown_on_signal().await {
+                    tracing::warn!(error = %e, "shutdown signal handler failed; proceeding with shutdown");
+                }
                 info!("Received shutdown signal, shutting down");
                 let _ = shutdown_tx_clone.send(true);
             });
@@ -239,17 +241,7 @@ async fn list_clients(hub_url: &str) -> Result<()> {
 }
 
 fn extract_host_port(s: &str) -> Option<String> {
-    let s = s.trim();
-    if let Ok(url) = reqwest::Url::parse(s) {
-        if let Some(host) = url.host_str() {
-            let port = url.port().unwrap_or(8765);
-            return Some(format!("{}:{}", host, port));
-        }
-    }
-    if s.contains(':') {
-        return Some(s.to_string());
-    }
-    None
+    ilink_hub::paths::parse_host_port(s)
 }
 
 fn get_addr_default() -> String {
@@ -281,27 +273,34 @@ fn get_addr_default() -> String {
 
 /// Wait for either Ctrl+C or SIGTERM (Unix only).
 /// On non-Unix platforms only Ctrl+C is listened to.
-async fn shutdown_on_signal() {
+///
+/// Returns an error if the signal handler cannot be installed, which is
+/// exceedingly rare in practice (would indicate fd exhaustion or
+/// permission issues). Callers log the error and shut down rather than
+/// `panic!`, so a misconfigured production environment still tears down
+/// cleanly instead of aborting the process.
+async fn shutdown_on_signal() -> Result<()> {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
-            .expect("failed to install Ctrl+C handler");
+            .map_err(|e| anyhow::anyhow!("failed to install Ctrl+C handler: {e}"))
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler")
-            .recv()
-            .await;
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|e| anyhow::anyhow!("failed to install SIGTERM handler: {e}"))?;
+        sig.recv()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("SIGTERM stream ended unexpectedly"))
     };
 
     #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
+    let terminate = std::future::pending::<Result<()>>();
 
     tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
+        res = ctrl_c => { res.map(|_| ()) }
+        res = terminate => { res.map(|_| ()) }
     }
 }
 

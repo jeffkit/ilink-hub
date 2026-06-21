@@ -63,6 +63,26 @@ pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
 #[async_trait]
 pub trait MessageQueue: Send + Sync {
     async fn push(&self, vtoken: &str, msg: WeixinMessage) -> Result<bool, HubError>;
+    /// Optimised push for the broadcast path: the base message is shared via
+    /// `Arc<WeixinMessage>` and only the per-recipient `context_token` and
+    /// `ilink_hub_ext` are supplied separately. The base clone cost drops from
+    /// O(N × msg_size) to O(msg_size) + N × cheap field clone, which matters
+    /// when many backends are online and a message carries images / files.
+    ///
+    /// The default implementation clones the base and overlays the overrides,
+    /// so implementations that don't care about the optimisation still work.
+    async fn push_shared(
+        &self,
+        vtoken: &str,
+        base: Arc<WeixinMessage>,
+        context_token: Option<String>,
+        hub_ext: Option<crate::ilink::types::HubExt>,
+    ) -> Result<bool, HubError> {
+        let mut msg = (*base).clone();
+        msg.context_token = context_token;
+        msg.ilink_hub_ext = hub_ext;
+        self.push(vtoken, msg).await
+    }
     async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError>;
     async fn wait_notify(&self, vtoken: &str, timeout_secs: u64) -> Result<bool, HubError>;
     async fn remove_client(&self, vtoken: &str) -> Result<(), HubError>;
@@ -163,6 +183,24 @@ impl MessageQueue for InMemoryQueue {
         Ok(self.get_or_create(vtoken).push(msg))
     }
 
+    async fn push_shared(
+        &self,
+        vtoken: &str,
+        base: Arc<WeixinMessage>,
+        context_token: Option<String>,
+        hub_ext: Option<crate::ilink::types::HubExt>,
+    ) -> Result<bool, HubError> {
+        // Specialised path: clone the base, overlay only the two per-recipient
+        // fields, then push. `WeixinMessage::item_list` is `Arc<Vec<…>>` so
+        // its clone cost is shared with the broadcast source; the
+        // `context_token` and `ilink_hub_ext` are the only per-recipient
+        // allocations.
+        let mut msg = (*base).clone();
+        msg.context_token = context_token;
+        msg.ilink_hub_ext = hub_ext;
+        Ok(self.get_or_create(vtoken).push(msg))
+    }
+
     async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
         Ok(self
             .slots
@@ -224,6 +262,67 @@ mod queue_config_tests {
         assert_eq!(drained.len(), 10);
         assert_eq!(drained[0].message_id, Some(1));
         assert_eq!(drained[9].message_id, Some(10));
+    }
+
+    #[tokio::test]
+    async fn test_push_shared_overrides_context_and_hub_ext_per_recipient() {
+        use crate::ilink::types::HubExt;
+        let q = InMemoryQueue::new();
+        let base = Arc::new(WeixinMessage {
+            from_user_id: Some("user-1".into()),
+            context_token: Some("shared".into()),
+            ..Default::default()
+        });
+
+        // Two recipients should see the shared fields preserved, but their
+        // own context_token and hub_ext applied.
+        q.push_shared(
+            "v1",
+            Arc::clone(&base),
+            Some("vctx-v1".into()),
+            Some(HubExt {
+                session_id: Some("sid-v1".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        q.push_shared(
+            "v2",
+            Arc::clone(&base),
+            Some("vctx-v2".into()),
+            Some(HubExt {
+                session_id: Some("sid-v2".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let v1 = q.drain("v1").await.unwrap();
+        let v2 = q.drain("v2").await.unwrap();
+        assert_eq!(v1.len(), 1);
+        assert_eq!(v2.len(), 1);
+        assert_eq!(v1[0].context_token.as_deref(), Some("vctx-v1"));
+        assert_eq!(v2[0].context_token.as_deref(), Some("vctx-v2"));
+        // Shared field is preserved across recipients.
+        assert_eq!(v1[0].from_user_id.as_deref(), Some("user-1"));
+        assert_eq!(v2[0].from_user_id.as_deref(), Some("user-1"));
+        // Per-recipient hub_ext is preserved.
+        assert_eq!(
+            v1[0]
+                .ilink_hub_ext
+                .as_ref()
+                .and_then(|e| e.session_id.as_deref()),
+            Some("sid-v1")
+        );
+        assert_eq!(
+            v2[0]
+                .ilink_hub_ext
+                .as_ref()
+                .and_then(|e| e.session_id.as_deref()),
+            Some("sid-v2")
+        );
     }
 
     #[test]

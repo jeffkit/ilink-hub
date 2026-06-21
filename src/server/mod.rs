@@ -3,7 +3,7 @@ pub mod routes;
 pub mod sse_ticket;
 
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, Request},
     middleware::{self, Next},
     response::Response,
     routing::{get, patch, post},
@@ -27,21 +27,23 @@ use routes::*;
 const SENDMESSAGE_MAX_CONCURRENCY: usize = 64;
 
 /// Middleware that logs every mutating admin API call with caller IP, method and path.
-async fn admin_audit_log(
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn admin_audit_log(req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // Log before forwarding so the entry is written even if the handler panics.
     if matches!(method.as_str(), "POST" | "PUT" | "PATCH" | "DELETE") {
-        tracing::info!(
-            ip = %addr.ip(),
-            %method,
-            %path,
-            "admin API call"
-        );
+        // `ConnectInfo` is only present when the router is served via
+        // `into_make_service_with_connect_info`; in tests that use `oneshot()`
+        // or plain `axum::serve`, the extension is absent and we log without the IP.
+        let ip_str = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string());
+        if let Some(ip) = ip_str {
+            tracing::info!(ip = %ip, %method, %path, "admin API call");
+        } else {
+            tracing::info!(%method, %path, "admin API call");
+        }
     }
     next.run(req).await
 }

@@ -37,6 +37,14 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
 /// 503 instead of growing an unbounded queue.
 const HUB_OUTBOUND_CAPACITY: usize = 256;
 
+/// Maximum number of distinct Hubs (i.e. distinct `device_id`s) the relay
+/// will register at once. Prevents a misconfigured or malicious Hub
+/// fleet from exhaust­ing the relay's `device_keys` map, the `hubs` map,
+/// and the `pending` request map. With a 32-byte device-key per Hub, 1024
+/// Hubs cost ~32 KiB of memory; raising the cap above 4096 is rarely
+/// justified.
+const MAX_REGISTERED_HUBS: usize = 1024;
+
 // Per-IP: WS handshakes (Hub reconnects every ~5s → need headroom); pairing HTTP from phones.
 const WS_RATE_MAX: usize = 120;
 const WS_RATE_WINDOW_SECS: u64 = 600;
@@ -150,6 +158,29 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
                         timestamp,
                         signature,
                     } if device_id.is_none() => {
+                        // Enforce the global Hub cap BEFORE running the
+                        // Ed25519 verification (which is the expensive part).
+                        // Re-registration of an already-registered Hub is
+                        // exempt — the existing handle is replaced in place
+                        // (a Hub restart is the common case).
+                        {
+                            let hubs = state.hubs.read().await;
+                            if !hubs.contains_key(&id) && hubs.len() >= MAX_REGISTERED_HUBS {
+                                let reason = format!(
+                                    "relay at capacity ({MAX_REGISTERED_HUBS} Hubs); \
+                                     retry later"
+                                );
+                                warn!(device_id = %id, "hub registration rejected: cap reached");
+                                let err = RelayMessage::Registered {
+                                    ok: false,
+                                    error: Some(reason),
+                                };
+                                let _ = write
+                                    .send(Message::Text(err.to_json().unwrap_or_default().into()))
+                                    .await;
+                                break;
+                            }
+                        }
                         match accept_registration(&state, &id, &public_key, timestamp, &signature).await {
                             Ok(()) => {
                                 state.hubs.write().await.insert(

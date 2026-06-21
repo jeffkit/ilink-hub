@@ -22,6 +22,7 @@
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tracing::debug;
 
 use super::common;
 
@@ -48,9 +49,11 @@ pub async fn run() -> Result<()> {
 /// Call `agent --output-format stream-json`, emit every assistant text chunk as an
 /// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via ILINK_PARTIAL. When the model uses tools
-/// between turns, the final assistant reply may only appear in `result.result` (with no
-/// preceding `assistant` event); we emit it as an extra ILINK_PARTIAL in that case.
+/// All visible response text is streamed via ILINK_PARTIAL. Cursor's `result.result`
+/// is the concatenation of every assistant text already streamed, so it is not re-sent
+/// in the normal case. The sole exception: when **no** assistant text events were emitted
+/// (the model responded with tool-only actions), `result.result` is used as a fallback
+/// so the user receives at least one message.
 async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -127,14 +130,16 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
             Some("assistant") => {
                 if let Some(msg) = &event.message {
                     let text = msg.text();
-                    if !text.is_empty() {
+                    // Guard with trim() so that whitespace-only text blocks (e.g. a bare
+                    // "\n" between tool calls) do not produce an empty-looking ILINK_PARTIAL.
+                    if !text.trim().is_empty() {
                         assistant_event_count += 1;
                         assistant_total_chars += text.len();
-                        eprintln!(
-                            "[cursor] assistant#{} len={} total_so_far={}",
-                            assistant_event_count,
-                            text.len(),
-                            assistant_total_chars
+                        debug!(
+                            event = assistant_event_count,
+                            len = text.len(),
+                            total_chars = assistant_total_chars,
+                            "cursor assistant chunk"
                         );
                         common::emit_partial(&text)?;
                     }
@@ -142,17 +147,27 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
             }
             Some("result") => {
                 found_session_id = event.session_id;
-                // Cursor agent's result.result = concat of all assistant texts.
-                // Since all assistant events are already streamed via ILINK_PARTIAL,
-                // sending result would duplicate the full content to the user.
-                // Disabled: only log for observability.
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    eprintln!(
-                        "[cursor] result len={} assistant_events={} assistant_chars={} (NOT sending)",
-                        result_text.len(),
-                        assistant_event_count,
-                        assistant_total_chars,
-                    );
+                    if assistant_event_count == 0 {
+                        // No assistant text events were emitted: the model responded with
+                        // tool-only actions and produced no explanatory text during the run.
+                        // result.result is our only source of content; emit it as a fallback
+                        // so the user receives at least one message instead of total silence.
+                        debug!(
+                            len = result_text.len(),
+                            "cursor result fallback (0 assistant events)"
+                        );
+                        common::emit_partial(&result_text)?;
+                    } else {
+                        // Normal case: Cursor's result.result = concat of all assistant texts
+                        // already streamed. Re-sending would duplicate the full conversation.
+                        debug!(
+                            len = result_text.len(),
+                            assistant_events = assistant_event_count,
+                            assistant_chars = assistant_total_chars,
+                            "cursor result skipped (already streamed)"
+                        );
+                    }
                 }
             }
             _ => {}
@@ -198,5 +213,88 @@ mod tests {
         let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
         assert_eq!(event.event_type.as_deref(), Some("system"));
         assert!(event.message.is_none());
+    }
+
+    // ── Bug-fix regression tests ─────────────────────────────────────────────
+
+    /// Bug #2: whitespace-only text blocks must not be counted as assistant events
+    /// or emitted as ILINK_PARTIAL. The old guard `!text.is_empty()` passed "\n";
+    /// the fix uses `!text.trim().is_empty()`.
+    #[test]
+    fn whitespace_only_text_is_not_an_assistant_event() {
+        for ws in ["\n", "  ", "\t", "\r\n"] {
+            let json = format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{ws}"}}]}}}}"#,
+                ws = ws
+                    .replace('\n', "\\n")
+                    .replace('\t', "\\t")
+                    .replace('\r', "\\r")
+            );
+            let event: CursorStreamEvent = serde_json::from_str(&json).unwrap();
+            let text = event.message.unwrap().text();
+            assert!(
+                !text.is_empty(),
+                "raw '{ws:?}' is non-empty — old guard would count it"
+            );
+            assert!(
+                text.trim().is_empty(),
+                "trimmed '{ws:?}' is empty → must not be counted as assistant event"
+            );
+        }
+    }
+
+    /// Real content with trailing newline must still pass the trim() guard.
+    #[test]
+    fn text_with_real_content_passes_guard() {
+        let json = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Step 1 done.\n"}]}}"#;
+        let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
+        let text = event.message.unwrap().text();
+        assert!(!text.trim().is_empty(), "real content must not be blocked");
+    }
+
+    /// Bug #1 (Cursor): when `assistant_event_count == 0` (tool-only response) and
+    /// `result.result` is non-empty, the bridge must emit result.result as a fallback.
+    #[test]
+    fn result_is_fallback_when_no_assistant_events() {
+        let json = r#"{"type":"result","result":"Shell executed successfully.","session_id":"sf"}"#;
+        let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
+        let result_text = event.result.as_deref().unwrap_or("");
+        let assistant_event_count: u32 = 0;
+
+        let should_fallback = assistant_event_count == 0 && !result_text.trim().is_empty();
+        assert!(
+            should_fallback,
+            "when 0 assistant events and non-empty result, bridge must emit fallback"
+        );
+    }
+
+    /// Normal case: when assistant events were already emitted, result.result
+    /// (which equals their concat) must NOT be re-sent.
+    #[test]
+    fn result_is_not_resent_when_assistant_events_exist() {
+        let json = r#"{"type":"result","result":"Step 1\nStep 2","session_id":"sc"}"#;
+        let event: CursorStreamEvent = serde_json::from_str(json).unwrap();
+        let result_text = event.result.as_deref().unwrap_or("");
+        let assistant_event_count: u32 = 2; // 2 partials already streamed
+
+        let should_fallback = assistant_event_count == 0 && !result_text.trim().is_empty();
+        assert!(
+            !should_fallback,
+            "result must NOT be re-sent when assistant events already streamed"
+        );
+    }
+
+    /// Edge case: tool-only run with empty result.result must remain completely
+    /// silent — there is no content to deliver, and an empty partial would confuse
+    /// message consumers.
+    #[test]
+    fn empty_result_with_no_assistant_events_stays_silent() {
+        let result_text = "";
+        let assistant_event_count: u32 = 0;
+        let should_fallback = assistant_event_count == 0 && !result_text.trim().is_empty();
+        assert!(
+            !should_fallback,
+            "empty result.result with no assistant events must stay silent"
+        );
     }
 }

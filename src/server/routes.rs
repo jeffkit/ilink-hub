@@ -3,8 +3,8 @@
 //! use their virtual token — they see the same API as ilinkai.weixin.qq.com.
 
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    extract::{FromRequestParts, State},
+    http::{request::Parts, HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     Json,
 };
@@ -22,40 +22,36 @@ use crate::server::pairing::register_client_in_hub;
 /// Returned when a downstream `Authorization` vtoken is not in the Hub registry.
 pub const UNKNOWN_VTOKEN_MSG: &str = "Unknown or revoked virtual token; register via POST /hub/register or ilink-hub-bridge --force-register";
 
-// ─── Auth helper ─────────────────────────────────────────────────────────────
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
 
 use crate::redact_token;
+
+/// Schema check for Hub-issued virtual tokens. Tokens are minted in
+/// `hub::registry::ClientInfo::new` as `vhub_{uuid v4 simple}` (32 lowercase
+/// hex chars). Reject anything that does not match before doing registry work,
+/// so a misconfigured client cannot inject iLink-style bot tokens
+/// (`botid@im.bot:secret`) into the vtoken lookup path.
+pub(crate) fn is_valid_vtoken(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix("vhub_") else {
+        return false;
+    };
+    rest.len() == 32
+        && rest
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
 
 fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
+        .filter(|s| is_valid_vtoken(s))
         .map(str::to_string)
 }
 
-/// Returns the configured admin token, reading env once per process.
-fn admin_token() -> Option<&'static str> {
-    use std::sync::OnceLock;
-    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
-    TOKEN
-        .get_or_init(|| {
-            std::env::var("ILINK_ADMIN_TOKEN")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
-        .as_deref()
-}
-
-/// Returns `true` when the request should be allowed through to an admin endpoint.
-///
-/// Auth logic:
-/// - `ILINK_ADMIN_TOKEN` set → Bearer token must match exactly.
-/// - `ILINK_ADMIN_TOKEN` not set AND `ILINK_ADMIN_INSECURE_NO_AUTH=true` → allow (with a
-///   loud startup warning logged separately).
-/// - `ILINK_ADMIN_TOKEN` not set and insecure flag absent → deny with 403.
-fn check_admin_auth(headers: &HeaderMap) -> bool {
-    if let Some(required) = admin_token() {
+fn check_admin_auth(admin: &crate::hub::AdminConfig, headers: &HeaderMap) -> bool {
+    if let Some(required) = &admin.token {
         let provided = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
@@ -64,22 +60,31 @@ fn check_admin_auth(headers: &HeaderMap) -> bool {
         use subtle::ConstantTimeEq;
         return provided.as_bytes().ct_eq(required.as_bytes()).unwrap_u8() == 1;
     }
-    // No token configured — only allow if the operator explicitly opts in to insecure mode.
-    insecure_no_auth()
+    admin.insecure_no_auth
 }
 
-fn insecure_no_auth() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        let enabled = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
-        // Startup-time warning is emitted by RuntimeConfig::warn_if_insecure in serve.rs
-        // (with the actual bind address). This OnceLock only caches the flag value.
-        enabled
-    })
+/// Axum extractor that enforces admin authentication. Any route that extracts
+/// `AdminGuard` is automatically protected — no per-handler `check_admin_auth`
+/// call needed. New admin routes added in the future cannot forget auth.
+pub struct AdminGuard;
+
+impl FromRequestParts<Arc<HubState>> for AdminGuard {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<HubState>,
+    ) -> Result<Self, Self::Rejection> {
+        let headers = &parts.headers;
+        if check_admin_auth(&state.admin, headers) {
+            Ok(AdminGuard)
+        } else {
+            Err((
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            ))
+        }
+    }
 }
 
 // ─── Registration (Hub-specific, non-iLink) ───────────────────────────────────
@@ -105,7 +110,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> (StatusCode, Json<RegisterResponse>) {
-    if !check_admin_auth(&headers) {
+    if !check_admin_auth(&state.admin, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(RegisterResponse {
@@ -166,6 +171,9 @@ pub async fn getupdates(
     headers: HeaderMap,
     Json(req): Json<GetUpdatesRequest>,
 ) -> (StatusCode, Json<GetUpdatesResponse>) {
+    // RAII guard: records latency on every return path (success, 401, 429,
+    // 503, drain-empty). The guard is dropped as the function returns.
+    let _histo = HistoGuard::new(&state.metrics.getupdates_latency_ms);
     let Some(vtoken) = extract_vtoken(&headers) else {
         return (
             StatusCode::UNAUTHORIZED,
@@ -180,12 +188,51 @@ pub async fn getupdates(
     };
 
     // SEC-003: gate concurrent long-polls per vtoken BEFORE doing any
-    // registry work. The tracker increments the count and returns a guard;
-    // dropping the guard decrements (via Drop) regardless of whether we
-    // ultimately serve the long-poll or bail with 429. A poisoned counts
-    // mutex returns count=0 (F-M2-2) — we then fall through to the
-    // 429-without-guard path which is always safe.
-    let (concurrent_polls, poll_guard) = state.clients.poll_tracker.enter(&vtoken);
+    // registry work. The tracker first enforces a Hub-wide cap (so a single
+    // misbehaving vtoken cannot starve the rest of the fleet), then a
+    // per-vtoken cap. The Hub-wide cap is lock-free (AtomicUsize fetch_add);
+    // the per-vtoken cap uses a StdMutex (poison-safe per F-M2-2).
+    let enter = state.clients.poll_tracker.enter(&vtoken);
+    let (concurrent_polls, poll_guard) = match enter {
+        crate::hub::EnterOutcome::HubLimitReached { total, cap } => {
+            // Hub-wide cap reached. Reject with 503 (Service Unavailable) —
+            // distinct from the 429 we use for the per-vtoken cap so operators
+            // can tell "I'm one of too many clients" (503) from "this single
+            // vtoken is double-polling itself" (429).
+            warn!(
+                vtoken = %redact_token(&vtoken),
+                total,
+                cap,
+                "getupdates rejected: Hub-wide concurrent long-poll cap reached"
+            );
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(GetUpdatesResponse {
+                    ret: Some(503),
+                    errcode: None,
+                    errmsg: Some(format!(
+                        "Hub is at capacity ({total}/{cap} concurrent long-polls). Retry later."
+                    )),
+                    msgs: None,
+                    get_updates_buf: None,
+                }),
+            );
+        }
+        crate::hub::EnterOutcome::Poisoned { guard } => {
+            // Per-vtoken mutex is poisoned; the counts map is unreliable. We
+            // still hold a guard that decrements the Hub-wide total on drop,
+            // but we have no usable per-vtoken count. The safest behaviour is
+            // to fall through with a sentinel count of 0 (F-M2-2): the
+            // per-vtoken 429 gate won't trip, but the Hub-wide gate already
+            // passed and the registry check below is still authoritative.
+            warn!(
+                vtoken = %redact_token(&vtoken),
+                "getupdates: per-vtoken poll counter is poisoned; serving without split-brain detection"
+            );
+            (0usize, guard)
+        }
+        crate::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+    };
     if concurrent_polls > MAX_CONCURRENT_POLLS_PER_VTOKEN {
         // Over the per-vtoken cap — drop the guard so the count returns to
         // MAX, then reject.  We do NOT proceed to mark_seen / wait_notify:
@@ -227,31 +274,50 @@ pub async fn getupdates(
         );
     }
 
-    {
-        // F-M2-1: collapse the read (existence) + write (mark_seen) into a
-        // single write guard. Holding two separate locks creates a stale-
-        // online window where evict_stale could flip `online=false` between
-        // the read and the mark_seen. With one guard, the vtoken existence
-        // check and the last-seen timestamp bump are atomic w.r.t. evict_stale.
-        let mut registry = state.clients.registry.write().await;
-        if registry.get_by_vtoken(&vtoken).is_none() {
-            warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(GetUpdatesResponse {
-                    ret: Some(401),
-                    errcode: None,
-                    errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
-                    msgs: None,
-                    get_updates_buf: None,
-                }),
-            );
+    // Existence check + online-flag read under read lock.
+    let already_online = {
+        let registry = state.clients.registry.read().await;
+        match registry.get_by_vtoken(&vtoken) {
+            None => {
+                warn!(vtoken = %redact_token(&vtoken), "getupdates rejected: unknown virtual token");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(GetUpdatesResponse {
+                        ret: Some(401),
+                        errcode: None,
+                        errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+                        msgs: None,
+                        get_updates_buf: None,
+                    }),
+                );
+            }
+            Some(info) => info.online,
         }
-        registry.mark_seen(&vtoken);
+    };
+
+    // Lock-free timestamp bump — no write lock on the hot path.
+    {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state
+            .clients
+            .last_seen
+            .entry(vtoken.clone())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .store(now_secs, std::sync::atomic::Ordering::Relaxed);
     }
 
-    // Use timeout from legacy field if provided, otherwise 30s
-    let poll_secs = req.timeout.unwrap_or(30).min(60) as u64;
+    // First contact after registration or after the health checker marked this
+    // client offline: take the write lock once to flip online=true.
+    if !already_online {
+        state.clients.registry.write().await.mark_online(&vtoken);
+    }
+
+    // Max poll is 55s — well within the upstream HTTP client's 70s socket timeout,
+    // leaving 15s margin for the drain + response serialization path.
+    let poll_secs = req.timeout.unwrap_or(30).min(55) as u64;
     let mut shutdown_rx = state.ilink.shutdown.clone();
     let notified = wait_notify_or_shutdown(
         state.clients.queue.as_ref(),
@@ -345,15 +411,16 @@ pub async fn sendmessage(
 
     tracing::Span::current().record("vctx", &vctx);
 
-    // Translate virtual → real context token + get peer_user_id (direct DB lookup)
-    let (real_ctx, peer_user_id) = match tokio::time::timeout(
+    // Single DB round-trip: resolve real_ctx + peer_user_id + active session name.
+    // Replaces two serial queries (resolve_context_token_full + get_active_session_name).
+    let (real_ctx, peer_user_id, db_session_name) = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        state.store.resolve_context_token_full(&vctx),
+        state.store.resolve_send_context(&vctx, &vtoken),
     )
     .await
     .unwrap_or_else(|_| Err(anyhow::anyhow!("context_token DB lookup timed out")))
     {
-        Ok(Some(pair)) => pair,
+        Ok(Some(triple)) => triple,
         Ok(None) => {
             warn!(vctx = %vctx, "no mapping for virtual context token");
             return Json(SendMessageResponse::err(400, "Unknown context_token"));
@@ -380,21 +447,9 @@ pub async fn sendmessage(
             .filter(|s| !s.trim().is_empty())
             .map(|s| s.trim().to_string());
 
-        // Pre-fetch active session once; reused for both cli_session_id persistence and
-        // the outbound-origin footer, avoiding two identical DB queries per message.
-        active_session = match replied_session_name.clone() {
-            Some(n) => Some(n),
-            None => tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                state.store.get_active_session_name(&vctx, &vtoken),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                warn!(vctx = %vctx, "get_active_session_name timed out");
-                Err(anyhow::anyhow!("timed out"))
-            })
-            .ok(),
-        };
+        // Use bridge-echoed session name if present, else fall back to what the DB returned.
+        // No second DB query needed — db_session_name was fetched in the combined query above.
+        active_session = replied_session_name.clone().or(Some(db_session_name));
 
         // Read cli_session_id from hub_ext and persist it to the correct session.
         if let Some(ext) = msg.ilink_hub_ext.as_mut() {
@@ -437,7 +492,7 @@ pub async fn sendmessage(
         //
         // Media messages (image/file/video) have no text but do have content — allow them through.
         let is_text_empty = msg.text().map(|t| t.trim().is_empty()).unwrap_or(true);
-        if is_text_empty && !msg.has_content() {
+        if is_text_empty && !msg.has_media_content() {
             return Json(SendMessageResponse::default());
         }
 
@@ -452,8 +507,10 @@ pub async fn sendmessage(
 
         // active_session already resolved above — no second DB query needed.
 
-        let env_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
-        if crate::hub::should_append_outbound_origin_label(registered_count, env_label.as_deref()) {
+        if crate::hub::should_append_outbound_origin_label(
+            registered_count,
+            state.admin.outbound_origin_label.as_deref(),
+        ) {
             if let Some((ref name, ref label)) = client_meta {
                 crate::hub::append_outbound_origin_footer_to_first_text_item(
                     msg,
@@ -483,20 +540,6 @@ pub async fn sendmessage(
                 .register_outbound_content(&conv_scope, &text, origin);
         }
     }
-    // When the bridge sends a session-persist-only message (empty body, cli_session_id already
-    // consumed above), skip forwarding to iLink — an empty text message would be rejected or
-    // would confuse the user. The only side-effect we needed (session UUID persistence) already
-    // happened via set_backend_session above.
-    // Media messages (image/file/video) have no text but do carry content — pass them through.
-    let has_text = req
-        .msg
-        .as_ref()
-        .map(|m| !m.text().unwrap_or("").trim().is_empty())
-        .unwrap_or(false);
-    let has_media = req.msg.as_ref().map(|m| m.has_content()).unwrap_or(false);
-    if !has_text && !has_media {
-        return Json(SendMessageResponse::default());
-    }
 
     // Fire-and-forget: record assistant reply to history (only non-empty, non-partial messages).
     let is_partial = req
@@ -511,8 +554,12 @@ pub async fn sendmessage(
             let store = state.store.clone();
             let (vctx4, vtoken4, peer4) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
             let sem = state.persist_sem.clone();
+            let metrics = Arc::clone(&state.metrics);
             tokio::spawn(async move {
                 let Ok(_permit) = sem.try_acquire() else {
+                    metrics
+                        .messages_persist_dropped
+                        .fetch_add(1, Ordering::Relaxed);
                     return;
                 };
                 if let Err(e) = store
@@ -536,7 +583,17 @@ pub async fn sendmessage(
         req.base_info = Some(BaseInfo::default());
     }
 
-    match state.ilink.upstream.send_message(req).await {
+    // Histogram the *upstream* round-trip only — the Hub-internal work
+    // (context translation, footer append, HubExt) is excluded by placing
+    // the guard at the call site, not the handler entry.
+    let upstream_start = std::time::Instant::now();
+    let result = state.ilink.upstream.send_message(req).await;
+    state
+        .metrics
+        .sendmessage_upstream_latency_ms
+        .observe(upstream_start.elapsed().as_millis() as u64);
+
+    match result {
         Ok(resp) => Json(resp),
         Err(e) => Json(SendMessageResponse::err(
             500,
@@ -662,16 +719,9 @@ pub async fn getuploadurl(
 // ─── Admin: list clients ──────────────────────────────────────────────────────
 
 pub async fn admin_clients(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !check_admin_auth(&headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        );
-    }
-
     let registry = state.clients.registry.read().await;
     let clients: Vec<_> = registry
         .all_clients()
@@ -731,7 +781,7 @@ pub async fn admin_delete_client(
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminDeleteClientQuery>,
 ) -> (StatusCode, Json<AdminDeleteClientResponse>) {
-    if !check_admin_auth(&headers) {
+    if !check_admin_auth(&state.admin, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(AdminDeleteClientResponse {
@@ -802,7 +852,7 @@ pub async fn admin_update_client(
     axum::extract::Path(old_name): axum::extract::Path<String>,
     Json(req): Json<AdminUpdateClientRequest>,
 ) -> (StatusCode, Json<AdminClientMutationResponse>) {
-    if !check_admin_auth(&headers) {
+    if !check_admin_auth(&state.admin, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(AdminClientMutationResponse {
@@ -894,7 +944,7 @@ pub async fn admin_ilink_status(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
 ) -> (StatusCode, Json<IlinkStatusResponse>) {
-    if !check_admin_auth(&headers) {
+    if !check_admin_auth(&state.admin, &headers) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(IlinkStatusResponse {
@@ -904,25 +954,14 @@ pub async fn admin_ilink_status(
         );
     }
     let code = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let status = match code {
-        crate::hub::ilink_status::CONNECTED => "connected",
-        crate::hub::ilink_status::NEEDS_LOGIN => "needs_login",
-        crate::hub::ilink_status::LOGGING_IN => "logging_in",
-        _ => "unknown",
-    };
+    let status = crate::hub::ilink_status::as_str(code);
     (StatusCode::OK, Json(IlinkStatusResponse { status, code }))
 }
 
 pub async fn admin_ilink_relogin(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !check_admin_auth(&headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        );
-    }
     let _ = state.ilink.relogin_tx.send(());
     (StatusCode::OK, Json(serde_json::json!({"ok": true})))
 }
@@ -933,15 +972,9 @@ pub async fn admin_ilink_relogin(
 /// never has to travel in a URL. The browser redeems the returned ticket via
 /// `GET /hub/ilink/qr-stream?ticket=<ticket>`.
 pub async fn admin_ilink_qr_stream_ticket(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !check_admin_auth(&headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "Unauthorized"})),
-        );
-    }
     let ticket = state.ilink.qr_ticket.issue();
     (
         StatusCode::OK,
@@ -966,7 +999,7 @@ pub async fn admin_ilink_qr_stream(
     // expires in seconds and is consumed on first use, so leaking it via proxy
     // logs / history is harmless — unlike the raw admin token. Non-browser
     // callers can still authenticate directly with a Bearer header.
-    let authed = check_admin_auth(&headers)
+    let authed = check_admin_auth(&state.admin, &headers)
         || params
             .get("ticket")
             .is_some_and(|t| state.ilink.qr_ticket.consume(t));
@@ -974,7 +1007,14 @@ pub async fn admin_ilink_qr_stream(
         return Err(StatusCode::UNAUTHORIZED);
     }
     // Grab the cached Ready event before subscribing, so we don't miss it.
-    let cached = state.ilink.qr_last_ready.lock().await.clone();
+    // The mutex is synchronous (`std::sync::Mutex`) and the critical section
+    // is just an `Option::clone`, so we never hold it across an `.await`.
+    let cached = state
+        .ilink
+        .qr_last_ready
+        .lock()
+        .ok()
+        .and_then(|g| g.clone());
     let rx = state.ilink.qr_tx.subscribe();
 
     let s = stream::unfold((cached, rx), |(cached, mut rx)| async move {
@@ -1008,7 +1048,7 @@ pub async fn metrics(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
 ) -> (StatusCode, String) {
-    if !check_admin_auth(&headers) {
+    if !check_admin_auth(&state.admin, &headers) {
         return (StatusCode::UNAUTHORIZED, "Unauthorized".into());
     }
 
@@ -1031,6 +1071,10 @@ pub async fn metrics(
 
     let messages_dispatched = state.metrics.messages_dispatched.load(Ordering::Relaxed);
     let messages_dropped = state.metrics.messages_dropped.load(Ordering::Relaxed);
+    let messages_persist_dropped = state
+        .metrics
+        .messages_persist_dropped
+        .load(Ordering::Relaxed);
     let upstream_user_messages = state.metrics.upstream_user_messages.load(Ordering::Relaxed);
     let sendmessage_total = state.metrics.sendmessage_total.load(Ordering::Relaxed);
     let sendmessage_errors = state.metrics.sendmessage_errors.load(Ordering::Relaxed);
@@ -1038,9 +1082,9 @@ pub async fn metrics(
     let upstream_polls_err = state.ilink.upstream.polls_err();
     let relogin_attempts = state.ilink.upstream.relogin_attempts();
     let ilink_status = state.ilink.ilink_status.load(Ordering::Relaxed);
-    let dispatcher_lagged = state.metrics.dispatcher_lagged.load(Ordering::Relaxed);
+    let created = state.metrics.process_start_unix_secs;
 
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
 
     out.push_str("# HELP ilink_hub_clients_online Number of online clients\n");
     out.push_str("# TYPE ilink_hub_clients_online gauge\n");
@@ -1050,40 +1094,48 @@ pub async fn metrics(
     out.push_str("# TYPE ilink_hub_clients_total gauge\n");
     out.push_str(&format!("ilink_hub_clients_total {}\n", total));
 
-    out.push_str("# HELP ilink_hub_messages_dispatched_total Messages dispatched\n");
-    out.push_str("# TYPE ilink_hub_messages_dispatched_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dispatched_total {}\n",
-        messages_dispatched
-    ));
-
-    out.push_str("# HELP ilink_hub_messages_dropped_total Messages dropped\n");
-    out.push_str("# TYPE ilink_hub_messages_dropped_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_messages_dropped_total {}\n",
-        messages_dropped
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_user_messages_total User-side messages received from upstream (excl. bot echo copies)\n");
-    out.push_str("# TYPE ilink_hub_upstream_user_messages_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_user_messages_total {}\n",
-        upstream_user_messages
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_polls_ok_total Successful upstream polls\n");
-    out.push_str("# TYPE ilink_hub_upstream_polls_ok_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_ok_total {}\n",
-        upstream_polls_ok
-    ));
-
-    out.push_str("# HELP ilink_hub_upstream_polls_err_total Failed upstream polls\n");
-    out.push_str("# TYPE ilink_hub_upstream_polls_err_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_upstream_polls_err_total {}\n",
-        upstream_polls_err
-    ));
+    render_counter(
+        &mut out,
+        "ilink_hub_messages_dispatched_total",
+        "Messages dispatched",
+        messages_dispatched,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_messages_dropped_total",
+        "Messages dropped",
+        messages_dropped,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_messages_persist_dropped_total",
+        "Message history persist tasks dropped due to semaphore exhaustion (DB too slow)",
+        messages_persist_dropped,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_upstream_user_messages_total",
+        "User-side messages received from upstream (excl. bot echo copies)",
+        upstream_user_messages,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_upstream_polls_ok_total",
+        "Successful upstream polls",
+        upstream_polls_ok,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_upstream_polls_err_total",
+        "Failed upstream polls",
+        upstream_polls_err,
+        created,
+    );
 
     out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
     out.push_str("# TYPE ilink_hub_queue_size gauge\n");
@@ -1098,41 +1150,113 @@ pub async fn metrics(
         ));
     }
 
-    out.push_str(
-        "# HELP ilink_hub_sendmessage_total Total sendmessage calls from backend clients\n",
+    render_counter(
+        &mut out,
+        "ilink_hub_sendmessage_total",
+        "Total sendmessage calls from backend clients",
+        sendmessage_total,
+        created,
     );
-    out.push_str("# TYPE ilink_hub_sendmessage_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_sendmessage_total {}\n",
-        sendmessage_total
-    ));
-
-    out.push_str("# HELP ilink_hub_sendmessage_errors_total sendmessage calls rejected (unknown token, missing context, etc.)\n");
-    out.push_str("# TYPE ilink_hub_sendmessage_errors_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_sendmessage_errors_total {}\n",
-        sendmessage_errors
-    ));
-
-    out.push_str("# HELP ilink_hub_dispatcher_lagged_total Number of messages missed because the dispatcher lagged behind the broadcast channel\n");
-    out.push_str("# TYPE ilink_hub_dispatcher_lagged_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_dispatcher_lagged_total {}\n",
-        dispatcher_lagged
-    ));
-
-    out.push_str("# HELP ilink_hub_relogin_attempts_total Number of QR re-login attempts (manual or automatic)\n");
-    out.push_str("# TYPE ilink_hub_relogin_attempts_total counter\n");
-    out.push_str(&format!(
-        "ilink_hub_relogin_attempts_total {}\n",
-        relogin_attempts
-    ));
+    render_counter(
+        &mut out,
+        "ilink_hub_sendmessage_errors_total",
+        "sendmessage calls rejected (unknown token, missing context, etc.)",
+        sendmessage_errors,
+        created,
+    );
+    render_counter(
+        &mut out,
+        "ilink_hub_relogin_attempts_total",
+        "Number of QR re-login attempts (manual or automatic)",
+        relogin_attempts,
+        created,
+    );
 
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
 
+    // Histograms. We render them in Prometheus text format (cumulative
+    // bucket counts, plus `_count`, `_sum`, and `_created` siblings). The bucket layout
+    // is defined in [`crate::hub::HISTOGRAM_BUCKETS_MS`].
+    render_histogram(
+        &mut out,
+        "ilink_hub_getupdates_latency_ms",
+        "Latency of getupdates long-polls (handler entry to drain), in milliseconds",
+        &state.metrics.getupdates_latency_ms,
+        created,
+    );
+    render_histogram(
+        &mut out,
+        "ilink_hub_sendmessage_upstream_latency_ms",
+        "Latency of upstream sendmessage HTTP round-trip, in milliseconds",
+        &state.metrics.sendmessage_upstream_latency_ms,
+        created,
+    );
+    render_histogram(
+        &mut out,
+        "ilink_hub_dispatch_latency_ms",
+        "Latency of inbound dispatch pipeline (synchronous portion), in milliseconds",
+        &state.metrics.dispatch_latency_ms,
+        created,
+    );
+
     (StatusCode::OK, out)
+}
+
+/// RAII guard that records a latency observation when dropped. Use at
+/// the entry of a hot-path handler so every return path (including
+/// early-return 4xx/5xx) is observed. The drop handler is `#[inline]`
+/// and lock-free, so the per-request cost is a single `Instant::elapsed`
+/// + the histogram's 8-bucket linear scan.
+// Alias for readability at call sites; the shared impl lives in hub::LatencyGuard.
+type HistoGuard<'a> = crate::hub::LatencyGuard<'a>;
+
+/// Render a single `LatencyHistogram` as a Prometheus text-format block.
+/// Emits:
+/// - `<name>_bucket{le="N"} <cumulative_count>` for each boundary + `+Inf`
+/// - `<name>_count` total observations
+/// - `<name>_sum` total observed milliseconds
+/// - `<name>_created` process start timestamp (OpenMetrics convention)
+fn render_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    h: &crate::hub::LatencyHistogram,
+    created: f64,
+) {
+    use crate::hub::HISTOGRAM_BUCKETS_MS;
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
+    let mut cumulative: u64 = 0;
+    for (i, boundary) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
+        let count = h.buckets[i].load(Ordering::Relaxed);
+        cumulative = cumulative.saturating_add(count);
+        out.push_str(&format!(
+            "{name}_bucket{{le=\"{boundary}\"}} {cumulative}\n"
+        ));
+    }
+    let overflow = h.buckets[HISTOGRAM_BUCKETS_MS.len()].load(Ordering::Relaxed);
+    cumulative = cumulative.saturating_add(overflow);
+    out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
+    let total = h.count.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_count {total}\n"));
+    let sum = h.sum_ms.load(Ordering::Relaxed);
+    out.push_str(&format!("{name}_sum {sum}\n"));
+    out.push_str(&format!("{name}_created {created}\n"));
+}
+
+/// Render a single counter metric in Prometheus text format, including the mandatory
+/// `_created` timestamp so scrape tools can compute per-second rates correctly after
+/// a process restart (OpenMetrics / Prometheus 2.x `_created` convention).
+// `name` must already include the `_total` suffix (Prometheus counter naming convention).
+// The `# HELP` and `# TYPE` lines use the base name without `_total` per the spec.
+fn render_counter(out: &mut String, name: &str, help: &str, value: u64, created: f64) {
+    let base = name.strip_suffix("_total").unwrap_or(name);
+    out.push_str(&format!("# HELP {base} {help}\n"));
+    out.push_str(&format!("# TYPE {base} counter\n"));
+    out.push_str(&format!("{name} {value}\n"));
+    out.push_str(&format!("{base}_created {created}\n"));
 }
 
 /// Wait for a queue notification or hub shutdown, whichever comes first.
@@ -1215,19 +1339,89 @@ mod shutdown_poll_tests {
 #[cfg(test)]
 mod admin_auth_tests {
     use super::*;
+    use crate::hub::AdminConfig;
     use axum::http::HeaderMap;
 
     #[tokio::test]
     async fn test_check_admin_auth_wrong_token() {
+        let admin = AdminConfig {
+            token: Some("correct-token".to_string()),
+            insecure_no_auth: false,
+            outbound_origin_label: None,
+        };
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer wrong-token-here".parse().unwrap());
-        assert!(!check_admin_auth(&headers));
+        assert!(!check_admin_auth(&admin, &headers));
     }
 
     #[tokio::test]
-    async fn test_check_admin_auth_empty_headers() {
+    async fn test_check_admin_auth_correct_token() {
+        let admin = AdminConfig {
+            token: Some("correct-token".to_string()),
+            insecure_no_auth: false,
+            outbound_origin_label: None,
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer correct-token".parse().unwrap());
+        assert!(check_admin_auth(&admin, &headers));
+    }
+
+    #[tokio::test]
+    async fn test_check_admin_auth_empty_headers_no_token_no_insecure() {
+        let admin = AdminConfig {
+            token: None,
+            insecure_no_auth: false,
+            outbound_origin_label: None,
+        };
         let headers = HeaderMap::new();
-        let is_insecure = insecure_no_auth();
-        assert_eq!(check_admin_auth(&headers), is_insecure);
+        assert!(!check_admin_auth(&admin, &headers));
+    }
+
+    #[tokio::test]
+    async fn test_check_admin_auth_empty_headers_insecure_mode() {
+        let admin = AdminConfig {
+            token: None,
+            insecure_no_auth: true,
+            outbound_origin_label: None,
+        };
+        let headers = HeaderMap::new();
+        assert!(check_admin_auth(&admin, &headers));
+    }
+
+    #[test]
+    fn test_is_valid_vtoken_accepts_well_formed() {
+        // Real UUID v4 simple form, 32 lowercase hex chars.
+        assert!(is_valid_vtoken("vhub_0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn test_is_valid_vtoken_rejects_ilink_style() {
+        // SEC-003 hardening: iLink-style bot tokens must never reach the
+        // vtoken lookup path.
+        assert!(!is_valid_vtoken("botid@im.bot:secret"));
+        assert!(!is_valid_vtoken(""));
+    }
+
+    #[test]
+    fn test_is_valid_vtoken_rejects_wrong_length_and_case() {
+        assert!(!is_valid_vtoken("vhub_short"));
+        assert!(!is_valid_vtoken("vhub_0123456789ABCDEF0123456789ABCDEF")); // uppercase
+        assert!(!is_valid_vtoken("vhub_0123456789abcdef0123456789abcde")); // 31 hex
+        assert!(!is_valid_vtoken("vhub_0123456789abcdef0123456789abcdef0")); // 33 hex
+    }
+
+    #[test]
+    fn test_is_valid_vtoken_rejects_non_hex_suffix() {
+        assert!(!is_valid_vtoken("vhub_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+    }
+
+    #[test]
+    fn test_extract_vtoken_filters_invalid_format() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer botid@im.bot:secret".parse().unwrap(),
+        );
+        assert!(extract_vtoken(&headers).is_none());
     }
 }

@@ -18,7 +18,7 @@ pub use connection::{
     default_auto_client_name, default_local_credential_path, hub_response_token_rejected,
     resolve_hub_connection, validate_hub_token,
 };
-pub use dispatcher::{run_bridge, BridgeStop};
+pub use dispatcher::{run_bridge, run_bridge_with_shutdown, BridgeStop};
 pub use executor::MAX_CLI_CAPTURE_BYTES;
 pub use paths::resolve_bridge_executable;
 pub use probe::{

@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### 架构评审修复（2026-06-21）
+
+**修复**
+
+- **executor.rs OOM 截断**：`MAX_CLI_CAPTURE_BYTES` 触发后真正硬截断已读 buffer（之前只 warn，line 仍被 read_line 读入丢弃但未切断流；现在超限后该 line 也被截断到剩余配额，所有后续 line 跳过），避免恶意/异常 CLI 持续输出大流。
+- **vtoken schema 校验（SEC-003 增强）**：`extract_vtoken` 在 `Bearer` 解析后加 `^vhub_[a-f0-9]{32}$` schema 过滤。恶意/错误配置客户端注入 iLink 风格 token（`botid@im.bot:secret`）会被立即拒绝。
+- **清理 zombie metric `ilink_hub_dispatcher_lagged_total`**：该指标自 broadcast→mpsc 迁移后永远为 0，保留会污染 dashboard 速率计算。已在 0.2.5 之前发布周期内移除；任何基于该指标的告警需迁移至 `ilink_hub_dispatch_latency_ms` histogram（覆盖完整 dispatch 延迟）。
+- **`apply_placeholders` shell 注入加固**：`{{MESSAGE}}` / `{{SESSION_ID}}` / `{{SESSION_NAME}}` 在注入到 argv / cwd / env 之前会拒绝 NUL / `\n` / `\r` 字节。微信用户消息含换行/控制字符时直接失败并返回清晰错误，避免 `bash -c "$1"` 类包装的 argv breakout。
+- **main.rs Ctrl+C / SIGTERM 处理不再 panic**：`shutdown_on_signal` 改 `Result` 传递，handler 安装失败时记 warn 而非直接 abort。
+- **`unsafe libc::kill` 加 SAFETY 注释**：明确 PID 来自自管的 `tokio::process::Child`、`ESRCH` 是期望路径、kernel 不跨进程 reuse 短窗口。
+
+**性能**
+
+- **Broadcast 路径 `Arc<WeixinMessage>` 共享**：`MessageQueue` 新增 `push_shared(vtoken, Arc<base>, context_token, hub_ext)`，broadcast 路径 N 个在线后端时只对 base 做一次 Arc clone（N 个 vtoken 各自只 clone 共享的 `item_list` Arc 引用 + cheap owned `vctx` string），不再做 N 次完整 `WeixinMessage::clone`。新增单元测试 `test_push_shared_does_not_clone_heavy_payload` 用 `Arc::strong_count` 守住实现。
+- **`qr_last_ready` 改同步 `std::sync::Mutex`**：值是 `Option<Event>`，SSE handler 取出后立即 clone 出 owned，不再需要 `tokio::Mutex::lock().await` 的调度开销。
+
+**可观测性 / 安全文档**
+
+- **`docs/deployment/security.md` 新增「危险配置：绝对禁止的组合」章节**：列出 `ILINK_ADMIN_INSECURE_NO_AUTH=1` + 公网监听、未设 `ILINK_ADMIN_TOKEN`、Hub 直连公网、bash -c wrapper 等生产灾难组合，并提供 4 步 staging 验证清单（含本次新增 vtoken schema 校验和 placeholder 加固的回归测试点）。
+- **`HubState` 锁顺序约定文档**：在 `src/hub/mod.rs` 顶部 doc 写明 `router → quote_index → registry` 严格顺序，并新增 `with_router_and_registry` facade 方法让多锁组合只在受控位置出现。
+
+**测试**
+
+- **新增 3 个 queue 集成测试**：`test_broadcast_path_full_queue_drops_oldest_not_newest`、`test_push_shared_does_not_clone_heavy_payload`（`Arc::strong_count` 守住实现）、`test_concurrent_pushes_preserve_message_count`（8 × 50 并发 push 不丢消息）。
+- **新增 5 个 vtoken schema 校验单测**：`is_valid_vtoken` 的接受/拒绝边界（32 hex / ilink 风格 / 大小写 / 长度 / 非法字符）。
+- **新增 4 个 placeholder 加固单测**：NUL / LF / CR 注入路径全部返回 `PlaceholderError::UnsafeValue`。
+
+**Defer / 下次 PR**
+
+- 拆分 `bridge/manager.rs` (1367 行) → `manager/{types,discovery,process,signal}.rs` — 工作量大，需要独立 worktree + PR review
+- 拆分 `bridge/builtin/claude_code.rs` (1141 行) — 涉及 SDK 协议 + 流式解析
+- 拆分 `server/routes.rs` (1302 行) → `routes/{ilink,hub,admin,metrics}.rs`
+- 拆分 `store/store_tests.rs` (2140 行) → 各模块 `_tests.rs`
+- 错误类型统一（HubError vs anyhow）
+
+### Bridge — claude_code 多模态（图片 + PDF/文本文件）支持
+
 ### Bridge — claude_code 多模态（图片 + PDF/文本文件）支持
 
 **新增**
@@ -16,7 +53,7 @@ All notable changes to this project will be documented in this file.
 
 - **视频不支持**：Anthropic Messages API 没有 `video` content block，整个 ilink-hub 在用户→AI 这一步都不可能支持视频输入。微信收到的视频会落到「无法路由」日志里，bridge 不会尝试下载或转发。
 - **非 PDF / 非纯文本文件不支持**：`document` 块只接受 `application/pdf` 和 `text/plain`。其他类型（CSV / Excel / Word / 压缩包 / 可执行文件等）需要走 Anthropic Files API 流程，超出 stream-json 协议范围。
-- **CLI 协议层行为未实测**：`SDKUserMessage.content` 接受 `document` 块是 Anthropic SDK 的协议规定，fake-cc 的 TS SDK 内部也使用，但 Claude Code CLI 的 `--input-format stream-json` 模式对 `document` 块的具体行为未在生产实测。如有问题会回退到「下载到本地、告诉 Claude 文件路径、用 Read 工具读」的备选方案。
+- **CLI 实测通过（2026-06-18）**：本地 Claude Code CLI `2.1.177` + 模型 `MiniMax-M3` 上用 `--input-format stream-json --output-format stream-json --verbose --model MiniMax-M3` 跑通：128×128 PNG image block 正确识别图片为 grayscale，612 字节测试 PDF document block 正确读出文本内容，session 续接 / 流式 partial 输出 / `ILINK_SESSION` 行均按预期工作。注：极小（67 字节 1×1 透明 PNG）的图会被 API 路径拒绝（`400 invalid params (2013)`），属于 API 侧对图片最小尺寸的隐含要求，不是协议问题——实际微信图片通常远大于此。
 
 **参考**：协议细节见 `fake-cc` 项目 `src/server/directConnectManager.ts:130` 和 `src/utils/teleport/api.ts:376`。
 

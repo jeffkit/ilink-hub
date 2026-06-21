@@ -7,6 +7,17 @@
 
 pub const NO_BACKEND: &str = "❌ 当前未路由到任何后端，请先用 `/use <名称>` 切换到一个后端。";
 
+pub const NO_BACKEND_ONLINE: &str = "你好！我是 iLink Hub 消息路由服务。\n\
+     \n\
+     当前暂无 AI 助手后端在线，您的消息暂时无法被处理。\n\
+     \n\
+     您可以：\n\
+     • 发送 /status 查看服务状态\n\
+     • 发送 /list   查看已注册的后端\n\
+     • 发送 /help   查看完整帮助\n\
+     \n\
+     如需接入 AI 助手，请联系管理员配置后端服务。";
+
 pub const UNRECOGNIZED_COMMAND: &str = "未识别的指令。发送 /help 查看可用指令。";
 
 // ─── /session list ────────────────────────────────────────────────────────────

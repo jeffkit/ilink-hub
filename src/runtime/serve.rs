@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::hub::{
-    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, HubState, InMemoryQueue,
-    MessageQueue,
+    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, AdminConfig, HubState,
+    InMemoryQueue, MessageQueue,
 };
 use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
@@ -28,14 +28,19 @@ use crate::store::Store;
 /// surfaces immediately at launch rather than silently using a wrong default at runtime.
 #[derive(Debug)]
 pub struct RuntimeConfig {
-    /// Capacity of the broadcast channel between the upstream polling loop and the
-    /// dispatcher task. Overflow causes silent message drops. Default: 1024.
+    /// Capacity of the mpsc channel between the upstream polling loop and the
+    /// dispatcher task. When full, the polling loop blocks (backpressure) rather
+    /// than dropping messages. Default: 1024.
     pub dispatch_channel_size: usize,
     /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
     pub shutdown_drain_secs: u64,
-    /// Whether admin auth is deliberately disabled via ILINK_ADMIN_INSECURE_NO_AUTH.
-    /// Stored here so run_serve can emit a startup-time warning with the actual bind address.
-    pub insecure_no_auth: bool,
+    /// Admin auth config — parsed once here so it can be injected into HubState
+    /// and used by routes without re-reading env vars at request time.
+    pub admin: AdminConfig,
+    /// Hub-wide cap on concurrent `getupdates` long-polls. Defaults to
+    /// [`crate::hub::state::MAX_HUB_POLLS_DEFAULT`] (8192). Operators can
+    /// raise this via `ILINK_MAX_HUB_POLLS`.
+    pub max_hub_polls: usize,
 }
 
 impl RuntimeConfig {
@@ -45,20 +50,23 @@ impl RuntimeConfig {
             anyhow::bail!("ILINK_DISPATCH_CHANNEL_SIZE must be > 0");
         }
 
-        let shutdown_drain_secs = parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
+        let shutdown_drain_secs =
+            parse_env_u64("ILINK_SHUTDOWN_DRAIN_SECS", DEFAULT_SHUTDOWN_DRAIN_SECS)?;
 
-        let insecure_no_auth = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let max_hub_polls =
+            parse_env_usize("ILINK_MAX_HUB_POLLS", crate::hub::MAX_HUB_POLLS_DEFAULT)?;
+        if max_hub_polls == 0 {
+            anyhow::bail!("ILINK_MAX_HUB_POLLS must be > 0");
+        }
 
-        // Validate that admin security is not silently disabled.
-        let admin_token_set = std::env::var("ILINK_ADMIN_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
+        let admin = AdminConfig::from_env();
 
-        if insecure_no_auth && admin_token_set {
+        if admin.insecure_no_auth
+            && std::env::var("ILINK_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+        {
             // ILINK_ADMIN_TOKEN takes precedence; the insecure flag is redundant but harmless.
             tracing::warn!(
                 "Both ILINK_ADMIN_TOKEN and ILINK_ADMIN_INSECURE_NO_AUTH are set. \
@@ -69,21 +77,23 @@ impl RuntimeConfig {
         Ok(Self {
             dispatch_channel_size,
             shutdown_drain_secs,
-            insecure_no_auth,
+            admin,
+            max_hub_polls,
         })
     }
 
     /// Emit a startup warning if admin auth is disabled, scaled to the actual risk level.
     /// Called after the listen address is known so the message can be actionable.
     pub fn warn_if_insecure(&self, bind_addr: &str) {
-        if !self.insecure_no_auth {
+        if !self.admin.insecure_no_auth {
             return;
         }
         let is_public = bind_addr.starts_with("0.0.0.0");
         if is_public {
             tracing::error!(
                 addr = %bind_addr,
-                "⚠️  SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
+                is_public = true,
+                "SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
                  0.0.0.0 (all interfaces). Admin endpoints are accessible with NO authentication. \
                  Set ILINK_ADMIN_TOKEN or restrict the listen address to 127.0.0.1."
             );
@@ -101,9 +111,10 @@ fn parse_env_usize(name: &str, default: usize) -> Result<usize> {
     match std::env::var(name) {
         Err(_) => Ok(default),
         Ok(v) if v.trim().is_empty() => Ok(default),
-        Ok(v) => v.trim().parse::<usize>().map_err(|_| {
-            anyhow::anyhow!("{name}={v:?} is not a valid positive integer")
-        }),
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid positive integer")),
     }
 }
 
@@ -111,9 +122,10 @@ fn parse_env_u64(name: &str, default: u64) -> Result<u64> {
     match std::env::var(name) {
         Err(_) => Ok(default),
         Ok(v) if v.trim().is_empty() => Ok(default),
-        Ok(v) => v.trim().parse::<u64>().map_err(|_| {
-            anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")
-        }),
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")),
     }
 }
 
@@ -168,6 +180,44 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     info!(%addr, %database_url, "iLink Hub starting");
 
+    // Bind the listen socket FIRST — before token resolution / QR login,
+    // store connection, or any background WeChat polling. An invalid listen
+    // address (e.g. derived from a domain WEIXIN_BASE_URL) must fail fast
+    // with a friendly EADDRNOTAVAIL hint deterministically, instead of
+    // surfacing an unrelated "QR code expired" login error that happens to
+    // win the race on a fresh environment.
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                let is_from_env = std::env::var("WEIXIN_BASE_URL")
+                    .ok()
+                    .and_then(|val| extract_host_port(&val))
+                    .map(|parsed| parsed == addr)
+                    .unwrap_or(false);
+                if is_from_env {
+                    eprintln!(
+                        "❌ Failed to bind to address '{}' (EADDRNOTAVAIL).\n\
+                         This listen address was derived from WEIXIN_BASE_URL which contains a domain/external URL.\n\
+                         To fix this, please specify a local address to listen on, for example:\n\
+                         --addr 127.0.0.1:8765 or --addr 0.0.0.0:8765",
+                        addr
+                    );
+                }
+            }
+            return Err(e.into());
+        }
+    };
+    let local_display = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| addr.clone());
+    if let Some(tx) = on_listening {
+        let _ = tx.send(local_display);
+    }
+    info!(%addr, "iLink Hub listening");
+    runtime_cfg.warn_if_insecure(&addr);
+
     let store = Arc::new(Store::connect(&database_url).await?);
 
     let (token, base_url) = resolve_token(
@@ -180,11 +230,30 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
     let queue = build_queue_backend()?;
+    // Load or persist the relay secret BEFORE building HubState. I/O is
+    // small (one 32-char file) and synchronous std::fs is acceptable on the
+    // startup path; spawning a blocking task for a single file read is more
+    // ceremony than it's worth.
+    let relay_secret = crate::paths::load_or_create_relay_secret();
     let state = HubState::new(
         upstream.clone() as Arc<dyn crate::ilink::UpstreamSink>,
         store.clone(),
         queue,
         shutdown_rx.clone(),
+        relay_secret,
+        runtime_cfg.admin.clone(),
+    );
+    // Apply operator-tuned Hub-wide poll cap. ClientState::new defaults this to
+    // MAX_HUB_POLLS_DEFAULT; we override only if the operator set a custom value.
+    if runtime_cfg.max_hub_polls != crate::hub::MAX_HUB_POLLS_DEFAULT {
+        state
+            .clients
+            .poll_tracker
+            .set_hub_cap(runtime_cfg.max_hub_polls);
+    }
+    info!(
+        max_hub_polls = runtime_cfg.max_hub_polls,
+        "hub poll cap installed"
     );
 
     if let Some(tx) = on_hub_state {
@@ -193,7 +262,8 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    let (tx, rx) = broadcast::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
+    let (tx, rx) =
+        mpsc::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
@@ -245,37 +315,6 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let state_for_drain = Arc::clone(&state);
     let router = build_router(state);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                let is_from_env = std::env::var("WEIXIN_BASE_URL")
-                    .ok()
-                    .and_then(|val| extract_host_port(&val))
-                    .map(|parsed| parsed == addr)
-                    .unwrap_or(false);
-                if is_from_env {
-                    eprintln!(
-                        "❌ Failed to bind to address '{}' (EADDRNOTAVAIL).\n\
-                         This listen address was derived from WEIXIN_BASE_URL which contains a domain/external URL.\n\
-                         To fix this, please specify a local address to listen on, for example:\n\
-                         --addr 127.0.0.1:8765 or --addr 0.0.0.0:8765",
-                        addr
-                    );
-                }
-            }
-            return Err(e.into());
-        }
-    };
-    let local_display = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| addr.clone());
-    if let Some(tx) = on_listening {
-        let _ = tx.send(local_display);
-    }
-    info!(%addr, "iLink Hub listening");
-    runtime_cfg.warn_if_insecure(&addr);
 
     axum::serve(
         listener,
@@ -527,16 +566,24 @@ mod tests {
         std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
     }
 
-    #[tokio::test]
-    async fn test_build_queue_backend_max_size_clamp() {
-        // Custom valid value: 15
+    // Each clamp variant is its own test so env-var mutation never crosses an
+    // `.await` point while ENV_LOCK is held. make_queue_for() acquires and
+    // releases the lock *before* returning, so the queue is safe to .await.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_custom_value() {
         let q = make_queue_for("15");
         for i in 0..15 {
-            let msg = WeixinMessage {
-                message_id: Some(i),
-                ..Default::default()
-            };
-            let dropped = q.push("vtoken", msg).await.unwrap();
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(!dropped);
         }
         let dropped = q
@@ -553,8 +600,12 @@ mod tests {
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 15);
         assert_eq!(drained[0].message_id, Some(1));
+        clear_env();
+    }
 
-        // Lower bound clamping: 5 -> clamped to 10
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_lower_bound() {
+        // 5 -> clamped to MIN (10)
         let q = make_queue_for("5");
         for i in 0..10 {
             let dropped = q
@@ -582,8 +633,12 @@ mod tests {
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 10);
+        clear_env();
+    }
 
-        // Upper bound clamping: 20000 -> clamped to 10000
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_upper_bound() {
+        // 20000 -> clamped to MAX (10000)
         let q = make_queue_for("20000");
         for i in 0..10_000 {
             let dropped = q
@@ -609,7 +664,6 @@ mod tests {
             .await
             .unwrap();
         assert!(dropped);
-
         clear_env();
     }
 
@@ -834,7 +888,14 @@ mod drain_tests {
         let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        HubState::new(upstream, store, queue, rx)
+        HubState::new(
+            upstream,
+            store,
+            queue,
+            rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
     }
 
     #[tokio::test]
@@ -899,15 +960,5 @@ mod drain_tests {
 }
 
 fn extract_host_port(s: &str) -> Option<String> {
-    let s = s.trim();
-    if let Ok(url) = reqwest::Url::parse(s) {
-        if let Some(host) = url.host_str() {
-            let port = url.port().unwrap_or(8765);
-            return Some(format!("{}:{}", host, port));
-        }
-    }
-    if s.contains(':') {
-        return Some(s.to_string());
-    }
-    None
+    crate::paths::parse_host_port(s)
 }

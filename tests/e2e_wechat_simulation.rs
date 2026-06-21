@@ -46,9 +46,12 @@ use ilink_hub::ilink::types::{
 };
 use ilink_hub::ilink::UpstreamSink;
 use ilink_hub::store::Store;
-use ilink_hub::{hub::HubState, server, InMemoryQueue};
+use ilink_hub::{
+    hub::{AdminConfig, HubState},
+    server, InMemoryQueue,
+};
 use serde_json::json;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{mpsc, Mutex};
 
 // ─── MockUpstream ────────────────────────────────────────────────────────────
 
@@ -116,7 +119,7 @@ struct Harness {
     base_url: String,
     state: Arc<HubState>,
     mock: Arc<MockUpstream>,
-    _dispatch_tx: broadcast::Sender<WeixinMessage>,
+    _dispatch_tx: mpsc::Sender<WeixinMessage>,
     /// Held so the watch::channel is never closed for the lifetime of the
     /// harness. Closing the sender would let `wait_shutdown_signal` resolve
     /// immediately and short-circuit every long-poll before its timer fires.
@@ -138,6 +141,8 @@ async fn boot() -> Harness {
         store,
         queue,
         shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     );
 
     let router = server::build_router(state.clone());
@@ -148,12 +153,17 @@ async fn boot() -> Harness {
     let base_url = format!("http://{addr}");
 
     let dispatch_channel_size: usize = 64;
-    let (tx, rx) = broadcast::channel::<WeixinMessage>(dispatch_channel_size);
+    let (tx, rx) = mpsc::channel::<WeixinMessage>(dispatch_channel_size);
     ilink_hub::hub::spawn_dispatcher(state.clone(), rx);
 
     let state_for_server = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("axum serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
         drop(state_for_server);
     });
 
@@ -185,6 +195,8 @@ async fn boot_without_default() -> Harness {
         store,
         queue,
         shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     );
 
     // Override the default route to None — HubState::new starts with None,
@@ -199,12 +211,17 @@ async fn boot_without_default() -> Harness {
     let base_url = format!("http://{addr}");
 
     let dispatch_channel_size: usize = 64;
-    let (tx, rx) = broadcast::channel::<WeixinMessage>(dispatch_channel_size);
+    let (tx, rx) = mpsc::channel::<WeixinMessage>(dispatch_channel_size);
     ilink_hub::hub::spawn_dispatcher(state.clone(), rx);
 
     let state_for_server = state.clone();
     tokio::spawn(async move {
-        axum::serve(listener, router).await.expect("axum serve");
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
         drop(state_for_server);
     });
 
@@ -363,7 +380,7 @@ async fn user_message_flows_through_dispatcher_to_bridge_and_reply_reaches_upstr
     //    path `UpstreamClient::run_polling_loop` would use in production.
     let real_ctx = "real-ctx-golden-001";
     let user_msg = user_text_msg("alice@wechat", real_ctx, "hello");
-    h._dispatch_tx.send(user_msg).unwrap();
+    h._dispatch_tx.try_send(user_msg).unwrap();
 
     // 2) The bridge (simulated by this test) long-polls and picks up the
     //    message. The dispatcher rewrites context_token to a vctx — the
@@ -412,7 +429,7 @@ async fn no_backend_online_triggers_fallback_reply_to_user() {
     let real_ctx = "real-ctx-fallback-001";
 
     h._dispatch_tx
-        .send(user_text_msg("bob@wechat", real_ctx, "anyone home?"))
+        .try_send(user_text_msg("bob@wechat", real_ctx, "anyone home?"))
         .unwrap();
 
     // Wait for the dispatch + fallback to land. 200ms is generous because the
@@ -457,7 +474,7 @@ async fn broadcast_dispatches_to_every_online_bridge() {
     pre_poll(&v2).await;
 
     h._dispatch_tx
-        .send(user_text_msg("carol@wechat", "real-ctx-bcast", "ping"))
+        .try_send(user_text_msg("carol@wechat", "real-ctx-bcast", "ping"))
         .unwrap();
 
     // Give the dispatcher a beat to fan out and write to both queues.
@@ -494,7 +511,7 @@ async fn cli_session_id_round_trips_through_persistence() {
 
     // ── Turn 1 ────────────────────────────────────────────────────────────────
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "first question"))
+        .try_send(user_text_msg(user, real_ctx, "first question"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -530,7 +547,7 @@ async fn cli_session_id_round_trips_through_persistence() {
 
     // ── Turn 2 ────────────────────────────────────────────────────────────────
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "follow-up"))
+        .try_send(user_text_msg(user, real_ctx, "follow-up"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -583,7 +600,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
 
     // ── Turn 1: broadcast a question; claude (and codex) both receive it.
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "what is foo?"))
+        .try_send(user_text_msg(user, real_ctx, "what is foo?"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -617,7 +634,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
     // Pin the user's default to codex so we can prove the quote override wins
     // against a non-broadcast base decision (ForwardTo{codex} rather than Broadcast).
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "/use codex"))
+        .try_send(user_text_msg(user, real_ctx, "/use codex"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Discard the /use ack that landed on the mock upstream.
@@ -639,7 +656,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
             }
         }
     });
-    h._dispatch_tx.send(msg).unwrap();
+    h._dispatch_tx.try_send(msg).unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Codex (the user's current /use default) must NOT receive the quoted reply.
@@ -683,7 +700,7 @@ async fn hub_command_list_reports_active_backend() {
 
     let user = "alice@wechat";
     h._dispatch_tx
-        .send(user_text_msg(user, "real-ctx-list-001", "/list"))
+        .try_send(user_text_msg(user, "real-ctx-list-001", "/list"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -720,7 +737,7 @@ async fn hub_command_use_reroutes_subsequent_messages() {
 
     // /use codex
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "/use codex"))
+        .try_send(user_text_msg(user, real_ctx, "/use codex"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -729,7 +746,7 @@ async fn hub_command_use_reroutes_subsequent_messages() {
 
     // The user's follow-up should now land in codex's queue, not claude's.
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "hello codex"))
+        .try_send(user_text_msg(user, real_ctx, "hello codex"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
@@ -760,7 +777,7 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
 
     // Create + activate a named session.
     h._dispatch_tx
-        .send(user_text_msg(
+        .try_send(user_text_msg(
             user,
             real_ctx,
             "/session new feature-x some-uuid-zzz",
@@ -772,7 +789,7 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
     // Now send a normal message; the inbound message on the bridge side must
     // carry session_name = "feature-x".
     h._dispatch_tx
-        .send(user_text_msg(user, real_ctx, "work on feature-x please"))
+        .try_send(user_text_msg(user, real_ctx, "work on feature-x please"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     let inbound = poll_one(&h.base_url, &vtoken, 2).await;
@@ -811,13 +828,23 @@ async fn over_cap_concurrent_polls_get_429() {
     let tracker = h.state.clients.poll_tracker.clone();
     let vtoken_for_inproc = vtoken.clone();
     let inproc = std::thread::spawn(move || {
-        let c1 = tracker.enter(&vtoken_for_inproc).0;
-        let g1 = tracker.enter(&vtoken_for_inproc).1;
-        let c2 = tracker.enter(&vtoken_for_inproc).0;
-        let g2 = tracker.enter(&vtoken_for_inproc).1;
-        let c3 = tracker.enter(&vtoken_for_inproc).0;
-        let g3 = tracker.enter(&vtoken_for_inproc).1;
-        let c4 = tracker.enter(&vtoken_for_inproc).0;
+        let tracker = tracker; // shadow to satisfy clippy after capture
+        let (c1, g1) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c2, g2) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c3, g3) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        let (c4, _g4) = match tracker.enter(&vtoken_for_inproc) {
+            ilink_hub::hub::EnterOutcome::Ok { per_vtoken, guard } => (per_vtoken, guard),
+            other => panic!("expected Ok, got {other:?}"),
+        };
         drop(g3);
         drop(g2);
         drop(g1);

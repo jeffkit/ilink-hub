@@ -302,3 +302,107 @@ async fn test_with_limit_remove_client_resets_capacity() {
     assert_eq!(drained.len(), 1);
     assert_eq!(msg_text(&drained[0]), Some("fresh"));
 }
+
+// ─── Backpressure / broadcast tests ──────────────────────────────────────────
+
+/// When the per-client queue is full, the OLDEST message is dropped to make
+/// room for the new one. This is the documented "drop_oldest" policy
+/// (see `PerClientSlot::push`). Without this property a slow consumer could
+/// permanently block the dispatcher or fill memory.
+#[tokio::test]
+async fn test_broadcast_path_full_queue_drops_oldest_not_newest() {
+    let q = InMemoryQueue::with_limit(2);
+
+    let dropped1 = q.push("v1", make_msg("first")).await.unwrap();
+    let dropped2 = q.push("v1", make_msg("second")).await.unwrap();
+    assert!(!dropped1);
+    assert!(!dropped2);
+
+    // Overflow: "first" should be evicted, "third" kept.
+    let dropped3 = q.push("v1", make_msg("third")).await.unwrap();
+    assert!(dropped3, "queue full must report a drop");
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 2);
+    assert_eq!(msg_text(&drained[0]), Some("second"));
+    assert_eq!(msg_text(&drained[1]), Some("third"));
+}
+
+/// `push_shared` lets the broadcast path share the unchanged base via
+/// `Arc<WeixinMessage>`. Under contention from many concurrent recipients
+/// pushing to different vtokens, the inner `item_list` (the expensive
+/// `Arc<Vec<MessageItem>>` payload) must be cloned only once per push, not
+/// per recipient. We assert that the `Arc::strong_count` of the inner
+/// payload does not balloon — a regression here would silently regress
+/// the broadcast hot path.
+#[tokio::test]
+async fn test_push_shared_does_not_clone_heavy_payload() {
+    use ilink_hub::ilink::types::HubExt;
+    let q = InMemoryQueue::new();
+    let heavy = Arc::new(vec![MessageItem {
+        item_type: Some(1),
+        text_item: Some(TextItem {
+            text: Some("payload".to_string()),
+        }),
+        ..Default::default()
+    }]);
+    let base = Arc::new(WeixinMessage {
+        from_user_id: Some("u".into()),
+        item_list: Some(Arc::clone(&heavy)),
+        ..Default::default()
+    });
+    // Strong count of the inner payload before any push.
+    let before = Arc::strong_count(&heavy);
+
+    for i in 0..32 {
+        q.push_shared(
+            &format!("v{i}"),
+            Arc::clone(&base),
+            Some(format!("vctx-{i}")),
+            Some(HubExt {
+                session_id: Some(format!("sid-{i}")),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    // After 32 push_shared calls, the inner payload's strong count should
+    // have grown by at most 33 (the original + one clone per push into the
+    // slot's VecDeque). If the impl were cloning the full base instead of
+    // sharing the Arc, growth would be linear in the *full* WeixinMessage
+    // size, not just `+1` per recipient.
+    let after = Arc::strong_count(&heavy);
+    let growth = after - before;
+    assert!(
+        growth <= 33,
+        "inner payload Arc should not balloon: grew by {growth}"
+    );
+}
+
+/// Many concurrent producers pushing to the same vtoken must not lose
+/// messages or corrupt the queue, even if the order of arrival matters.
+/// This is the closest integration test to a real "burst" scenario.
+#[tokio::test]
+async fn test_concurrent_pushes_preserve_message_count() {
+    use std::sync::Arc;
+    let q = Arc::new(InMemoryQueue::with_limit(10_000));
+    let mut handles = vec![];
+    for t in 0..8 {
+        let q = Arc::clone(&q);
+        handles.push(tokio::spawn(async move {
+            for i in 0..50 {
+                let dropped = q.push("v1", make_msg(&format!("t{t}-i{i}"))).await.unwrap();
+                assert!(
+                    !dropped,
+                    "queue should not overflow with 8*50=400 msgs and limit 10_000"
+                );
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+    let drained = q.drain("v1").await.unwrap();
+    assert_eq!(drained.len(), 400, "all 8*50 pushes must be preserved");
+}

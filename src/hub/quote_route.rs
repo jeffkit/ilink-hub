@@ -13,7 +13,7 @@
 //! group id) so a quote-reply in one conversation can never resolve to a message the Hub
 //! sent into a *different* conversation.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::hash::{BuildHasher, Hash};
 use std::time::{Duration, Instant};
 
@@ -79,6 +79,11 @@ pub struct QuoteRouteIndex {
     next_seq: u64,
     /// Per-instance random seed so content hashes are not predictable externally.
     hasher: std::collections::hash_map::RandomState,
+    /// Global oldest-first ordering across all `(created_ms, seq, key)` tuples, used to evict
+    /// the oldest content key in O(log N) instead of scanning the entire `by_content` map.
+    /// The key tuple is included so two entries with the same `(created_ms, seq)` still
+    /// disambiguate; equality is structural so the BTreeSet stays consistent.
+    by_age: BTreeSet<(i64, u64, u64)>,
 }
 
 impl Default for QuoteRouteIndex {
@@ -87,6 +92,7 @@ impl Default for QuoteRouteIndex {
             by_content: HashMap::new(),
             next_seq: 0,
             hasher: std::collections::hash_map::RandomState::new(),
+            by_age: BTreeSet::new(),
         }
     }
 }
@@ -120,33 +126,26 @@ impl QuoteRouteIndex {
         for key_str in content_keys(text) {
             let key = self.hash_key(&key_str);
             if !self.by_content.contains_key(&key) && self.by_content.len() >= MAX_BY_CONTENT_KEYS {
-                // Find the oldest key to evict.
-                let mut oldest_key: Option<u64> = None;
-                let mut oldest_ms = i64::MAX;
-                let mut oldest_seq = u64::MAX;
-                for (k, bucket) in &self.by_content {
-                    if let Some(entry) = bucket.iter().min_by_key(|e| (e.created_ms, e.seq)) {
-                        if entry.created_ms < oldest_ms
-                            || (entry.created_ms == oldest_ms && entry.seq < oldest_seq)
-                        {
-                            oldest_ms = entry.created_ms;
-                            oldest_seq = entry.seq;
-                            oldest_key = Some(*k);
-                        }
-                    }
-                }
-                if let Some(k) = oldest_key {
-                    self.by_content.remove(&k);
+                // O(log N): the BTreeSet is kept in (created_ms, seq, key) order, so the
+                // oldest entry is always at the front. Pop one and remove that key from
+                // the content map. If by_age and by_content have drifted (e.g. an
+                // entry was removed from by_content but its age tuple remains), the
+                // entry is silently skipped — see evict_expired for the reconciliation.
+                if let Some(&(oldest_ms, oldest_seq, oldest_key)) = self.by_age.iter().next() {
+                    self.by_content.remove(&oldest_key);
+                    self.by_age.remove(&(oldest_ms, oldest_seq, oldest_key));
                 }
             }
             let bucket = self.by_content.entry(key).or_default();
+            let seq = self.next_seq;
             bucket.push(ContentEntry {
                 scope: scope.to_string(),
                 origin: origin.clone(),
                 created_ms: now_ms,
-                seq: self.next_seq,
+                seq,
                 deadline,
             });
+            self.by_age.insert((now_ms, seq, key));
             self.next_seq = self.next_seq.wrapping_add(1);
             if bucket.len() > MAX_CONTENT_ENTRIES_PER_KEY {
                 let overflow = bucket.len() - MAX_CONTENT_ENTRIES_PER_KEY;
@@ -215,10 +214,37 @@ impl QuoteRouteIndex {
 
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
-        for bucket in self.by_content.values_mut() {
+        // Walk by_content first (source of truth), removing dead entries and
+        // collecting the age tuples we need to drop from by_age. We can't iterate
+        // by_age alone because the `(created_ms, seq)` tuple no longer maps back
+        // to a single key once that key has been removed.
+        let mut dead_age_tuples: Vec<(i64, u64, u64)> = Vec::new();
+        for (key, bucket) in self.by_content.iter_mut() {
+            for entry in bucket.iter() {
+                if entry.deadline <= now {
+                    dead_age_tuples.push((entry.created_ms, entry.seq, *key));
+                }
+            }
             bucket.retain(|e| now <= e.deadline);
         }
         self.by_content.retain(|_, bucket| !bucket.is_empty());
+        for t in dead_age_tuples {
+            self.by_age.remove(&t);
+        }
+        // Belt-and-suspenders: if a key vanished (e.g. oldest-eviction path)
+        // without removing its by_age entry, the front of by_age may now point
+        // to a non-existent key. Drain any orphan tuples whose key is missing
+        // from by_content. Capped at one sweep per call to bound work in the
+        // face of large drift; remaining orphans are cleaned on the next call.
+        let orphans: Vec<(i64, u64, u64)> = self
+            .by_age
+            .iter()
+            .take_while(|t| !self.by_content.contains_key(&t.2))
+            .copied()
+            .collect();
+        for t in orphans {
+            self.by_age.remove(&t);
+        }
     }
 }
 

@@ -62,7 +62,8 @@ async fn test_migration_incremental_from_v2() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store { rpool: pool.clone(),
+        let s = Store {
+            rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -190,7 +191,8 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             .connect("sqlite::memory:")
             .await
             .expect("pool");
-        let s = Store { rpool: pool.clone(),
+        let s = Store {
+            rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
         };
@@ -688,7 +690,8 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -813,7 +816,8 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -973,7 +977,8 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1058,7 +1063,8 @@ async fn m2_ddl_error_propagates_through_migrator() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1103,12 +1109,14 @@ async fn m2_ddl_error_propagates_through_migrator() {
         result.is_err(),
         "migrate_to_v3 must propagate DDL errors, got Ok — F-M2-03 not fixed"
     );
-    // The claim row is still inserted (the M1 design writes the row
-    // BEFORE the DDL); a subsequent connect will see v3 as claimed
-    // and skip the broken step (DBA drops the row manually).
+    // The non-_tx wrapper now runs inside its own transaction, so a DDL
+    // failure causes a full rollback — the claim row is NOT retained.
+    // This is cleaner than the old behaviour: the migrator can be safely
+    // retried after fixing the underlying data issue (e.g. deduplicating
+    // real_ctx rows), without a manual DELETE from schema_version.
     assert!(
-        store.is_migration_run(3).await.unwrap(),
-        "v3 claim row is present even though DDL failed"
+        !store.is_migration_run(3).await.unwrap(),
+        "v3 claim row must be absent after rollback — migrator is safely retryable"
     );
 }
 
@@ -1152,7 +1160,8 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1505,7 +1514,8 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1920,7 +1930,8 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -1977,7 +1988,8 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2007,7 +2019,8 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         .connect("sqlite::memory:")
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
     };
@@ -2082,7 +2095,8 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         .connect(&db_url)
         .await
         .expect("pool");
-    let store = Store { rpool: pool.clone(),
+    let store = Store {
+        rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
     };
@@ -2099,7 +2113,8 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
 
     // Both transactions race for v99. Only one tx's claim can succeed.
     let pool2 = pool.clone();
-    let store2 = Store { rpool: pool.clone(),
+    let store2 = Store {
+        rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
     };

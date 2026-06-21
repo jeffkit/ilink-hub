@@ -24,8 +24,8 @@ use tracing::{info, warn};
 
 use anyhow::Context;
 use ilink_hub::bridge::{
-    builtin, default_local_credential_path, resolve_hub_connection, run_bridge, BridgeApp,
-    BridgeStop,
+    builtin, default_local_credential_path, resolve_hub_connection, run_bridge_with_shutdown,
+    BridgeApp, BridgeStop,
 };
 use ilink_hub::paths::{
     default_bridge_config_path, default_bridge_manager_credentials_dir, default_bridge_profiles_dir,
@@ -116,6 +116,20 @@ enum Commands {
         #[arg(long, default_value_t = 60)]
         max_restart_backoff_secs: u64,
     },
+}
+
+/// Resolves on SIGTERM on Unix; never resolves on other platforms.
+/// Lets us use SIGTERM in `tokio::select!` without `#[cfg]` inside the macro.
+async fn make_sigterm_future() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
 }
 
 fn explicit_token(cli: &Cli) -> Option<&str> {
@@ -237,6 +251,15 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(default_local_credential_path);
             let using_explicit_token = explicit_token(&cli).is_some();
 
+            // Shared shutdown token — cancelled by Ctrl-C or SIGTERM so that
+            // in-flight AI calls are gracefully cancelled and users are notified.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+
+            // Build a SIGTERM future once, outside the reconnect loop.
+            // On non-Unix platforms this never resolves (pending forever).
+            let sigterm_fut = make_sigterm_future();
+            tokio::pin!(sigterm_fut);
+
             'reconnect: loop {
                 let (hub_url, token) = resolve_hub_connection(
                     &cli.hub_url,
@@ -250,12 +273,36 @@ async fn main() -> Result<()> {
                 .await?;
                 info!(%hub_url, "using Hub base URL for downstream");
 
-                let mut handle = tokio::spawn(run_bridge(hub_url, token, app.clone()));
+                let mut handle = tokio::spawn(run_bridge_with_shutdown(
+                    hub_url,
+                    token,
+                    app.clone(),
+                    shutdown.clone(),
+                ));
+
                 tokio::select! {
                     _ = tokio::signal::ctrl_c() => {
+                        info!("bridge received Ctrl-C; shutting down gracefully");
+                        shutdown.cancel();
+                        // Wait up to 3 s for error replies to be sent before aborting.
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            &mut handle,
+                        ).await;
                         handle.abort();
                         let _ = handle.await;
                         info!("exit");
+                        return Ok(());
+                    }
+                    _ = &mut sigterm_fut => {
+                        info!("bridge received SIGTERM; shutting down gracefully");
+                        shutdown.cancel();
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(3),
+                            &mut handle,
+                        ).await;
+                        handle.abort();
+                        let _ = handle.await;
                         return Ok(());
                     }
                     result = &mut handle => {
@@ -278,6 +325,10 @@ async fn main() -> Result<()> {
                                 anyhow::bail!(
                                     "CLI 认证失败，需要用户处理后重启 bridge：{reason}"
                                 );
+                            }
+                            Ok(BridgeStop::Shutdown) => {
+                                info!("bridge shut down gracefully");
+                                return Ok(());
                             }
                             Err(e) => {
                                 return Err(e).context("bridge task panicked or failed");

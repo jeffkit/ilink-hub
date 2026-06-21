@@ -5,7 +5,11 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ilink_hub::{
-    hub::HubState, ilink::UpstreamClient, server::build_router, store::Store, InMemoryQueue,
+    hub::{AdminConfig, HubState},
+    ilink::UpstreamClient,
+    server::build_router,
+    store::Store,
+    InMemoryQueue,
 };
 use tower::ServiceExt; // for .oneshot()
 
@@ -26,7 +30,14 @@ async fn make_state() -> Arc<HubState> {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
+    )
 }
 
 #[tokio::test]

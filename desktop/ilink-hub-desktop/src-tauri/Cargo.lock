@@ -2073,7 +2073,7 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub"
-version = "0.2.0"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2087,6 +2087,7 @@ dependencies = [
  "dirs 5.0.1",
  "ed25519-dalek",
  "futures-util",
+ "libc",
  "lru",
  "percent-encoding",
  "qrcode",
@@ -5114,6 +5115,7 @@ dependencies = [
  "pin-project-lite",
  "sync_wrapper",
  "tokio",
+ "tokio-util",
  "tower-layer",
  "tower-service",
  "tracing",

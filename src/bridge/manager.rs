@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(unix)]
+extern crate libc;
+
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
 use tokio::sync::watch;
@@ -30,10 +33,16 @@ pub struct BridgeManagerOptions {
     pub restart_backoff: Duration,
     pub max_restart_backoff: Duration,
     pub force_register: bool,
+    /// Admin token for Hub API calls (e.g. auto-deregister on profile delete).
+    /// Parsed once at startup from `ILINK_ADMIN_TOKEN`; callers may override.
+    pub admin_token: Option<String>,
 }
 
 impl BridgeManagerOptions {
     pub fn new(hub_url: String, profiles_dir: PathBuf, credentials_dir: PathBuf) -> Self {
+        let admin_token = std::env::var("ILINK_ADMIN_TOKEN")
+            .ok()
+            .filter(|t| !t.trim().is_empty());
         Self {
             hub_url,
             profiles_dir,
@@ -42,6 +51,7 @@ impl BridgeManagerOptions {
             restart_backoff: DEFAULT_RESTART_BACKOFF,
             max_restart_backoff: DEFAULT_MAX_RESTART_BACKOFF,
             force_register: false,
+            admin_token,
         }
     }
 }
@@ -177,11 +187,24 @@ pub async fn run_bridge_manager_with_shutdown(
     let mut manager = BridgeManager::new(opts, status);
     manager.reconcile_once().await?;
 
+    // On Unix, build a SIGTERM future so the manager can stop gracefully when
+    // launchd or systemd send SIGTERM.  On non-Unix platforms we use a future
+    // that never resolves, keeping the select! arms balanced without cfg guards
+    // inside the macro (which tokio::select! does not support).
+    let sigterm_fut = make_sigterm_future();
+
+    tokio::pin!(sigterm_fut);
+
     loop {
         if listen_ctrl_c {
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => {
                     info!("bridge manager received Ctrl-C; stopping children");
+                    manager.stop_all().await;
+                    return Ok(());
+                }
+                _ = &mut sigterm_fut => {
+                    info!("bridge manager received SIGTERM; stopping children gracefully");
                     manager.stop_all().await;
                     return Ok(());
                 }
@@ -223,14 +246,20 @@ struct BridgeManager {
     opts: BridgeManagerOptions,
     status: Arc<Mutex<BridgeManagerStatus>>,
     children: HashMap<String, ManagedBridge>,
+    http_client: reqwest::Client,
 }
 
 impl BridgeManager {
     fn new(opts: BridgeManagerOptions, status: Arc<Mutex<BridgeManagerStatus>>) -> Self {
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("build reqwest client for BridgeManager");
         Self {
             opts,
             status,
             children: HashMap::new(),
+            http_client,
         }
     }
 
@@ -292,12 +321,16 @@ impl BridgeManager {
                     // unreachable the operator can always clean up manually.
                     let hub_url = self.opts.hub_url.clone();
                     let register_name = managed.spec.register_name.clone();
-                    let admin_token = std::env::var("ILINK_ADMIN_TOKEN")
-                        .ok()
-                        .filter(|t| !t.trim().is_empty());
+                    let admin_token = self.opts.admin_token.clone();
+                    let http_client = self.http_client.clone();
                     tokio::spawn(async move {
-                        match deregister_from_hub(&hub_url, &register_name, admin_token.as_deref())
-                            .await
+                        match deregister_from_hub(
+                            &http_client,
+                            &hub_url,
+                            &register_name,
+                            admin_token.as_deref(),
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 info!(profile = %register_name, "auto-deregistered deleted profile from Hub")
@@ -522,9 +555,63 @@ impl BridgeManager {
     }
 
     async fn stop_all(&mut self) {
-        for (_, mut managed) in self.children.drain() {
-            stop_managed_child(&mut managed).await;
+        // Send SIGTERM to all children concurrently then wait concurrently.
+        // Sequential stop_managed_child accumulates up to 5s × N total wait time.
+        let managed_list: Vec<ManagedBridge> = self.children.drain().map(|(_, m)| m).collect();
+
+        // Abort probing tasks and collect child processes.
+        let mut children: Vec<Child> = Vec::new();
+        for managed in managed_list {
+            if let ManagedBridgeState::Probing { task } = &managed.state {
+                task.abort();
+            }
+            if let Some(child) = managed.child {
+                children.push(child);
+            }
         }
+
+        // Phase 1: SIGTERM all running children in parallel (non-blocking syscall).
+        #[cfg(unix)]
+        for child in &children {
+            if let Some(pid) = child.id() {
+                // SAFETY: `pid` is the OS-assigned pid of a `tokio::process::Child`
+                // we own — we spawned it, we never reaped it, and we are the
+                // only writer. PIDs are not reused within the brief window
+                // between signal delivery and `wait()` since the same kernel
+                // holds the live task struct. `kill` is a pure syscall with
+                // no memory-safety surface. The call is racing against the
+                // child exiting on its own, which is harmless: an
+                // `ESRCH` (no such process) is the expected outcome and is
+                // already handled below.
+                let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if rc != 0 {
+                    let errno = std::io::Error::last_os_error();
+                    warn!(pid, error = %errno, "failed to send SIGTERM during stop_all");
+                }
+            }
+        }
+
+        // Phase 2: spawn a task per child to wait concurrently (5s grace, then SIGKILL).
+        const GRACEFUL: u64 = 5;
+        let handles: Vec<JoinHandle<()>> = children
+            .into_iter()
+            .map(|mut child| {
+                tokio::spawn(async move {
+                    match tokio::time::timeout(Duration::from_secs(GRACEFUL), child.wait()).await {
+                        Ok(Ok(_)) => {}
+                        _ => {
+                            let _ = child.kill().await;
+                            let _ = child.wait().await;
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
         self.publish_status("stopped", None);
     }
 
@@ -622,6 +709,40 @@ async fn stop_child(child: &mut Child) {
             warn!(error = %e, "failed to inspect bridge child before stop");
         }
     }
+
+    // Send SIGTERM first so the child bridge can cancel in-flight AI calls and send
+    // error replies to users before exiting.  Fall back to SIGKILL after a grace period.
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: see the symmetric note in `stop_removed_profile`: the
+            // `pid` comes from a child we own, `kill` is a pure syscall, and
+            // any `ESRCH` is the expected "child already exited" case
+            // handled below.
+            let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+            if rc != 0 {
+                let errno = std::io::Error::last_os_error();
+                warn!(pid, error = %errno, "failed to send SIGTERM to bridge child");
+            } else {
+                // Give the child up to GRACEFUL_SHUTDOWN_SECS to finish its error replies.
+                const GRACEFUL_SHUTDOWN_SECS: u64 = 5;
+                match tokio::time::timeout(
+                    Duration::from_secs(GRACEFUL_SHUTDOWN_SECS),
+                    child.wait(),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => return, // exited cleanly within the grace period
+                    Ok(Err(e)) => warn!(error = %e, "error waiting for bridge child after SIGTERM"),
+                    Err(_) => info!(
+                        pid,
+                        "bridge child did not exit after SIGTERM; sending SIGKILL"
+                    ),
+                }
+            }
+        }
+    }
+
     if let Err(e) = child.kill().await {
         warn!(error = %e, "failed to kill bridge child");
     }
@@ -859,6 +980,7 @@ fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> 
 ///
 /// Returns `Ok(())` when the client was deleted or was already absent (404).
 async fn deregister_from_hub(
+    client: &reqwest::Client,
     hub_url: &str,
     name: &str,
     admin_token: Option<&str>,
@@ -868,10 +990,6 @@ async fn deregister_from_hub(
         hub_url.trim_end_matches('/'),
         name
     );
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("build reqwest client")?;
     let mut req = client.delete(&url);
     if let Some(token) = admin_token {
         req = req.header("Authorization", format!("Bearer {}", token.trim()));
@@ -885,6 +1003,26 @@ async fn deregister_from_hub(
             anyhow::bail!("Hub returned {s}: {body}");
         }
     }
+}
+
+/// Returns a future that resolves when SIGTERM is received on Unix, or never on
+/// other platforms.  Used in `tokio::select!` to avoid `#[cfg]` inside macros.
+async fn make_sigterm_future() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    std::future::pending::<()>().await;
 }
 
 #[cfg(test)]
@@ -1033,6 +1171,7 @@ stdin: none
             restart_backoff: Duration::from_secs(1),
             max_restart_backoff: Duration::from_secs(60),
             force_register: true,
+            admin_token: None,
         };
         let spec = BridgeProcessSpec {
             id: "claude".into(),

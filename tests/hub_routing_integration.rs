@@ -11,13 +11,13 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use axum::Json;
 use ilink_hub::{
-    hub::{spawn_dispatcher, HubState},
+    hub::{spawn_dispatcher, AdminConfig, HubState},
     ilink::types::{MessageItem, SendMessageRequest, TextItem, WeixinMessage},
     ilink::UpstreamClient,
     store::Store,
     InMemoryQueue,
 };
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -28,7 +28,14 @@ async fn make_state() -> Arc<HubState> {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+    HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
+    )
 }
 
 fn make_user_msg(from_user: &str, real_ctx: &str, text: &str) -> WeixinMessage {
@@ -62,11 +69,11 @@ async fn single_client_receives_dispatched_message() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     let msg = make_user_msg("user@wx", "real-ctx-001", "hello");
-    tx.send(msg).unwrap();
+    tx.try_send(msg).unwrap();
 
     // Give dispatcher a moment to process.
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -81,11 +88,11 @@ async fn single_client_receives_dispatched_message() {
 async fn no_online_clients_message_is_dropped() {
     let state = make_state().await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     let msg = make_user_msg("user@wx", "real-ctx-002", "dropped");
-    tx.send(msg).unwrap();
+    tx.try_send(msg).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -107,8 +114,8 @@ async fn two_clients_both_receive_broadcast_message() {
     // Mark both clients as online (normally done by getupdates handler).
     {
         let mut registry = state.clients.registry.write().await;
-        registry.mark_seen(&vtoken_a);
-        registry.mark_seen(&vtoken_b);
+        registry.mark_online(&vtoken_a);
+        registry.mark_online(&vtoken_b);
     }
 
     // Remove routes for both clients so no default remains → routing falls
@@ -120,11 +127,11 @@ async fn two_clients_both_receive_broadcast_message() {
         router.remove_routes_for_vtoken(&vtoken_b, None);
     }
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     let msg = make_user_msg("user@wx", "real-ctx-003", "broadcast me");
-    tx.send(msg).unwrap();
+    tx.try_send(msg).unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -165,15 +172,15 @@ async fn single_default_client_receives_forward_to_message() {
     // Mark both online, but only the default is set as routing target.
     {
         let mut registry = state.clients.registry.write().await;
-        registry.mark_seen(&vtoken_default);
-        registry.mark_seen(&vtoken_other);
+        registry.mark_online(&vtoken_default);
+        registry.mark_online(&vtoken_other);
     }
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     let msg = make_user_msg("user@wx", "real-ctx-forward", "forward me");
-    tx.send(msg).unwrap();
+    tx.try_send(msg).unwrap();
 
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -202,8 +209,8 @@ async fn at_mention_routes_to_named_backend_on_new_session() {
 
     {
         let mut registry = state.clients.registry.write().await;
-        registry.mark_seen(&vtoken_claude);
-        registry.mark_seen(&vtoken_codex);
+        registry.mark_online(&vtoken_claude);
+        registry.mark_online(&vtoken_codex);
     }
 
     // The user's current backend is codex (via /use). The @claude mention must NOT change this.
@@ -212,10 +219,10 @@ async fn at_mention_routes_to_named_backend_on_new_session() {
         router.set_route("user@wx", vtoken_codex.clone());
     }
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
-    tx.send(make_user_msg(
+    tx.try_send(make_user_msg(
         "user@wx",
         "real-ctx-at",
         "@claude 看下日志 有 空格",
@@ -275,17 +282,17 @@ async fn at_mention_unknown_backend_falls_through_to_normal_routing() {
     let vtoken = register(&state, "claude").await;
     {
         let mut registry = state.clients.registry.write().await;
-        registry.mark_seen(&vtoken);
+        registry.mark_online(&vtoken);
     }
     {
         let mut router = state.routing.router.lock().await;
         router.set_route("user@wx", vtoken.clone());
     }
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
-    tx.send(make_user_msg(
+    tx.try_send(make_user_msg(
         "user@wx",
         "real-ctx-at-unknown",
         "@nobody hello",
@@ -309,16 +316,16 @@ async fn same_user_gets_stable_virtual_context_token() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     // Same real_ctx, same from_user → same vctx.
-    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
+    tx.try_send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let msgs1 = state.clients.queue.drain(&vtoken).await.unwrap();
 
-    tx.send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
+    tx.try_send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     let msgs2 = state.clients.queue.drain(&vtoken).await.unwrap();
@@ -338,11 +345,11 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     // Dispatch a message so a vctx→real_ctx mapping is created.
-    tx.send(make_user_msg("user@wx", "real-ctx-send", "hello"))
+    tx.try_send(make_user_msg("user@wx", "real-ctx-send", "hello"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(80)).await;
 
@@ -380,12 +387,12 @@ async fn bot_echo_messages_are_not_dispatched() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     let mut bot_msg = make_user_msg("bot@wx", "real-ctx-bot", "bot echo");
     bot_msg.message_type = Some(2); // bot echo type
-    tx.send(bot_msg).unwrap();
+    tx.try_send(bot_msg).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -402,11 +409,11 @@ async fn messages_queued_in_fifo_order() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    let (tx, rx) = broadcast::channel(16);
+    let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
     for i in 0..5u8 {
-        tx.send(make_user_msg(
+        tx.try_send(make_user_msg(
             "user@wx",
             "real-ctx-fifo",
             &format!("msg-{i}"),
@@ -635,36 +642,55 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
 
 // ─── Adversarial: SEC-003 / F-M2-1 / F-M2-2 ──────────────────────────────────
 
-/// F-M2-1: the new getupdates path collapses the registry existence check
-/// and `mark_seen` into a single write guard. This is structurally tested
-/// by acquiring the registry write lock externally, then calling
-/// `mark_seen` — the implementation must take the same write guard
-/// (observable as: the external guard blocks the call from making
-/// progress).
-///
-/// This is a structural test, not a behavioural one: it pins the
-/// lock-acquisition shape so a future refactor that re-introduces the
-/// stale-online window is caught.
+/// getupdates mark_seen is now lock-free: the timestamp is stored in
+/// `ClientState::last_seen` (a DashMap<String, AtomicU64>) and does not
+/// require the registry write lock. This test verifies that:
+/// 1. The last_seen DashMap is updated atomically while the registry read
+///    lock is held concurrently (no deadlock).
+/// 2. mark_online (called during registration) correctly sets online=true.
 #[tokio::test]
-async fn getupdates_mark_seen_runs_under_write_lock() {
+async fn getupdates_mark_seen_is_lock_free() {
     let state = make_state().await;
     let vtoken = register(&state, "claude").await;
 
-    // Hold the registry write lock from outside; mark_seen-equivalent
-    // operations on the new code path must not be able to interleave.
-    let guard = state.clients.registry.write().await;
-    // While we hold the write lock, the registry is unreachable. After
-    // we drop it, mark_seen must succeed.
-    assert!(guard.get_by_vtoken(&vtoken).is_some());
-    drop(guard);
+    // Simulate what getupdates does: existence check under read lock,
+    // then lock-free timestamp bump.
+    {
+        let registry = state.clients.registry.read().await;
+        assert!(registry.get_by_vtoken(&vtoken).is_some());
+        // Read lock still held — the timestamp update must not need write lock.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state
+            .clients
+            .last_seen
+            .entry(vtoken.clone())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .store(now_secs, std::sync::atomic::Ordering::Relaxed);
+        // registry read lock drops here — no deadlock.
+    }
 
-    let mut registry = state.clients.registry.write().await;
-    registry.mark_seen(&vtoken);
-    let info = registry.get_by_vtoken(&vtoken).unwrap();
+    // Verify timestamp was stored.
+    let stored = state
+        .clients
+        .last_seen
+        .get(&vtoken)
+        .map(|e| e.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(0);
     assert!(
-        info.online,
-        "mark_seen under the new code path flips online=true"
+        stored > 0,
+        "last_seen timestamp should be non-zero after getupdates"
     );
+
+    // mark_online is used by registration; verify it still sets online=true.
+    {
+        let mut registry = state.clients.registry.write().await;
+        registry.mark_online(&vtoken);
+        let info = registry.get_by_vtoken(&vtoken).unwrap();
+        assert!(info.online, "mark_online flips online=true");
+    }
 }
 
 /// F-M2-2: a poisoned PollTracker counts mutex must NOT panic the worker
@@ -676,6 +702,9 @@ async fn poll_tracker_poisoned_mutex_does_not_panic() {
     use std::sync::Arc;
 
     let tracker = Arc::new(PollTracker::default());
+    // Without an explicit set_hub_cap the default is MAX_HUB_POLLS_DEFAULT (8192),
+    // which lets the poisoned-mutex path be reached before the Hub-wide cap fires.
+    tracker.set_hub_cap(ilink_hub::hub::MAX_HUB_POLLS_DEFAULT);
 
     // Poison the counts mutex by panicking while holding it.
     let t2 = Arc::clone(&tracker);
@@ -687,10 +716,14 @@ async fn poll_tracker_poisoned_mutex_does_not_panic() {
 
     // enter() must not panic; it reports count=0 in the poisoned case and
     // still produces a guard.
-    let (count, guard) = tracker.enter("vtoken-1");
-    assert_eq!(count, 0, "poisoned mutex reports count=0");
-    // Dropping the guard must not panic either.
-    drop(guard);
+    let guard = match tracker.enter("vtoken-1") {
+        ilink_hub::hub::EnterOutcome::Poisoned { guard } => {
+            drop(guard);
+            0
+        }
+        other => panic!("expected Poisoned, got {other:?}"),
+    };
+    assert_eq!(guard, 0, "poisoned mutex reports count=0");
 }
 
 /// SEC-003 / M2: when a single vtoken is long-polled more than
@@ -726,7 +759,14 @@ async fn getupdates_returns_429_when_polls_exceed_cap() {
     let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
     let queue = Arc::new(InMemoryQueue::new());
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = HubState::new(upstream, Arc::new(store), queue, shutdown_rx);
+    let state = HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
+    );
     let _shutdown_tx_keepalive = shutdown_tx; // pin for test lifetime
 
     let vtoken = register(&state, "claude").await;

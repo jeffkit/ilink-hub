@@ -245,6 +245,21 @@ impl WeixinMessage {
             .unwrap_or(false)
     }
 
+    /// Return true if the message contains at least one non-text media item (image / voice / file / video).
+    ///
+    /// Unlike [`has_content`], this returns `false` for a text-only item_list even when the text
+    /// is empty. Used by the sendmessage handler to distinguish session-persist-only messages
+    /// (empty TextItem) from real media replies that have no text but do carry content.
+    pub fn has_media_content(&self) -> bool {
+        self.item_list
+            .as_ref()
+            .map(|l| {
+                l.iter()
+                    .any(|item| !matches!(item.item_type, Some(msg_type::TEXT) | None))
+            })
+            .unwrap_or(false)
+    }
+
     /// Build a text reply to this message.
     pub fn build_text_reply(context_token: String, text: String) -> WeixinMessage {
         let mut msg = WeixinMessage {
@@ -358,6 +373,64 @@ mod outbound_tests {
         msg2.ensure_outbound();
         assert_ne!(msg1.client_id, msg2.client_id);
     }
+
+    // ── has_media_content ────────────────────────────────────────────────────
+
+    /// 空文本消息（session-persist-only）不含 media 内容。
+    /// 这是发现 duplicate-reply bug 的核心断言：`build_text_reply("")` 会建出一个含空
+    /// TextItem 的 item_list，has_content() 对此返回 true，但 has_media_content() 必须
+    /// 返回 false，否则 sendmessage 的早返回保护失效，footer 被追加到空消息后发出。
+    #[test]
+    fn has_media_content_false_for_empty_text_reply() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), String::new());
+        assert!(
+            !msg.has_media_content(),
+            "空 TextItem 不应视为 media content"
+        );
+    }
+
+    #[test]
+    fn has_media_content_false_for_nonempty_text_reply() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), "hello".to_string());
+        assert!(!msg.has_media_content(), "纯文本回复不含 media content");
+    }
+
+    #[test]
+    fn has_media_content_true_for_image_reply() {
+        let msg = WeixinMessage::build_image_reply("ctx".to_string(), "media-id-abc".to_string());
+        assert!(msg.has_media_content(), "图片回复应视为有 media content");
+    }
+
+    #[test]
+    fn has_media_content_true_for_file_reply() {
+        let msg = WeixinMessage::build_file_reply(
+            "ctx".to_string(),
+            "media-id-xyz".to_string(),
+            Some("report.pdf".to_string()),
+        );
+        assert!(msg.has_media_content(), "文件回复应视为有 media content");
+    }
+
+    #[test]
+    fn has_media_content_false_for_empty_item_list() {
+        let msg = WeixinMessage::default();
+        assert!(
+            !msg.has_media_content(),
+            "无 item_list 时不含 media content"
+        );
+    }
+
+    /// 保证旧的 has_content() 对空 TextItem 仍返回 true（语义未变）。
+    /// sendmessage handler 已改用 has_media_content()；此测试记录 has_content() 的现有行为
+    /// 避免未来误改其语义影响其他调用方。
+    #[test]
+    fn has_content_true_for_empty_text_item() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), String::new());
+        assert!(
+            msg.has_content(),
+            "has_content() 对含空 TextItem 的 item_list 应返回 true（记录现有行为）"
+        );
+    }
 }
 
 // ─── GetUpdates (getupdates endpoint) ────────────────────────────────────────
@@ -395,7 +468,7 @@ pub struct GetUpdatesResponse {
 // ─── SendMessage ─────────────────────────────────────────────────────────────
 
 /// Request body for `POST /ilink/bot/sendmessage`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<WeixinMessage>,

@@ -92,10 +92,7 @@ mod tests {
     #[test]
     fn loopback_replaces_only_first_occurrence() {
         // Pathological input — only the leading 0.0.0.0 should be replaced.
-        assert_eq!(
-            hub_loopback_addr("0.0.0.0:0.0.0.0"),
-            "127.0.0.1:0.0.0.0"
-        );
+        assert_eq!(hub_loopback_addr("0.0.0.0:0.0.0.0"), "127.0.0.1:0.0.0.0");
     }
 
     // ─── relay_ws_url ───────────────────────────────────────────────────────
