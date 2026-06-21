@@ -2758,7 +2758,8 @@ async fn m3_warmup_round_trip_through_quote_index() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
     let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -2879,7 +2880,8 @@ async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn test_migration_v8_missing_master_key_fails() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
     let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -2937,7 +2939,8 @@ async fn test_migration_v8_missing_master_key_fails() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn test_migration_v8_idempotency_does_not_double_encrypt() {
-    let _guard = ENV_MUTEX.lock().unwrap();
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
     let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -2972,6 +2975,15 @@ async fn test_migration_v8_idempotency_does_not_double_encrypt() {
     sqlx::query("INSERT INTO bot_credentials (id, token, base_url) VALUES (1, $1, $2)")
         .bind(plain_bot_token)
         .bind("https://dummy.url")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // migrate_to_v8 only encrypts bot_credentials when clients table is non-empty
+    // (it uses the first vtoken as a sentinel to decide whether migration is needed).
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind("vhub_plain_sentinel_for_migration_test")
+        .bind("test-client")
+        .bind(Option::<String>::None)
         .execute(store.pool())
         .await
         .unwrap();
