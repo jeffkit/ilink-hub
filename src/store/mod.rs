@@ -40,18 +40,27 @@ pub enum DatabaseKind {
 }
 
 impl DatabaseKind {
-    /// Parse the driver from the URL scheme. The set of accepted schemes
-    /// mirrors sqlx's `AnyKind::from_str` (src/any/kind.rs). Unknown schemes
-    /// default to `Sqlite` for backwards compatibility — the iLink Hub
-    /// desktop default is `sqlite:~/.ilink-hub/ilink-hub.db`, and a typo
-    /// in a CLI flag should not refuse to start.
-    fn from_url(url: &str) -> Self {
+    /// Parse the driver from the URL scheme. Accepted schemes:
+    /// `sqlite:` (or empty/bare path) → SQLite,
+    /// `postgres:` / `postgresql:` → PostgreSQL,
+    /// `mysql:` / `mariadb:` → MySQL.
+    ///
+    /// Any other scheme (e.g. `postgress://`, `file:`, `http:`) returns
+    /// `Err` immediately so a typo surfaces at startup rather than being
+    /// silently treated as SQLite.
+    fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("postgres:") || url.starts_with("postgresql:") {
-            DatabaseKind::Postgres
+            Ok(DatabaseKind::Postgres)
         } else if url.starts_with("mysql:") || url.starts_with("mariadb:") {
-            DatabaseKind::MySql
+            Ok(DatabaseKind::MySql)
+        } else if url.starts_with("sqlite:") || url.is_empty() {
+            Ok(DatabaseKind::Sqlite)
         } else {
-            DatabaseKind::Sqlite
+            anyhow::bail!(
+                "unsupported DATABASE_URL scheme in {:?}; \
+                 supported schemes: sqlite:, postgres://, postgresql://, mysql://, mariadb://",
+                url
+            )
         }
     }
 }
@@ -82,7 +91,7 @@ impl Store {
         // `SELECT current_database()` is unreliable because both SQLite AND
         // MySQL reject that function (SQLite has no concept; MySQL uses
         // `database()` instead). See F-M3-01 in the m3 review-findings.
-        let kind = DatabaseKind::from_url(url);
+        let kind = DatabaseKind::from_url(url)?;
         let is_sqlite = kind == DatabaseKind::Sqlite;
 
         // For SQLite we must ensure the file (and its parent directory) exist

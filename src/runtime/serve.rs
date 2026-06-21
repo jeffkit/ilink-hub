@@ -32,7 +32,7 @@ pub struct RuntimeConfig {
     /// dispatcher task. When full, the polling loop blocks (backpressure) rather
     /// than dropping messages. Default: 1024.
     pub dispatch_channel_size: usize,
-    /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
+    /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 30.
     pub shutdown_drain_secs: u64,
     /// Admin auth config — parsed once here so it can be injected into HubState
     /// and used by routes without re-reading env vars at request time.

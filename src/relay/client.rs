@@ -265,7 +265,7 @@ async fn run_session(
                             id,
                             status: 502,
                             headers: HashMap::new(),
-                            body: Some(format!("{{\"error\":\"{e}\"}}")),
+                            body: Some(serde_json::json!({"error": e.to_string()}).to_string()),
                         },
                     }
                 };

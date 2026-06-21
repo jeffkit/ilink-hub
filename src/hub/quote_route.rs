@@ -169,7 +169,9 @@ impl QuoteRouteIndex {
             self.next_seq = self.next_seq.wrapping_add(1);
             if bucket.len() > MAX_CONTENT_ENTRIES_PER_KEY {
                 let overflow = bucket.len() - MAX_CONTENT_ENTRIES_PER_KEY;
-                bucket.drain(0..overflow);
+                for entry in bucket.drain(0..overflow) {
+                    self.by_age.remove(&(entry.created_ms, entry.seq, key));
+                }
             }
         }
     }

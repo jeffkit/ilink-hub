@@ -153,6 +153,13 @@ impl HubPairingClient {
         }
         let data = serde_json::to_string_pretty(creds)?;
         tokio::fs::write(&path, format!("{data}\n")).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| format!("chmod 0600 {path}"))?;
+        }
         Ok(())
     }
 

@@ -1411,48 +1411,48 @@ fn m3_v5_mysql_ddl_uses_auto_increment_and_bigint() {
 }
 
 /// F-M3-01 (driver detection from URL): `DatabaseKind::from_url` must
-/// recognise every supported scheme and fall back to `Sqlite` for
-/// unknown / missing schemes. The M3 review flagged the old
+/// recognise every supported scheme. Unknown schemes now return `Err` so
+/// typos (e.g. `postgress://`) surface at startup instead of silently
+/// falling back to SQLite. The M3 review flagged the old
 /// `SELECT current_database()` runtime probe as broken on MySQL (it
 /// errors on BOTH SQLite and MySQL); the fix parses the kind from the
 /// URL prefix at `Store::connect` time.
 #[test]
 fn adversarial_database_kind_from_url() {
     assert_eq!(
-        DatabaseKind::from_url("sqlite::memory:"),
+        DatabaseKind::from_url("sqlite::memory:").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("sqlite:/tmp/x.db"),
+        DatabaseKind::from_url("sqlite:/tmp/x.db").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("sqlite:///var/data/x.db"),
+        DatabaseKind::from_url("sqlite:///var/data/x.db").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("postgres://u:p@h:5432/db"),
+        DatabaseKind::from_url("postgres://u:p@h:5432/db").unwrap(),
         DatabaseKind::Postgres
     );
     assert_eq!(
-        DatabaseKind::from_url("postgresql://u:p@h:5432/db"),
+        DatabaseKind::from_url("postgresql://u:p@h:5432/db").unwrap(),
         DatabaseKind::Postgres
     );
     assert_eq!(
-        DatabaseKind::from_url("mysql://u:p@h:3306/db"),
+        DatabaseKind::from_url("mysql://u:p@h:3306/db").unwrap(),
         DatabaseKind::MySql
     );
     assert_eq!(
-        DatabaseKind::from_url("mariadb://u:p@h:3306/db"),
+        DatabaseKind::from_url("mariadb://u:p@h:3306/db").unwrap(),
         DatabaseKind::MySql
     );
-    // Unknown / malformed URLs default to Sqlite (back-compat for
-    // the iLink Hub default; a CLI typo should not refuse to start).
-    assert_eq!(DatabaseKind::from_url(""), DatabaseKind::Sqlite);
-    assert_eq!(
-        DatabaseKind::from_url("file:/tmp/x.db"),
-        DatabaseKind::Sqlite
-    );
+    // Empty URL defaults to SQLite (the iLink Hub desktop default path).
+    assert_eq!(DatabaseKind::from_url("").unwrap(), DatabaseKind::Sqlite);
+    // Unknown schemes now return Err — a typo should not silently become SQLite.
+    assert!(DatabaseKind::from_url("file:/tmp/x.db").is_err());
+    assert!(DatabaseKind::from_url("postgress://u:p@h/db").is_err());
+    assert!(DatabaseKind::from_url("http://example.com/db").is_err());
 }
 
 /// F-M3-01 (`Store::connect` populates the driver kind from the URL):
