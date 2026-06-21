@@ -38,23 +38,35 @@ fn backoff_for(attempt: u32) -> Duration {
 
 /// Internal helper exposed for testing — lets the test inject a smaller
 /// cap so it doesn't have to sleep tens of seconds to observe multiple
-/// retries. The `initial_secs` / `max_secs` parameters are **seconds**
-/// (same unit as the production constants); the test passes millisecond
-/// values converted via `Duration::from_millis` if it wants ms.
+/// retries. Operates in **milliseconds** so tests can use sub-second
+/// schedules (e.g. 5ms initial, 40ms cap) without losing the exponential
+/// shape via `as_secs()` truncation. F-M2-001.
 #[cfg(test)]
 fn backoff_for_test(attempt: u32, initial: Duration, cap: Duration) -> Duration {
-    backoff_for_with(attempt, initial.as_secs().max(1), cap.as_secs().max(1))
+    backoff_for_with_millis(
+        attempt,
+        initial.as_millis().max(1) as u64,
+        cap.as_millis().max(1) as u64,
+    )
 }
 
 fn backoff_for_with(attempt: u32, initial_secs: u64, max_secs: u64) -> Duration {
-    // attempt 0 -> initial_secs, attempt 1 -> 2*initial_secs, ...
+    backoff_for_with_millis(
+        attempt,
+        initial_secs.saturating_mul(1000),
+        max_secs.saturating_mul(1000),
+    )
+}
+
+fn backoff_for_with_millis(attempt: u32, initial_ms: u64, max_ms: u64) -> Duration {
+    // attempt 0 -> initial_ms, attempt 1 -> 2*initial_ms, ...
     // Multiply by 2^attempt, then clamp. Avoid u64 overflow by bounding
     // the shift to a value well past the cap.
-    const SATURATION_SHIFT: u32 = 20; // 2^20 * initial ≈ 60 days; far past 60s cap.
+    const SATURATION_SHIFT: u32 = 20; // 2^20 * initial ≈ far past any practical cap.
     let shift = attempt.min(SATURATION_SHIFT);
     let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
-    let raw = initial_secs.saturating_mul(multiplier);
-    Duration::from_secs(raw.min(max_secs))
+    let raw = initial_ms.saturating_mul(multiplier);
+    Duration::from_millis(raw.min(max_ms))
 }
 
 /// Returned from [`run_bridge`] when Hub terminates the bridge.
@@ -101,11 +113,22 @@ pub(super) enum SendOutcome {
 /// sanitization.
 fn sanitize_errmsg(s: Option<&str>) -> Option<String> {
     const MAX_LEN: usize = 256;
+    sanitize_field(s, MAX_LEN)
+}
+
+/// Sanitize a free-form string field (`session_name`, future identifiers)
+/// for safe logging and bounded memory use.
+///
+/// Strips control characters (incl. CR/LF and ANSI escapes) and caps the
+/// length at `max_len` chars. Returns `None` when the input is `None` or
+/// empty after sanitization. F-M2-004 lifts the same handling used by
+/// `sanitize_errmsg` to other upstream-controlled string fields.
+fn sanitize_field(s: Option<&str>, max_len: usize) -> Option<String> {
     let raw = s?;
     let cleaned: String = raw
         .chars()
         .filter(|c| !c.is_control())
-        .take(MAX_LEN)
+        .take(max_len)
         .collect();
     if cleaned.is_empty() {
         None
@@ -289,9 +312,14 @@ impl ReplySender for HubClient {
     ) -> BoxFuture<'_, Result<SendOutcome>> {
         let mut req =
             SendMessageRequest::reply_text(ctx.to_string(), text.to_string(), from_user, None);
+        // F-M2-004 / F-M2-009: sanitize the upstream-controlled
+        // session_name so a hostile 10MB or control-character payload
+        // cannot exhaust reqwest body memory, pollute log lines, or
+        // accidentally become an empty `Some("")` field.
+        let cleaned_session = sanitize_field(Some(session_name), 128);
         if let Some(ref mut msg) = req.msg {
             let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-            ext.session_name = Some(session_name.to_string());
+            ext.session_name = cleaned_session;
         }
         Box::pin(self.sendmessage(req))
     }
@@ -356,7 +384,7 @@ async fn run_partial_forward_loop<S: ReplySender>(
             //   (b) a newer chunk arrives from the CLI → overwrite
             //       `pending` so the retry uses the freshest content,
             //       then loop back to (a) to keep the sleep alive.
-            let mut backoff = backoff_fn(attempt);
+            let backoff = backoff_fn(attempt);
             loop {
                 tokio::select! {
                     biased;
@@ -370,12 +398,14 @@ async fn run_partial_forward_loop<S: ReplySender>(
                                 "overwriting buffered partial chunk with newer content during backoff"
                             );
                             pending = Some(c);
-                            // Don't reset `attempt` here — the
-                            // hub is still throttling us; just keep
-                            // extending the wait. But cap the sleep
-                            // to the new (same) backoff value so we
-                            // don't get stuck past the cap.
-                            backoff = backoff_fn(attempt);
+                            // `attempt` is intentionally preserved
+                            // across overwrites — the hub is still
+                            // throttling us, so resetting the counter
+                            // would let any CLI cadence flatten the
+                            // exponential schedule. `backoff` is
+                            // unchanged here as a consequence; we
+                            // recompute it only to surface the same
+                            // value through the local binding. F-M2-006.
                         }
                         None => return,
                     },
@@ -844,12 +874,13 @@ async fn handle_one_message(
         .and_then(|e| e.session_id.as_deref())
         .unwrap_or("")
         .to_string();
-    let session_name_for_cli = msg
-        .ilink_hub_ext
-        .as_ref()
-        .and_then(|e| e.session_name.as_deref())
-        .unwrap_or("default")
-        .to_string();
+    let session_name_for_cli = sanitize_field(
+        msg.ilink_hub_ext
+            .as_ref()
+            .and_then(|e| e.session_name.as_deref()),
+        128,
+    )
+    .unwrap_or_else(|| "default".to_string());
 
     tracing::Span::current().record("profile", profile_name);
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
@@ -1214,8 +1245,14 @@ timeout_secs: 5
     #[test]
     fn parse_unparseable_body_falls_back_to_sent() {
         // Legacy behaviour: pre-M1 code returned Ok(Sent) on JSON parse
-        // failure. M1 keeps the fallback but the dispatcher now emits a
-        // warn log; the unit test pins the fallback itself.
+        // failure. M1 keeps the fallback. The dispatcher emits a warn
+        // log only when ALL three conditions hold:
+        //   1. body_len > 0          (skip empty bodies silently)
+        //   2. JSON parse fails      (not a parseable envelope)
+        //   3. outcome is Sent       (would otherwise hide the anomaly)
+        // The unit test here pins the fallback itself; the warn
+        // emission is exercised end-to-end by the dispatcher
+        // integration tests. F-M2-008.
         assert_eq!(parse_sendoutcome("not json"), Ok(SendOutcome::Sent));
         assert_eq!(parse_sendoutcome(r#"{"ret": "#), Ok(SendOutcome::Sent));
     }
@@ -1412,16 +1449,33 @@ timeout_secs: 5
     //   - whether the loop exits cleanly on shutdown
 
     use std::sync::{Arc, Mutex};
+    use std::time::Instant;
 
     /// Scripted ReplySender. Holds a queue of outcomes to return in
     /// order. Cloning the sender shares the same queue and the same
     /// log; the spawn handle takes one clone, the test holds the
     /// other as a probe. We hand-implement Clone (Mutex doesn't
     /// derive Clone) by wrapping the inner state in Arc<Mutex<…>>.
+    ///
+    /// Each `send_reply` call stamps `Instant::now()` into a parallel
+    /// `timestamps` log so tests can assert wall-clock intervals and
+    /// pin the exponential-backoff shape end-to-end (F-M2-002).
+    ///
+    /// `loop_forever` mode (set via [`ScriptedSender::new_loop`])
+    /// replays the same `SendOutcome` outcome indefinitely instead of
+    /// panicking when the script is exhausted — used by persistent
+    /// throttle tests that want the loop to keep retrying until
+    /// shutdown rather than blow up after N scripted sends. Only
+    /// `SendOutcome` (Clone) is supported here; tests that need a
+    /// looping `Err` use a regular script with a single outcome
+    /// (the loop fires one retry before the panic, which is enough
+    /// to assert shutdown-cancel behavior).
     #[derive(Clone)]
     struct ScriptedSender {
         script: Arc<Mutex<Vec<Result<SendOutcome>>>>,
         log: Arc<Mutex<Vec<String>>>,
+        timestamps: Arc<Mutex<Vec<Instant>>>,
+        loop_outcome: Arc<Mutex<Option<SendOutcome>>>,
     }
 
     impl ScriptedSender {
@@ -1429,6 +1483,21 @@ timeout_secs: 5
             Self {
                 script: Arc::new(Mutex::new(script)),
                 log: Arc::new(Mutex::new(Vec::new())),
+                timestamps: Arc::new(Mutex::new(Vec::new())),
+                loop_outcome: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        /// Construct a sender that returns `Ok(outcome)` every call.
+        /// Useful for "always throttled" scenarios where we want the
+        /// loop to keep retrying until shutdown rather than panic
+        /// when an in-line script is exhausted.
+        fn new_loop(outcome: SendOutcome) -> Self {
+            Self {
+                script: Arc::new(Mutex::new(Vec::new())),
+                log: Arc::new(Mutex::new(Vec::new())),
+                timestamps: Arc::new(Mutex::new(Vec::new())),
+                loop_outcome: Arc::new(Mutex::new(Some(outcome))),
             }
         }
 
@@ -1438,6 +1507,10 @@ timeout_secs: 5
 
         fn sent_texts(&self) -> Vec<String> {
             self.log.lock().unwrap().clone()
+        }
+
+        fn sent_timestamps(&self) -> Vec<Instant> {
+            self.timestamps.lock().unwrap().clone()
         }
     }
 
@@ -1450,16 +1523,20 @@ timeout_secs: 5
             _session_name: &str,
         ) -> BoxFuture<'_, Result<SendOutcome>> {
             self.log.lock().unwrap().push(text.to_string());
-            let next = self.script.lock().unwrap().remove(0);
+            self.timestamps.lock().unwrap().push(Instant::now());
+            let next: Result<SendOutcome> = if let Some(outcome) =
+                self.loop_outcome.lock().unwrap().clone()
+            {
+                Ok(outcome)
+            } else {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() {
+                    panic!("ScriptedSender script exhausted; use new_loop for persistent-throttle tests");
+                }
+                script.remove(0)
+            };
             Box::pin(async move { next })
         }
-    }
-
-    fn err_sender_once(_err: anyhow::Error) -> ScriptedSender {
-        // `Err` outcomes are scripted in the existing `ScriptedSender` —
-        // we don't need a separate helper. The function remains so that
-        // future test expansions have a single canonical builder.
-        ScriptedSender::new(vec![])
     }
 
     /// Helper: spawn the forward loop with a fresh mpsc and shutdown
@@ -1479,7 +1556,11 @@ timeout_secs: 5
             // 5ms initial, 40ms cap — small enough that 4 retries still
             // complete well under the tokio test timeout, large enough
             // that macOS timer granularity doesn't collapse adjacent
-            // sleeps to zero.
+            // sleeps to zero. After F-M2-001 fix, this schedule
+            // exercises the real exponential-then-cap shape
+            // [5ms, 10ms, 20ms, 40ms, 40ms, ...] (production schedule
+            // is [5s, 10s, 20s, 40s, 60s, 60s, ...] — also unit-pinned
+            // by backoff_sequence_matches_spec).
             backoff_for_test(attempt, Duration::from_millis(5), Duration::from_millis(40))
         }
         let (tx, rx) = mpsc::unbounded_channel::<String>();
@@ -1502,6 +1583,16 @@ timeout_secs: 5
         // Three chunks are pushed; each overwrites the previous one
         // while the loop is throttled. After the throttle clears the
         // last-written content must land exactly once.
+        //
+        // After F-M2-001 fix, with the real ms-scale test backoff
+        // schedule [5, 10, 20, 40, 40, ...] and the test's 50ms
+        // inter-chunk sleeps, the loop may consume the script more
+        // or fewer times than 4 depending on exact timing of the
+        // chunk recv() races vs the exponential backoff cycles. We
+        // therefore script one extra `Sent` at the end (5 outcomes)
+        // so the trailing fresh chunk ("v3") can also be delivered
+        // without panicking the mock, and assert the LAST sent text
+        // equals "v3" — which is the spec property we care about.
         let scripted = ScriptedSender::new(vec![
             Ok(SendOutcome::Throttled {
                 ret: -2,
@@ -1516,15 +1607,12 @@ timeout_secs: 5
                 errmsg: Some("rl".into()),
             }),
             Ok(SendOutcome::Sent),
+            Ok(SendOutcome::Sent),
         ]);
         let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        // Push 3 chunks while the hub is throttling. Each overwrites
-        // the buffered `pending` (verified in the sender log: only the
-        // last pre-Sent text survives; intermediate values are sent
-        // exactly once each because the loop re-issues with the
-        // current pending at each retry).
+        // Push 3 chunks while the hub is throttling.
         tx.send("v1".into()).unwrap();
         // Give the loop time to attempt the first send.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1532,10 +1620,9 @@ timeout_secs: 5
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send("v3".into()).unwrap();
 
-        // Final pending = "v3" when ret==0 finally lands.
-        // All 3 retries are observed as distinct sent texts because
-        // each overwrite happened before the previous send returned.
-        // Wait until the script is exhausted (4 sends).
+        // Wait until we have at least 4 sends (covers the throttled
+        // retries + first success; the trailing v3 may or may not
+        // have been delivered yet, depending on timing).
         for _ in 0..200 {
             if probe.sent_count() >= 4 {
                 break;
@@ -1547,18 +1634,46 @@ timeout_secs: 5
         let _ = shutdown; // never cancelled; loop exits when tx drops.
 
         let texts = probe.sent_texts();
-        assert_eq!(
-            texts.len(),
-            4,
-            "expected exactly 4 send attempts (3 throttled + 1 success), got {texts:?}"
+        assert!(
+            texts.len() >= 4,
+            "expected at least 4 sends (3 throttled + ≥1 success), got {texts:?}"
         );
         // The last attempt must be the final chunk's content, so the
         // user sees the freshest fragment after the throttle clears.
         assert_eq!(
             texts.last().unwrap(),
             "v3",
-            "final successful send must be the latest buffered content"
+            "final successful send must be the latest buffered content; got {texts:?}"
         );
+
+        // Wall-clock spacing between the first 4 sends must be
+        // monotonic non-decreasing (F-M2-002). We accept a 1ms
+        // tolerance per gap to absorb tokio timer granularity.
+        let stamps = probe.sent_timestamps();
+        assert!(stamps.len() >= 4, "expected ≥4 timestamp entries");
+        let gaps: Vec<Duration> = stamps
+            .iter()
+            .take(4)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| w[1].duration_since(*w[0]))
+            .collect();
+        assert_eq!(gaps.len(), 3);
+        // First gap is the initial 5ms backoff.
+        assert!(
+            gaps[0] >= Duration::from_millis(4),
+            "first retry must wait at least ~5ms (initial backoff), got {:?}",
+            gaps[0]
+        );
+        for i in 1..gaps.len() {
+            assert!(
+                gaps[i] >= gaps[i - 1].saturating_sub(Duration::from_millis(1)),
+                "backoff regressed at gap[{i}]: {:?} < {:?} (full gaps = {:?})",
+                gaps[i],
+                gaps[i - 1],
+                gaps
+            );
+        }
     }
 
     #[tokio::test]
@@ -1595,7 +1710,33 @@ timeout_secs: 5
         // backoff sleep and overwrites the buffer. After the throttle
         // clears, only the second chunk must be delivered — the first
         // (stale) fragment must NOT be re-sent after the second one.
+        //
+        // With the real ms-scale test backoff schedule [5, 10, 20,
+        // 40, 40, ...], the first chunk may be retried several times
+        // before the test sends the second one (the 100ms inter-chunk
+        // sleep is much longer than the early backoffs but the cap at
+        // 40ms means up to 4 retries fit in 100ms). We therefore
+        // script 4 throttled outcomes followed by 2 Sents so the
+        // mock never panics, and assert the load-bearing invariants:
+        //
+        //   1. The LAST sent text must be v2.
+        //   2. No send carrying v1 may occur AFTER a send carrying v2
+        //      (i.e. the stale fragment must NOT be re-sent once v2
+        //      has overwritten the buffer).
+        //   3. F-M2-003: the inter-send gap BEFORE the first v2 send
+        //      (which is attempt=1's 10ms backoff) must be ≤ the gap
+        //      after v2 arrives, which corresponds to attempt=2's
+        //      20ms backoff — pinning that overwrite does NOT reset
+        //      `attempt`.
         let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
             Ok(SendOutcome::Throttled {
                 ret: -2,
                 errmsg: None,
@@ -1605,22 +1746,22 @@ timeout_secs: 5
                 errmsg: None,
             }),
             Ok(SendOutcome::Sent),
+            Ok(SendOutcome::Sent),
         ]);
         let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
         tx.send("v1".into()).unwrap();
-        // Give the loop time to attempt the first send and enter
+        // Give the loop time to attempt several retries and enter
         // backoff sleep. Then send v2 — by the time v2 arrives the
         // loop is sleeping; the recv() inside the select! will
-        // overwrite pending. The second Throttled in the script then
-        // fires with v2 as the carrier. The third send is the success
-        // (also v2).
+        // overwrite pending. Subsequent sends then carry v2.
         tokio::time::sleep(Duration::from_millis(100)).await;
         tx.send("v2".into()).unwrap();
 
         for _ in 0..2000 {
-            if probe.sent_count() >= 3 {
+            // We expect at least one send of v2 to land. Wait for that.
+            if probe.sent_texts().iter().any(|t| t == "v2") {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1629,24 +1770,54 @@ timeout_secs: 5
         handle.await.unwrap();
 
         let texts = probe.sent_texts();
-        assert_eq!(texts.len(), 3, "expected 3 send attempts, got {texts:?}");
+        // Invariant 1: final delivered content must be v2.
         assert_eq!(
             texts.last().unwrap(),
             "v2",
-            "final delivered content must be the latest buffered chunk"
+            "final delivered content must be the latest buffered chunk; got {texts:?}"
         );
-        // "v1" must appear at most once — it was overwritten before
-        // a second send carried it. The new "v2" replaced it.
-        let v1_count = texts.iter().filter(|t| *t == "v1").count();
-        assert_eq!(
-            v1_count, 1,
-            "stale v1 must not be re-sent after v2 overwrote it: {texts:?}"
+        // Invariant 2: no stale v1 send after the first v2 send.
+        // Find the index of the first "v2" in the send log; every
+        // send after that index must also be v2 (never v1).
+        let first_v2_idx = texts
+            .iter()
+            .position(|t| t == "v2")
+            .expect("v2 must be sent at least once");
+        for (i, t) in texts.iter().enumerate().skip(first_v2_idx) {
+            assert_eq!(
+                t, "v2",
+                "stale v1 must not be re-sent after v2 overwrote it (send #{i} = {:?}); full log: {texts:?}",
+                t
+            );
+        }
+        // We must have at least one v1 send (the initial retry
+        // before the overwrite).
+        assert!(
+            texts.iter().any(|t| t == "v1"),
+            "expected at least one v1 send before the overwrite; got {texts:?}"
         );
-        let v2_count = texts.iter().filter(|t| *t == "v2").count();
-        assert_eq!(
-            v2_count, 2,
-            "v2 must be sent on the second throttle and on success: {texts:?}"
-        );
+
+        // F-M2-003: the gap between the 1st send and the first v2
+        // send corresponds to attempt=1's 10ms backoff (10ms). The
+        // gap between the first v2 send and the next send (which is
+        // still pending=v2 in a fresh retry cycle) corresponds to
+        // attempt=2's 20ms backoff. So gap_after_v2 >= gap_before_v2
+        // would catch a future regression that resets `attempt` on
+        // overwrite. Allow 2ms slack for tokio timer jitter.
+        let stamps = probe.sent_timestamps();
+        assert!(stamps.len() >= 2);
+        let gap_before_v2 = stamps[first_v2_idx].duration_since(stamps[0]);
+        if first_v2_idx + 1 < stamps.len() {
+            let gap_after_v2 = stamps[first_v2_idx + 1].duration_since(stamps[first_v2_idx]);
+            assert!(
+                gap_after_v2 + Duration::from_millis(2) >= gap_before_v2,
+                "overwrite reset attempt (gap_after_v2={:?} < gap_before_v2={:?}); \
+                 gap_before_v2 corresponds to attempt=1 (10ms), \
+                 gap_after_v2 corresponds to attempt=2 (20ms)",
+                gap_after_v2,
+                gap_before_v2
+            );
+        }
     }
 
     #[tokio::test]
@@ -1655,34 +1826,35 @@ timeout_secs: 5
         // and we send a small burst of chunks. The expected behavior
         // is the loop keeps trying, the backoff saturates at 60s, and
         // the most recent chunk is what's pending.
-        let scripted = ScriptedSender::new(vec![
-            Ok(SendOutcome::Throttled {
-                ret: -2,
-                errmsg: None,
-            }),
-            Ok(SendOutcome::Throttled {
-                ret: -2,
-                errmsg: None,
-            }),
-            Ok(SendOutcome::Throttled {
-                ret: -2,
-                errmsg: None,
-            }),
-            Ok(SendOutcome::Throttled {
-                ret: -2,
-                errmsg: None,
-            }),
-        ]);
+        //
+        // After F-M2-001/F-M2-002, this test also asserts the
+        // wall-clock spacing between successive sends is monotonic
+        // and converges to the cap (≤ 40ms with our test schedule).
+        //
+        // We use `new_loop` (Throttled forever) instead of a finite
+        // script because with a real ms-scale backoff schedule the
+        // loop will fire more than 4 sends within the 50ms inter-chunk
+        // sleeps (overwrites during backoff trigger extra cycles);
+        // a finite script would panic. We assert that we observed
+        // AT LEAST the expected retry count, and then verify the
+        // wall-clock shape across the first 4 retries.
+        let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
+            ret: -2,
+            errmsg: None,
+        });
         let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        // Send 3 chunks during the persistent throttle; the script
-        // will be drained 4 times.
+        // Send 3 chunks during the persistent throttle. Each arrives
+        // during a backoff sleep and overwrites pending.
         for i in 0..3 {
             tx.send(format!("chunk-{i}")).unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        for _ in 0..200 {
+        // Wait for at least 4 retry attempts (test_backoff schedule
+        // = [5, 10, 20, 40, 40, ...], so 4 retries complete in
+        // 5+10+20+40 = 75ms; allow generous slack).
+        for _ in 0..400 {
             if probe.sent_count() >= 4 {
                 break;
             }
@@ -1694,16 +1866,64 @@ timeout_secs: 5
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
         let texts = probe.sent_texts();
-        assert_eq!(
-            texts.len(),
-            4,
-            "expected 4 retry attempts under persistent throttle, got {texts:?}"
+        assert!(
+            texts.len() >= 4,
+            "expected at least 4 retry attempts under persistent throttle, got {texts:?}"
         );
         // The last attempt must carry the most-recently-pushed content.
         assert_eq!(
             texts.last().unwrap(),
             "chunk-2",
             "most recent chunk must be the one being retried"
+        );
+
+        // Wall-clock spacing between the first 4 sends: must be
+        // monotonic non-decreasing and converging to the 40ms cap.
+        // Allow a 5ms tolerance for tokio timer granularity and
+        // macOS scheduling jitter.
+        let stamps = probe.sent_timestamps();
+        assert!(stamps.len() >= 4, "expected ≥4 timestamp entries");
+        let gaps: Vec<Duration> = stamps
+            .iter()
+            .take(4)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| w[1].duration_since(*w[0]))
+            .collect();
+        assert_eq!(gaps.len(), 3);
+        // First gap (after 1st throttle) is the initial 5ms backoff.
+        assert!(
+            gaps[0] >= Duration::from_millis(4),
+            "first retry must wait at least ~5ms (initial backoff), got {:?}",
+            gaps[0]
+        );
+        // Monotonic non-decreasing: each gap ≥ previous gap (allow
+        // 1ms tolerance for timer jitter).
+        for i in 1..gaps.len() {
+            assert!(
+                gaps[i] >= gaps[i - 1].saturating_sub(Duration::from_millis(1)),
+                "backoff regressed at gap[{i}]: {:?} < {:?} (full gaps = {:?})",
+                gaps[i],
+                gaps[i - 1],
+                gaps
+            );
+        }
+        // At least one gap must be roughly 2× the previous gap,
+        // catching hardcoded sleeps. Allow generous jitter bounds
+        // (1.4× to 3×).
+        let mut doubled = false;
+        for i in 1..gaps.len() {
+            if gaps[i].as_micros() >= (gaps[i - 1].as_micros() * 14) / 10
+                && gaps[i] < gaps[i - 1].saturating_mul(3)
+            {
+                doubled = true;
+                break;
+            }
+        }
+        assert!(
+            doubled,
+            "expected at least one roughly-2× gap (exponential shape); got {:?}",
+            gaps
         );
     }
 
@@ -1742,38 +1962,39 @@ timeout_secs: 5
         // While a backoff is sleeping, a shutdown signal must wake the
         // loop and let it return. The buffered chunk is dropped (it
         // was held in memory only).
-        let scripted = ScriptedSender::new(vec![Ok(SendOutcome::Throttled {
+        //
+        // Uses loop mode because with the real ms-scale test backoff
+        // schedule the loop will fire more than one retry before the
+        // test cancels shutdown (the cap of 40ms keeps retries
+        // tightly packed); a finite 1-outcome script would panic.
+        let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
             ret: -2,
             errmsg: None,
-        })]);
+        });
         let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
         tx.send("stuck".into()).unwrap();
-        // Wait until the loop has issued the throttled send and is
-        // currently sleeping in the backoff.
+        // Wait until the loop has issued at least one throttled send
+        // and is currently sleeping in the backoff.
         for _ in 0..200 {
             if probe.sent_count() >= 1 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert_eq!(
-            probe.sent_count(),
-            1,
-            "loop should have attempted the first send before we cancel"
+        assert!(
+            probe.sent_count() >= 1,
+            "loop should have attempted at least one send before we cancel"
         );
 
         shutdown.cancel();
-        // The 5s first backoff means we need a way to wake it without
-        // waiting. CancellationToken observed in the same select! as
-        // the sleep is the wake-up mechanism; give the runtime a
-        // small moment to schedule the cancellation.
+        // CancellationToken observed in the same select! as the sleep
+        // is the wake-up mechanism. With the ms-scale backoff the
+        // sleep may be very short, but the loop must still exit
+        // promptly on cancel.
         let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(
-            joined.is_ok(),
-            "loop must exit within 2s of shutdown (cancel was racing the 5s backoff sleep)"
-        );
+        assert!(joined.is_ok(), "loop must exit within 2s of shutdown");
         drop(tx);
     }
 
@@ -1817,14 +2038,5 @@ timeout_secs: 5
         fn assert_reply_sender<S: ReplySender>(_: &S) {}
         let client = fake_client();
         assert_reply_sender(&client);
-    }
-
-    // We don't run `err_sender_once` from a test because the closure
-    // it returns borrows the ErrSender mutably across an await. The
-    // function exists for documentation / future use; silence the
-    // dead-code lint so the test mod compiles cleanly.
-    #[allow(dead_code)]
-    fn _keep_err_sender_helper_in_scope() {
-        let _ = err_sender_once(anyhow::anyhow!("x"));
     }
 }
