@@ -20,7 +20,7 @@ mod migrations;
 
 mod sessions;
 
-pub use clients::ClientRow;
+pub use clients::{ClientRow, HUB_DEFAULT_SENTINEL};
 
 pub use messages::{MessageRow, SessionStatusEntry};
 

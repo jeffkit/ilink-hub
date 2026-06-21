@@ -298,6 +298,14 @@ pub async fn register_client_in_hub(
     if is_first {
         let mut router = state.routing.router.lock().await;
         router.set_default(hashed.clone());
+        // Persist the default so it survives hub restarts (HUB_DEFAULT_SENTINEL row).
+        if let Err(e) = state
+            .store
+            .set_route(crate::store::HUB_DEFAULT_SENTINEL, &hashed)
+            .await
+        {
+            warn!(error = %e, "failed to persist default client on first registration");
+        }
     }
 
     if let Err(e) = state

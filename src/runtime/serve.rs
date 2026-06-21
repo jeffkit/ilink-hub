@@ -427,13 +427,12 @@ async fn perform_qr_login(
 }
 
 async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
+    use crate::store::HUB_DEFAULT_SENTINEL;
+
     match store.list_clients().await {
         Ok(clients) => {
             let count = clients.len();
-            // Capture the first client's vtoken to use as the startup default.
-            // This ensures that after a restart with no routing_state rows, inbound
-            // messages still go to a single deterministic client rather than broadcasting
-            // to all registered backends.
+            // Fallback default: use the first client only when no persisted default exists.
             let first_vtoken = clients.first().map(|c| c.vtoken.clone());
             {
                 let mut registry = state.clients.registry.write().await;
@@ -445,9 +444,27 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                     );
                 }
             }
-            if let Some(vtoken) = first_vtoken {
+            // Prefer the explicitly persisted default (HUB_DEFAULT_SENTINEL row) so that a
+            // restart restores the same default that was active before — not just whichever
+            // client happens to be first in the DB.
+            let default_vtoken = match store.get_route(HUB_DEFAULT_SENTINEL).await {
+                Ok(Some(v)) => {
+                    info!(vtoken = %crate::redact_token(&v), "restored persisted default client");
+                    Some(v)
+                }
+                _ => {
+                    // No sentinel row yet (fresh install or first run after upgrade).
+                    // Fall back to first registered client and persist it for future restarts.
+                    first_vtoken.clone()
+                }
+            };
+            if let Some(vtoken) = &default_vtoken {
                 let mut router = state.routing.router.lock().await;
-                router.set_default(vtoken);
+                router.set_default(vtoken.clone());
+                // Persist the resolved default so the next restart can restore it.
+                if let Err(e) = store.set_route(HUB_DEFAULT_SENTINEL, vtoken).await {
+                    tracing::warn!(error = %e, "failed to persist resolved default client");
+                }
             }
             info!(count, "loaded clients from database");
         }
@@ -458,10 +475,18 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
 
     match store.list_routes().await {
         Ok(routes) => {
-            let count = routes.len();
+            use crate::store::HUB_DEFAULT_SENTINEL;
+            let count = routes
+                .iter()
+                .filter(|(from_user, _)| from_user != HUB_DEFAULT_SENTINEL)
+                .count();
             let mut router = state.routing.router.lock().await;
             let registry = state.clients.registry.read().await;
             for (from_user, vtoken) in routes {
+                // Skip the sentinel — it is handled above as the global default, not a per-user route.
+                if from_user == HUB_DEFAULT_SENTINEL {
+                    continue;
+                }
                 if registry.get_by_vtoken(&vtoken).is_some() {
                     router.set_route(&from_user, vtoken);
                 } else {
