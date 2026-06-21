@@ -1,0 +1,30 @@
+milestone: M1
+title: vtoken 哈希存储对抗性审查结果（最终）
+verdict: PASS
+review_date: 2026-06-21
+reviewer: Manual resolution (orchestrator)
+
+summary: |
+  SEC-M1-001（投机注册并发竞争）、SEC-M1-002（CSRF 校验顺序颠倒）、SEC-M1-003（ClientInfo::new 明文丢失）
+  三个问题已全部修复并验证：
+  - pre_check_confirm 在 speculative register 之前完成 CSRF + session 状态校验（SEC-M1-001/002）
+  - confirm 成功后才调用 register_confirmed_client_in_hub 写入 registry（方案 B）
+  - ClientInfo::new 改为返回 (Self, String) tuple，明文不再丢弃（SEC-M1-003）
+  - 新增对抗性测试 adversarial_pair_confirm_prevent_eviction_of_legitimate_client 通过
+  - cargo fmt / clippy / test 全绿（371 tests passed）
+
+findings:
+  - id: SEC-M1-001
+    severity: Critical
+    status: RESOLVED
+    resolution: "方案 B 实施：confirm 成功后才写 registry，彻底消除 speculative register 污染全局状态的路径"
+
+  - id: SEC-M1-002
+    severity: Medium
+    status: RESOLVED
+    resolution: "pre_check_confirm 在任何 DB/registry 写操作前完成 CSRF 校验，违法请求在锁内早期拒绝"
+
+  - id: SEC-M1-003
+    severity: Low
+    status: RESOLVED
+    resolution: "ClientInfo::new 返回 (ClientInfo, String) tuple，plaintext 由调用方持有并返回给客户端"

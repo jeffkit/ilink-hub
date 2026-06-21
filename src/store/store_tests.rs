@@ -2381,12 +2381,28 @@ fn test_load_or_derive_master_key_scenarios() {
     let res = crate::runtime::crypto::load_or_derive_master_key();
     assert!(res.is_ok());
 
+    // 3a. Hex key with double quotes
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("\"{}\"", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // 3b. Hex key with single quotes
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("'{}'", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // 3c. Hex key with leading/trailing whitespaces
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("   {}   ", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
     // 4. Correct 32-byte base64 (44 characters)
     // 32 zero bytes in base64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
     let b64_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     std::env::set_var("ILINK_HUB_MASTER_KEY", b64_key);
     let res = crate::runtime::crypto::load_or_derive_master_key();
     assert!(res.is_ok());
+
+    // 4a. Base64 key with quotes and whitespaces
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("  \"{}\"  ", b64_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
 
     // Restore old env var
     match old_val {

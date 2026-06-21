@@ -51,3 +51,4 @@ findings:
     resolution: |
       在 `store_tests.rs` 中添加相应的测试，以验证加密与解密的正确性，并验证密钥缺失时能够正确报错。
       同时，补充了针对异常密钥与恶意篡改密文的对抗性测试（`test_bot_credentials_decryption_adversarial_wrong_key` 与 `test_bot_credentials_decryption_adversarial_tampered_ciphertext`），涵盖了使用错误密钥解密、格式损坏（非 Base64）、长度过短、以及密文/Tag 被篡改（翻转比特）等攻击与异常边界场景。
+      此外，在 `test_load_or_derive_master_key_scenarios` 中补充了针对包含单双引号、空格以及各种混合边界格式的密钥环境变量解析与加载校验的对抗性测试。
