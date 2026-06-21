@@ -177,10 +177,13 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Step 1: find MAX(id) per vtoken across all roles — id is autoincrement so
-        // MAX(id) always picks the row that was inserted last, even within the same second.
+        // Round-trip 1 (was 2): join messages against a per-vtoken MAX(id) subquery to
+        // retrieve the latest row's role and session_name in a single SQL statement.
         let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT vtoken, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+            "SELECT m.vtoken, m.session_name, m.role \
+             FROM messages m \
+             INNER JOIN (SELECT vtoken, MAX(id) AS max_id FROM messages \
+                         WHERE vtoken IN (",
         );
         {
             let mut sep = qb.separated(", ");
@@ -188,67 +191,40 @@ impl Store {
                 sep.push_bind(vt.as_str());
             }
         }
-        qb.push(") GROUP BY vtoken");
-        let max_rows = qb.build().fetch_all(&self.rpool).await?;
+        qb.push(") GROUP BY vtoken) t ON m.id = t.max_id");
+        let latest_rows = qb.build().fetch_all(&self.rpool).await?;
 
-        if max_rows.is_empty() {
+        if latest_rows.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Step 2: fetch the actual latest row by id to determine role.
+        // Round-trip 2 (was 2): same approach for the latest user-role message per vtoken,
+        // fetching content and created_at for the status snippet and elapsed-time display.
         let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
+            "SELECT m.vtoken, m.content, m.created_at \
+             FROM messages m \
+             INNER JOIN (SELECT vtoken, MAX(id) AS max_id FROM messages \
+                         WHERE role = 'user' AND vtoken IN (",
         );
         {
             let mut sep = qb2.separated(", ");
-            for row in &max_rows {
-                let max_id: i64 = row.get("max_id");
-                sep.push_bind(max_id);
-            }
-        }
-        qb2.push(")");
-        let latest_rows = qb2.build().fetch_all(&self.rpool).await?;
-
-        // Step 3: find MAX(id) of user-role messages per vtoken (for the display snippet).
-        // We always want to show the user's question, not the assistant's reply.
-        // Also fetch created_at to compute elapsed processing time when waiting_for_reply.
-        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT vtoken, MAX(id) AS max_id FROM messages \
-             WHERE role = 'user' AND vtoken IN (",
-        );
-        {
-            let mut sep = qb3.separated(", ");
             for vt in vtokens {
                 sep.push_bind(vt.as_str());
             }
         }
-        qb3.push(") GROUP BY vtoken");
-        let user_max_rows = qb3.build().fetch_all(&self.rpool).await?;
+        qb2.push(") GROUP BY vtoken) t ON m.id = t.max_id");
+        let user_rows = qb2.build().fetch_all(&self.rpool).await?;
 
         // (vtoken → (content, created_at))
         let mut user_content_map: std::collections::HashMap<String, (String, String)> =
             std::collections::HashMap::new();
-        if !user_max_rows.is_empty() {
-            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
-                "SELECT vtoken, content, created_at FROM messages WHERE id IN (",
-            );
-            {
-                let mut sep = qb4.separated(", ");
-                for row in &user_max_rows {
-                    let max_id: i64 = row.get("max_id");
-                    sep.push_bind(max_id);
-                }
-            }
-            qb4.push(")");
-            let user_rows = qb4.build().fetch_all(&self.rpool).await?;
-            for row in user_rows {
-                let vtoken: String = row.get("vtoken");
-                let content: String = row.get("content");
-                let created_at: String = row.get("created_at");
-                user_content_map
-                    .entry(vtoken)
-                    .or_insert((content, created_at));
-            }
+        for row in user_rows {
+            let vtoken: String = row.get("vtoken");
+            let content: String = row.get("content");
+            let created_at: String = row.get("created_at");
+            user_content_map
+                .entry(vtoken)
+                .or_insert((content, created_at));
         }
 
         let mut map = std::collections::HashMap::new();
@@ -285,9 +261,14 @@ impl Store {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Step 1: for each (vtoken, session_name) find MAX(id) — determines the latest role.
+        // Round-trip 1 (was 2): per (vtoken, session_name) MAX(id) subquery joined back to
+        // messages to retrieve the latest row's role in one statement.
+        // ORDER BY t.max_id DESC preserves "most recent session first" ordering.
         let mut qb = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages WHERE vtoken IN (",
+            "SELECT m.vtoken, m.session_name, m.role, t.max_id \
+             FROM messages m \
+             INNER JOIN (SELECT vtoken, session_name, MAX(id) AS max_id FROM messages \
+                         WHERE vtoken IN (",
         );
         {
             let mut sep = qb.separated(", ");
@@ -295,87 +276,56 @@ impl Store {
                 sep.push_bind(vt.as_str());
             }
         }
-        qb.push(") GROUP BY vtoken, session_name ORDER BY max_id DESC");
-        let session_rows = qb.build().fetch_all(&self.rpool).await?;
+        qb.push(") GROUP BY vtoken, session_name) t ON m.id = t.max_id ORDER BY t.max_id DESC");
+        let latest_rows = qb.build().fetch_all(&self.rpool).await?;
 
-        if session_rows.is_empty() {
+        if latest_rows.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
 
-        // Collect (vtoken, session_name, max_id, role) by fetching the latest row per session.
-        let max_ids: Vec<i64> = session_rows
-            .iter()
-            .map(|r| r.get::<i64, _>("max_id"))
-            .collect();
-
-        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT id, vtoken, session_name, role FROM messages WHERE id IN (",
-        );
-        {
-            let mut sep = qb2.separated(", ");
-            for id in &max_ids {
-                sep.push_bind(*id);
-            }
-        }
-        qb2.push(")");
-        let role_rows = qb2.build().fetch_all(&self.rpool).await?;
+        // Build role map from the single result set.
         // (vtoken, session_name) → role of the latest message
         let mut role_map: std::collections::HashMap<(String, String), String> =
             std::collections::HashMap::new();
-        for row in &role_rows {
+        for row in &latest_rows {
             let vt: String = row.get("vtoken");
             let sn: String = row.get("session_name");
             let role: String = row.get("role");
             role_map.insert((vt, sn), role);
         }
 
-        // Step 2: for each (vtoken, session_name), find the latest user message.
-        let mut qb3 = sqlx::QueryBuilder::<sqlx::Any>::new(
-            "SELECT vtoken, session_name, MAX(id) AS max_id FROM messages \
-             WHERE role = 'user' AND vtoken IN (",
+        // Round-trip 2 (was 2): same approach for the latest user-role message per
+        // (vtoken, session_name), fetching content and created_at together.
+        let mut qb2 = sqlx::QueryBuilder::<sqlx::Any>::new(
+            "SELECT m.vtoken, m.session_name, m.content, m.created_at \
+             FROM messages m \
+             INNER JOIN (SELECT vtoken, session_name, MAX(id) AS max_id FROM messages \
+                         WHERE role = 'user' AND vtoken IN (",
         );
         {
-            let mut sep = qb3.separated(", ");
+            let mut sep = qb2.separated(", ");
             for vt in vtokens {
                 sep.push_bind(vt.as_str());
             }
         }
-        qb3.push(") GROUP BY vtoken, session_name");
-        let user_max_rows = qb3.build().fetch_all(&self.rpool).await?;
-
-        let user_max_ids: Vec<i64> = user_max_rows
-            .iter()
-            .map(|r| r.get::<i64, _>("max_id"))
-            .collect();
+        qb2.push(") GROUP BY vtoken, session_name) t ON m.id = t.max_id");
+        let user_rows = qb2.build().fetch_all(&self.rpool).await?;
 
         // (vtoken, session_name) → (content, created_at)
         let mut user_content_map: std::collections::HashMap<(String, String), (String, String)> =
             std::collections::HashMap::new();
-        if !user_max_ids.is_empty() {
-            let mut qb4 = sqlx::QueryBuilder::<sqlx::Any>::new(
-                "SELECT vtoken, session_name, content, created_at FROM messages WHERE id IN (",
-            );
-            {
-                let mut sep = qb4.separated(", ");
-                for id in &user_max_ids {
-                    sep.push_bind(*id);
-                }
-            }
-            qb4.push(")");
-            let user_rows = qb4.build().fetch_all(&self.rpool).await?;
-            for row in user_rows {
-                let vt: String = row.get("vtoken");
-                let sn: String = row.get("session_name");
-                let content: String = row.get("content");
-                let created_at: String = row.get("created_at");
-                user_content_map.insert((vt, sn), (content, created_at));
-            }
+        for row in user_rows {
+            let vt: String = row.get("vtoken");
+            let sn: String = row.get("session_name");
+            let content: String = row.get("content");
+            let created_at: String = row.get("created_at");
+            user_content_map.insert((vt, sn), (content, created_at));
         }
 
-        // Assemble result — preserve order from session_rows (most recent first).
+        // Assemble result — preserve order from latest_rows (most recent first).
         let mut map: std::collections::HashMap<String, Vec<SessionStatusEntry>> =
             std::collections::HashMap::new();
-        for row in &session_rows {
+        for row in &latest_rows {
             let vt: String = row.get("vtoken");
             let sn: String = row.get("session_name");
             let role = role_map

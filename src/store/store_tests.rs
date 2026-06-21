@@ -3237,3 +3237,144 @@ async fn test_get_session_status_multi_vtoken() {
         "vtoken2: latest user content must be question B1"
     );
 }
+
+// ─── get_all_session_entries_per_vtoken ──────────────────────────────────────
+
+/// N-13-1: empty input returns empty map without panic.
+#[tokio::test]
+async fn test_get_all_session_entries_empty() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let result = store
+        .get_all_session_entries_per_vtoken(&[])
+        .await
+        .expect("get_all_session_entries_per_vtoken with empty slice");
+    assert!(result.is_empty(), "empty input must produce empty output");
+}
+
+/// N-13-2: single vtoken, single session with three messages (user→assistant→user).
+/// Expects waiting_for_reply = true and last_user_content = "world".
+#[tokio::test]
+async fn test_get_all_session_entries_single_vtoken() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vtoken = "vt-n13-single";
+
+    store
+        .save_message("ctx1", Some(vtoken), "default", "peer1", "user", "hello")
+        .await
+        .unwrap();
+    store
+        .save_message("ctx2", Some(vtoken), "default", "peer1", "assistant", "hi")
+        .await
+        .unwrap();
+    store
+        .save_message("ctx3", Some(vtoken), "default", "peer1", "user", "world")
+        .await
+        .unwrap();
+
+    let result = store
+        .get_all_session_entries_per_vtoken(&[vtoken.to_string()])
+        .await
+        .expect("get_all_session_entries_per_vtoken");
+
+    assert_eq!(result.len(), 1, "should return entries for one vtoken");
+    let entries = result.get(vtoken).expect("entries for vtoken");
+    assert_eq!(entries.len(), 1, "one session");
+
+    let entry = &entries[0];
+    assert_eq!(entry.session_name, "default");
+    assert!(
+        entry.waiting_for_reply,
+        "last message is user → waiting_for_reply must be true"
+    );
+    assert_eq!(
+        entry.last_user_content.as_deref(),
+        Some("world"),
+        "last user content must be 'world'"
+    );
+    assert!(
+        entry.user_msg_created_at.is_some(),
+        "user_msg_created_at must be set"
+    );
+}
+
+/// N-13-3: same vtoken, two different session_names — entries are independent.
+#[tokio::test]
+async fn test_get_all_session_entries_multi_session() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vtoken = "vt-n13-multi";
+
+    // session-a: user asks, assistant replies → not waiting
+    store
+        .save_message(
+            "ctxA1",
+            Some(vtoken),
+            "session-a",
+            "peerA",
+            "user",
+            "question-A",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "ctxA2",
+            Some(vtoken),
+            "session-a",
+            "peerA",
+            "assistant",
+            "answer-A",
+        )
+        .await
+        .unwrap();
+
+    // session-b: user asks but no reply yet → waiting
+    store
+        .save_message(
+            "ctxB1",
+            Some(vtoken),
+            "session-b",
+            "peerB",
+            "user",
+            "question-B",
+        )
+        .await
+        .unwrap();
+
+    let result = store
+        .get_all_session_entries_per_vtoken(&[vtoken.to_string()])
+        .await
+        .expect("get_all_session_entries_per_vtoken");
+
+    assert_eq!(result.len(), 1);
+    let entries = result.get(vtoken).expect("entries for vtoken");
+    assert_eq!(entries.len(), 2, "two sessions must each produce an entry");
+
+    let entry_a = entries
+        .iter()
+        .find(|e| e.session_name == "session-a")
+        .expect("entry for session-a");
+    let entry_b = entries
+        .iter()
+        .find(|e| e.session_name == "session-b")
+        .expect("entry for session-b");
+
+    assert!(
+        !entry_a.waiting_for_reply,
+        "session-a: assistant replied last → not waiting"
+    );
+    assert_eq!(
+        entry_a.last_user_content.as_deref(),
+        Some("question-A"),
+        "session-a last user content"
+    );
+
+    assert!(
+        entry_b.waiting_for_reply,
+        "session-b: user message pending → waiting"
+    );
+    assert_eq!(
+        entry_b.last_user_content.as_deref(),
+        Some("question-B"),
+        "session-b last user content"
+    );
+}
