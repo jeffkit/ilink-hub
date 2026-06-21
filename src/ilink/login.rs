@@ -7,7 +7,18 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
+use crate::error::HubError;
+
 use super::types::*;
+
+/// Map a JSON parse error from the QR login response decode into a
+/// `HubError::UpstreamParse` so the N-06 specific variant survives a
+/// round-trip through `anyhow::Result` and is observable to downstream
+/// `HubError` consumers. See `crate::error::From<anyhow::Error>` for
+/// the downcast that recovers this variant.
+fn upstream_parse_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(HubError::UpstreamParse(e.to_string()))
+}
 
 /// UI hints for embedders (e.g. Tauri) during WeChat QR login — safe to serialize to the webview.
 #[derive(Clone, serde::Serialize)]
@@ -97,7 +108,8 @@ impl LoginClient {
             .send()
             .await?
             .json::<GetQrcodeResponse>()
-            .await?;
+            .await
+            .map_err(upstream_parse_err)?;
         if resp.ret != 0 {
             return Err(anyhow!(
                 "get_bot_qrcode failed: {}",

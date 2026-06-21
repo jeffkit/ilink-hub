@@ -11,10 +11,33 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, mpsc::UnboundedSender};
 use tracing::{debug, error, info, warn};
 
+use crate::error::HubError;
 use crate::store::Store;
 
 use super::login::{LoginClient, QrLoginUiEvent};
 use super::types::*;
+
+/// Map a `reqwest::Error` from a `.send()` / `.error_for_status()` step into
+/// a `HubError::UpstreamHttp` carrying the HTTP status code, then wrap it in
+/// `anyhow::Error` so the upstream module's `anyhow::Result` signature stays
+/// unchanged. When this propagates back to a `HubError` consumer, the
+/// `From<anyhow::Error> for HubError` impl in `crate::error` will downcast
+/// and recover the specific `UpstreamHttp` variant — see N-06.
+fn upstream_http_err(e: reqwest::Error) -> anyhow::Error {
+    let status = e.status().map(|s| s.as_u16()).unwrap_or(0);
+    anyhow::Error::new(HubError::UpstreamHttp {
+        status,
+        msg: e.to_string(),
+    })
+}
+
+/// Map a `reqwest::Error` from a `.json::<T>()` body-decode step (or a
+/// `serde_json` parse error) into a `HubError::UpstreamParse` and wrap it
+/// in `anyhow::Error`. Recovered downstream by the same downcast path
+/// as `upstream_http_err` — see N-06.
+fn upstream_parse_err(e: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::Error::new(HubError::UpstreamParse(e.to_string()))
+}
 
 /// Abstraction over the iLink upstream HTTP surface, used by the Hub to send
 /// messages back to WeChat users and to issue long-polls. Production wires
@@ -116,8 +139,10 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(upstream_http_err)?
+            .error_for_status()
+            .map_err(upstream_http_err)?;
 
         // Parse the body to surface iLink business errors.
         // We tolerate JSON parse failures here — notifystart is best-effort.
@@ -177,9 +202,11 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&req_body)
             .send()
-            .await?
+            .await
+            .map_err(upstream_http_err)?
             .json::<GetUpdatesResponse>()
-            .await?;
+            .await
+            .map_err(upstream_parse_err)?;
         Ok(resp)
     }
 
@@ -198,9 +225,11 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&req)
             .send()
-            .await?
+            .await
+            .map_err(upstream_http_err)?
             .text()
-            .await?;
+            .await
+            .map_err(upstream_http_err)?;
         debug!(response = %text, "send_message raw response");
         // Empty body means success
         if text.trim().is_empty() {
@@ -232,22 +261,10 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&req)
             .send()
-            .await;
-        let resp = match resp {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "iLink sendtyping network error");
-                return Err(e.into());
-            }
-        };
-        if let Err(e) = resp.error_for_status() {
-            warn!(
-                status = %e.status().unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
-                error = %e,
-                "iLink sendtyping returned non-2xx status"
-            );
-            return Err(e.into());
-        }
+            .await
+            .map_err(upstream_http_err)?
+            .error_for_status()
+            .map_err(upstream_http_err)?;
         Ok(())
     }
 
@@ -259,9 +276,11 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&req)
             .send()
-            .await?
+            .await
+            .map_err(upstream_http_err)?
             .json::<GetConfigResponse>()
-            .await?;
+            .await
+            .map_err(upstream_parse_err)?;
         Ok(resp)
     }
 
@@ -273,9 +292,11 @@ impl UpstreamClient {
             .headers(self.headers()?)
             .json(&req)
             .send()
-            .await?
+            .await
+            .map_err(upstream_http_err)?
             .json::<GetUploadUrlResponse>()
-            .await?;
+            .await
+            .map_err(upstream_parse_err)?;
         Ok(resp)
     }
 

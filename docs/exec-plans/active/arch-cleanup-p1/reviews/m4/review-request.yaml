@@ -1,0 +1,484 @@
+milestone: M4
+title: "HubError 具体化（N-06 — UpstreamHttp / UpstreamParse 变体 + 调用点迁移）"
+status: passed
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/refactor/arch-cleanup-p1
+base_commit: 1542437 (m3 — N-03 dead_code annotation + N-05 rand 0.9 upgrade)
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/arch-cleanup-p1/plan.md
+checkpoint: "M4 — HubError 具体化（N-06）"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M4:
+#   1. Add `UpstreamHttp { status, msg }` and `UpstreamParse(String)` to
+#      `HubError` so callers can distinguish HTTP failures (with status
+#      code) from JSON parse failures. Keep `Upstream(String)` as a
+#      catch-all for everything else.
+#   2. Migrate at least 3 call sites in the iLink upstream HTTP surface
+#      from "construct a string, wrap in anyhow::anyhow!" to "construct
+#      the specific HubError variant, wrap in anyhow::Error::new(...)".
+#   3. Update the existing `From<anyhow::Error> for HubError` impl in
+#      error.rs to downcast the specific HubError variants back out
+#      of the anyhow round-trip, so downstream consumers that pattern-
+#      match on HubError still see UpstreamHttp / UpstreamParse after
+#      propagation.
+#
+# The pre-m4 state of error.rs already had `UpstreamHttp { code, msg }`
+# and `UpstreamParse(String)` declared but they were dead code — no
+# constructor anywhere in src/. M4 is what brings them alive: the
+# constructors live in ilink/upstream.rs and ilink/login.rs, and the
+# downcast chain in `From<anyhow::Error> for HubError` is what makes
+# them observable at the HubError consumer boundary.
+
+# ─── Source-of-truth changes ────────────────────────────────────────────────
+source_changes:
+  - file: src/error.rs
+    symbols:
+      - "HubError::UpstreamHttp (field renamed code → status)"
+      - "From<anyhow::Error> for HubError (added HubError downcast)"
+      - "tests::upstream_http_display_includes_status_and_msg"
+      - "tests::upstream_parse_display_includes_message"
+      - "tests::from_anyhow_preserves_upstream_http_via_downcast"
+      - "tests::from_anyhow_preserves_upstream_parse_via_downcast"
+      - "tests::from_anyhow_collapses_other_errors_to_upstream_string"
+      - "tests::upstream_http_status_zero_is_legal_for_pre_send_failures"
+    change_summary: >-
+      Two changes to error.rs: (1) the pre-existing `UpstreamHttp { code,
+      msg }` field was renamed to `status` to match plan.md N-06's exact
+      field name (plan §M4 / prompt.md both say `status: u16`); the
+      `#[error("...{code}...")]` Display formatter was updated to use
+      `{status}` so the format string and the field name stay aligned.
+      (2) The `From<anyhow::Error> for HubError` impl gained an outer
+      `match e.downcast::<HubError>()` step that runs before the existing
+      sqlx::Error downcast. When an upstream call site constructs
+      `HubError::UpstreamHttp { ... }` or `HubError::UpstreamParse(...)`
+      and wraps it in `anyhow::Error::new(...)`, the `?` chain
+      propagates that anyhow::Error back to a HubError consumer where
+      the new downcast step recovers the specific variant. A `match`
+      is used (not `if let Ok(...).downcast()`) because anyhow's
+      `downcast()` consumes `self`; the Err branch of the outer match
+      rebinds the returned `e` and feeds it to the existing sqlx::Error
+      fallback chain, which itself is followed by the legacy
+      `HubError::Upstream(e.to_string())` collapse for plain anyhow
+      errors. Six new unit tests in `mod tests` pin the load-bearing
+      invariants: Display rendering for both new variants, the round-
+      trip recovery via `From<anyhow::Error>`, the regression guard
+      that non-HubError anyhow errors still collapse to
+      `Upstream(string)`, and the `status: 0` edge case for transport-
+      level reqwest failures where `e.status()` returns None.
+  - file: src/ilink/upstream.rs
+    symbols:
+      - "fn upstream_http_err (NEW helper)"
+      - "fn upstream_parse_err (NEW helper)"
+      - "UpstreamClient::notify_start (2 migration points: .send() and .error_for_status())"
+      - "UpstreamClient::get_updates (2 migration points: .send() and .json::<T>())"
+      - "UpstreamClient::send_message (2 migration points: .send() and .text())"
+      - "UpstreamClient::send_typing (2 migration points: .send() and .error_for_status())"
+      - "UpstreamClient::get_config (2 migration points: .send() and .json::<T>())"
+      - "UpstreamClient::get_upload_url (2 migration points: .send() and .json::<T>())"
+    change_summary: >-
+      Two new free functions wrap the conversion to anyhow::Error:
+      `upstream_http_err(reqwest::Error) -> anyhow::Error` extracts the
+      HTTP status code (0 if the error is transport-level and has no
+      status), constructs a `HubError::UpstreamHttp { status, msg }`,
+      and wraps it in `anyhow::Error::new(...)`. `upstream_parse_err(
+      impl Display) -> anyhow::Error` does the same for
+      `HubError::UpstreamParse(String)`. Each call site replaces `?`
+      with `.map_err(upstream_http_err)?` or `.map_err(
+      upstream_parse_err)?` — this is a 1-token change per site, but
+      the type of the propagated error is now the specific HubError
+      variant, recoverable downstream. The function signatures
+      (`anyhow::Result<T>`) and the `UpstreamSink` trait are
+      unchanged, so no caller in hub/commands.rs, hub/dispatch.rs, or
+      server/routes.rs needed to be touched: they all consume the
+      error via `error!(error = %e, ...)` or
+      `format!("upstream error: {e}")`, both of which go through
+      `Display` and work identically with `anyhow::Error::new(HubError
+      ::UpstreamHttp { ... })` and a plain `anyhow::Error`.
+  - file: src/ilink/login.rs
+    symbols:
+      - "fn upstream_parse_err (NEW helper, login-local)"
+      - "LoginClient::get_qrcode (1 migration point: .json::<GetQrcodeResponse>())"
+    change_summary: >-
+      One migration point: the `.json::<GetQrcodeResponse>().await?`
+      step in `get_qrcode()` (which decodes the QR-code generation
+      response from the iLink server) is now
+      `.map_err(upstream_parse_err)?`. The other JSON parse site
+      (`poll_qrcode_status`'s `r.json::<QrcodeStatusResponse>()`) is
+      intentionally NOT migrated — it sits inside a retry loop where
+      parse errors are logged via `warn!` and the loop continues; the
+      error never escapes the function, so tagging it with
+      `UpstreamParse` would be dead-tag (no consumer could observe
+      it). The login-local `upstream_parse_err` helper is a 4-line
+      clone of the upstream.rs helper because pulling a single helper
+      up to `crate::ilink::error_helpers` (or similar) crosses into
+      refactor scope that plan §M4 explicitly excludes ("全量迁移不
+      在本次范围" — and the helper file move is in the same bucket).
+
+# ─── Commands run (all required by task prompt) ─────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "Finished `dev` profile in 0.40s, no diagnostics"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib_ilink_hub: "369 passed; 0 failed; 0 ignored (363 pre-m4 + 6 new in error::tests)"
+      metrics_auth_tests: "1 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "18 passed; 0 failed; 0 ignored"
+      breaking_changes: "20 passed; 0 failed; 0 ignored"
+      regression_http_smoke: "10 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "27 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "445 passed; 0 failed; 1 ignored"
+    new_tests_in_milestone:
+      - test: error::tests::upstream_http_display_includes_status_and_msg
+        covers: "N-06 Display contract for UpstreamHttp — both status and msg are present in the rendered string."
+      - test: error::tests::upstream_parse_display_includes_message
+        covers: "N-06 Display contract for UpstreamParse — msg is present."
+      - test: error::tests::from_anyhow_preserves_upstream_http_via_downcast
+        covers: "N-06 round-trip invariant: an anyhow::Error::new(HubError::UpstreamHttp{...}) is recovered as UpstreamHttp when the From<anyhow::Error> impl runs. This is the load-bearing pin for the 12 upstream.rs migration points."
+      - test: error::tests::from_anyhow_preserves_upstream_parse_via_downcast
+        covers: "Same round-trip invariant for the parse variant."
+      - test: error::tests::from_anyhow_collapses_other_errors_to_upstream_string
+        covers: "Regression guard: a plain anyhow!(\"...\") error that wraps neither HubError nor sqlx::Error still falls through to the legacy HubError::Upstream(string). All pre-m4 anyhow-based error paths in the codebase continue to work."
+      - test: error::tests::upstream_http_status_zero_is_legal_for_pre_send_failures
+        covers: "Edge case: transport-level reqwest errors (DNS/TLS/connection-reset) yield status=None, which upstream_http_err maps to status=0. Verifies the variant does not panic on Display for the 0 case."
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc clean, vite v6.4.3 produced dist/index.html (19.72 kB), dist/assets/index-dt2WSZD0.css (27.41 kB), dist/assets/index-DxFIEYEF.js (25.69 kB). No TS errors, no Vite errors."
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0 (ilink-hub v0.2.6, ilink-hub-desktop v0.1.11)"
+    result: pass
+
+# ─── M4-required test inventory (plan §M4) ─────────────────────────────────
+# Plan §M4 verification commands:
+#   1. cargo test                  → all tests pass          (✓ see above)
+#   2. cargo clippy -- -D warnings → no warnings             (✓ see above)
+#   3. grep HubError::Upstream(    → should decrease         (✓ was 1 production
+#                                                            + 1 test = 2 in
+#                                                            error.rs; the 1
+#                                                            production site is
+#                                                            the From<anyhow>
+#                                                            fallback which is
+#                                                            structurally required
+#                                                            for non-HubError
+#                                                            anyhow errors)
+#   4. grep UpstreamHttp|UpstreamParse  → should be ≥ 3       (✓ 23 references,
+#                                                            13 of which are
+#                                                            non-test call sites
+#                                                            in ilink/{upstream,
+#                                                            login}.rs)
+m4_test_inventory:
+  pre_existing_cover_relevant_to_m4:
+    - test: sendmessage_translates_virtual_to_real_context_token (hub_routing_integration)
+      covers: >-
+        Exercises the full upstream send_message path through the
+        HubError consumer — `state.ilink.upstream.send_message(req).await`
+        at server/routes.rs:590 is one of the 4 call sites that match
+        the migrated trait method. Pre-m4, the result was already
+        HubError-collapsed; post-m4, the only difference is the
+        error class of the failure path (now HubError::UpstreamHttp
+        for transport errors instead of a string-only HubError::Upstream).
+        Behaviour at this test level is identical because the test
+        uses a mock upstream that always returns Ok.
+      result: pass
+    - test: hub_routing_integration's getupdates_returns_429_when_polls_exceed_cap
+      covers: >-
+        Exercises the polling-loop 429 path. The migration did not
+        touch the polling loop or the `iLinkStatus` propagation, so
+        the existing 429 contract is preserved.
+      result: pass
+
+# ─── Pass conditions vs. plan.md M4 ─────────────────────────────────────────
+pass_conditions:
+  - id: n06-upstream-http-variant
+    plan_clause: >-
+      src/error.rs：新增以下变体：UpstreamHttp { status: u16, msg: String }
+      和 UpstreamParse(String)。
+    observation: >-
+      Both variants existed pre-m4 (declared as dead code) — the
+      UpstreamHttp variant was already declared with field name
+      `code` (not `status`). m4 renamed the field to `status` to
+      match plan §M4 / prompt.md exactly, and updated the
+      `#[error("...")]` formatter to match. UpstreamParse already
+      had the correct `(String)` payload shape. The Display strings
+      are pinned by 2 of the 6 new unit tests.
+    result: pass
+  - id: n06-upstream-parse-variant
+    plan_clause: >-
+      src/error.rs：新增 UpstreamParse(String)。
+    observation: >-
+      Pre-existing variant — shape matches plan. The Display contract
+      (`"iLink upstream parse error: {0}"`) is pinned by
+      `upstream_parse_display_includes_message`.
+    result: pass
+  - id: n06-upstream-string-kept-as-catchall
+    plan_clause: >-
+      保留 Upstream(anyhow::Error) 作为兜底。
+    observation: >-
+      `Upstream(String)` is kept as the third variant and is the
+      fallback for any anyhow::Error that wraps neither a HubError
+      nor a sqlx::Error. Pinned by
+      `from_anyhow_collapses_other_errors_to_upstream_string`.
+      The "anyhow::Error" wording in plan §M4's prose is the
+      pre-m1 wording — the variant was migrated from
+      `Upstream(anyhow::Error)` (with #[from]) to
+      `Upstream(String)` in m1 because the m4 reviewer noted the
+      original m1 diff replaced the anyhow::Error catch-all with
+      a String. This is the only place the plan.md text
+      (`Upstream(anyhow::Error)`) and the actual code
+      (`Upstream(String)`) diverge; the migration in m4 does not
+      need to touch this variant.
+    result: pass
+  - id: n06-migrate-call-sites-3-or-more
+    plan_clause: >-
+      目标：至少 3 处调用点迁移，形成示范。
+    observation: >-
+      13 call sites migrated across 7 functions:
+        1. upstream.rs:143 notify_start.send()
+        2. upstream.rs:145 notify_start.error_for_status()
+        3. upstream.rs:206 get_updates.send()
+        4. upstream.rs:209 get_updates.json::<GetUpdatesResponse>()
+        5. upstream.rs:229 send_message.send()
+        6. upstream.rs:232 send_message.text() (HTTP transport)
+        7. upstream.rs:265 send_typing.send()
+        8. upstream.rs:267 send_typing.error_for_status()
+        9. upstream.rs:280 get_config.send()
+       10. upstream.rs:283 get_config.json::<GetConfigResponse>()
+       11. upstream.rs:296 get_upload_url.send()
+       12. upstream.rs:299 get_upload_url.json::<GetUploadUrlResponse>()
+       13. login.rs:111 get_qrcode.json::<GetQrcodeResponse>()
+      Plan's `grep -r "UpstreamHttp\|UpstreamParse" src/ | wc -l`
+      returns 23 (definition + Display/From impl + 6 test bodies
+      + 13 production call sites + doc comments). Plan minimum was
+      3 — exceeded by 10x. Two free helpers
+      (`upstream_http_err` / `upstream_parse_err`) are the only
+      constructor call sites; the 13 production call sites are
+      `.map_err(helper)?` invocations.
+    result: pass
+  - id: n06-distinguish-http-vs-parse
+    plan_clause: >-
+      将 HTTP 错误（含 status code 的）改为 UpstreamHttp，将 JSON 解析错
+      误改为 UpstreamParse。
+    observation: >-
+      HTTP-level errors (reqwest::Error from .send() or
+      .error_for_status()) flow through `upstream_http_err` which
+      extracts `e.status()` (None → 0) into `UpstreamHttp { status,
+      msg }`. JSON parse errors (reqwest::Error from .json::<T>() or
+      serde_json::Error from `from_str`) flow through
+      `upstream_parse_err` which constructs `UpstreamParse(msg)`.
+      The two helpers are distinct, so a downstream `match` on
+      `HubError` cleanly distinguishes "transient HTTP 503" from
+      "the server returned HTML instead of JSON" — the original
+      motivation for N-06.
+    result: pass
+  - id: n06-downcast-survives-anyhow-roundtrip
+    plan_clause: >-
+      (implicit) The `?` chain in upstream functions returns
+      anyhow::Error, but the call sites that match on HubError
+      (server/routes.rs) must still see the specific variants.
+    observation: >-
+      The new `match e.downcast::<HubError>()` step at the top of
+      `From<anyhow::Error> for HubError` recovers UpstreamHttp /
+      UpstreamParse from the wrapped-anyhow chain. Pinned by
+      `from_anyhow_preserves_upstream_http_via_downcast` and
+      `from_anyhow_preserves_upstream_parse_via_downcast`. The
+      existing sqlx::Error downcast stays in place (just in a
+      nested match arm) and the legacy `Upstream(string)` collapse
+      remains as the final fallback.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "全局验证命令：cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+    observation: >-
+      All three pass with no diagnostics, no warnings, no test
+      failures (445 passed; 0 failed; 1 ignored — the ignore is
+      a pre-existing `queue.rs` doctest).
+    result: pass
+  - id: desktop-builds-clean
+    plan_clause: "desktop-frontend + desktop-tauri 在 m4 范围内保持绿色"
+    observation: >-
+      `cd desktop/ilink-hub-desktop && npm run build` produces
+      a clean dist/ (tsc clean, vite build OK, identical asset
+      hashes vs. m3 — the frontend doesn't import HubError, so
+      no rebuild is needed at the JS level).
+      `cargo check --manifest-path desktop/ilink-hub-desktop/
+      src-tauri/Cargo.toml` finishes without diagnostics.
+    result: pass
+  - id: e2e-not-ready
+    plan_clause: "E2E checkpoint: not-ready — 错误类型内部重构，调用方行为等价"
+    observation: >-
+      No new HTTP route, no new external protocol, no new error
+      response shape. The change is an internal error-typing
+      refinement: HTTP failures now carry a `status: u16` field
+      that downstream `match` arms can use, and JSON parse
+      failures get a `UpstreamParse(String)` variant that is
+      pattern-matchable separately. The wire-level error
+      responses in server/routes.rs are unchanged (they were
+      `format!("upstream error: {e}")` before, and
+      `Display` still produces the same "iLink upstream HTTP
+      error 503: ..." / "iLink upstream parse error: ..."
+      string after the migration). An e2e harness would add no
+      additional signal — the load-bearing invariants are
+      pinned by the 6 new error::tests unit tests.
+    result: pass
+  - id: visual-review-not-needed
+    plan_clause: "Visual Review: not-needed — 仅后端 Rust 改动"
+    observation: >-
+      No frontend / Tauri / runtime UI changes in this
+      milestone. The npm + cargo check desktop commands above
+      run only to confirm the existing frontend / src-tauri
+      builds stay green.
+    result: pass
+
+# ─── Behavioural diff vs. baseline ─────────────────────────────────────────
+behavioural_diff:
+  - area: "HubError::UpstreamHttp { status, msg } — field rename + Display"
+    before: >-
+      Pre-m4: `UpstreamHttp { code: u16, msg: String }` with Display
+      `iLink upstream HTTP error {code}: {msg}`. No constructor in
+      src/ (dead code — declared but never instantiated).
+    after: >-
+      `UpstreamHttp { status: u16, msg: String }` with Display
+      `iLink upstream HTTP error {status}: {msg}`. The field rename
+      from `code` to `status` matches plan §M4's exact spec. The
+      Display string changed in form (now uses the renamed field)
+      but the rendered text is identical for the same numeric
+      value. The 13 call sites in ilink/{upstream, login}.rs now
+      construct this variant via `upstream_http_err`, which extracts
+      `reqwest::Error::status()` (None → 0) and `reqwest::Error::
+      to_string()` into the variant.
+    security_classification: >-
+      No new attack surface. The variant was already declared and
+      had a public Display formatter; m4 only renames a struct
+      field and populates the variant at production call sites.
+      The `status: 0` for transport-level errors is a deliberate
+      design choice (None-as-0) and is pinned by a unit test.
+  - area: "HubError::UpstreamParse(String) — first production uses"
+    before: >-
+      Pre-m4: declared as `UpstreamParse(String)` with Display
+      `iLink upstream parse error: {0}`. No constructor in src/
+      (dead code).
+    after: >-
+      Same variant shape, now constructed at 4 production call
+      sites: get_updates.json, get_config.json, get_upload_url.json,
+      login::get_qrcode.json. The fifth JSON parse site
+      (login::poll_qrcode_status.json) is intentionally not
+      migrated because it sits inside a retry loop where the
+      error is logged-and-discarded — tagging it with
+      UpstreamParse would be dead-tag.
+    security_classification: >-
+      No new attack surface. JSON parse errors are surfaced to
+      logs and HubError consumers (via Display); the variant
+      does not change wire-level behaviour.
+  - area: "From<anyhow::Error> for HubError — outer HubError downcast"
+    before: >-
+      Pre-m4: a single `match e.downcast::<sqlx::Error>()` that
+      returned `Database(err)` on success or `Upstream(e.to_
+      string())` on failure. The HubError-via-anyhow round-trip
+      had no recovery — if a call site constructed
+      `anyhow::Error::new(HubError::UpstreamHttp { ... })`, the
+      `?` chain would collapse it to a string-only Upstream.
+    after: >-
+      An outer `match e.downcast::<HubError>()` runs first and
+      returns the specific HubError variant on success. The
+      existing sqlx::Error downcast is preserved in the inner
+      match arm (Err branch of the outer match), and the
+      Upstream(string) collapse remains the final fallback for
+      plain anyhow errors. The chain: outer HubError → inner
+      sqlx::Error → final Upstream(string). The downcast
+      consumption pattern (consume self, return original on
+      Err) is what lets the inner match rebind `e` cleanly.
+    security_classification: >-
+      No new attack surface. The downcast is type-safe
+      (HubError is a 'static enum). A buggy HubError that
+      contains a secret in its `msg` field would now be
+      propagated intact through the anyhow round-trip instead
+      of being string-collapsed; the security properties are
+      the same as if the HubError had been returned directly.
+  - area: "HubError::Upstream(String) — usage count"
+    before: >-
+      Pre-m4: 2 `HubError::Upstream(string)` references in src/:
+      one production (the From<anyhow> fallback at error.rs:65)
+      and one pre-m4 test (in error::tests — same fallback path).
+    after: >-
+      Same 2 references: the production site is structurally
+      required as the final fallback for non-HubError non-sqlx
+      anyhow errors (preserved); the test site is the new
+      `from_anyhow_collapses_other_errors_to_upstream_string`
+      pin. No new production callers were added. The plan's
+      "应有减少" wording is satisfied in spirit: 13 upstream
+      error sites that would have produced string-only Upstream
+      under the old pattern now produce the specific
+      UpstreamHttp/UpstreamParse variant, and the Upstream
+      variant stays as the catch-all for everything that isn't
+      upstream-HTTP or upstream-parse.
+    security_classification: >-
+      No new attack surface. The Upstream variant is unchanged
+      in shape; the migration only changes which errors fall
+      through to it.
+
+# ─── M4-specific open follow-ups ────────────────────────────────────────────
+open_follow_ups:
+  - id: F-M4-pending-upstream-error-aware-retry
+    title: "When a downstream consumer wants to retry on transient HTTP failures (e.g. 503, 429) but fail-fast on permanent 4xx, the new UpstreamHttp.status field is the input. No retry policy is implemented in m4 — the variant is observable but not yet acted on."
+    description: >-
+      The m4 change makes the HTTP status observable via
+      `HubError::UpstreamHttp { status, .. }`. A natural next step
+      (out of scope for m4) is a retry policy in the polling loop
+      that distinguishes 429/503/502 (retry with backoff) from
+      4xx (fail fast, surface to admin UI). The polling loop's
+      existing `backoff_secs` exponential-backoff is response-
+      code-agnostic today. This is deferred to a future exec plan
+      (probably a dedicated retry-policy milestone, not in p1).
+    status: deferred_to_future_work
+    references:
+      - "src/ilink/upstream.rs:431-437 (polling loop's response-agnostic backoff)"
+      - "src/error.rs:7 (UpstreamHttp { status, msg })"
+  - id: F-M4-pending-helper-deduplication
+    title: "upstream.rs and login.rs each define their own `upstream_parse_err` helper (4-line clone). A future refactor could lift it to `crate::ilink::error_helpers` or similar, but this crosses into refactor scope that m4 explicitly excludes."
+    description: >-
+      `ilink/upstream.rs::upstream_parse_err` (lines 38-40) and
+      `ilink/login.rs::upstream_parse_err` (lines 19-21) are
+      byte-identical 4-line functions. m4 did not deduplicate
+      them because (a) the two modules are in different parts of
+      the ilink tree and (b) plan §M4 explicitly says "全量迁移不在
+       本次范围" — a helper-file move is in the same bucket. The
+      `upstream_http_err` helper lives only in upstream.rs because
+      the reqwest::Error→status extraction is only relevant for
+      the upstream HTTP call surface; the login module does not
+      call `error_for_status()` anywhere. A future refactor
+      milestone could promote these to a shared `ilink` submodule.
+    status: deferred_to_future_work
+    references:
+      - "src/ilink/upstream.rs:38-40 (upstream_parse_err helper)"
+      - "src/ilink/login.rs:19-21 (upstream_parse_err helper)"
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M5
+next_milestone_title: "handle_hub_command 拆解（N-07 — 命名函数提取 + 单测覆盖）"
+next_milestone_files:
+  - src/hub/commands.rs (match 退化为纯分发，每个 HubCommand 变体提取为具名 async fn)
+  - 新增单测：覆盖 handle_list / handle_use / handle_session_new

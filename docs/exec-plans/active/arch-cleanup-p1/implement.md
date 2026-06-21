@@ -89,15 +89,31 @@
 
 ### Decisions
 
-_待填写_
+- **N-06 既有变体的发现**：m4 起步时 `src/error.rs` 已经在 `HubError` 上声明了 `UpstreamHttp { code, msg }` 和 `UpstreamParse(String)` 两个变体——但 `grep -r "HubError::UpstreamHttp\|HubError::UpstreamParse" src/` 0 个 constructor，**两个变体都是 dead code**。这种"提前留好接口但没人用"的状态是 m4 的真实工作面：m4 的目标不是"加两个变体"（已经有了），而是"在 ilink 上游 HTTP 面上把 anyhow-? 转成这两个变体，并让 `From<anyhow::Error> for HubError` 能在 round-trip 后 downcast 回原变体"。所以 m4 的 3 个改动点是：(1) `error.rs` 的 From downcast 链 + (2) `ilink/upstream.rs` / `ilink/login.rs` 的 13 处 call site + (3) error.rs 的 6 个新单测。
+- **N-06 字段重命名 `code` → `status`**：plan §M4 / prompt.md 都说 `UpstreamHttp { status: u16, msg: String }`；实际代码用的是 `code`。`code` 在语义上是"任何整数码"（HTTP / 自定义错误码 / 业务码），`status` 在语义上是"HTTP 状态码"——这次变体是专门给 HTTP 用的，plan 的命名更准确。改名同步更新 `#[error("...{code}...")]` 的 Display formatter，两个新单测（`upstream_http_display_includes_status_and_msg` 等）锁住契约。pre-m4 没有 constructor、改 Display 不破坏任何生产代码，是低风险 rename。
+- **N-06 整体策略：保持 `anyhow::Result<T>` 签名不变**：UpstreamClient 的 `notify_start` / `get_updates` / `send_message` / `send_typing` / `get_config` / `get_upload_url` 全部返回 `anyhow::Result<T>`，被 `UpstreamSink` trait 锁定，被 `hub/commands.rs:391` / `hub/dispatch.rs:221` / `server/routes.rs:590/623/670/708` 等 6 处 caller 调用——这些 caller 全部用 `error!(error = %e, ...)` 或 `format!("upstream error: {e}")` 消费错误，与 `anyhow::Error` 的 `Display` 等价。**改 trait 签名会触发 6 处 caller 的 `?` 链重构，但 6 处 caller 全部不 pattern-match 错误变体——纯纯的浪费 churn**。所以采用"内部构造 HubError、外部包成 anyhow::Error"的策略：error.rs 加 downcast，ilink/upstream.rs 加 helper（`upstream_http_err` / `upstream_parse_err`），call site 用 `.map_err(helper)?` 替换 `?`。这与 m1 的 `unwrap_or_else(|e| e.into_inner())` 风格一致——把"等价的更精确表示"封装到 helper 里，call site 仍是 1 token 的改动。
+- **N-06 From<anyhow::Error> downcast 链**：新加 outer `match e.downcast::<HubError>()` 把 wrapped-HubError 还原成具体变体；既有 `match e.downcast::<sqlx::Error>()` 挪到 outer 的 Err 分支里做 inner match（再不行就 fallback 到 `Upstream(e.to_string())`）。原本想用 `if let Ok(...) = e.downcast::<HubError>() { return ... }`，但 compile error：anyhow 的 `downcast` 消费 self 即便走 Err 分支，第一次 `if let` 已经把 `e` move 走了，inner match 拿不到 e。改用 `match e.downcast::<HubError>() { Ok(hub_err) => hub_err, Err(e) => match e.downcast::<sqlx::Error>() { ... } }`——anyhow 的 downcast 契约就是"消费 self，Err 分支把 self 还回来"，所以 inner match 可以 rebind `e`。
+- **N-06 status=0 的设计选择**：`reqwest::Error::status()` 在 transport-level failure（DNS / TLS / connection reset）时返回 `None`。`upstream_http_err` 用 `.map(|s| s.as_u16()).unwrap_or(0)` 把 None 映射成 `status: 0`——而不是 Option<u16> 或 enum，避免 `UpstreamHttp` 退化成"再嵌一层 Result"的形式。`status: 0` 是 sentinel，对应"还没有 HTTP 响应就失败"。`upstream_http_status_zero_is_legal_for_pre_send_failures` 单测锁住这个不变量。
+- **N-06 故意不迁移的 1 处**：`ilink/login.rs::poll_qrcode_status` 的 `r.json::<QrcodeStatusResponse>().await` 也在 upstream_parse_err 的覆盖范围内，但**故意不迁移**——它在一个 retry loop 里，parse error 走 `warn!` + `continue;`，错误**永远不 escape 函数**。给这种 dead-tag 标 UpstreamParse 是"加 invariant 但没有 consumer 来 enforce"——徒增代码噪音。`login::get_qrcode` 那一处是真 parse error 会 escape 的（被 `login_with_qr` 的 `?` 传回 `RuntimeError`），所以那一处迁。
+- **N-06 helper 不去重**：`ilink/upstream.rs` 和 `ilink/login.rs` 各有一个 `upstream_parse_err`——4 行 byte-identical clone。可以提到 `crate::ilink::error_helpers` 子模块，但 plan §M4 明确"全量迁移不在本次范围"，helper 提文件属于 refactor 范畴，留到后续 milestone 处理。`upstream_http_err` 只在 upstream.rs 用一次（login 模块不用 `error_for_status`），不需要提。
 
 ### Problems
 
-_待填写_
+- plan §M4 第一段"保留 `Upstream(anyhow::Error)` 作为兜底"与代码现状不符——pre-m1 的 `Upstream` 变体曾经是 `anyhow::Error` (有 `#[from]`)，m1 重构时已经被简化成 `Upstream(String)`，pre-m4 的 `From<anyhow::Error> for HubError` 已经在用 `HubError::Upstream(e.to_string())` 兜底。plan 文字是 plan 作者沿用 pre-m1 的旧措辞；执行时按现状走（保留 `Upstream(String)` 作为兜底，via `From<anyhow::Error>` 的最后 match arm），不引入 `anyhow::Error` 的 `#[from]` 重新混进 enum 字段。
+- 第一次写 `if let Ok(hub_err) = e.downcast::<HubError>()` 想偷懒，被 `error[E0382]: use of moved value: e` 教做人——`if let` 只 bind Ok 分支，Err 分支没有 rebind e 的语法，self 在 downcast 调用里就被 move 走了。改成嵌套 `match` 是 anyhow downcast 的标准 idiom，编译通过。Review 时如果发现还能再简洁（比如改用 `.downcast_ref::<HubError>().cloned()` 的 `Clone` 路线）会加 notes，但前提是给 HubError 加 `derive(Clone)`——而 HubError 含 `sqlx::Error`（不实现 Clone），加 Clone 会改 m1 已经稳定的 11 个字段 enum 的 derive 列表，超出 m4 范围。
+- 第一次写 `upstream_parse_err(e: reqwest::Error)` 时想只接受 `reqwest::Error`，但 `send_message` 里 `serde_json::from_str::<SendMessageResponse>(&text)` 失败时是 `serde_json::Error`——`send_message` 那处其实没有 parse-error 出口（parse fail 走 `warn!` + 返回 `Ok(SendMessageResponse::ok())`），所以现在 4 个用 upstream_parse_err 的位置全是 `reqwest::Error` 来源。但 helper 签名用 `impl std::fmt::Display` 更灵活：未来若有 `serde_json::from_str` 真要 escape 错误（不在 m4 范围），可以一行 `.map_err(upstream_parse_err)?` 复用，不需要再改 helper 签名。runtime cost 0（Display 是 to_string 触发一次）。
 
 ### Outcome
 
-_待填写_
+- ✅ `cargo fmt --check`
+- ✅ `cargo clippy -- -D warnings`
+- ✅ `cargo test`（6 个新增测试 + 全部历史测试绿；lib 369 / metrics_auth 1 / breaking_changes 20 / regression_http_smoke 10 / hub_routing_integration 27 / queue_trait 18 / doc_tests 0+1 ignored；合计 445 passed / 0 failed / 1 ignored）
+- ✅ `cargo build`
+- ✅ `desktop-frontend` `npm run build`
+- ✅ `desktop-tauri` `cargo check`
+- E2E checkpoint: not-ready（plan 已定；错误类型内部重构，wire-level error response shape 不变）
+- Visual Review: not-needed（plan 已定；仅后端 Rust 改动）
+- Reviewer handoff: `docs/exec-plans/active/arch-cleanup-p1/reviews/m4/review-request.yaml`
 
 ---
 
