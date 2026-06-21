@@ -249,7 +249,10 @@ impl SessionDispatcher {
 
     async fn dispatch(&self, msg: WeixinMessage) {
         let key = session_dispatch_key(&msg);
-        let mut senders = self.senders.lock().expect("SessionDispatcher senders lock poisoned");
+        let mut senders = self
+            .senders
+            .lock()
+            .expect("SessionDispatcher senders lock poisoned");
 
         // Check if a live worker already exists for this key.
         let needs_new = match senders.get(&key) {
@@ -310,7 +313,13 @@ impl SessionDispatcher {
 
     #[cfg(test)]
     fn sender_keys(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.senders.lock().expect("senders poisoned").keys().cloned().collect();
+        let mut keys: Vec<String> = self
+            .senders
+            .lock()
+            .expect("senders poisoned")
+            .keys()
+            .cloned()
+            .collect();
         keys.sort();
         keys
     }
@@ -330,9 +339,12 @@ pub async fn run_bridge_with_shutdown(
     let client = HubClient::new(hub_url, token);
     let app = Arc::new(app);
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(None::<BridgeStop>);
-    let dispatcher = Arc::new(
-        SessionDispatcher::new(client.clone(), Arc::clone(&app), stop_tx, shutdown.clone())
-    );
+    let dispatcher = Arc::new(SessionDispatcher::new(
+        client.clone(),
+        Arc::clone(&app),
+        stop_tx,
+        shutdown.clone(),
+    ));
     let mut buf = String::new();
     let mut backoff_secs: u64 = 3;
     const MAX_BACKOFF_SECS: u64 = 60;
@@ -716,10 +728,7 @@ timeout_secs: 5
         );
         disp.dispatch(make_msg("ctx-a", "default")).await;
         disp.dispatch(make_msg("ctx-b", "default")).await;
-        assert_eq!(
-            disp.sender_keys(),
-            vec!["ctx-a:default", "ctx-b:default"]
-        );
+        assert_eq!(disp.sender_keys(), vec!["ctx-a:default", "ctx-b:default"]);
     }
 
     #[tokio::test]

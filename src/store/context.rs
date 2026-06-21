@@ -193,6 +193,12 @@ impl Store {
         .bind(vtoken)
         .fetch_optional(&self.rpool)
         .await?;
-        Ok(row.map(|r| (r.get("real_ctx"), r.get("peer_user_id"), r.get("session_name"))))
+        Ok(row.map(|r| {
+            (
+                r.get("real_ctx"),
+                r.get("peer_user_id"),
+                r.get("session_name"),
+            )
+        }))
     }
 }

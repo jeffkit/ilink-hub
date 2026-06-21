@@ -679,7 +679,10 @@ async fn getupdates_mark_seen_is_lock_free() {
         .get(&vtoken)
         .map(|e| e.load(std::sync::atomic::Ordering::Relaxed))
         .unwrap_or(0);
-    assert!(stored > 0, "last_seen timestamp should be non-zero after getupdates");
+    assert!(
+        stored > 0,
+        "last_seen timestamp should be non-zero after getupdates"
+    );
 
     // mark_online is used by registration; verify it still sets online=true.
     {

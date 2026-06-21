@@ -1109,12 +1109,14 @@ async fn m2_ddl_error_propagates_through_migrator() {
         result.is_err(),
         "migrate_to_v3 must propagate DDL errors, got Ok — F-M2-03 not fixed"
     );
-    // The claim row is still inserted (the M1 design writes the row
-    // BEFORE the DDL); a subsequent connect will see v3 as claimed
-    // and skip the broken step (DBA drops the row manually).
+    // The non-_tx wrapper now runs inside its own transaction, so a DDL
+    // failure causes a full rollback — the claim row is NOT retained.
+    // This is cleaner than the old behaviour: the migrator can be safely
+    // retried after fixing the underlying data issue (e.g. deduplicating
+    // real_ctx rows), without a manual DELETE from schema_version.
     assert!(
-        store.is_migration_run(3).await.unwrap(),
-        "v3 claim row is present even though DDL failed"
+        !store.is_migration_run(3).await.unwrap(),
+        "v3 claim row must be absent after rollback — migrator is safely retryable"
     );
 }
 

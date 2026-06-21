@@ -567,10 +567,28 @@ mod tests {
     async fn test_build_queue_backend_clamp_custom_value() {
         let q = make_queue_for("15");
         for i in 0..15 {
-            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(!dropped);
         }
-        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(15), ..Default::default() }).await.unwrap();
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(15),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 15);
@@ -583,10 +601,28 @@ mod tests {
         // 5 -> clamped to MIN (10)
         let q = make_queue_for("5");
         for i in 0..10 {
-            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(!dropped);
         }
-        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(10), ..Default::default() }).await.unwrap();
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(10),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 10);
@@ -598,10 +634,28 @@ mod tests {
         // 20000 -> clamped to MAX (10000)
         let q = make_queue_for("20000");
         for i in 0..10_000 {
-            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
+            let dropped = q
+                .push(
+                    "vtoken",
+                    WeixinMessage {
+                        message_id: Some(i),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
             assert!(!dropped);
         }
-        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(10_000), ..Default::default() }).await.unwrap();
+        let dropped = q
+            .push(
+                "vtoken",
+                WeixinMessage {
+                    message_id: Some(10_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert!(dropped);
         clear_env();
     }

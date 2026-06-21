@@ -1,8 +1,8 @@
 //! Background health checker — periodically evicts clients that have
 //! stopped polling `getupdates` for longer than `timeout`.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 

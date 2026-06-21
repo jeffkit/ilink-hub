@@ -10,7 +10,11 @@ use axum::{
     http::{Request, StatusCode},
 };
 use ilink_hub::{
-    hub::HubState, ilink::UpstreamClient, server::build_router, store::Store, InMemoryQueue,
+    hub::{AdminConfig, HubState},
+    ilink::UpstreamClient,
+    server::build_router,
+    store::Store,
+    InMemoryQueue,
 };
 use tower::ServiceExt; // for .oneshot()
 
@@ -29,6 +33,7 @@ async fn make_state() -> Arc<HubState> {
         queue,
         shutdown_rx,
         "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     )
 }
 
@@ -361,6 +366,7 @@ async fn sendtyping_error_propagation_test() {
         queue,
         shutdown_rx,
         "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     );
 
     let (vtoken, _) =

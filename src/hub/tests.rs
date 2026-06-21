@@ -143,6 +143,7 @@ async fn concurrent_register_and_route_does_not_deadlock() {
         queue,
         shutdown_rx,
         "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     );
 
     let mut handles = vec![];
@@ -259,6 +260,7 @@ async fn make_state() -> Arc<HubState> {
         queue,
         shutdown_rx,
         "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
     )
 }
 
