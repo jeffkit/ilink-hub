@@ -97,6 +97,21 @@ impl Default for QuoteRouteIndex {
     }
 }
 
+/// One item for [`QuoteRouteIndex::warm_from_history`]: a previously-sent
+/// outbound message we want to re-index on startup so a quote-reply arriving
+/// right after Hub boot still resolves without waiting for a new outbound
+/// message to fill the gap.
+///
+/// The fields mirror what [`QuoteRouteIndex::register_outbound_content`]
+/// takes, plus the pre-built [`QuoteOrigin`] — the index itself stays unaware
+/// of where the origin came from (DB row vs. live dispatch path).
+#[derive(Debug, Clone)]
+pub struct WarmItem {
+    pub scope: String,
+    pub text: String,
+    pub origin: QuoteOrigin,
+}
+
 const INDEX_TTL: Duration = Duration::from_secs(86400 * 7);
 /// Cap entries per content signature to bound memory when the same text is sent repeatedly.
 const MAX_CONTENT_ENTRIES_PER_KEY: usize = 32;
@@ -104,6 +119,11 @@ const MAX_CONTENT_ENTRIES_PER_KEY: usize = 32;
 const CONTENT_PREFIX_CHARS: usize = 48;
 /// Cap the total number of content signature keys in the index to prevent memory exhaustion.
 const MAX_BY_CONTENT_KEYS: usize = 10_000;
+/// Default number of recent outbound messages to replay into the in-memory
+/// `QuoteRouteIndex` on Hub startup. 500 covers the most recent 8 hours of
+/// typical iLink traffic (≈ one message/minute) while staying well below the
+/// 10 000-key memory cap. Tunable via `ILINK_QUOTE_INDEX_WARMUP_LIMIT`.
+pub const DEFAULT_QUOTE_INDEX_WARMUP_LIMIT: i64 = 500;
 
 impl QuoteRouteIndex {
     fn hash_key<T: Hash>(&self, t: &T) -> u64 {
@@ -152,6 +172,36 @@ impl QuoteRouteIndex {
                 bucket.drain(0..overflow);
             }
         }
+    }
+
+    /// Replay previously-sent outbound messages into the index. Used on Hub
+    /// startup to close the cold-start gap where a quote-reply arrives before
+    /// the next outbound message would re-populate the in-memory cache.
+    ///
+    /// The replay is equivalent to calling [`register_outbound_content`] for
+    /// each item, but the `created_ms` is the **wall clock at replay time**
+    /// (not the original `created_at` from the DB). Rationale: the TTL is a
+    /// sliding window from "now", and the original `created_at` would let
+    /// historical rows outlive the 7-day TTL in edge cases; pinning `now_ms`
+    /// keeps the eviction policy uniform between live and replayed entries.
+    ///
+    /// `items` are processed in the order given. Callers that want a
+    /// "newest-first" replay should sort the slice by `created_at` descending
+    /// before passing it in — the index itself stays order-agnostic.
+    ///
+    /// Returns the number of items actually indexed. Items whose `text` is
+    /// empty (after the trim inside `content_keys`) are silently skipped, so a
+    /// caller can hand in a batch with junk rows without first filtering.
+    pub fn warm_from_history(&mut self, items: &[WarmItem]) -> usize {
+        let mut indexed = 0;
+        for item in items {
+            if item.text.trim().is_empty() {
+                continue;
+            }
+            self.register_outbound_content(&item.scope, &item.text, item.origin.clone());
+            indexed += 1;
+        }
+        indexed
     }
 
     /// Resolve a quoted text (+ optional quoted timestamp) within `scope` to an outbound
@@ -323,6 +373,56 @@ pub fn parse_footer_from_quoted_text(text: &str) -> Option<(String, Option<Strin
     });
 
     Some((name.to_string(), session))
+}
+
+/// Convert a freshly-loaded [`RecentOutboundRow`] into a [`WarmItem`] ready for
+/// [`QuoteRouteIndex::warm_from_history`].
+///
+/// The conversion needs the *name* of the originating client (the `QuoteOrigin::Client`
+/// `name` field) which the `messages` table does not store directly — it is only
+/// embedded in the rendered text footer. We re-parse the footer with
+/// [`parse_footer_from_quoted_text`]; rows whose footer is missing or unrecognised
+/// fall back to a [`QuoteOrigin::Hub`] variant with a synthetic `HubCommand::Help`
+/// marker so the index still records *something* — the alternative (silently
+/// dropping the row) would let a real outbound message become un-quoteable for
+/// the rest of the process lifetime, which is worse than an over-broad match.
+pub fn warm_item_from_recent_row(row: &crate::store::RecentOutboundRow) -> WarmItem {
+    let origin = match (
+        row.vtoken.as_deref(),
+        parse_footer_from_quoted_text(&row.text),
+    ) {
+        (Some(vt), Some((name, session_name))) => QuoteOrigin::Client {
+            vtoken: vt.to_string(),
+            name,
+            label: None,
+            session_name,
+        },
+        (Some(vt), None) => {
+            // No recognisable footer. Fall back to a Client origin with a generic
+            // name so at least the vtoken (the load-bearing routing field) is set;
+            // operators can still tell from logs that the warmup is missing names
+            // for footer-less historical rows.
+            QuoteOrigin::Client {
+                vtoken: vt.to_string(),
+                name: "<warmup>".to_string(),
+                label: None,
+                session_name: Some(row.session_name.clone()),
+            }
+        }
+        (None, _) => {
+            // No vtoken at all (legacy / migration / system message). The
+            // quote index needs *some* origin to record; we pick Hub so it
+            // can't accidentally route to a non-existent client.
+            QuoteOrigin::Hub {
+                cmd: HubCommand::Help,
+            }
+        }
+    };
+    WarmItem {
+        scope: row.from_user.clone(),
+        text: row.text.clone(),
+        origin,
+    }
 }
 
 /// Pull the quoted text and its (second-granularity) `create_time_ms` from a user message's
@@ -765,5 +865,209 @@ mod tests {
     #[test]
     fn parse_footer_no_footer_returns_none() {
         assert!(parse_footer_from_quoted_text("plain message without footer").is_none());
+    }
+
+    // ─── M3 — quote_index startup warmup ───────────────────────────────────
+
+    /// Equivalence with N manual `register_outbound_content` calls. Each warm
+    /// item must produce an entry in the index that resolves to the same
+    /// `QuoteOrigin` as if we had fed it through the live dispatch path.
+    #[test]
+    fn warm_from_history_equivalent_to_register_loop() {
+        let items = vec![
+            WarmItem {
+                scope: SCOPE.into(),
+                text: "alpha\n\n---\nilink-claude · session-20260611-1".into(),
+                origin: QuoteOrigin::Client {
+                    vtoken: "vt_a".into(),
+                    name: "ilink-claude".into(),
+                    label: None,
+                    session_name: Some("session-20260611-1".into()),
+                },
+            },
+            WarmItem {
+                scope: SCOPE.into(),
+                text: "beta\n\n---\nilink-claude · session-20260611-2".into(),
+                origin: QuoteOrigin::Client {
+                    vtoken: "vt_b".into(),
+                    name: "ilink-claude".into(),
+                    label: None,
+                    session_name: Some("session-20260611-2".into()),
+                },
+            },
+            WarmItem {
+                scope: SCOPE.into(),
+                text: "list\n\n---\nhub".into(),
+                origin: QuoteOrigin::Hub {
+                    cmd: HubCommand::List,
+                },
+            },
+        ];
+
+        let mut warm_idx = QuoteRouteIndex::default();
+        let n = warm_idx.warm_from_history(&items);
+        assert_eq!(n, 3);
+
+        let mut live_idx = QuoteRouteIndex::default();
+        for item in &items {
+            live_idx.register_outbound_content(&item.scope, &item.text, item.origin.clone());
+        }
+
+        // Both indices must resolve each of the three texts to a non-None origin,
+        // and the resolved origins must agree with the input WarmItems.
+        for item in &items {
+            let warm_origin = warm_idx
+                .resolve_by_content(SCOPE, &item.text, None)
+                .expect("warm resolve");
+            let live_origin = live_idx
+                .resolve_by_content(SCOPE, &item.text, None)
+                .expect("live resolve");
+            assert_eq!(
+                format!("{:?}", warm_origin),
+                format!("{:?}", live_origin),
+                "warm and live paths must agree for `{}`",
+                item.text
+            );
+        }
+    }
+
+    /// Empty slice is a no-op (returns 0, no panic, no entries created).
+    #[test]
+    fn warm_from_history_empty_slice_is_noop() {
+        let mut idx = QuoteRouteIndex::default();
+        assert_eq!(idx.warm_from_history(&[]), 0);
+        assert_eq!(idx.by_content.len(), 0);
+    }
+
+    /// An item with empty text is silently dropped — `content_keys` would
+    /// return an empty Vec, and a literal empty `text` is never what we want
+    /// to index.
+    #[test]
+    fn warm_from_history_skips_empty_text() {
+        let mut idx = QuoteRouteIndex::default();
+        let items = vec![
+            WarmItem {
+                scope: SCOPE.into(),
+                text: "".into(),
+                origin: QuoteOrigin::Client {
+                    vtoken: "vt".into(),
+                    name: "n".into(),
+                    label: None,
+                    session_name: None,
+                },
+            },
+            WarmItem {
+                scope: SCOPE.into(),
+                text: "   ".into(), // whitespace-only — trim().is_empty() is true
+                origin: QuoteOrigin::Client {
+                    vtoken: "vt2".into(),
+                    name: "n".into(),
+                    label: None,
+                    session_name: None,
+                },
+            },
+        ];
+        assert_eq!(idx.warm_from_history(&items), 0);
+        assert_eq!(idx.by_content.len(), 0);
+    }
+
+    /// Warmup must respect the conversation scope just like the live path:
+    /// a quote-reply from a different scope must not resolve to a warmup row
+    /// belonging to a different conversation.
+    #[test]
+    fn warm_from_history_preserves_per_scope_isolation() {
+        let mut idx = QuoteRouteIndex::default();
+        let items = vec![WarmItem {
+            scope: "userA@x".into(),
+            text: "ping\n\n---\nilink-claude".into(),
+            origin: QuoteOrigin::Client {
+                vtoken: "vt_a".into(),
+                name: "ilink-claude".into(),
+                label: None,
+                session_name: None,
+            },
+        }];
+        idx.warm_from_history(&items);
+
+        // Build a real quote-reply whose ref_msg.text matches the warmup text;
+        // `resolve_user_quote` is the public entry point and exercises the
+        // same scope filter as the live dispatch path.
+        let reply_a = quote_reply("userA@x", "ping\n\n---\nilink-claude", None);
+        let reply_b = quote_reply("userB@x", "ping\n\n---\nilink-claude", None);
+        assert!(idx.resolve_user_quote("userA@x", &reply_a).is_some());
+        assert!(idx.resolve_user_quote("userB@x", &reply_b).is_none());
+    }
+
+    /// `warm_item_from_recent_row` happy path: footer present, vtoken present
+    /// → QuoteOrigin::Client with the parsed name and session.
+    #[test]
+    fn warm_item_from_recent_row_uses_footer_name_and_session() {
+        let row = crate::store::RecentOutboundRow {
+            from_user: "user@x".into(),
+            text: "hello\n\n---\nilink-claude · session-20260611-1".into(),
+            vtoken: Some("vt".into()),
+            session_name: "session-20260611-1".into(),
+            created_at: "2026-06-11 12:00:00".into(),
+        };
+        let item = warm_item_from_recent_row(&row);
+        assert_eq!(item.scope, "user@x");
+        assert_eq!(item.text, row.text);
+        match item.origin {
+            QuoteOrigin::Client {
+                vtoken,
+                name,
+                session_name,
+                ..
+            } => {
+                assert_eq!(vtoken, "vt");
+                assert_eq!(name, "ilink-claude");
+                assert_eq!(session_name.as_deref(), Some("session-20260611-1"));
+            }
+            _ => panic!("expected Client origin"),
+        }
+    }
+
+    /// Footer present but vtoken missing → Hub origin (we don't want to
+    /// route to a non-existent client).
+    #[test]
+    fn warm_item_from_recent_row_missing_vtoken_falls_back_to_hub() {
+        let row = crate::store::RecentOutboundRow {
+            from_user: "user@x".into(),
+            text: "list\n\n---\nhub".into(),
+            vtoken: None,
+            session_name: "default".into(),
+            created_at: "2026-06-11 12:00:00".into(),
+        };
+        let item = warm_item_from_recent_row(&row);
+        assert!(matches!(item.origin, QuoteOrigin::Hub { .. }));
+    }
+
+    /// Footer missing but vtoken present → Client origin with a `<warmup>`
+    /// placeholder name. The vtoken (the load-bearing routing field) is
+    /// still set, so a quote-reply will at minimum hit the right client
+    /// even though we can't disambiguate the session cleanly.
+    #[test]
+    fn warm_item_from_recent_row_missing_footer_uses_placeholder_name() {
+        let row = crate::store::RecentOutboundRow {
+            from_user: "user@x".into(),
+            text: "no footer here".into(),
+            vtoken: Some("vt".into()),
+            session_name: "session-20260611-1".into(),
+            created_at: "2026-06-11 12:00:00".into(),
+        };
+        let item = warm_item_from_recent_row(&row);
+        match item.origin {
+            QuoteOrigin::Client {
+                vtoken,
+                name,
+                session_name,
+                ..
+            } => {
+                assert_eq!(vtoken, "vt");
+                assert_eq!(name, "<warmup>");
+                assert_eq!(session_name.as_deref(), Some("session-20260611-1"));
+            }
+            _ => panic!("expected Client origin with placeholder name"),
+        }
     }
 }

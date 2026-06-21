@@ -2511,3 +2511,227 @@ async fn test_bot_credentials_decryption_adversarial_tampered_ciphertext() {
     assert!(res.is_err());
     assert!(res.unwrap_err().to_string().contains("Decryption failed"));
 }
+
+// ─── M3 — quote_index startup warmup tests ────────────────────────────────
+
+/// M3 contract: only `role = 'assistant'` rows are returned, and they are
+/// returned in `id DESC` (newest first) order, capped by `limit`. Empty
+/// `content` rows are filtered out so the index never indexes whitespace.
+#[tokio::test]
+async fn m3_recent_outbound_messages_filters_role_and_orders_newest_first() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // One user message (must be skipped) and three assistant messages, with
+    // ascending ids so we can assert the DESC ordering by id later.
+    store
+        .save_message("vctx1", Some("vt1"), "default", "user@x", "user", "inbound")
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "first reply",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "second reply",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx2",
+            Some("vt2"),
+            "default",
+            "user@y",
+            "assistant",
+            "", // empty content — must be filtered out
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "third reply",
+        )
+        .await
+        .unwrap();
+
+    let rows = store.recent_outbound_messages(500).await.unwrap();
+    // 3 assistant rows with non-empty content, in id-desc order.
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].text, "third reply");
+    assert_eq!(rows[0].from_user, "user@x");
+    assert_eq!(rows[0].vtoken.as_deref(), Some("vt1"));
+    assert_eq!(rows[1].text, "second reply");
+    assert_eq!(rows[2].text, "first reply");
+}
+
+/// `limit` clamps to `[1, 10000]`. 0 and negative values clamp up to 1;
+/// very large values clamp down to 10000.
+#[tokio::test]
+async fn m3_recent_outbound_messages_clamps_limit() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // Insert 5 assistant rows.
+    for i in 0..5 {
+        store
+            .save_message(
+                "vctx1",
+                Some("vt1"),
+                "default",
+                "user@x",
+                "assistant",
+                &format!("reply {i}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    // limit = 0 clamps to 1 → exactly one row, the newest.
+    let rows = store.recent_outbound_messages(0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "reply 4");
+
+    // Negative clamps to 1 as well.
+    let rows_neg = store.recent_outbound_messages(-5).await.unwrap();
+    assert_eq!(rows_neg.len(), 1);
+
+    // 100_000 clamps down to 10_000 — but we only have 5 rows so we get 5.
+    let rows_huge = store.recent_outbound_messages(100_000).await.unwrap();
+    assert_eq!(rows_huge.len(), 5);
+}
+
+/// End-to-end: write a few `assistant` rows to the messages table, then ask
+/// the warmup path to load + replay them into a fresh `QuoteRouteIndex`, and
+/// finally verify that a quote-reply resolves through the in-memory path
+/// (i.e. never hits the SQL fallback) for every warmup row.
+#[tokio::test]
+async fn m3_warmup_round_trip_through_quote_index() {
+    use crate::hub::quote_route::{
+        warm_item_from_recent_row, QuoteOrigin, QuoteRouteIndex, WarmItem,
+    };
+    use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let body = "你好！有什么我可以帮你的吗？\n\n---\nilink-claude · session-20260611-125634";
+    let body2 = "完成了\n\n---\nilink-claude · session-20260611-130000";
+
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-125634",
+            "user@x",
+            "user",
+            "在吗",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-125634",
+            "user@x",
+            "assistant",
+            body,
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-130000",
+            "user@x",
+            "assistant",
+            body2,
+        )
+        .await
+        .unwrap();
+
+    let rows = store.recent_outbound_messages(500).await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let items: Vec<WarmItem> = rows.iter().map(warm_item_from_recent_row).collect();
+    let mut idx = QuoteRouteIndex::default();
+    let n = idx.warm_from_history(&items);
+    assert_eq!(n, 2);
+
+    // Build a quote-reply whose ref_msg.text matches `body` exactly and confirm
+    // resolution yields the Client origin with the right vtoken / session.
+    fn quote_reply(scope: &str, text: &str) -> WeixinMessage {
+        let ref_item = serde_json::json!({
+            "ref_msg": {
+                "message_item": {
+                    "type": 1,
+                    "text_item": { "text": text }
+                }
+            }
+        });
+        WeixinMessage {
+            message_type: Some(1),
+            from_user_id: Some(scope.into()),
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("follow up".into()),
+                }),
+                extra: ref_item,
+                ..Default::default()
+            }])),
+            ..Default::default()
+        }
+    }
+
+    let user_msg = quote_reply("user@x", body);
+    match idx
+        .resolve_user_quote("user@x", &user_msg)
+        .expect("warmup must resolve")
+    {
+        QuoteOrigin::Client {
+            vtoken,
+            session_name,
+            ..
+        } => {
+            assert_eq!(vtoken, "vt1");
+            assert_eq!(session_name.as_deref(), Some("session-20260611-125634"));
+        }
+        _ => panic!("expected Client origin"),
+    }
+
+    // Second warmup row resolves too — and the timestamp tiebreaker picks the
+    // matching session even though both rows have text strings the index must
+    // keep distinct (they differ in body).
+    let user_msg2 = quote_reply("user@x", body2);
+    match idx
+        .resolve_user_quote("user@x", &user_msg2)
+        .expect("warmup must resolve second row")
+    {
+        QuoteOrigin::Client {
+            vtoken,
+            session_name,
+            ..
+        } => {
+            assert_eq!(vtoken, "vt1");
+            assert_eq!(session_name.as_deref(), Some("session-20260611-130000"));
+        }
+        _ => panic!("expected Client origin"),
+    }
+}

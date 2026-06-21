@@ -86,7 +86,9 @@ pub use outbound_label::{
 };
 pub use pairing::PairingRegistry;
 pub use queue::{InMemoryQueue, MessageQueue};
-pub use quote_route::{merge_routing_with_quote, QuoteOrigin, QuoteRouteIndex};
+pub use quote_route::{
+    merge_routing_with_quote, parse_footer_from_quoted_text, QuoteOrigin, QuoteRouteIndex, WarmItem,
+};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 pub use state::{
