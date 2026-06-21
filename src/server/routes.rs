@@ -152,6 +152,25 @@ pub async fn register(
 
     let outcome = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
+    // M1: plaintext is only available for brand-new registrations. When an existing
+    // client name is re-registered the original plaintext is irrecoverable (only the
+    // SHA-256 hash was ever stored). Return 409 so the bridge can either retry with
+    // a different name or use --force-register to replace the old entry.
+    if outcome.plaintext.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(RegisterResponse {
+                ret: 409,
+                vtoken: String::new(),
+                base_url: String::new(),
+                errmsg: Some(format!(
+                    "client name '{}' is already registered; use --force-register to replace it",
+                    req.name
+                )),
+            }),
+        );
+    }
+
     (
         StatusCode::OK,
         Json(RegisterResponse {
