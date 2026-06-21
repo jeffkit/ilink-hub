@@ -1,0 +1,52 @@
+milestone: M2
+title: bot_token 静态加密对抗性审查结果
+verdict: PASS
+review_date: 2026-06-21
+reviewer: Antigravity (AI Auditor)
+
+summary: |
+  对 M2 里程碑（bot_token 静态加密）的实现代码执行了对抗性安全与并发审查。
+  结果表明，所有缺陷已成功修复，项目编译正常，并且新引入的防御逻辑和测试用例均运行通过。
+  已解决的主要缺陷如下：
+  1. 测试套件因字段缺失无法编译的问题已解决。在 `store_tests.rs` 中所有手动初始化 `Store` 的字面量初始化点中均已补上 `master_key` 字段。
+  2. 启动逻辑中已集成 Master Key 加载与注入逻辑。在 `run_serve` 和 `run_login` 启动阶段已调用 `load_or_derive_master_key()` 并成功将 Key 设置到 `Store` 中。
+  3. 已对缺失环境变量执行安全退出校验。在 `run_serve` 中，缺失 `ILINK_HUB_MASTER_KEY` 环境变量或密钥格式非法时，程序会通过 `tracing::error!` 记录并安全地强制以非零退出码返回。
+  4. 补充了加密、解密及异常密钥处理相关的单元及集成测试，测试覆盖度符合 M2 预期。
+
+findings:
+  - id: SEC-M2-001
+    title: Store 结构体修改破坏测试套件编译 (E0063)
+    severity: Critical
+    status: RESOLVED
+    description: |
+      在 `src/store/mod.rs` 中为 `Store` 结构体增加了 `master_key` 字段。但是，`src/store/store_tests.rs` 广泛使用了结构体字面量语法（struct literal）来手动初始化 `Store` 实例（共 13 处）。这导致 `cargo test` 抛出 E0063 错误，无法编译测试二进制。
+    resolution: |
+      在 `store_tests.rs` 初始化 `Store` 的地方，应该补上 `master_key: std::sync::OnceLock::new()` 字段以使编译通过，或者提供统一的 `Store` 构造函数。
+
+  - id: SEC-M2-002
+    title: 启动路径中缺失 Master Key 加载与注入逻辑
+    severity: Critical
+    status: RESOLVED
+    description: |
+      根据 `plan.md` 的 M2 规定，`src/runtime/serve.rs::run_serve` 应在最早期调用 `load_or_derive_master_key()`，并将得到的 `Key` 设置到 `Store`（或存入上下文）中。但在当前的 `serve.rs` 里没有任何关于 `load_or_derive_master_key` 和 `store.set_master_key(...)` 的调用。
+      由于启动时会执行 `resolve_token -> store.load_credentials`，此时 `store.master_key` 为空，会触发 `Master key not configured on Store` 报错导致进程崩溃启动失败。
+    resolution: |
+      In `run_serve` 连接 Store 后，应立即执行 `load_or_derive_master_key` 获取 Key，并通过 `store.set_master_key` 注入 Store 中。
+
+  - id: SEC-M2-003
+    title: 缺失环境变量 ILINK_HUB_MASTER_KEY 校验和进程强制退出处理
+    severity: High
+    status: RESOLVED
+    description: |
+      在不提供 `ILINK_HUB_MASTER_KEY` 环境变量，或者环境变量格式非法（不是 32 字节 hex/base64）时，当前代码没有在 `run_serve` 启动阶段捕捉并以非零退出码和 `tracing::error!` 强制退出。由于启动逻辑中完全缺失了该项加载，从而未能实施对应的安全策略。
+    resolution: |
+      在 `run_serve` 最早期对 `load_or_derive_master_key` 返回的 `Err` 进行显式截获，调用 `tracing::error!` 并强制程序返回非零错误。
+
+  - id: SEC-M2-004
+    title: 缺失加密落盘及异常密钥的单元/集成测试
+    severity: Medium
+    status: RESOLVED
+    description: |
+      在 `store_tests.rs` 中，没有新增针对 `bot_credentials` 数据加密落盘、解密正确性以及 `ILINK_HUB_MASTER_KEY` 缺失时报错启动失败等场景的测试，未能提供计划中 M2 预期的测试覆盖。
+    resolution: |
+      在 `store_tests.rs` 中添加相应的测试，以验证加密与解密的正确性，并验证密钥缺失时能够正确报错。

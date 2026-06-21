@@ -66,6 +66,7 @@ async fn test_migration_incremental_from_v2() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            master_key: std::sync::OnceLock::new(),
         };
 
         // Manually create the tables that v1 and v2 would create.
@@ -195,6 +196,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            master_key: std::sync::OnceLock::new(),
         };
 
         // Manually create the v1-v5 schema (we don't need the full DDL — we
@@ -694,6 +696,7 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the same v1+v2 state as `test_migration_incremental_from_v2`.
     store
@@ -820,6 +823,7 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl(
@@ -981,6 +985,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap only the schema_version table — no migrations applied yet.
     store
@@ -1067,6 +1072,7 @@ async fn m2_ddl_error_propagates_through_migrator() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the version-tracking table and the v1 schema with
     // duplicated real_ctx values — the v3 unique index cannot be
@@ -1164,6 +1170,7 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl(
@@ -1518,6 +1525,7 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl("CREATE TABLE t (a INTEGER, b TEXT)")
@@ -1934,6 +1942,7 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version table (required by run_migrations).
     store
@@ -1992,6 +2001,7 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // No tables created — `column_exists` on a non-existent table must
     // return `Ok(false)`, NOT propagate a runtime error.
@@ -2023,6 +2033,7 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // column_exists returns false → caller tries DDL
     let col_missing = !store
@@ -2099,6 +2110,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version.
     store
@@ -2117,6 +2129,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     let (r1, r2) = tokio::join!(
         async {
@@ -2285,4 +2298,99 @@ async fn m1_two_distinct_plaintexts_never_collide() {
         by_name.get("bob").map(String::as_str),
         Some(hash_b.as_str())
     );
+}
+
+#[tokio::test]
+async fn test_bot_credentials_encryption_decryption() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Without master key:
+    // loading credentials on empty DB returns Ok(None)
+    assert!(store.load_credentials().await.unwrap().is_none());
+    // saving credentials must fail
+    assert!(store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .is_err());
+
+    // 2. Set master key (using standard 32-byte key)
+    let raw_key = [0u8; 32];
+    let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key).unwrap();
+    let key = ring::aead::LessSafeKey::new(unbound_key);
+    store
+        .set_master_key(std::sync::Arc::new(key))
+        .expect("set_master_key");
+
+    // 3. Load credentials on empty store returns None
+    let loaded = store.load_credentials().await.unwrap();
+    assert!(loaded.is_none());
+
+    // 4. Save and load credentials successfully
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+    let loaded = store.load_credentials().await.unwrap().expect("loaded");
+    assert_eq!(loaded.0, "my-secret-token");
+    assert_eq!(loaded.1, "https://api.example.com");
+
+    // 5. Verify database contains encrypted ciphertext, not the plaintext
+    let row: (String,) = sqlx::query_as("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_ne!(row.0, "my-secret-token");
+    // Formats output as base64, so it should decode successfully as base64 and not match plaintext
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    assert!(B64.decode(&row.0).is_ok());
+
+    // 6. Test loading credentials when master key is absent (on a new Store instance sharing the pool)
+    let store2 = Store {
+        pool: store.pool.clone(),
+        rpool: store.pool.clone(),
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    // Because a row exists in bot_credentials now, loading should fail due to missing master key
+    assert!(store2.load_credentials().await.is_err());
+}
+
+#[test]
+fn test_load_or_derive_master_key_scenarios() {
+    // Save current env var to restore it later
+    let old_val = std::env::var("ILINK_HUB_MASTER_KEY");
+
+    // 1. Missing env var
+    std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_err());
+
+    // 2. Invalid formats (too short, not hex/b64, etc.)
+    std::env::set_var("ILINK_HUB_MASTER_KEY", "short");
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_err());
+
+    std::env::set_var(
+        "ILINK_HUB_MASTER_KEY",
+        "not-hex-and-too-long-but-invalid-characters-zzzzzzzzzzzzzzzzzzzzzzzzz",
+    );
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_err());
+
+    // 3. Correct 32-byte hex (64 hex characters)
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", hex_key);
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_ok());
+
+    // 4. Correct 32-byte base64 (44 characters)
+    // 32 zero bytes in base64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    let b64_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", b64_key);
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_ok());
+
+    // Restore old env var
+    match old_val {
+        Ok(val) => std::env::set_var("ILINK_HUB_MASTER_KEY", val),
+        Err(_) => std::env::remove_var("ILINK_HUB_MASTER_KEY"),
+    }
 }

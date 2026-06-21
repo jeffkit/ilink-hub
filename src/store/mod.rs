@@ -62,6 +62,8 @@ pub struct Store {
     /// Read pool — multiple connections on SQLite WAL, same as `pool` for PG/MySQL.
     rpool: AnyPool,
     kind: DatabaseKind,
+    /// Master key for encrypting/decrypting sensitive credentials (like bot tokens).
+    master_key: std::sync::OnceLock<std::sync::Arc<ring::aead::LessSafeKey>>,
 }
 
 impl Store {
@@ -154,9 +156,25 @@ impl Store {
             (pool.clone(), pool)
         };
 
-        let store = Self { pool, rpool, kind };
+        let store = Self {
+            pool,
+            rpool,
+            kind,
+            master_key: std::sync::OnceLock::new(),
+        };
         store.run_migrations().await?;
         Ok(store)
+    }
+
+    pub fn set_master_key(
+        &self,
+        key: std::sync::Arc<ring::aead::LessSafeKey>,
+    ) -> Result<(), std::sync::Arc<ring::aead::LessSafeKey>> {
+        self.master_key.set(key)
+    }
+
+    pub fn master_key(&self) -> Option<&std::sync::Arc<ring::aead::LessSafeKey>> {
+        self.master_key.get()
     }
 
     #[cfg(test)]

@@ -218,7 +218,17 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     info!(%addr, "iLink Hub listening");
     runtime_cfg.warn_if_insecure(&addr);
 
+    // Eagerly check and load the master key after bind succeeds.
+    let master_key = match crate::runtime::crypto::load_or_derive_master_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("CRITICAL: Failed to load master key: {}", e);
+            anyhow::bail!("Failed to load master key: {}", e);
+        }
+    };
+
     let store = Arc::new(Store::connect(&database_url).await?);
+    let _ = store.set_master_key(std::sync::Arc::new(master_key));
 
     let (token, base_url) = resolve_token(
         token_arg,
