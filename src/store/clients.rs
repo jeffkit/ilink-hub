@@ -5,6 +5,12 @@ use sqlx::Row;
 
 use super::Store;
 
+/// Sentinel `from_user` key used to persist the hub's global default client across restarts.
+/// This row lives in `routing_state` alongside per-user routes but is never exposed as a
+/// real WeChat-user route; the startup loader checks for it explicitly and skips it when
+/// populating per-user routes.
+pub const HUB_DEFAULT_SENTINEL: &str = "__hub_default__";
+
 impl Store {
     // ─── Clients ─────────────────────────────────────────────────────────────
 

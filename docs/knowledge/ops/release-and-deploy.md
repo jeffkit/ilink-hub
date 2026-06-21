@@ -4,7 +4,7 @@ title: 发布与部署规范
 description: ilink-hub / ilink-hub-bridge 的发布与部署规范——三档路径（本机 brew 快速调试 / mac-fast patch 发布 / 完整多平台发布）及远程 Hub 部署。
 resource: docs/knowledge/ops/release-and-deploy.md
 tags: [ops, release, deploy, brew, ci]
-timestamp: 2026-06-18T18:30:00+08:00
+timestamp: 2026-06-21T19:42:00+08:00
 ---
 
 # 发布与部署规范
@@ -67,31 +67,92 @@ git tag v0.3.0 && git push origin v0.3.0
 > **不再**依赖 `build-desktop`（Tauri）。Desktop 安装包为 best-effort（`continue-on-error`），
 > 其失败不会再跳过 Release 和 brew tap 更新 —— 这曾是 brew 长期停在旧版本的根因。
 
-## 远程 Hub 部署（tcloud_gz / systemd）
+## 远程 Hub 部署（tcloud_hk / systemd）
 
-远程 Hub（`43.138.149.34`，systemd 单元 `ilink-hub`）用 musl 静态二进制更新。本机直连其 `8765`
-端口（**不再走 SSH 隧道转发**）。
+远程 Hub（SSH 别名 `tcloud_hk`，地址 `43.138.149.34`，systemd 单元 `ilink-hub`）。
+本机直连其 `8765` 端口（**不再走 SSH 隧道转发**）。
+
+### ⚠️ 交叉编译避坑：优先在服务器上直接编译
+
+> **不要在本机用 `cross` 或 `musl` 交叉编译**，有以下两个已知坑：
+>
+> 1. **`cross`（Docker 容器）**：首次或缓存失效后需从头编译所有依赖，在 QEMU 仿真下
+>    耗时极长（30 分钟以上）；且曾出现 QEMU 下链接器 SIGSEGV 导致编译失败的问题。
+>    只有当 `target/x86_64-unknown-linux-gnu/` 缓存热时才快；缓存一旦冷，不如服务器直编。
+> 2. **`musl` 静态编译**：部分 crate 对 musl libc 兼容性存在问题，不稳定。
+>
+> **推荐做法：rsync 源码到服务器，直接 `cargo build`**（服务器已安装 Rust，原生编译
+> 约 1-2 分钟，增量编译仅需数秒）。
 
 ```bash
+# 0. 确认服务器有 Rust（首次确认即可）
+ssh tcloud_hk "~/.cargo/bin/cargo --version"
+
 # 1. 备份生产库（迁移不可逆，务必先备份）
-ssh tcloud_gz 'TS=$(date +%Y%m%d-%H%M%S); sqlite3 /var/lib/ilink-hub/ilink-hub.db ".backup /var/lib/ilink-hub/ilink-hub.db.bak.$TS"'
+ssh tcloud_hk "python3 -c \"
+import sqlite3, shutil, datetime
+ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+shutil.copy('/var/lib/ilink-hub/ilink-hub.db', f'/var/lib/ilink-hub/ilink-hub.db.bak.{ts}')
+print('backup ok:', ts)
+\""
 
-# 2. musl 交叉编译（macOS arm64 → linux x86_64 静态）
-MUSL_PREFIX=$(brew --prefix musl-cross)/bin
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$MUSL_PREFIX/x86_64-linux-musl-gcc" \
-CC_x86_64_unknown_linux_musl="$MUSL_PREFIX/x86_64-linux-musl-gcc" \
-  cargo build --release --target x86_64-unknown-linux-musl --bin ilink-hub
+# 2. rsync 源码到服务器（migrations 必须一起同步，include_str! 引用的是编译时路径）
+cd /path/to/ilink-hub
+rsync -av src/ tcloud_hk:/home/ubuntu/ilink-hub-build/src/
+rsync -av migrations/ tcloud_hk:/home/ubuntu/ilink-hub-build/migrations/
+rsync -av Cargo.toml Cargo.lock tcloud_hk:/home/ubuntu/ilink-hub-build/
 
-# 3. 上传 + 原子替换 + 重启（停服会有几秒微信中断，并在启动时跑挂起的迁移）
-scp target/x86_64-unknown-linux-musl/release/ilink-hub tcloud_gz:/tmp/ilink-hub.new
-ssh tcloud_gz 'set -e; TS=$(date +%Y%m%d-%H%M%S); chmod +x /tmp/ilink-hub.new; \
-  sudo systemctl stop ilink-hub; \
-  sudo cp /opt/ilink-hub/ilink-hub /opt/ilink-hub/ilink-hub.bak.$TS; \
-  sudo mv /tmp/ilink-hub.new /opt/ilink-hub/ilink-hub; \
-  sudo systemctl start ilink-hub'
+# 3. 在服务器上编译（约 1 分钟全量，增量数秒）
+ssh tcloud_hk "cd /home/ubuntu/ilink-hub-build && ~/.cargo/bin/cargo build --release --bin ilink-hub 2>&1 | tail -3"
 
-# 4. 健康检查
+# 4. 停服 → 替换二进制 → 启服（必须先 stop 再替换，否则报 "Text file busy"）
+ssh tcloud_hk "
+  sudo systemctl stop ilink-hub
+  sudo cp /home/ubuntu/ilink-hub-build/target/release/ilink-hub /opt/ilink-hub/ilink-hub
+  sudo systemctl start ilink-hub
+  sleep 2 && systemctl status ilink-hub --no-pager | tail -5
+"
+
+# 5. 健康检查
 curl -s http://43.138.149.34:8765/health   # → ok
+```
+
+### 已知环境变量（服务器 systemd 单元必须包含）
+
+服务器 `/etc/systemd/system/ilink-hub.service` 的 `[Service]` 段需要以下变量，
+缺任何一个都会导致 Hub 启动失败：
+
+```ini
+Environment=RUST_LOG=info
+Environment=DATABASE_URL=sqlite:///var/lib/ilink-hub/ilink-hub.db
+Environment=ILINK_TOKEN=<bot_token>
+Environment=ILINK_HUB_MASTER_KEY=<32字节base64>   # M2安全变更引入，缺少则启动即崩
+Environment=ILINK_ADMIN_TOKEN=<admin_token>        # 如启用了管理 API
+```
+
+> `ILINK_HUB_MASTER_KEY` 用于加密数据库中的 `bot_credentials`。若丢失此 key，
+> 需清空 `bot_credentials` 表并重新生成 key（Hub 会在启动时从 `ILINK_TOKEN` 重新加密写入）：
+>
+> ```bash
+> # 生成新 key
+> NEW_KEY=$(openssl rand -base64 32)
+> # 清空旧加密数据（否则用新 key 解密会失败）
+> python3 -c "import sqlite3; c=sqlite3.connect('/var/lib/ilink-hub/ilink-hub.db'); c.execute('DELETE FROM bot_credentials'); c.commit()"
+> # 然后把 $NEW_KEY 写入 service 文件并 systemctl daemon-reload
+> ```
+
+### 替换二进制时的 "Text file busy" 问题
+
+直接 `cp` 到正在运行的二进制会报 `Text file busy`。**必须先 stop 后替换**：
+
+```bash
+# 错误做法（会报错）：
+sudo cp new-binary /opt/ilink-hub/ilink-hub   # ❌ 服务运行时
+
+# 正确做法：
+sudo systemctl stop ilink-hub
+sudo cp new-binary /opt/ilink-hub/ilink-hub   # ✅
+sudo systemctl start ilink-hub
 ```
 
 ## 提交前检查清单（部署相关）
@@ -100,6 +161,9 @@ curl -s http://43.138.149.34:8765/health   # → ok
 - [ ] 本机调试用方案 2（brew），**绝不**裸拷到 `~/.local/bin`
 - [ ] patch 对外用方案 1（`v*-mac`），minor/major 用完整 `release.yml`（`vX.Y.Z`）
 - [ ] 远程 Hub 部署前已备份生产 SQLite 库
+- [ ] **不要**用 `cross` 或 `musl` 交叉编译 Hub，改为 rsync 源码到服务器直接编译
+- [ ] `systemd` service 文件包含所有必需的 `Environment=` 变量（见上方清单）
+- [ ] 替换二进制前先 `sudo systemctl stop ilink-hub`
 
 ## 相关文档
 

@@ -51,6 +51,7 @@ pub mod queue;
 pub mod quote_route;
 pub mod registry;
 pub mod router;
+pub mod vtoken_hash;
 
 mod commands;
 mod dispatch;
@@ -85,7 +86,9 @@ pub use outbound_label::{
 };
 pub use pairing::PairingRegistry;
 pub use queue::{InMemoryQueue, MessageQueue};
-pub use quote_route::{merge_routing_with_quote, QuoteOrigin, QuoteRouteIndex};
+pub use quote_route::{
+    merge_routing_with_quote, parse_footer_from_quoted_text, QuoteOrigin, QuoteRouteIndex, WarmItem,
+};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 pub use state::{
@@ -93,6 +96,7 @@ pub use state::{
     LatencyHistogram, Metrics, PollGuard, PollTracker, RoutingState, HISTOGRAM_BUCKETS_MS,
     MAX_CONCURRENT_POLLS_PER_VTOKEN, MAX_HUB_POLLS_DEFAULT,
 };
+pub use vtoken_hash::{hash_vtoken, is_vtoken_hash};
 
 #[cfg(test)]
 mod tests;

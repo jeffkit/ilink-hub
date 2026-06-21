@@ -11,12 +11,12 @@
     {
       "name": "clippy",
       "cmd": "cargo clippy -- -D warnings",
-      "onFail": "resume-fix"
+      "onFail": "rollback"
     },
     {
       "name": "test",
       "cmd": "cargo test",
-      "onFail": "resume-fix"
+      "onFail": "rollback"
     },
     {
       "name": "build",
@@ -26,12 +26,12 @@
     {
       "name": "desktop-frontend",
       "cmd": "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build",
-      "onFail": "resume-fix"
+      "onFail": "rollback"
     },
     {
       "name": "desktop-tauri",
       "cmd": "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml",
-      "onFail": "resume-fix"
+      "onFail": "rollback"
     }
   ],
 

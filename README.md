@@ -255,7 +255,7 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/hub/register` | Register a new backend client |
-| `GET` | `/hub/clients` | List all registered clients (includes vtoken) |
+| `GET` | `/hub/clients` | List all registered clients (includes vtoken hash) |
 | `PATCH` | `/hub/clients/{name}` | Update a client's name and label |
 | `DELETE` | `/hub/clients/{name}` | Delete an offline client |
 | `GET` | `/hub/ui` | Web admin panel (browser UI) |
@@ -272,6 +272,12 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 > 绝不要在生产环境设置 `ILINK_ADMIN_INSECURE_NO_AUTH=true`。该选项会完全移除 `/hub/` 管理端点的
 > 身份验证，使任何人都能注册客户端、查看所有 vtoken 并操作 Hub。仅在本地开发或完全隔离的私有网络
 > 中使用。
+
+**静态加密与凭证存储 / Static Encryption & Credential Storage（必填/Required）:**
+
+为了确保敏感凭据不以明文落盘，Hub 实现了静态加密与单向哈希：
+- **`ILINK_HUB_MASTER_KEY`（环境变量）**：**必须设置**。其值应为 32 字节的 Base64 字符串或 Hex 字符串。Hub 会用它对 `bot_credentials.token` 进行 AES-256-GCM 静态加密。若未设置或格式错误，Hub 将在启动时报错并退出。
+- **vtoken 单向哈希**：虚拟 Token (`vtoken`) 在内存和数据库中均只保存其 SHA-256 哈希值。任何人（包括拥有管理员权限的人和数据库管理员）都无法获取明文 `vtoken`，明文仅在注册时向客户端返回一次。
 
 ---
 

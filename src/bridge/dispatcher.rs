@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -711,6 +712,10 @@ struct SessionDispatcher {
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
+    /// Cumulative count of messages dropped because MAX_SESSION_WORKERS cap was reached.
+    /// Visible in structured logs via the warn! on each drop; exposed in the bridge
+    /// metrics endpoint (TODO: requires a bridge-side HTTP server).
+    sessions_dropped_on_cap: Arc<AtomicU64>,
 }
 
 impl SessionDispatcher {
@@ -726,6 +731,7 @@ impl SessionDispatcher {
             app,
             stop_tx,
             shutdown,
+            sessions_dropped_on_cap: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -749,10 +755,13 @@ impl SessionDispatcher {
             if senders.len() >= MAX_SESSION_WORKERS {
                 senders.retain(|_, tx| !tx.is_closed());
                 if senders.len() >= MAX_SESSION_WORKERS {
+                    let total_dropped =
+                        self.sessions_dropped_on_cap.fetch_add(1, Ordering::Relaxed) + 1;
                     warn!(
                         session_key = %key,
                         cap = MAX_SESSION_WORKERS,
                         active = senders.len(),
+                        sessions_dropped_on_cap = total_dropped,
                         "session worker cap reached, dropping message"
                     );
                     return;

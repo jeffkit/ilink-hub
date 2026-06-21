@@ -1,0 +1,19 @@
+milestone: M4
+title: 迁移兼容与环境变量防截断
+branch: feat/security-p1
+plan: docs/exec-plans/active/security-p1/plan.md
+summary: |
+  本里程碑 M4 主要实现：
+  1. 数据库升级至 v8 迁移：自动对 clients, routing_state, messages 中的 vtoken 进行 SHA-256 哈希，并对 bot_credentials.token 使用 AES-256-GCM 加密，实现数据迁移兼容。
+  2. 环境变量防注入与截断（SEC-011）：在 bridge 中增加对环境变量的过滤，防范 NUL/CR/LF。
+  3. 修复已有的 quote_index 预热中对于 legacy 无 vtoken 行的路由问题，空 vtoken 时放弃 warmup 录入。
+  4. 解决 Relay 在多 client 场景下由于 Hub 断开重连导致的设备公钥清理与 slot 释放逻辑。
+files_changed:
+  - src/bridge/executor.rs
+  - src/hub/quote_route.rs
+  - src/relay/server.rs
+  - src/runtime/serve.rs
+  - src/store/migrations.rs
+  - src/store/mod.rs
+  - src/store/store_tests.rs
+  - migrations/0008_vtoken_and_bot_token_hash.sql

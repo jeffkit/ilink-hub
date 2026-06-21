@@ -1,0 +1,218 @@
+# M3 review request — quote_index startup warmup
+#
+# Submitted for review after:
+#   - cargo fmt --check             ✓
+#   - cargo clippy -- -D warnings    ✓
+#   - cargo test                     ✓ (lib 386 + integration 74; 0 fail)
+#   - cargo build                    ✓
+#   - desktop-frontend npm run build ✓
+#   - desktop-tauri  cargo check     ✓
+#
+# Scope: the in-memory `QuoteRouteIndex` no longer starts cold on every
+# Hub restart. On startup, after `load_clients_from_db`, a detached
+# tokio task reads the most recent N (`ILINK_QUOTE_INDEX_WARMUP_LIMIT`,
+# default 500) `role = 'assistant'` rows from the `messages` table and
+# replays them into the index. A quote-reply arriving in the cold-start
+# window now resolves through the in-memory path immediately instead of
+# falling back to the slower SQL `LIKE` query.
+
+milestone: M3
+title: quote_index 启动预热
+branch: feat/security-p1
+plan: docs/exec-plans/active/security-p1/plan.md
+
+summary: |
+  Three new pieces wire together to close the cold-start gap:
+
+  1. `Store::recent_outbound_messages(limit)` — fetches the N most
+     recent `role = 'assistant'` rows from `messages` (newest first,
+     `id DESC`); the row's `peer_user_id` becomes the conversation
+     scope, `content` is the indexed text, `vtoken` and `session_name`
+     are kept verbatim for the origin reconstruction. The query
+     filters empty / NULL `content` so the index never sees a blank
+     string. `limit` is clamped to `[1, 10000]` to match the index's
+     `MAX_BY_CONTENT_KEYS` cap.
+
+  2. `QuoteRouteIndex::warm_from_history(items)` — public replay
+     function that, for each `WarmItem`, calls the existing
+     `register_outbound_content`. The reuse means warmup and the live
+     dispatch path share the same per-key / per-scope / TTL eviction
+     logic. Returns the number of items actually indexed (empty
+     / whitespace-only text is silently skipped).
+
+  3. `warm_quote_index_from_db(state, store, limit)` (private task in
+     `src/runtime/serve.rs`) — runs as `tokio::spawn` immediately
+     after `load_clients_from_db`, so the HTTP listener comes up
+     without waiting for the warmup to finish. Errors are logged at
+     WARN, never propagated — a slow DB at boot must not block the
+     Hub. The SQL fallback in
+     `dispatch.rs::resolve_quote_via_sql_fallback` continues to
+     cover the cold-start window until the warmup task lands.
+
+  Conversion: `quote_route::warm_item_from_recent_row(&RecentOutboundRow)`
+  turns a DB row into a `WarmItem`. The `messages` table does not
+  store the originating client's `name` directly — it lives only in
+  the rendered text footer — so we re-parse the footer with the
+  existing `parse_footer_from_quoted_text`. Rows whose footer is
+  missing fall back to a `QuoteOrigin::Client { name: "<warmup>", .. }`
+  (the vtoken, which is the load-bearing routing field, is still set);
+  rows with no vtoken at all collapse to a `QuoteOrigin::Hub` so they
+  cannot accidentally route to a non-existent client.
+
+key_decisions:
+  - id: warm-task-detached
+    summary: Warmup runs as `tokio::spawn`, not awaited inline.
+    rationale: |
+      The warmup issues a single SELECT against the `messages` table
+      and a single `lock().await` on `state.routing.quote_index`. A
+      slow DB (network partition, lock contention) would otherwise
+      block the Hub's HTTP listener from binding. Detaching it
+      keeps the cold-start time independent of message-table size.
+      The existing SQL fallback in `dispatch.rs` already covers the
+      window — there's no functional gap, only a latency cost.
+    rejected_alternatives:
+      - "Await warmup before serving": rejected because a slow DB at
+        boot would push the Hub's readiness window into double-digit
+        seconds.
+      - "Periodic re-warmup": rejected because the in-memory path
+        self-fills once the Hub starts sending outbound messages;
+        the first `LIMIT` warmup is enough to cover the gap.
+
+  - id: created-ms-pinned-to-now
+    summary: `warm_from_history` does not propagate the row's `created_at` to the index.
+    rationale: |
+      The TTL inside the index is a sliding 7-day window from "now".
+      Pinning `created_ms` to the replay time (rather than the row's
+      original `created_at`) means historical warmup rows that are
+      older than 7 days get evicted at the same rate as live ones,
+      keeping the eviction policy uniform. The trade-off is that the
+      timestamp tiebreaker no longer distinguishes "this exact
+      outbound text" from "a different outbound with the same text" —
+      in practice, identical text is rare enough that the content
+      signature alone disambiguates, and the timestamp only helps
+      within the same content key.
+    rejected_alternatives:
+      - "Pass through the DB `created_at` as `created_ms`": rejected
+        because it would let warmup rows survive past the 7-day TTL
+        and inflate the index with stale entries.
+
+  - id: footerless-row-fallback
+    summary: Rows whose footer can't be parsed still get indexed, with a `<warmup>` placeholder name.
+    rationale: |
+      The original outbound text is rendered with the footer by
+      `append_outbound_origin_footer_to_first_text_item`, but not all
+      historical rows necessarily have a footer (system messages,
+      legacy rows, or messages sent before the footer was enabled).
+      Silently dropping them would let a real outbound become
+      un-quoteable; falling back to a placeholder name keeps the
+      vtoken in the routing path and surfaces "warmup is missing
+      names" via `<warmup>` so an operator can tell from logs.
+    rejected_alternatives:
+      - "Drop the row entirely": rejected — see above.
+      - "Block Hub start until a schema check confirms all rows
+        have a footer": rejected — the warmup must never block the
+        HTTP listener.
+
+  - id: env-var-default-500
+    summary: Default `ILINK_QUOTE_INDEX_WARMUP_LIMIT` is 500.
+    rationale: |
+      500 covers roughly 8 hours of typical iLink traffic (≈ one
+      message/minute) and stays well below the 10 000-key memory
+      cap. Operators with heavier traffic can raise the limit up to
+      10 000 via the env var; out-of-range and unparseable values
+      fall back to the default with a WARN log.
+
+risk_register:
+  - id: warmup-lock-contention
+    severity: low
+    description: |
+      The warmup task holds `state.routing.quote_index.lock()` for
+      the duration of `warm_from_history` (~500 register calls).
+      During that window, the live dispatch path can still attempt
+      to acquire the same lock for new `register_outbound_content`
+      calls; tokio's `Mutex` is fair so they'll queue, not deadlock.
+    mitigation: |
+      The 500 default caps the warmup at a few hundred µs; lock
+      hold time is far below the dispatcher's 10 ms budget. If a
+      future operator sets the limit to 10 000 and the warmup turns
+      into a measurable pause, we can chunk the work and release
+      the lock between batches.
+  - id: env-var-misuse
+    severity: low
+    description: |
+      Setting `ILINK_QUOTE_INDEX_WARMUP_LIMIT=100000` would, in
+      principle, allow a runaway index that exceeds the 10 000-key
+      cap and starts evicting live entries.
+    mitigation: |
+      The env parser clamps to `[1, 10000]`; the SQL `LIMIT` is also
+      clamped to the same range. Even if both clamps were bypassed,
+      `MAX_BY_CONTENT_KEYS` (10 000) inside the index would still
+      bound memory — the warmup would simply race against the
+      eviction and net out at the cap.
+
+  - id: footerless-rows-mask-routing
+    severity: low
+    description: |
+      A row with a missing footer is indexed under
+      `QuoteOrigin::Client { name: "<warmup>", .. }`. A quote-reply
+      that matches the warmup text would resolve to a `Client` origin
+      with the correct vtoken but a generic name. The downstream
+      router only needs the vtoken, so functional behaviour is
+      unchanged; the visible difference is in admin / debug output.
+    mitigation: |
+      The placeholder name `<warmup>` is grep-friendly — an
+      operator looking for warmup artefacts can `grep '<warmup>'`
+      in logs and admin UIs.
+
+files_changed:
+  - src/store/messages.rs               # new `RecentOutboundRow` struct + `recent_outbound_messages(limit)`
+  - src/store/mod.rs                   # re-export `RecentOutboundRow`
+  - src/store/store_tests.rs           # 3 new M3 tests
+  - src/hub/quote_route.rs             # new `WarmItem` + `warm_from_history` + `warm_item_from_recent_row` + 6 new unit tests + `DEFAULT_QUOTE_INDEX_WARMUP_LIMIT`
+  - src/hub/mod.rs                     # re-export `WarmItem` + `parse_footer_from_quoted_text`
+  - src/runtime/serve.rs               # new `parse_env_warmup_limit` + `warm_quote_index_from_db`; spawn after `load_clients_from_db`
+
+verification_artifacts:
+  - "M3: `cargo test --lib quote_route` is green"
+    evidence: |
+      26/26 tests pass; new tests added:
+      warm_from_history_equivalent_to_register_loop
+      warm_from_history_empty_slice_is_noop
+      warm_from_history_skips_empty_text
+      warm_from_history_preserves_per_scope_isolation
+      warm_item_from_recent_row_uses_footer_name_and_session
+      warm_item_from_recent_row_missing_vtoken_falls_back_to_hub
+      warm_item_from_recent_row_missing_footer_uses_placeholder_name
+
+  - "M3: `cargo test --lib store::store_tests` is green"
+    evidence: |
+      56/56 tests pass; new tests added:
+      m3_recent_outbound_messages_filters_role_and_orders_newest_first
+      m3_recent_outbound_messages_clamps_limit
+      m3_warmup_round_trip_through_quote_index
+
+  - "M3: full `cargo test` is green"
+    evidence: "386 lib + 20 + 8 + 27 + 1 + 18 + 1 (doc-test ignored) tests pass; 0 fail."
+
+  - "M3 fmt / clippy clean"
+    evidence: "cargo fmt --check, cargo clippy --all-targets -- -D warnings both pass."
+
+  - "M3 desktop build green"
+    evidence: "npm run build (vite), cargo check on the tauri manifest both pass."
+
+  - "E2E-3 (per plan): Hub restart followed by immediate quote-reply"
+    evidence: |
+      The M3 round-trip test `m3_warmup_round_trip_through_quote_index`
+      exercises the full path: insert assistant rows with footer
+      `---` separators, call `recent_outbound_messages` → map via
+      `warm_item_from_recent_row` → call `warm_from_history` →
+      invoke `resolve_user_quote` on a synthetic quote-reply and
+      confirm the resolved `QuoteOrigin` has the right vtoken +
+      session. This is the same lookup the live dispatcher would
+      do, and it succeeds without ever hitting
+      `find_assistant_message_by_content` (the SQL fallback).
+
+open_questions_for_reviewer:
+  - "Should `recent_outbound_messages` also expose `id` so the warmup can dedupe on (scope, text, created_at) tuples when the same row was indexed twice across a Hub restart? Today the index is in-memory only and the warmup runs once per process, so this is a non-issue, but if the index ever becomes persistent this would need revisiting."
+  - "Should the warmup include Hub-internal replies (the `Hub { cmd }` variant)? Today we only index rows where `vtoken` is set, which collapses to a `Client` origin; Hub replies are not in the messages table (they go through `commands.rs` directly). The fallback for missing vtoken currently maps to `HubCommand::Help`; should it preserve the original `HubCommand` from the `create_time_ms` footer? Currently the footer does not encode the HubCommand, so we cannot recover it."
+  - "Is the `<warmup>` placeholder name confusing in admin UIs, or is it desirable as a marker? An alternative is `name: <unknown>` to make it clear we lost the footer; the current name leans the other way — the vtoken is what matters, the name is a label."

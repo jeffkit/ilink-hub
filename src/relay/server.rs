@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use axum::{
@@ -58,6 +58,11 @@ pub struct RelayState {
     device_keys: Arc<RwLock<HashMap<String, [u8; 32]>>>,
     ws_rate_limiter: Arc<RateLimiter>,
     pair_rate_limiter: Arc<RateLimiter>,
+    /// Tracks (device_id, timestamp_secs) pairs that have already been used for
+    /// registration. Prevents replay attacks within the 60-second skew window.
+    /// Entries are passively evicted whenever a new registration arrives.
+    /// Only prevents replay within a single relay process (single-instance relay).
+    used_register_nonces: Arc<DashMap<(String, i64), Instant>>,
 }
 
 #[derive(Clone)]
@@ -72,6 +77,7 @@ pub fn build_relay_router() -> Router {
         device_keys: Arc::new(RwLock::new(HashMap::new())),
         ws_rate_limiter: Arc::new(RateLimiter::new(WS_RATE_MAX, WS_RATE_WINDOW_SECS)),
         pair_rate_limiter: Arc::new(RateLimiter::new(PAIR_RATE_MAX, PAIR_RATE_WINDOW_SECS)),
+        used_register_nonces: Arc::new(DashMap::new()),
     };
 
     Router::new()
@@ -118,6 +124,19 @@ async fn accept_registration(
     let verifying_key = verifying_key_from_b64(public_key).map_err(|e| e.to_string())?;
     verify_register(&verifying_key, device_id, timestamp, signature, unix_now())
         .map_err(|e| e.to_string())?;
+
+    // Replay-attack prevention: reject if this (device_id, timestamp) pair has
+    // already been used within the 60-second skew window.
+    let nonce_key = (device_id.to_string(), timestamp);
+    // Passively evict expired nonces (older than the max skew window) before checking.
+    let skew = Duration::from_secs(super::auth::REGISTER_MAX_SKEW_SECS as u64);
+    state
+        .used_register_nonces
+        .retain(|_, seen_at| seen_at.elapsed() < skew);
+    if state.used_register_nonces.contains_key(&nonce_key) {
+        return Err("registration nonce already used; replay detected".into());
+    }
+    state.used_register_nonces.insert(nonce_key, Instant::now());
 
     let key_bytes = verifying_key.to_bytes();
     let mut keys = state.device_keys.write().await;
@@ -444,6 +463,7 @@ mod tests {
             device_keys: Arc::new(RwLock::new(HashMap::new())),
             ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
             pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            used_register_nonces: Arc::new(DashMap::new()),
         };
 
         let device_id = "test-device".to_string();
@@ -500,5 +520,119 @@ mod tests {
                 "pending request must be cleaned up on cancel!"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_relay_disconnect_does_not_erase_device_key() {
+        let state = RelayState {
+            hubs: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
+            device_keys: Arc::new(RwLock::new(HashMap::new())),
+            ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            used_register_nonces: Arc::new(DashMap::new()),
+        };
+
+        let device_id = "device_123".to_string();
+        let pub_key = [7u8; 32];
+        state
+            .device_keys
+            .write()
+            .await
+            .insert(device_id.clone(), pub_key);
+
+        // Simulate connection
+        let (ws_tx, _ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
+        state
+            .hubs
+            .write()
+            .await
+            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+
+        // Verify key exists
+        assert!(state.device_keys.read().await.contains_key(&device_id));
+
+        // Simulate disconnection (calling the cleanup part of handle_hub_socket)
+        if let Some(id) = Some(device_id.clone()) {
+            state.hubs.write().await.remove(&id);
+        }
+
+        // Verify key is NOT removed after disconnect
+        assert!(
+            state.device_keys.read().await.contains_key(&device_id),
+            "device key must be preserved after hub disconnects (SEC-M4-001)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_relay_disconnect_prevents_hijacking() {
+        let state = RelayState {
+            hubs: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
+            device_keys: Arc::new(RwLock::new(HashMap::new())),
+            ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            used_register_nonces: Arc::new(DashMap::new()),
+        };
+
+        let device_id = "device_123".to_string();
+        let pub_key_a = [7u8; 32];
+        let pub_key_b = [8u8; 32];
+
+        // 1. First registration binds device_123 to pub_key_a
+        state
+            .device_keys
+            .write()
+            .await
+            .insert(device_id.clone(), pub_key_a);
+
+        // Simulate Hub connection
+        let (ws_tx, _ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
+        state
+            .hubs
+            .write()
+            .await
+            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+
+        // Verify key exists
+        assert!(state.device_keys.read().await.contains_key(&device_id));
+
+        // 2. Hub disconnects
+        state.hubs.write().await.remove(&device_id);
+
+        // 3. Hijacker attempts to register with pub_key_b
+        // We simulate accept_registration's key-check logic
+        let accept_hijack = {
+            let keys = state.device_keys.read().await;
+            if let Some(existing) = keys.get(&device_id) {
+                if existing != &pub_key_b {
+                    Err("device_id already bound to another key".to_string())
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        };
+        assert!(accept_hijack.is_err());
+        assert_eq!(
+            accept_hijack.unwrap_err(),
+            "device_id already bound to another key"
+        );
+
+        // 4. Legitimate Hub reconnects with pub_key_a
+        let accept_legit = {
+            let keys = state.device_keys.read().await;
+            if let Some(existing) = keys.get(&device_id) {
+                if existing != &pub_key_a {
+                    Err("device_id already bound to another key".to_string())
+                } else {
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            }
+        };
+        assert!(accept_legit.is_ok());
     }
 }

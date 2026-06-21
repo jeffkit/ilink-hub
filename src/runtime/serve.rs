@@ -32,7 +32,7 @@ pub struct RuntimeConfig {
     /// dispatcher task. When full, the polling loop blocks (backpressure) rather
     /// than dropping messages. Default: 1024.
     pub dispatch_channel_size: usize,
-    /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
+    /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 30.
     pub shutdown_drain_secs: u64,
     /// Admin auth config — parsed once here so it can be injected into HubState
     /// and used by routes without re-reading env vars at request time.
@@ -218,7 +218,17 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     info!(%addr, "iLink Hub listening");
     runtime_cfg.warn_if_insecure(&addr);
 
+    // Eagerly check and load the master key after bind succeeds.
+    let master_key = match crate::runtime::crypto::load_or_derive_master_key() {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::error!("CRITICAL: Failed to load master key: {}", e);
+            anyhow::bail!("Failed to load master key: {}", e);
+        }
+    };
+
     let store = Arc::new(Store::connect(&database_url).await?);
+    let _ = store.set_master_key(std::sync::Arc::new(master_key));
 
     let (token, base_url) = resolve_token(
         token_arg,
@@ -229,6 +239,24 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     .await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
+
+    // P-16: Spawn a lightweight startup probe so a stale/expired token is detected at
+    // boot instead of silently reporting healthy until the first real message arrives.
+    // Non-blocking: failure only logs a warn; the Hub continues starting normally and
+    // the polling loop will surface session errors on its own schedule.
+    {
+        let probe_upstream = upstream.clone();
+        tokio::spawn(async move {
+            match probe_upstream.notify_start().await {
+                Ok(()) => info!("upstream token validated (startup probe ok)"),
+                Err(e) => warn!(
+                    error = %e,
+                    "upstream token probe failed: will retry on first message"
+                ),
+            }
+        });
+    }
+
     let queue = build_queue_backend()?;
     // Load or persist the relay secret BEFORE building HubState. I/O is
     // small (one 32-char file) and synchronous std::fs is acceptable on the
@@ -261,6 +289,22 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     }
 
     load_clients_from_db(state.clone(), store.clone()).await;
+
+    // Replay the most recent outbound messages into the in-memory
+    // `QuoteRouteIndex` so a quote-reply arriving right after Hub boot still
+    // resolves through the in-memory path instead of falling back to the
+    // slower `LIKE`-based SQL query (see the cold-start note in
+    // `HubState::routing.quote_index`). Spawned rather than awaited so a slow
+    // DB never delays the HTTP listener coming up.
+    let warmup_state = state.clone();
+    let warmup_store = store.clone();
+    let warmup_limit = parse_env_warmup_limit()
+        .unwrap_or(crate::hub::quote_route::DEFAULT_QUOTE_INDEX_WARMUP_LIMIT);
+    let warmup_flag = state.quote_index_warmed.clone();
+    tokio::spawn(async move {
+        warm_quote_index_from_db(warmup_state, warmup_store, warmup_limit).await;
+        warmup_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 
     let (tx, rx) =
         mpsc::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
@@ -380,7 +424,7 @@ async fn resolve_token(
                 // Bootstrap: persist the env/CLI token so future restarts load from DB.
                 store.save_credentials(&token, &base).await?;
             }
-            info!("using iLink token without startup session probe");
+            info!("using iLink token; scheduling async upstream probe");
             return Ok((token, base));
         }
         warn!("iLink token malformed");
@@ -416,17 +460,109 @@ async fn perform_qr_login(
     Ok((token, base))
 }
 
+/// Read `ILINK_QUOTE_INDEX_WARMUP_LIMIT` from the environment. Returns the
+/// parsed value if it is in `[1, 10000]`; returns `None` (caller falls back
+/// to [`DEFAULT_QUOTE_INDEX_WARMUP_LIMIT`]) on missing, empty, unparseable,
+/// or out-of-range input. The upper bound mirrors the clamp inside
+/// [`Store::recent_outbound_messages`] so a runaway env var cannot blow
+/// past the index's `MAX_BY_CONTENT_KEYS`.
+fn parse_env_warmup_limit() -> Option<i64> {
+    let raw = std::env::var("ILINK_QUOTE_INDEX_WARMUP_LIMIT").ok()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    match raw.trim().parse::<i64>() {
+        Ok(v) if (1..=10_000).contains(&v) => Some(v),
+        Ok(v) => {
+            tracing::warn!(
+                value = v,
+                "ILINK_QUOTE_INDEX_WARMUP_LIMIT out of range [1, 10000]; using default"
+            );
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                value = %raw,
+                "ILINK_QUOTE_INDEX_WARMUP_LIMIT is not a valid integer; using default"
+            );
+            None
+        }
+    }
+}
+
+/// Replay the most recent N outbound messages from the `messages` table into
+/// the in-memory `QuoteRouteIndex`. Runs as a detached tokio task on the
+/// startup path; errors are logged at WARN, never propagated — a DB hiccup
+/// at boot must not take down the Hub, the SQL fallback covers the gap.
+async fn warm_quote_index_from_db(state: Arc<HubState>, store: Arc<Store>, limit: i64) {
+    match store.recent_outbound_messages(limit).await {
+        Ok(rows) => {
+            let total = rows.len();
+            let warm_items: Vec<crate::hub::quote_route::WarmItem> = rows
+                .iter()
+                .filter_map(crate::hub::quote_route::warm_item_from_recent_row)
+                .collect();
+            let mut idx = state.routing.quote_index.lock().await;
+            let indexed = idx.warm_from_history(&warm_items);
+            if total > 0 {
+                info!(
+                    requested = limit,
+                    rows_loaded = total,
+                    rows_indexed = indexed,
+                    "quote_index warmup complete: {indexed} items"
+                );
+            } else {
+                info!("quote_index warmup complete: 0 items (no history)");
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                "quote_index warmup failed; SQL fallback will cover the cold-start window"
+            );
+        }
+    }
+}
+
 async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
+    use crate::store::HUB_DEFAULT_SENTINEL;
+
     match store.list_clients().await {
         Ok(clients) => {
             let count = clients.len();
-            let mut registry = state.clients.registry.write().await;
-            for c in clients {
-                registry.register_with_vtoken(
-                    c.name.clone(),
-                    c.label.clone(),
-                    Some(c.vtoken.clone()),
-                );
+            // Fallback default: use the first client only when no persisted default exists.
+            let first_vtoken = clients.first().map(|c| c.vtoken.clone());
+            {
+                let mut registry = state.clients.registry.write().await;
+                for c in &clients {
+                    registry.register_with_vtoken(
+                        c.name.clone(),
+                        c.label.clone(),
+                        Some(c.vtoken.clone()),
+                    );
+                }
+            }
+            // Prefer the explicitly persisted default (HUB_DEFAULT_SENTINEL row) so that a
+            // restart restores the same default that was active before — not just whichever
+            // client happens to be first in the DB.
+            let default_vtoken = match store.get_route(HUB_DEFAULT_SENTINEL).await {
+                Ok(Some(v)) => {
+                    info!(vtoken = %crate::redact_token(&v), "restored persisted default client");
+                    Some(v)
+                }
+                _ => {
+                    // No sentinel row yet (fresh install or first run after upgrade).
+                    // Fall back to first registered client and persist it for future restarts.
+                    first_vtoken.clone()
+                }
+            };
+            if let Some(vtoken) = &default_vtoken {
+                let mut router = state.routing.router.lock().await;
+                router.set_default(vtoken.clone());
+                // Persist the resolved default so the next restart can restore it.
+                if let Err(e) = store.set_route(HUB_DEFAULT_SENTINEL, vtoken).await {
+                    tracing::warn!(error = %e, "failed to persist resolved default client");
+                }
             }
             info!(count, "loaded clients from database");
         }
@@ -437,10 +573,18 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
 
     match store.list_routes().await {
         Ok(routes) => {
-            let count = routes.len();
+            use crate::store::HUB_DEFAULT_SENTINEL;
+            let count = routes
+                .iter()
+                .filter(|(from_user, _)| from_user != HUB_DEFAULT_SENTINEL)
+                .count();
             let mut router = state.routing.router.lock().await;
             let registry = state.clients.registry.read().await;
             for (from_user, vtoken) in routes {
+                // Skip the sentinel — it is handled above as the global default, not a per-user route.
+                if from_user == HUB_DEFAULT_SENTINEL {
+                    continue;
+                }
                 if registry.get_by_vtoken(&vtoken).is_some() {
                     router.set_route(&from_user, vtoken);
                 } else {

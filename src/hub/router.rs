@@ -231,7 +231,11 @@ impl Router {
                 session_override: None,
             }
         } else {
-            RoutingDecision::Broadcast
+            // No per-user route and no default client: do NOT broadcast.
+            // Broadcasting to all registered backends as a fallback is surprising and
+            // can cause duplicate replies from every AI backend. Instead, tell the user
+            // to pick one explicitly with /use or /list.
+            RoutingDecision::HubInternal(HubCommand::Help)
         }
     }
 }
@@ -403,7 +407,10 @@ mod tests {
     }
 
     #[test]
-    fn route_broadcast_when_no_default_and_no_route() {
+    fn route_shows_help_when_no_default_and_no_route() {
+        // Broadcasting to all backends as a fallback is dangerous (all AIs reply at once).
+        // When there is no per-user route and no default client, the router should return
+        // a HubInternal(Help) response so the user is guided to pick a backend explicitly.
         let r = Router::new(None);
         let msg = WeixinMessage {
             from_user_id: Some("user@wechat".into()),
@@ -416,7 +423,10 @@ mod tests {
             }])),
             ..Default::default()
         };
-        assert!(matches!(r.route(&msg), RoutingDecision::Broadcast));
+        assert!(matches!(
+            r.route(&msg),
+            RoutingDecision::HubInternal(HubCommand::Help)
+        ));
     }
 
     #[test]

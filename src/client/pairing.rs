@@ -117,7 +117,7 @@ impl HubPairingClient {
                     println!("✅ 配对成功，虚拟 Token 已保存。");
                     return Ok(creds);
                 }
-                Err(e) if e.to_string().contains("expired") => {
+                Err(e) if is_qr_expired(&e) => {
                     warn!("pairing QR expired, refreshing ({qr_refresh}/{MAX_QR_REFRESH})");
                     println!("⏳ 二维码已过期，正在刷新…");
                     continue;
@@ -153,6 +153,13 @@ impl HubPairingClient {
         }
         let data = serde_json::to_string_pretty(creds)?;
         tokio::fs::write(&path, format!("{data}\n")).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .with_context(|| format!("chmod 0600 {path}"))?;
+        }
         Ok(())
     }
 
@@ -316,6 +323,15 @@ pub fn render_qr_terminal(url: &str) -> Result<()> {
         .build();
     println!("{image}");
     Ok(())
+}
+
+/// Returns `true` if the error represents a QR code expiry.
+///
+/// Centralises the expiry detection so that when the upstream error message
+/// changes (e.g. a server-side wording update), there is exactly one place to
+/// update instead of hunting for every `contains("expired")` call site.
+fn is_qr_expired(e: &anyhow::Error) -> bool {
+    e.to_string().contains("expired")
 }
 
 fn default_cred_path() -> String {

@@ -20,9 +20,9 @@ mod migrations;
 
 mod sessions;
 
-pub use clients::ClientRow;
+pub use clients::{ClientRow, HUB_DEFAULT_SENTINEL};
 
-pub use messages::{MessageRow, SessionStatusEntry};
+pub use messages::{MessageRow, RecentOutboundRow, SessionStatusEntry};
 
 pub use sessions::BackendSessionRow;
 
@@ -40,18 +40,33 @@ pub enum DatabaseKind {
 }
 
 impl DatabaseKind {
-    /// Parse the driver from the URL scheme. The set of accepted schemes
-    /// mirrors sqlx's `AnyKind::from_str` (src/any/kind.rs). Unknown schemes
-    /// default to `Sqlite` for backwards compatibility — the iLink Hub
-    /// desktop default is `sqlite:~/.ilink-hub/ilink-hub.db`, and a typo
-    /// in a CLI flag should not refuse to start.
-    fn from_url(url: &str) -> Self {
+    /// Parse the driver from the URL scheme. Accepted schemes:
+    /// `sqlite:` (or empty/bare path) → SQLite,
+    /// `postgres:` / `postgresql:` → PostgreSQL,
+    /// `mysql:` / `mariadb:` → MySQL.
+    ///
+    /// Any other scheme (e.g. `postgress://`, `file:`, `http:`) returns
+    /// `Err` immediately so a typo surfaces at startup rather than being
+    /// silently treated as SQLite.
+    fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("postgres:") || url.starts_with("postgresql:") {
-            DatabaseKind::Postgres
+            Ok(DatabaseKind::Postgres)
         } else if url.starts_with("mysql:") || url.starts_with("mariadb:") {
-            DatabaseKind::MySql
+            #[cfg(feature = "mysql")]
+            return Ok(DatabaseKind::MySql);
+            #[cfg(not(feature = "mysql"))]
+            anyhow::bail!(
+                "MySQL support requires the `mysql` feature flag to be enabled at compile time; \
+                 rebuild with `--features mysql`"
+            );
+        } else if url.starts_with("sqlite:") || url.is_empty() {
+            Ok(DatabaseKind::Sqlite)
         } else {
-            DatabaseKind::Sqlite
+            anyhow::bail!(
+                "unsupported DATABASE_URL scheme in {:?}; \
+                 supported schemes: sqlite:, postgres://, postgresql://, mysql://, mariadb://",
+                url
+            )
         }
     }
 }
@@ -62,6 +77,8 @@ pub struct Store {
     /// Read pool — multiple connections on SQLite WAL, same as `pool` for PG/MySQL.
     rpool: AnyPool,
     kind: DatabaseKind,
+    /// Master key for encrypting/decrypting sensitive credentials (like bot tokens).
+    master_key: std::sync::OnceLock<std::sync::Arc<ring::aead::LessSafeKey>>,
 }
 
 impl Store {
@@ -70,6 +87,19 @@ impl Store {
     /// For SQLite URLs, the database file is created automatically if it does
     /// not exist yet (equivalent to `create_if_missing(true)`).
     pub async fn connect(url: &str) -> Result<Self> {
+        #[cfg(test)]
+        {
+            static TEST_INIT_KEY: std::sync::Once = std::sync::Once::new();
+            TEST_INIT_KEY.call_once(|| {
+                if std::env::var("ILINK_HUB_MASTER_KEY").is_err() {
+                    std::env::set_var(
+                        "ILINK_HUB_MASTER_KEY",
+                        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                    );
+                }
+            });
+        }
+
         sqlx::any::install_default_drivers();
 
         // Parse the driver from the URL scheme prefix BEFORE opening the
@@ -80,7 +110,7 @@ impl Store {
         // `SELECT current_database()` is unreliable because both SQLite AND
         // MySQL reject that function (SQLite has no concept; MySQL uses
         // `database()` instead). See F-M3-01 in the m3 review-findings.
-        let kind = DatabaseKind::from_url(url);
+        let kind = DatabaseKind::from_url(url)?;
         let is_sqlite = kind == DatabaseKind::Sqlite;
 
         // For SQLite we must ensure the file (and its parent directory) exist
@@ -154,9 +184,25 @@ impl Store {
             (pool.clone(), pool)
         };
 
-        let store = Self { pool, rpool, kind };
+        let store = Self {
+            pool,
+            rpool,
+            kind,
+            master_key: std::sync::OnceLock::new(),
+        };
         store.run_migrations().await?;
         Ok(store)
+    }
+
+    pub fn set_master_key(
+        &self,
+        key: std::sync::Arc<ring::aead::LessSafeKey>,
+    ) -> Result<(), std::sync::Arc<ring::aead::LessSafeKey>> {
+        self.master_key.set(key)
+    }
+
+    pub fn master_key(&self) -> Option<&std::sync::Arc<ring::aead::LessSafeKey>> {
+        self.master_key.get()
     }
 
     #[cfg(test)]

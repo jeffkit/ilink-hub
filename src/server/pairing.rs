@@ -283,32 +283,99 @@ pub async fn register_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
-) -> (String, bool) {
+) -> RegisterClientOutcome {
     // Lock order: registry → router (always). MUST NOT be called while
     // `state.clients.pairing.write()` is held; doing so would introduce a new
     // `pairing → registry → router` lock order that deadlocks against any
     // future code path that takes registry+router and then pairing. (F-M1-1)
-    let (vtoken, is_new, is_first) = {
+    let (plaintext, hashed, is_new, is_first) = {
         let mut registry = state.clients.registry.write().await;
-        let (vtoken, is_new) = registry.register(name.clone(), label.clone());
+        let (plaintext, hashed, is_new) = registry.register(name.clone(), label.clone());
         let is_first = is_new && registry.all_clients().len() == 1;
-        (vtoken, is_new, is_first)
+        (plaintext, hashed, is_new, is_first)
     };
 
     if is_first {
         let mut router = state.routing.router.lock().await;
-        router.set_default(vtoken.clone());
+        router.set_default(hashed.clone());
+        // Persist the default so it survives hub restarts (HUB_DEFAULT_SENTINEL row).
+        if let Err(e) = state
+            .store
+            .set_route(crate::store::HUB_DEFAULT_SENTINEL, &hashed)
+            .await
+        {
+            warn!(error = %e, "failed to persist default client on first registration");
+        }
     }
 
     if let Err(e) = state
         .store
-        .upsert_client(&vtoken, &name, label.as_deref())
+        .upsert_client(&hashed, &name, label.as_deref())
         .await
     {
         warn!(error = %e, name = %name, "failed to persist paired client");
     }
 
-    (vtoken, is_new)
+    RegisterClientOutcome {
+        plaintext,
+        hashed,
+        is_new,
+    }
+}
+
+pub async fn register_confirmed_client_in_hub(
+    state: &HubState,
+    name: String,
+    label: Option<String>,
+    vtoken_plain: String,
+) -> Result<RegisterClientOutcome, PairingError> {
+    use crate::hub::hash_vtoken;
+
+    let hashed = hash_vtoken(&vtoken_plain);
+    let is_first = {
+        let mut registry = state.clients.registry.write().await;
+        if registry
+            .register_confirmed(name.clone(), label.clone(), hashed.clone())
+            .is_err()
+        {
+            return Err(PairingError::NameCollision);
+        }
+        registry.all_clients().len() == 1
+    };
+
+    if is_first {
+        let mut router = state.routing.router.lock().await;
+        router.set_default(hashed.clone());
+    }
+
+    if let Err(e) = state
+        .store
+        .upsert_client(&hashed, &name, label.as_deref())
+        .await
+    {
+        warn!(error = %e, name = %name, "failed to persist paired client");
+    }
+
+    Ok(RegisterClientOutcome {
+        plaintext: vtoken_plain,
+        hashed,
+        is_new: true,
+    })
+}
+
+/// Outcome of a single [`register_client_in_hub`] call.
+///
+/// The two vtoken views coexist by design: `plaintext` is the bearer
+/// credential the bridge needs (returned to the caller exactly once and
+/// never persisted), `hashed` is the SHA-256 form the registry / store /
+/// queue use as the canonical key. Re-registration of an existing name
+/// yields `plaintext = ""` and `hashed = existing_hash`, since the
+/// original plaintext is no longer recoverable.
+#[derive(Debug, Clone)]
+pub struct RegisterClientOutcome {
+    pub plaintext: String,
+    pub hashed: String,
+    pub is_new: bool,
 }
 
 #[derive(Debug)]
@@ -799,59 +866,12 @@ pub async fn pair_confirm(
         }
     };
 
-    // Speculative register — runs OUTSIDE the pairing write lock to keep the
-    // canonical `registry → router` lock order intact (F-M1-1).
-    // `is_new` tells us whether this call actually inserted a fresh row; if
-    // the supplied name was already registered, the registry returned the
-    // legitimate client's vtoken. The pairing write lock may still reject the
-    // confirm (CSRF / state / AlreadyConfirmed), but rolling back in that
-    // case would evict the legitimate client (F-M1-A). We MUST gate the
-    // rollback on `is_new`.
-    let (vtoken, is_new) =
-        register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
-
-    // Atomic check + commit under the pairing write lock. On any non-Ok
-    // result, roll back the speculative register so we don't leak a
-    // vtoken/queue/store row (F-M1-2). The rollback is gated on `is_new`
-    // (F-M1-A) to prevent evicting a legitimate pre-existing client.
-    let confirm_result = {
+    // Pre-check the pairing session before speculative registry insertion to prevent
+    // unauthorized registration pollution and database writes (SEC-M1-001, SEC-M1-002).
+    {
         let mut pairing = state.clients.pairing.write().await;
-        pairing.confirm(&code, name.clone(), label, vtoken.clone(), &csrf_header)
-    };
-    if confirm_result.is_ok() {
-        state.clients.pairing_notify.notify_waiters();
-    }
-
-    match confirm_result {
-        Ok(()) => {
-            // SEC-013 / F-M3-3: `name` may be user-supplied PII; demote to
-            // debug to align with the pair_url demotion.
-            debug!(code = %code, name = %name, "pairing confirmed");
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ret": 0,
-                    "name": name,
-                    "vtoken": vtoken,
-                })),
-            )
-        }
-        Err(e) => {
-            // The speculative register must be undone on every non-Ok
-            // outcome — BUT only when the speculative call actually inserted
-            // a fresh row (F-M1-A). If the name was already registered, the
-            // speculative call was a no-op merge and the rollback would
-            // evict the legitimate client. `is_new` is the gate.
-            if is_new {
-                rollback_speculative_register(state.as_ref(), &name, &vtoken).await;
-            } else {
-                debug!(
-                    name = %name,
-                    "pair_confirm lost the race on a pre-existing client; \
-                     skipping rollback to preserve the legitimate entry (F-M1-A)"
-                );
-            }
-            match e {
+        if let Err(e) = pairing.pre_check_confirm(&code, &csrf_header) {
+            return match e {
                 PairingError::NotFound => (
                     StatusCode::NOT_FOUND,
                     Json(serde_json::json!({ "error": "pairing session not found" })),
@@ -876,8 +896,102 @@ pub async fn pair_confirm(
                     StatusCode::SERVICE_UNAVAILABLE,
                     Json(serde_json::json!({ "error": "too many active pairing sessions" })),
                 ),
+                PairingError::NameCollision => (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({ "error": "client name already registered" })),
+                ),
+            };
+        }
+    }
+
+    // Generate a fresh vtoken plain/hash first. Since we removed speculative
+    // register, we do not pollute the global registry or db on failure. (SEC-M1-001, SEC-M1-002)
+    let vtoken_plain = format!("vhub_{}", uuid::Uuid::new_v4().simple());
+
+    // Atomic check + commit under the pairing write lock.
+    let confirm_result = {
+        let mut pairing = state.clients.pairing.write().await;
+        pairing.confirm(
+            &code,
+            name.clone(),
+            label.clone(),
+            vtoken_plain.clone(),
+            &csrf_header,
+        )
+    };
+
+    match confirm_result {
+        Ok(()) => {
+            // Confirm passed, now try to write to global registry. (SEC-M1-001, SEC-M1-002)
+            match register_confirmed_client_in_hub(
+                state.as_ref(),
+                name.clone(),
+                label,
+                vtoken_plain.clone(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    state.clients.pairing_notify.notify_waiters();
+                    debug!(code = %code, name = %name, "pairing confirmed");
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ret": 0,
+                            "name": name,
+                            "vtoken": vtoken_plain,
+                        })),
+                    )
+                }
+                Err(e) => {
+                    // Global write failed (e.g. name collision). Roll back the confirmed pairing session.
+                    {
+                        let mut pairing = state.clients.pairing.write().await;
+                        pairing.remove_confirmed(&code);
+                    }
+                    match e {
+                        PairingError::NameCollision => (
+                            StatusCode::CONFLICT,
+                            Json(serde_json::json!({ "error": "client name already registered" })),
+                        ),
+                        _ => (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(serde_json::json!({ "error": "failed to register client" })),
+                        ),
+                    }
+                }
             }
         }
+        Err(e) => match e {
+            PairingError::NotFound => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "pairing session not found" })),
+            ),
+            PairingError::Expired => (
+                StatusCode::GONE,
+                Json(serde_json::json!({ "error": "pairing session expired" })),
+            ),
+            PairingError::AlreadyConfirmed => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "pairing already confirmed" })),
+            ),
+            PairingError::NotScanned => (
+                StatusCode::PRECONDITION_FAILED,
+                Json(serde_json::json!({ "error": "pairing code not yet scanned" })),
+            ),
+            PairingError::CsrfMismatch => (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({ "error": "csrf token mismatch" })),
+            ),
+            PairingError::TooManySessions => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "too many active pairing sessions" })),
+            ),
+            PairingError::NameCollision => (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "client name already registered" })),
+            ),
+        },
     }
 }
 

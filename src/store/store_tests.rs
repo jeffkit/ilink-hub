@@ -1,21 +1,23 @@
 use super::*;
 
+static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// After `Store::connect`, all v1-v5 migrations must have been applied.
 #[tokio::test]
 async fn test_schema_version_tracking() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    // All six migrations must be applied after a fresh connect.
+    // All nine migrations must be applied after a fresh connect.
     let version = store
         .get_current_version()
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 7,
-        "expected all 7 migrations to be applied on a fresh DB"
+        version, 9,
+        "expected all 9 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=7 {
+    for v in 1..=9 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -47,7 +49,7 @@ async fn test_migration_idempotency() {
         .get_current_version()
         .await
         .expect("get_current_version");
-    assert_eq!(version, 7, "version must remain 7 after idempotent re-run");
+    assert_eq!(version, 9, "version must remain 9 after idempotent re-run");
 }
 
 /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -66,6 +68,7 @@ async fn test_migration_incremental_from_v2() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            master_key: std::sync::OnceLock::new(),
         };
 
         // Manually create the tables that v1 and v2 would create.
@@ -148,9 +151,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 7, "must reach v7 after incremental migration");
+    assert_eq!(version, 9, "must reach v9 after incremental migration");
 
-    for v in 1..=7 {
+    for v in 1..=9 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -195,6 +198,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            master_key: std::sync::OnceLock::new(),
         };
 
         // Manually create the v1-v5 schema (we don't need the full DDL — we
@@ -243,7 +247,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 7, "current version must be 7, got {}", cur_ver);
+    assert_eq!(cur_ver, 9, "current version must be 9, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -597,13 +601,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        7,
-        "writer #1 must see all v1-v7 applied"
+        9,
+        "writer #1 must see all v1-v9 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        7,
-        "writer #2 must see all v1-v7 applied"
+        9,
+        "writer #2 must see all v1-v9 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -670,8 +674,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            7,
-            "connect #{i} must see all v1-v7 applied"
+            9,
+            "connect #{i} must see all v1-v9 applied"
         );
     }
 }
@@ -694,6 +698,7 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the same v1+v2 state as `test_migration_incremental_from_v2`.
     store
@@ -820,6 +825,7 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl(
@@ -881,8 +887,8 @@ async fn adversarial_version_api_boundaries() {
     assert!(!store.is_migration_run(0).await.unwrap());
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
-    // get_current_version: 7 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // get_current_version: 9 (the highest applied).
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -981,6 +987,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap only the schema_version table — no migrations applied yet.
     store
@@ -1035,7 +1042,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 7 are applied. Re-running each must NOT fail
+    // After connect, all 9 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1044,9 +1051,11 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v5().await.expect("v5 re-run");
     store.migrate_to_v6().await.expect("v6 re-run");
     store.migrate_to_v7().await.expect("v7 re-run");
+    store.migrate_to_v8().await.expect("v8 re-run");
+    store.migrate_to_v9().await.expect("v9 re-run");
 
-    // Still at v7.
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // Still at v9.
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1067,6 +1076,7 @@ async fn m2_ddl_error_propagates_through_migrator() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the version-tracking table and the v1 schema with
     // duplicated real_ctx values — the v3 unique index cannot be
@@ -1164,6 +1174,7 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl(
@@ -1210,21 +1221,21 @@ async fn m2_v4_alone_with_minimal_preconditions() {
     );
 }
 
-/// F-M2-06: full `run_migrations` walks all five steps in order and
-/// records v1..=v5 in `schema_version`. This is the headline M2
+/// F-M2-06: full `run_migrations` walks all steps in order and
+/// records v1..=v9 in `schema_version`. This is the headline M2
 /// invariant: any DDL error along the way aborts the walk.
 #[tokio::test]
 async fn m2_run_migrations_records_all_versions_in_order() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // All seven versions are present.
-    for v in 1..=7 {
+    // All nine versions are present.
+    for v in 1..=9 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be recorded after run_migrations"
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1235,8 +1246,8 @@ async fn m2_run_migrations_idempotent_double_call() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
-    // Version stays at 7 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 7);
+    // Version stays at 9 (no ghost rows from a third call).
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1404,48 +1415,63 @@ fn m3_v5_mysql_ddl_uses_auto_increment_and_bigint() {
 }
 
 /// F-M3-01 (driver detection from URL): `DatabaseKind::from_url` must
-/// recognise every supported scheme and fall back to `Sqlite` for
-/// unknown / missing schemes. The M3 review flagged the old
+/// recognise every supported scheme. Unknown schemes now return `Err` so
+/// typos (e.g. `postgress://`) surface at startup instead of silently
+/// falling back to SQLite. The M3 review flagged the old
 /// `SELECT current_database()` runtime probe as broken on MySQL (it
 /// errors on BOTH SQLite and MySQL); the fix parses the kind from the
 /// URL prefix at `Store::connect` time.
 #[test]
 fn adversarial_database_kind_from_url() {
     assert_eq!(
-        DatabaseKind::from_url("sqlite::memory:"),
+        DatabaseKind::from_url("sqlite::memory:").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("sqlite:/tmp/x.db"),
+        DatabaseKind::from_url("sqlite:/tmp/x.db").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("sqlite:///var/data/x.db"),
+        DatabaseKind::from_url("sqlite:///var/data/x.db").unwrap(),
         DatabaseKind::Sqlite
     );
     assert_eq!(
-        DatabaseKind::from_url("postgres://u:p@h:5432/db"),
+        DatabaseKind::from_url("postgres://u:p@h:5432/db").unwrap(),
         DatabaseKind::Postgres
     );
     assert_eq!(
-        DatabaseKind::from_url("postgresql://u:p@h:5432/db"),
+        DatabaseKind::from_url("postgresql://u:p@h:5432/db").unwrap(),
         DatabaseKind::Postgres
     );
-    assert_eq!(
-        DatabaseKind::from_url("mysql://u:p@h:3306/db"),
-        DatabaseKind::MySql
-    );
-    assert_eq!(
-        DatabaseKind::from_url("mariadb://u:p@h:3306/db"),
-        DatabaseKind::MySql
-    );
-    // Unknown / malformed URLs default to Sqlite (back-compat for
-    // the iLink Hub default; a CLI typo should not refuse to start).
-    assert_eq!(DatabaseKind::from_url(""), DatabaseKind::Sqlite);
-    assert_eq!(
-        DatabaseKind::from_url("file:/tmp/x.db"),
-        DatabaseKind::Sqlite
-    );
+    // MySQL support is gated behind the `mysql` feature flag.
+    #[cfg(feature = "mysql")]
+    {
+        assert_eq!(
+            DatabaseKind::from_url("mysql://u:p@h:3306/db").unwrap(),
+            DatabaseKind::MySql
+        );
+        assert_eq!(
+            DatabaseKind::from_url("mariadb://u:p@h:3306/db").unwrap(),
+            DatabaseKind::MySql
+        );
+    }
+    #[cfg(not(feature = "mysql"))]
+    {
+        assert!(
+            DatabaseKind::from_url("mysql://u:p@h:3306/db").is_err(),
+            "mysql:// must return Err when `mysql` feature is disabled"
+        );
+        assert!(
+            DatabaseKind::from_url("mariadb://u:p@h:3306/db").is_err(),
+            "mariadb:// must return Err when `mysql` feature is disabled"
+        );
+    }
+    // Empty URL defaults to SQLite (the iLink Hub desktop default path).
+    assert_eq!(DatabaseKind::from_url("").unwrap(), DatabaseKind::Sqlite);
+    // Unknown schemes now return Err — a typo should not silently become SQLite.
+    assert!(DatabaseKind::from_url("file:/tmp/x.db").is_err());
+    assert!(DatabaseKind::from_url("postgress://u:p@h/db").is_err());
+    assert!(DatabaseKind::from_url("http://example.com/db").is_err());
 }
 
 /// F-M3-01 (`Store::connect` populates the driver kind from the URL):
@@ -1518,6 +1544,7 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     store
         .ddl("CREATE TABLE t (a INTEGER, b TEXT)")
@@ -1859,8 +1886,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 7,
-        "database must still be at v7 after ensure_sqlite_file"
+        v, 9,
+        "database must still be at v9 after ensure_sqlite_file"
     );
 }
 
@@ -1911,7 +1938,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 7);
+    assert_eq!(v, 9);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -1934,6 +1961,7 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version table (required by run_migrations).
     store
@@ -1992,6 +2020,7 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // No tables created — `column_exists` on a non-existent table must
     // return `Ok(false)`, NOT propagate a runtime error.
@@ -2023,6 +2052,7 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // column_exists returns false → caller tries DDL
     let col_missing = !store
@@ -2099,6 +2129,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version.
     store
@@ -2117,6 +2148,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
     };
     let (r1, r2) = tokio::join!(
         async {
@@ -2136,5 +2168,1072 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
     assert_eq!(
         winners, 1,
         "exactly one tx must claim v99; r1={r1}, r2={r2}"
+    );
+}
+
+// ─── M1: vtoken hash storage contract ────────────────────────────────────────
+//
+// These tests pin the post-M1 contract on the Store: every bind that
+// carries a vtoken must accept the canonical hash form, and the round-trip
+// between register and the DB must never leak plaintext. Plaintext vtokens
+// only exist at the HTTP boundary (Authorization header) and in the
+// `register()` return value; the Store binds whatever the caller hands it,
+// and the caller is expected to have hashed the plaintext before calling.
+
+use crate::hub::{hash_vtoken, is_vtoken_hash};
+
+#[tokio::test]
+async fn m1_upsert_client_stores_hash_not_plaintext() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // Simulate the post-M1 call site: register() returns the plaintext,
+    // the caller hashes it, and passes the hash to upsert_client.
+    let plain = "vhub_0123456789abcdef0123456789abcdef";
+    let hashed = hash_vtoken(plain);
+    store
+        .upsert_client(&hashed, "claude", Some("claude test"))
+        .await
+        .expect("upsert_client");
+
+    // Round-trip: list_clients returns the same value that was bound.
+    let rows = store.list_clients().await.expect("list_clients");
+    let row = rows
+        .iter()
+        .find(|r| r.name == "claude")
+        .expect("claude row present");
+    assert_eq!(
+        row.vtoken, hashed,
+        "upsert must store exactly what was bound (hash form)"
+    );
+    assert!(
+        is_vtoken_hash(&row.vtoken),
+        "stored vtoken must be the canonical SHA-256 hex"
+    );
+    assert_ne!(row.vtoken, plain, "plaintext must NOT be persisted");
+}
+
+#[tokio::test]
+async fn m1_touch_client_uses_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    // touch_client must accept the hash (the value the production
+    // code path carries through the in-memory ClientInfo).
+    store.touch_client(&hashed).await.expect("touch_client");
+
+    // The row's stored vtoken is the hash, not the plaintext.
+    let rows = store.list_clients().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].vtoken, hashed);
+    assert_ne!(rows[0].vtoken, plain);
+}
+
+#[tokio::test]
+async fn m1_routes_are_keyed_by_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_route-target-aaaaaaaaaaaaaaaa";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    store.set_route("alice", &hashed).await.expect("set_route");
+
+    // get_route returns the hash.
+    let route = store.get_route("alice").await.expect("get_route");
+    assert_eq!(route.as_deref(), Some(hashed.as_str()));
+    assert_ne!(route.as_deref(), Some(plain));
+
+    // list_routes returns (from_user, hash) pairs.
+    let routes = store.list_routes().await.expect("list_routes");
+    assert_eq!(routes, vec![("alice".to_string(), hashed.clone())]);
+
+    // clear_routes_for_vtoken accepts the hash.
+    store
+        .clear_routes_for_vtoken(&hashed)
+        .await
+        .expect("clear_routes_for_vtoken");
+    assert!(store.get_route("alice").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn m1_messages_table_keys_by_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_msg-target-bbbbbbbbbbbbbbbbb";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    // save_message binds the hash (post-M1 caller contract).
+    store
+        .save_message(
+            "vctx-1",
+            Some(&hashed),
+            "default",
+            "user-1",
+            "assistant",
+            "hello",
+        )
+        .await
+        .expect("save_message");
+
+    // find_assistant_message_by_content returns the stored hash, not the
+    // plaintext. The dispatch layer's DB-fallback quote resolver then
+    // uses the returned value to look up the registry by hash.
+    let (vtoken, _session) = store
+        .find_assistant_message_by_content("user-1", "hello")
+        .await
+        .expect("find_assistant_message_by_content")
+        .expect("an assistant message should be found");
+    assert_eq!(vtoken, hashed);
+    assert_ne!(vtoken, plain);
+}
+
+#[tokio::test]
+async fn m1_two_distinct_plaintexts_never_collide() {
+    // The hash must be a function of the plaintext: two different
+    // vhub_… strings must produce two different rows. This guards against
+    // a regression that accidentally binds the same key for every
+    // registration (e.g. forgetting the name/vtoken distinction).
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain_a = "vhub_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let plain_b = "vhub_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let hash_a = hash_vtoken(plain_a);
+    let hash_b = hash_vtoken(plain_b);
+    assert_ne!(hash_a, hash_b, "distinct plaintexts hash differently");
+
+    store.upsert_client(&hash_a, "alice", None).await.unwrap();
+    store.upsert_client(&hash_b, "bob", None).await.unwrap();
+
+    let rows = store.list_clients().await.unwrap();
+    let by_name: std::collections::HashMap<_, _> = rows
+        .iter()
+        .map(|r| (r.name.clone(), r.vtoken.clone()))
+        .collect();
+    assert_eq!(
+        by_name.get("alice").map(String::as_str),
+        Some(hash_a.as_str())
+    );
+    assert_eq!(
+        by_name.get("bob").map(String::as_str),
+        Some(hash_b.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_bot_credentials_encryption_decryption() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Without master key:
+    // loading credentials on empty DB returns Ok(None)
+    assert!(store.load_credentials().await.unwrap().is_none());
+    // saving credentials must fail
+    assert!(store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .is_err());
+
+    // 2. Set master key (using standard 32-byte key)
+    let raw_key = [0u8; 32];
+    let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key).unwrap();
+    let key = ring::aead::LessSafeKey::new(unbound_key);
+    store
+        .set_master_key(std::sync::Arc::new(key))
+        .expect("set_master_key");
+
+    // 3. Load credentials on empty store returns None
+    let loaded = store.load_credentials().await.unwrap();
+    assert!(loaded.is_none());
+
+    // 4. Save and load credentials successfully
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+    let loaded = store.load_credentials().await.unwrap().expect("loaded");
+    assert_eq!(loaded.0, "my-secret-token");
+    assert_eq!(loaded.1, "https://api.example.com");
+
+    // 5. Verify database contains encrypted ciphertext, not the plaintext
+    let row: (String,) = sqlx::query_as("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_ne!(row.0, "my-secret-token");
+    // Formats output as base64, so it should decode successfully as base64 and not match plaintext
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    assert!(B64.decode(&row.0).is_ok());
+
+    // 6. Test loading credentials when master key is absent (on a new Store instance sharing the pool)
+    let store2 = Store {
+        pool: store.pool.clone(),
+        rpool: store.pool.clone(),
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    // Because a row exists in bot_credentials now, loading should fail due to missing master key
+    assert!(store2.load_credentials().await.is_err());
+}
+
+#[test]
+fn test_load_or_derive_master_key_scenarios() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    // Save current env var to restore it later
+    let old_val = std::env::var("ILINK_HUB_MASTER_KEY");
+
+    // 1. Missing env var
+    std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_err());
+
+    // 2. Invalid formats (too short, not hex/b64, etc.)
+    std::env::set_var("ILINK_HUB_MASTER_KEY", "short");
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_err());
+
+    std::env::set_var(
+        "ILINK_HUB_MASTER_KEY",
+        "not-hex-and-too-long-but-invalid-characters-zzzzzzzzzzzzzzzzzzzzzzzzz",
+    );
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_err());
+
+    // 3. Correct 32-byte hex (64 hex characters)
+    let hex_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", hex_key);
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_ok());
+
+    // 3a. Hex key with double quotes
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("\"{}\"", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // 3b. Hex key with single quotes
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("'{}'", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // 3c. Hex key with leading/trailing whitespaces
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("   {}   ", hex_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // 4. Correct 32-byte base64 (44 characters)
+    // 32 zero bytes in base64: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    let b64_key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", b64_key);
+    let res = crate::runtime::crypto::load_or_derive_master_key();
+    assert!(res.is_ok());
+
+    // 4a. Base64 key with quotes and whitespaces
+    std::env::set_var("ILINK_HUB_MASTER_KEY", format!("  \"{}\"  ", b64_key));
+    assert!(crate::runtime::crypto::load_or_derive_master_key().is_ok());
+
+    // Restore old env var
+    match old_val {
+        Ok(val) => std::env::set_var("ILINK_HUB_MASTER_KEY", val),
+        Err(_) => std::env::remove_var("ILINK_HUB_MASTER_KEY"),
+    }
+}
+
+#[tokio::test]
+async fn test_bot_credentials_decryption_adversarial_wrong_key() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Set master key A
+    let raw_key_a = [0u8; 32];
+    let unbound_key_a = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key_a).unwrap();
+    let key_a = ring::aead::LessSafeKey::new(unbound_key_a);
+    store
+        .set_master_key(std::sync::Arc::new(key_a))
+        .expect("set_master_key");
+
+    // 2. Save credentials under key A
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+
+    // 3. Create another Store instance with Master Key B sharing the same pool
+    let raw_key_b = [1u8; 32];
+    let unbound_key_b = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key_b).unwrap();
+    let key_b = ring::aead::LessSafeKey::new(unbound_key_b);
+
+    let store_b = Store {
+        pool: store.pool.clone(),
+        rpool: store.pool.clone(),
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    store_b
+        .set_master_key(std::sync::Arc::new(key_b))
+        .expect("set_master_key");
+
+    // 4. Loading credentials with key B must fail (should return Err)
+    let res = store_b.load_credentials().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("Decryption failed"));
+}
+
+#[tokio::test]
+async fn test_bot_credentials_decryption_adversarial_tampered_ciphertext() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Set master key
+    let raw_key = [0u8; 32];
+    let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key).unwrap();
+    let key = ring::aead::LessSafeKey::new(unbound_key);
+    store
+        .set_master_key(std::sync::Arc::new(key))
+        .expect("set_master_key");
+
+    // 2. Save credentials
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+
+    // Case A: Ciphertext replaced by invalid base64 (e.g. invalid characters)
+    sqlx::query("UPDATE bot_credentials SET token = 'not-base64-at-all-$$$' WHERE id = 1")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store.load_credentials().await.is_err());
+
+    // Case B: Ciphertext is too short to contain nonce + tag
+    sqlx::query("UPDATE bot_credentials SET token = 'c2hvcnQ=' WHERE id = 1") // "short" in base64
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let res = store.load_credentials().await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("data too short"));
+
+    // Case C: Ciphertext base64-decodes fine but is corrupted (one bit flipped in the payload/tag)
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+    let row: (String,) = sqlx::query_as("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let mut bytes = B64.decode(&row.0).unwrap();
+    // Flip a bit in the ciphertext or tag (not the nonce)
+    bytes[20] ^= 1;
+    let corrupted_b64 = B64.encode(&bytes);
+
+    sqlx::query("UPDATE bot_credentials SET token = $1 WHERE id = 1")
+        .bind(corrupted_b64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let res = store.load_credentials().await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Decryption failed"));
+}
+
+// ─── M3 — quote_index startup warmup tests ────────────────────────────────
+
+/// M3 contract: only `role = 'assistant'` rows are returned, and they are
+/// returned in `id DESC` (newest first) order, capped by `limit`. Empty
+/// `content` rows are filtered out so the index never indexes whitespace.
+#[tokio::test]
+async fn m3_recent_outbound_messages_filters_role_and_orders_newest_first() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // One user message (must be skipped) and three assistant messages, with
+    // ascending ids so we can assert the DESC ordering by id later.
+    store
+        .save_message("vctx1", Some("vt1"), "default", "user@x", "user", "inbound")
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "first reply",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "second reply",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx2",
+            Some("vt2"),
+            "default",
+            "user@y",
+            "assistant",
+            "", // empty content — must be filtered out
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "default",
+            "user@x",
+            "assistant",
+            "third reply",
+        )
+        .await
+        .unwrap();
+
+    let rows = store.recent_outbound_messages(500).await.unwrap();
+    // 3 assistant rows with non-empty content, in id-desc order.
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].text, "third reply");
+    assert_eq!(rows[0].from_user, "user@x");
+    assert_eq!(rows[0].vtoken.as_deref(), Some("vt1"));
+    assert_eq!(rows[1].text, "second reply");
+    assert_eq!(rows[2].text, "first reply");
+}
+
+/// `limit` clamps to `[1, 10000]`. 0 and negative values clamp up to 1;
+/// very large values clamp down to 10000.
+#[tokio::test]
+async fn m3_recent_outbound_messages_clamps_limit() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // Insert 5 assistant rows.
+    for i in 0..5 {
+        store
+            .save_message(
+                "vctx1",
+                Some("vt1"),
+                "default",
+                "user@x",
+                "assistant",
+                &format!("reply {i}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    // limit = 0 clamps to 1 → exactly one row, the newest.
+    let rows = store.recent_outbound_messages(0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "reply 4");
+
+    // Negative clamps to 1 as well.
+    let rows_neg = store.recent_outbound_messages(-5).await.unwrap();
+    assert_eq!(rows_neg.len(), 1);
+
+    // 100_000 clamps down to 10_000 — but we only have 5 rows so we get 5.
+    let rows_huge = store.recent_outbound_messages(100_000).await.unwrap();
+    assert_eq!(rows_huge.len(), 5);
+}
+
+/// End-to-end: write a few `assistant` rows to the messages table, then ask
+/// the warmup path to load + replay them into a fresh `QuoteRouteIndex`, and
+/// finally verify that a quote-reply resolves through the in-memory path
+/// (i.e. never hits the SQL fallback) for every warmup row.
+#[tokio::test]
+async fn m3_warmup_round_trip_through_quote_index() {
+    use crate::hub::quote_route::{
+        warm_item_from_recent_row, QuoteOrigin, QuoteRouteIndex, WarmItem,
+    };
+    use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
+
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let body = "你好！有什么我可以帮你的吗？\n\n---\nilink-claude · session-20260611-125634";
+    let body2 = "完成了\n\n---\nilink-claude · session-20260611-130000";
+
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-125634",
+            "user@x",
+            "user",
+            "在吗",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-125634",
+            "user@x",
+            "assistant",
+            body,
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx1",
+            Some("vt1"),
+            "session-20260611-130000",
+            "user@x",
+            "assistant",
+            body2,
+        )
+        .await
+        .unwrap();
+
+    let rows = store.recent_outbound_messages(500).await.unwrap();
+    assert_eq!(rows.len(), 2);
+
+    let items: Vec<WarmItem> = rows.iter().filter_map(warm_item_from_recent_row).collect();
+    let mut idx = QuoteRouteIndex::default();
+    let n = idx.warm_from_history(&items);
+    assert_eq!(n, 2);
+
+    // Build a quote-reply whose ref_msg.text matches `body` exactly and confirm
+    // resolution yields the Client origin with the right vtoken / session.
+    fn quote_reply(scope: &str, text: &str) -> WeixinMessage {
+        let ref_item = serde_json::json!({
+            "ref_msg": {
+                "message_item": {
+                    "type": 1,
+                    "text_item": { "text": text }
+                }
+            }
+        });
+        WeixinMessage {
+            message_type: Some(1),
+            from_user_id: Some(scope.into()),
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("follow up".into()),
+                }),
+                extra: ref_item,
+                ..Default::default()
+            }])),
+            ..Default::default()
+        }
+    }
+
+    let user_msg = quote_reply("user@x", body);
+    match idx
+        .resolve_user_quote("user@x", &user_msg)
+        .expect("warmup must resolve")
+    {
+        QuoteOrigin::Client {
+            vtoken,
+            session_name,
+            ..
+        } => {
+            assert_eq!(vtoken, "vt1");
+            assert_eq!(session_name.as_deref(), Some("session-20260611-125634"));
+        }
+        _ => panic!("expected Client origin"),
+    }
+
+    // Second warmup row resolves too — and the timestamp tiebreaker picks the
+    // matching session even though both rows have text strings the index must
+    // keep distinct (they differ in body).
+    let user_msg2 = quote_reply("user@x", body2);
+    match idx
+        .resolve_user_quote("user@x", &user_msg2)
+        .expect("warmup must resolve second row")
+    {
+        QuoteOrigin::Client {
+            vtoken,
+            session_name,
+            ..
+        } => {
+            assert_eq!(vtoken, "vt1");
+            assert_eq!(session_name.as_deref(), Some("session-20260611-130000"));
+        }
+        _ => panic!("expected Client origin"),
+    }
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    let plain_vtoken = "plain_vtoken_12345";
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind(plain_vtoken)
+        .bind("client_1")
+        .bind(Some("My Client"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO routing_state (from_user, active_vtoken) VALUES ($1, $2)")
+        .bind("user_1")
+        .bind(plain_vtoken)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("INSERT INTO messages (vctx, vtoken, session_name, role, content) VALUES ($1, $2, $3, $4, $5)")
+        .bind("vctx_1")
+        .bind(plain_vtoken)
+        .bind("default")
+        .bind("user")
+        .bind("hello")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let plain_bot_token = "plain_bot_token_secret_value";
+    sqlx::query("INSERT INTO bot_credentials (id, token, base_url) VALUES (1, $1, $2)")
+        .bind(plain_bot_token)
+        .bind("https://dummy.url")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    let temp_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", temp_key);
+
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 should succeed");
+
+    // Derive the key from temp_key BEFORE restoring the original env var, so
+    // decryption below uses the same key that was active during migration.
+    let migration_key = crate::runtime::crypto::load_or_derive_master_key()
+        .expect("master key must be loadable while temp_key is still set");
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
+
+    let hashed_vtoken = crate::hub::hash_vtoken(plain_vtoken);
+    let client_vtoken_db: String =
+        sqlx::query_scalar("SELECT vtoken FROM clients WHERE name = 'client_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(client_vtoken_db, hashed_vtoken);
+
+    let route_vtoken_db: String =
+        sqlx::query_scalar("SELECT active_vtoken FROM routing_state WHERE from_user = 'user_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(route_vtoken_db, hashed_vtoken);
+
+    let msg_vtoken_db: String =
+        sqlx::query_scalar("SELECT vtoken FROM messages WHERE vctx = 'vctx_1'")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(msg_vtoken_db, hashed_vtoken);
+
+    let cred_token_db: String =
+        sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_ne!(cred_token_db, plain_bot_token);
+
+    let decrypted = crate::runtime::crypto::decrypt_token(&cred_token_db, &migration_key).unwrap();
+    assert_eq!(decrypted, plain_bot_token);
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_migration_v8_missing_master_key_fails() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind("plain_token")
+        .bind("client_1")
+        .bind(Some("Client"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    std::env::remove_var("ILINK_HUB_MASTER_KEY");
+
+    let res = store.migrate_to_v8().await;
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
+
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("ILINK_HUB_MASTER_KEY is required"));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_migration_v8_idempotency_does_not_double_encrypt() {
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    let plain_bot_token = "plain_bot_token_secret_value";
+    sqlx::query("INSERT INTO bot_credentials (id, token, base_url) VALUES (1, $1, $2)")
+        .bind(plain_bot_token)
+        .bind("https://dummy.url")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // migrate_to_v8 only encrypts bot_credentials when clients table is non-empty
+    // (it uses the first vtoken as a sentinel to decide whether migration is needed).
+    sqlx::query("INSERT INTO clients (vtoken, name, label) VALUES ($1, $2, $3)")
+        .bind("vhub_plain_sentinel_for_migration_test")
+        .bind("test-client")
+        .bind(Option::<String>::None)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    let temp_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", temp_key);
+
+    // 1. Run migration first time
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 first run should succeed");
+
+    let migration_key =
+        crate::runtime::crypto::load_or_derive_master_key().expect("master key loadable");
+
+    let cred_token_1: String = sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_ne!(cred_token_1, plain_bot_token);
+    assert_eq!(
+        crate::runtime::crypto::decrypt_token(&cred_token_1, &migration_key).unwrap(),
+        plain_bot_token
+    );
+
+    // 2. Clear version tracking for v8 to force re-migration over already-encrypted data
+    sqlx::query("DELETE FROM schema_version WHERE version = 8")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    // 3. Run migration second time
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 second run should succeed");
+
+    let cred_token_2: String = sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+    // The token should remain exactly the same, no double-encryption!
+    assert_eq!(cred_token_2, cred_token_1);
+    assert_eq!(
+        crate::runtime::crypto::decrypt_token(&cred_token_2, &migration_key).unwrap(),
+        plain_bot_token
+    );
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
+}
+
+// ─── P-22: messages store unit tests ──────────────────────────────────────────
+
+/// P-22-1: `recent_outbound_messages` limit clamp.
+/// Insert 200 assistant messages and verify:
+///   - limit=100 returns exactly 100 rows (normal upper-bounded fetch)
+///   - limit=5000 returns all 200 rows (5000 is within [1,10000] but fewer rows exist)
+#[tokio::test]
+async fn test_recent_outbound_messages_limit_clamp() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    for i in 0..200_i64 {
+        store
+            .save_message(
+                &format!("vctx-{i}"),
+                Some("vtoken-test"),
+                "default",
+                "peer:user1",
+                "assistant",
+                &format!("message content {i}"),
+            )
+            .await
+            .expect("save_message");
+    }
+
+    let rows_100 = store
+        .recent_outbound_messages(100)
+        .await
+        .expect("recent_outbound_messages(100)");
+    assert_eq!(
+        rows_100.len(),
+        100,
+        "limit=100 should return exactly 100 rows"
+    );
+
+    let rows_5000 = store
+        .recent_outbound_messages(5000)
+        .await
+        .expect("recent_outbound_messages(5000)");
+    assert_eq!(
+        rows_5000.len(),
+        200,
+        "limit=5000 should return all 200 available rows"
+    );
+}
+
+/// P-22-2: `find_assistant_message_by_content` correctly escapes LIKE special characters.
+/// Insert a message whose content contains `%` and `_`.
+/// Verify the function finds it by exact prefix (not by wildcard expansion).
+#[tokio::test]
+async fn test_like_escape_in_find_assistant_message() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let peer = "peer:escape-test-user";
+    let special_content = "test%value_here\\end";
+
+    store
+        .save_message(
+            "vctx-esc",
+            Some("vtoken-esc"),
+            "default",
+            peer,
+            "assistant",
+            special_content,
+        )
+        .await
+        .expect("save_message with special chars");
+
+    // A decoy message that would match if % is not escaped (starts with "test").
+    store
+        .save_message(
+            "vctx-esc2",
+            Some("vtoken-esc2"),
+            "default",
+            peer,
+            "assistant",
+            "testXvalueYhereZend",
+        )
+        .await
+        .expect("save_message decoy");
+
+    // Query with the full special content as prefix; only the first message should match.
+    let result = store
+        .find_assistant_message_by_content(peer, special_content)
+        .await
+        .expect("find_assistant_message_by_content");
+
+    assert!(
+        result.is_some(),
+        "should find the message with special content"
+    );
+    let (vtoken, session) = result.unwrap();
+    assert_eq!(vtoken, "vtoken-esc", "should match the correct vtoken");
+    assert_eq!(session, Some("default".to_string()));
+}
+
+/// P-22-3: `get_session_status_per_vtoken` with an empty slice returns empty map without panic.
+#[tokio::test]
+async fn test_get_session_status_empty() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let result = store
+        .get_session_status_per_vtoken(&[])
+        .await
+        .expect("get_session_status_per_vtoken with empty slice");
+
+    assert!(result.is_empty(), "empty input must produce empty output");
+}
+
+/// P-22-4: `get_session_status_per_vtoken` returns correct entries for multiple vtokens.
+#[tokio::test]
+async fn test_get_session_status_multi_vtoken() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let vtoken1 = "vtoken-alpha";
+    let vtoken2 = "vtoken-beta";
+
+    // vtoken1: user sends last (waiting_for_reply = true)
+    store
+        .save_message(
+            "vctx-a1",
+            Some(vtoken1),
+            "default",
+            "peer:a",
+            "assistant",
+            "reply A1",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx-a2",
+            Some(vtoken1),
+            "default",
+            "peer:a",
+            "user",
+            "question A2",
+        )
+        .await
+        .unwrap();
+
+    // vtoken2: assistant replies last (waiting_for_reply = false)
+    store
+        .save_message(
+            "vctx-b1",
+            Some(vtoken2),
+            "default",
+            "peer:b",
+            "user",
+            "question B1",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx-b2",
+            Some(vtoken2),
+            "default",
+            "peer:b",
+            "assistant",
+            "reply B2",
+        )
+        .await
+        .unwrap();
+
+    let vtokens = vec![vtoken1.to_string(), vtoken2.to_string()];
+    let result = store
+        .get_session_status_per_vtoken(&vtokens)
+        .await
+        .expect("get_session_status_per_vtoken");
+
+    assert_eq!(result.len(), 2, "should return entries for both vtokens");
+
+    let entry1 = result.get(vtoken1).expect("entry for vtoken1");
+    assert!(
+        entry1.waiting_for_reply,
+        "vtoken1: last message is user → waiting"
+    );
+    assert_eq!(
+        entry1.last_user_content.as_deref(),
+        Some("question A2"),
+        "vtoken1: latest user content must be question A2"
+    );
+
+    let entry2 = result.get(vtoken2).expect("entry for vtoken2");
+    assert!(
+        !entry2.waiting_for_reply,
+        "vtoken2: last message is assistant → not waiting"
+    );
+    assert_eq!(
+        entry2.last_user_content.as_deref(),
+        Some("question B1"),
+        "vtoken2: latest user content must be question B1"
     );
 }

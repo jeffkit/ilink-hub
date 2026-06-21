@@ -47,7 +47,7 @@ fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .filter(|s| is_valid_vtoken(s))
-        .map(str::to_string)
+        .map(crate::hub::hash_vtoken)
 }
 
 fn check_admin_auth(admin: &crate::hub::AdminConfig, headers: &HeaderMap) -> bool {
@@ -150,14 +150,32 @@ pub async fn register(
         }
     }
 
-    let (vtoken, _is_new) =
-        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let outcome = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+
+    // M1: plaintext is only available for brand-new registrations. When an existing
+    // client name is re-registered the original plaintext is irrecoverable (only the
+    // SHA-256 hash was ever stored). Return 409 so the bridge can either retry with
+    // a different name or use --force-register to replace the old entry.
+    if outcome.plaintext.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(RegisterResponse {
+                ret: 409,
+                vtoken: String::new(),
+                base_url: String::new(),
+                errmsg: Some(format!(
+                    "client name '{}' is already registered; use --force-register to replace it",
+                    req.name
+                )),
+            }),
+        );
+    }
 
     (
         StatusCode::OK,
         Json(RegisterResponse {
             ret: 0,
-            vtoken: vtoken.clone(),
+            vtoken: outcome.plaintext.clone(),
             base_url: String::new(),
             errmsg: None,
         }),
@@ -1175,6 +1193,13 @@ pub async fn metrics(
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
+
+    let quote_index_ready = state.quote_index_warmed.load(Ordering::Relaxed) as u8;
+    out.push_str("# HELP ilink_hub_quote_index_ready 1 if the in-memory quote-reply index has finished warming up from DB, 0 during cold-start window\n");
+    out.push_str("# TYPE ilink_hub_quote_index_ready gauge\n");
+    out.push_str(&format!(
+        "ilink_hub_quote_index_ready {quote_index_ready}\n"
+    ));
 
     // Histograms. We render them in Prometheus text format (cumulative
     // bucket counts, plus `_count`, `_sum`, and `_created` siblings). The bucket layout

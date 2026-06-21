@@ -1,0 +1,14 @@
+milestone: M6
+title: 文档与回归
+branch: feat/security-p1
+plan: docs/exec-plans/active/security-p1/plan.md
+summary: |
+  本里程碑 M6 主要实现：
+  1. 更新 README.md、docs/knowledge/api/configuration.md 以及 docs/knowledge/ops/deployment-hardening.md，在文档中详细说明 vtoken 的单向哈希机制和 bot_credentials.token 的 AES-256-GCM 静态加密机制。
+  2. 强调 ILINK_HUB_MASTER_KEY 环境变量的必要性（为 32 字节 Base64/Hex 格式且为 Hub 启动所必须），并在上线前安全检查清单中新增对应项。
+  3. 执行回归测试，包含 cargo fmt、cargo clippy、cargo test、cargo build，以及 Tauri 桌面客户端构建与检查，保证项目全绿。
+files_changed:
+  - README.md
+  - docs/knowledge/api/configuration.md
+  - docs/knowledge/ops/deployment-hardening.md
+  - docs/exec-plans/active/security-p1/implement.md

@@ -369,9 +369,12 @@ async fn sendtyping_error_propagation_test() {
         AdminConfig::from_env(),
     );
 
-    let (vtoken, _) =
+    let outcome =
         ilink_hub::server::pairing::register_client_in_hub(&state, "test-client".to_string(), None)
             .await;
+    // The plaintext is what a real bridge would send in the
+    // `Authorization: Bearer` header; the Hub hashes it on receipt.
+    let vtoken = outcome.plaintext;
 
     let app = build_router(state);
 
