@@ -7,17 +7,17 @@ static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 async fn test_schema_version_tracking() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    // All six migrations must be applied after a fresh connect.
+    // All nine migrations must be applied after a fresh connect.
     let version = store
         .get_current_version()
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 8,
-        "expected all 8 migrations to be applied on a fresh DB"
+        version, 9,
+        "expected all 9 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=8 {
+    for v in 1..=9 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -49,7 +49,7 @@ async fn test_migration_idempotency() {
         .get_current_version()
         .await
         .expect("get_current_version");
-    assert_eq!(version, 8, "version must remain 8 after idempotent re-run");
+    assert_eq!(version, 9, "version must remain 9 after idempotent re-run");
 }
 
 /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -151,9 +151,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 8, "must reach v8 after incremental migration");
+    assert_eq!(version, 9, "must reach v9 after incremental migration");
 
-    for v in 1..=8 {
+    for v in 1..=9 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -247,7 +247,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 8, "current version must be 8, got {}", cur_ver);
+    assert_eq!(cur_ver, 9, "current version must be 9, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -601,13 +601,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        8,
-        "writer #1 must see all v1-v8 applied"
+        9,
+        "writer #1 must see all v1-v9 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        8,
-        "writer #2 must see all v1-v8 applied"
+        9,
+        "writer #2 must see all v1-v9 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -674,8 +674,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            8,
-            "connect #{i} must see all v1-v8 applied"
+            9,
+            "connect #{i} must see all v1-v9 applied"
         );
     }
 }
@@ -887,8 +887,8 @@ async fn adversarial_version_api_boundaries() {
     assert!(!store.is_migration_run(0).await.unwrap());
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
-    // get_current_version: 8 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 8);
+    // get_current_version: 9 (the highest applied).
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -1042,7 +1042,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 8 are applied. Re-running each must NOT fail
+    // After connect, all 9 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1052,9 +1052,10 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v6().await.expect("v6 re-run");
     store.migrate_to_v7().await.expect("v7 re-run");
     store.migrate_to_v8().await.expect("v8 re-run");
+    store.migrate_to_v9().await.expect("v9 re-run");
 
-    // Still at v8.
-    assert_eq!(store.get_current_version().await.unwrap(), 8);
+    // Still at v9.
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1221,20 +1222,20 @@ async fn m2_v4_alone_with_minimal_preconditions() {
 }
 
 /// F-M2-06: full `run_migrations` walks all steps in order and
-/// records v1..=v8 in `schema_version`. This is the headline M2
+/// records v1..=v9 in `schema_version`. This is the headline M2
 /// invariant: any DDL error along the way aborts the walk.
 #[tokio::test]
 async fn m2_run_migrations_records_all_versions_in_order() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // All eight versions are present.
-    for v in 1..=8 {
+    // All nine versions are present.
+    for v in 1..=9 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be recorded after run_migrations"
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 8);
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1245,8 +1246,8 @@ async fn m2_run_migrations_idempotent_double_call() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
-    // Version stays at 8 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 8);
+    // Version stays at 9 (no ghost rows from a third call).
+    assert_eq!(store.get_current_version().await.unwrap(), 9);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1885,8 +1886,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 8,
-        "database must still be at v8 after ensure_sqlite_file"
+        v, 9,
+        "database must still be at v9 after ensure_sqlite_file"
     );
 }
 
@@ -1937,7 +1938,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 8);
+    assert_eq!(v, 9);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -3040,4 +3041,199 @@ async fn test_migration_v8_idempotency_does_not_double_encrypt() {
     } else {
         std::env::remove_var("ILINK_HUB_MASTER_KEY");
     }
+}
+
+// ─── P-22: messages store unit tests ──────────────────────────────────────────
+
+/// P-22-1: `recent_outbound_messages` limit clamp.
+/// Insert 200 assistant messages and verify:
+///   - limit=100 returns exactly 100 rows (normal upper-bounded fetch)
+///   - limit=5000 returns all 200 rows (5000 is within [1,10000] but fewer rows exist)
+#[tokio::test]
+async fn test_recent_outbound_messages_limit_clamp() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    for i in 0..200_i64 {
+        store
+            .save_message(
+                &format!("vctx-{i}"),
+                Some("vtoken-test"),
+                "default",
+                "peer:user1",
+                "assistant",
+                &format!("message content {i}"),
+            )
+            .await
+            .expect("save_message");
+    }
+
+    let rows_100 = store
+        .recent_outbound_messages(100)
+        .await
+        .expect("recent_outbound_messages(100)");
+    assert_eq!(
+        rows_100.len(),
+        100,
+        "limit=100 should return exactly 100 rows"
+    );
+
+    let rows_5000 = store
+        .recent_outbound_messages(5000)
+        .await
+        .expect("recent_outbound_messages(5000)");
+    assert_eq!(
+        rows_5000.len(),
+        200,
+        "limit=5000 should return all 200 available rows"
+    );
+}
+
+/// P-22-2: `find_assistant_message_by_content` correctly escapes LIKE special characters.
+/// Insert a message whose content contains `%` and `_`.
+/// Verify the function finds it by exact prefix (not by wildcard expansion).
+#[tokio::test]
+async fn test_like_escape_in_find_assistant_message() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let peer = "peer:escape-test-user";
+    let special_content = "test%value_here\\end";
+
+    store
+        .save_message(
+            "vctx-esc",
+            Some("vtoken-esc"),
+            "default",
+            peer,
+            "assistant",
+            special_content,
+        )
+        .await
+        .expect("save_message with special chars");
+
+    // A decoy message that would match if % is not escaped (starts with "test").
+    store
+        .save_message(
+            "vctx-esc2",
+            Some("vtoken-esc2"),
+            "default",
+            peer,
+            "assistant",
+            "testXvalueYhereZend",
+        )
+        .await
+        .expect("save_message decoy");
+
+    // Query with the full special content as prefix; only the first message should match.
+    let result = store
+        .find_assistant_message_by_content(peer, special_content)
+        .await
+        .expect("find_assistant_message_by_content");
+
+    assert!(
+        result.is_some(),
+        "should find the message with special content"
+    );
+    let (vtoken, session) = result.unwrap();
+    assert_eq!(vtoken, "vtoken-esc", "should match the correct vtoken");
+    assert_eq!(session, Some("default".to_string()));
+}
+
+/// P-22-3: `get_session_status_per_vtoken` with an empty slice returns empty map without panic.
+#[tokio::test]
+async fn test_get_session_status_empty() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let result = store
+        .get_session_status_per_vtoken(&[])
+        .await
+        .expect("get_session_status_per_vtoken with empty slice");
+
+    assert!(result.is_empty(), "empty input must produce empty output");
+}
+
+/// P-22-4: `get_session_status_per_vtoken` returns correct entries for multiple vtokens.
+#[tokio::test]
+async fn test_get_session_status_multi_vtoken() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    let vtoken1 = "vtoken-alpha";
+    let vtoken2 = "vtoken-beta";
+
+    // vtoken1: user sends last (waiting_for_reply = true)
+    store
+        .save_message(
+            "vctx-a1",
+            Some(vtoken1),
+            "default",
+            "peer:a",
+            "assistant",
+            "reply A1",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx-a2",
+            Some(vtoken1),
+            "default",
+            "peer:a",
+            "user",
+            "question A2",
+        )
+        .await
+        .unwrap();
+
+    // vtoken2: assistant replies last (waiting_for_reply = false)
+    store
+        .save_message(
+            "vctx-b1",
+            Some(vtoken2),
+            "default",
+            "peer:b",
+            "user",
+            "question B1",
+        )
+        .await
+        .unwrap();
+    store
+        .save_message(
+            "vctx-b2",
+            Some(vtoken2),
+            "default",
+            "peer:b",
+            "assistant",
+            "reply B2",
+        )
+        .await
+        .unwrap();
+
+    let vtokens = vec![vtoken1.to_string(), vtoken2.to_string()];
+    let result = store
+        .get_session_status_per_vtoken(&vtokens)
+        .await
+        .expect("get_session_status_per_vtoken");
+
+    assert_eq!(result.len(), 2, "should return entries for both vtokens");
+
+    let entry1 = result.get(vtoken1).expect("entry for vtoken1");
+    assert!(
+        entry1.waiting_for_reply,
+        "vtoken1: last message is user → waiting"
+    );
+    assert_eq!(
+        entry1.last_user_content.as_deref(),
+        Some("question A2"),
+        "vtoken1: latest user content must be question A2"
+    );
+
+    let entry2 = result.get(vtoken2).expect("entry for vtoken2");
+    assert!(
+        !entry2.waiting_for_reply,
+        "vtoken2: last message is assistant → not waiting"
+    );
+    assert_eq!(
+        entry2.last_user_content.as_deref(),
+        Some("question B1"),
+        "vtoken2: latest user content must be question B1"
+    );
 }

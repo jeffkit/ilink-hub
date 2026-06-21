@@ -253,6 +253,7 @@ impl Store {
         self.migrate_to_v6_tx(&mut tx).await?;
         self.migrate_to_v7_tx(&mut tx).await?;
         self.migrate_to_v8_tx(&mut tx).await?;
+        self.migrate_to_v9_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -758,6 +759,60 @@ impl Store {
         Ok(())
     }
 
+    pub(super) async fn migrate_to_v9_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 9).await? {
+            return Ok(());
+        }
+        // Guard: the messages table may be absent on environments that applied
+        // v1-v5 as a schema stub (e.g. partial-schema tests). Skip the index
+        // DDL when the table is missing; in production the table always exists
+        // after v5 has run for real.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => {
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'")
+                    .fetch_optional(&mut **tx)
+                    .await
+                    .unwrap_or(None)
+                    .is_some()
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = 'messages' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await
+            .unwrap_or(None)
+            .is_some(),
+        };
+
+        if table_exists {
+            sqlx::query(V9_MESSAGES_LOOKUP_IDX)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!("DDL failed: {V9_MESSAGES_LOOKUP_IDX}\n  Error: {e}")
+                })?;
+            tracing::info!(version = 9, "migration applied: messages lookup index");
+        } else {
+            tracing::debug!(
+                "v9 migration: messages table absent (partial schema), skipping index creation"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v9(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v9_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -889,3 +944,6 @@ const V7_UNIQUE_IDX_PEER_USER_ID: &str =
     include_str!("../../migrations/0007_peer_user_id_unique_index.sql");
 
 const V8_DDL: &str = include_str!("../../migrations/0008_vtoken_and_bot_token_hash.sql");
+
+const V9_MESSAGES_LOOKUP_IDX: &str =
+    include_str!("../../migrations/0009_messages_lookup_index.sql");
