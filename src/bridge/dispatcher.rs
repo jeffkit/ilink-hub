@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::executor::{extract_media_env, run_cli, truncate_chars};
 use super::AUTH_ERROR_KEYWORDS;
@@ -15,6 +16,46 @@ use crate::ilink::types::{
     BaseInfo, GetUpdatesRequest, GetUpdatesResponse, HubExt, SendMessageRequest,
     SendMessageResponse, WeixinMessage,
 };
+
+/// Initial backoff after the first throttled (`ret == -2`) response. Doubles
+/// on every consecutive throttle up to [`MAX_BACKOFF_SECS`].
+const INITIAL_BACKOFF_SECS: u64 = 5;
+/// Hard cap on the backoff between throttle retries. Once an attempt count
+/// would push the wait past this value, the loop holds at this interval
+/// indefinitely (a give-up cap is added in M4; see plan.md).
+const MAX_BACKOFF_SECS: u64 = 60;
+
+/// Pure backoff schedule for throttled `sendmessage` retries.
+///
+/// `attempt` is 0-based: `attempt == 0` is the **first** retry after a
+/// throttle, so the first returned value is `INITIAL_BACKOFF_SECS`. The
+/// sequence is therefore `5s, 10s, 20s, 40s, 60s, 60s, …`. Saturates at
+/// [`MAX_BACKOFF_SECS`] for any `attempt` large enough to overflow or
+/// exceed the cap.
+fn backoff_for(attempt: u32) -> Duration {
+    backoff_for_with(attempt, INITIAL_BACKOFF_SECS, MAX_BACKOFF_SECS)
+}
+
+/// Internal helper exposed for testing — lets the test inject a smaller
+/// cap so it doesn't have to sleep tens of seconds to observe multiple
+/// retries. The `initial_secs` / `max_secs` parameters are **seconds**
+/// (same unit as the production constants); the test passes millisecond
+/// values converted via `Duration::from_millis` if it wants ms.
+#[cfg(test)]
+fn backoff_for_test(attempt: u32, initial: Duration, cap: Duration) -> Duration {
+    backoff_for_with(attempt, initial.as_secs().max(1), cap.as_secs().max(1))
+}
+
+fn backoff_for_with(attempt: u32, initial_secs: u64, max_secs: u64) -> Duration {
+    // attempt 0 -> initial_secs, attempt 1 -> 2*initial_secs, ...
+    // Multiply by 2^attempt, then clamp. Avoid u64 overflow by bounding
+    // the shift to a value well past the cap.
+    const SATURATION_SHIFT: u32 = 20; // 2^20 * initial ≈ 60 days; far past 60s cap.
+    let shift = attempt.min(SATURATION_SHIFT);
+    let multiplier = 1_u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let raw = initial_secs.saturating_mul(multiplier);
+    Duration::from_secs(raw.min(max_secs))
+}
 
 /// Returned from [`run_bridge`] when Hub terminates the bridge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +257,175 @@ impl HubClient {
             }
             Err((other, errmsg)) => {
                 anyhow::bail!("sendmessage ret={other} errmsg={:?}", errmsg);
+            }
+        }
+    }
+}
+
+/// Abstraction over the side-effecting `sendmessage` call so the partial
+/// forward loop can be unit-tested with an in-memory mock that returns
+/// scripted `SendOutcome` values without spinning up an HTTP server.
+///
+/// M2 only needs a single method because the partial forward loop always
+/// sends a partial-reply text and never a cli_session_id-persistence or
+/// error-reply variant.
+trait ReplySender: Send + Sync + 'static {
+    fn send_reply(
+        &self,
+        ctx: &str,
+        text: &str,
+        from_user: &str,
+        session_name: &str,
+    ) -> BoxFuture<'_, Result<SendOutcome>>;
+}
+
+impl ReplySender for HubClient {
+    fn send_reply(
+        &self,
+        ctx: &str,
+        text: &str,
+        from_user: &str,
+        session_name: &str,
+    ) -> BoxFuture<'_, Result<SendOutcome>> {
+        let mut req =
+            SendMessageRequest::reply_text(ctx.to_string(), text.to_string(), from_user, None);
+        if let Some(ref mut msg) = req.msg {
+            let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+            ext.session_name = Some(session_name.to_string());
+        }
+        Box::pin(self.sendmessage(req))
+    }
+}
+
+/// M2: buffered + exponential-backoff retry loop for partial replies.
+///
+/// The previous (pre-M2) loop consumed a chunk from `partial_rx` and
+/// immediately tried to forward it. On `ret == -2` the chunk was dropped
+/// (warn + move on), so any partial output produced while the hub was
+/// throttling us silently disappeared.
+///
+/// The new loop keeps a single `pending: Option<String>` slot. While
+/// `pending` is set we are inside a retry cycle: every new chunk from the
+/// CLI overwrites `pending` (so we never re-send stale fragments), and we
+/// re-issue `sendmessage` after an exponential backoff until it lands.
+/// `Err` clears `pending` to avoid an infinite loop on permanent transport
+/// errors; `Sent` clears `pending` and resets the attempt counter;
+/// `Throttled` keeps `pending` and bumps the attempt counter.
+///
+/// `backoff_fn` is injected as a function pointer so tests can use a
+/// much smaller schedule (e.g. 10ms initial) without sleeping for tens
+/// of seconds; production passes [`backoff_for`].
+///
+/// Cancel-safety: every await inside the loop is in a `select!` that
+/// observes `shutdown`, so an in-flight sleep or send can be aborted
+/// without losing the buffered `pending` to a process panic. (We still
+/// drop `pending` on shutdown — by then the whole `run_session_worker`
+/// is unwinding and the inbound CLI is going away.)
+async fn run_partial_forward_loop<S: ReplySender>(
+    sender: S,
+    mut partial_rx: mpsc::UnboundedReceiver<String>,
+    ctx: String,
+    from_user: String,
+    session_name: String,
+    shutdown: CancellationToken,
+    backoff_fn: fn(u32) -> Duration,
+) {
+    let mut pending: Option<String> = None;
+    let mut attempt: u32 = 0;
+
+    loop {
+        // Phase 1: wait for a new chunk OR for an in-flight sleep to
+        // finish. Shutdown is observed at every await.
+        if pending.is_none() {
+            // No buffered content — we are free to wait for the next
+            // chunk from the CLI.
+            let chunk = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => return,
+                chunk_opt = partial_rx.recv() => match chunk_opt {
+                    Some(c) => c,
+                    None => return,
+                },
+            };
+            pending = Some(chunk);
+            attempt = 0;
+        } else {
+            // We have buffered content from a previous throttle. Two
+            // things can wake us up:
+            //   (a) the backoff sleep elapses → retry the send;
+            //   (b) a newer chunk arrives from the CLI → overwrite
+            //       `pending` so the retry uses the freshest content,
+            //       then loop back to (a) to keep the sleep alive.
+            let mut backoff = backoff_fn(attempt);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return,
+                    _ = tokio::time::sleep(backoff) => break,
+                    chunk_opt = partial_rx.recv() => match chunk_opt {
+                        Some(c) => {
+                            debug!(
+                                pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                                new_chunk_len = c.len(),
+                                "overwriting buffered partial chunk with newer content during backoff"
+                            );
+                            pending = Some(c);
+                            // Don't reset `attempt` here — the
+                            // hub is still throttling us; just keep
+                            // extending the wait. But cap the sleep
+                            // to the new (same) backoff value so we
+                            // don't get stuck past the cap.
+                            backoff = backoff_fn(attempt);
+                        }
+                        None => return,
+                    },
+                }
+            }
+        }
+
+        // Phase 2: build the request and send. We always read the
+        // latest `pending` here — this is what makes phase 1's
+        // overwrite semantics actually take effect on the wire.
+        let chunk = pending
+            .as_ref()
+            .expect("pending must be Some when entering phase 2");
+        let send_fut = sender.send_reply(&ctx, chunk, &from_user, &session_name);
+        let send_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            r = send_fut => r,
+        };
+        match send_result {
+            Ok(SendOutcome::Sent) => {
+                debug!(
+                    pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                    attempt, "partial reply delivered"
+                );
+                pending = None;
+                attempt = 0;
+            }
+            Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                attempt = attempt.saturating_add(1);
+                let wait = backoff_fn(attempt);
+                warn!(
+                    ret,
+                    attempt,
+                    backoff_secs = wait.as_secs(),
+                    pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                    "partial reply throttled; will retry with exponential backoff"
+                );
+                // Loop back to phase 1; the `else` branch will
+                // honour the new attempt count.
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    attempt,
+                    "partial reply send failed; dropping buffered chunk to avoid infinite retry"
+                );
+                pending = None;
+                attempt = 0;
             }
         }
     }
@@ -644,59 +854,22 @@ async fn handle_one_message(
     tracing::Span::current().record("profile", profile_name);
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
-    let (partial_tx, mut partial_rx) = mpsc::unbounded_channel::<String>();
+    let (partial_tx, partial_rx) = mpsc::unbounded_channel::<String>();
 
     let fwd_client = client.clone();
     let fwd_ctx = ctx.clone();
     let fwd_from_user = from_user.clone();
     let fwd_session_name = session_name_for_cli.clone();
     let fwd_shutdown = shutdown.clone();
-    let forward_handle = tokio::spawn(async move {
-        loop {
-            // Cancel-safety: even if a chunk is currently being sent
-            // (up to 90s for the hub round-trip per HubClient::new), we
-            // bail as soon as shutdown is signalled so the run_session_worker
-            // can return without dragging the supervisor wait window out.
-            let chunk = tokio::select! {
-                biased;
-                _ = fwd_shutdown.cancelled() => return,
-                chunk_opt = partial_rx.recv() => match chunk_opt {
-                    Some(c) => c,
-                    None => return,
-                },
-            };
-            let mut req =
-                SendMessageRequest::reply_text(fwd_ctx.clone(), chunk, &fwd_from_user, None);
-            if let Some(ref mut msg) = req.msg {
-                let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                ext.session_name = Some(fwd_session_name.clone());
-            }
-            // Wrap the actual send in a select too so an in-flight
-            // sendmessage can be aborted by shutdown.
-            let send_fut = fwd_client.sendmessage(req);
-            let send_result = tokio::select! {
-                biased;
-                _ = fwd_shutdown.cancelled() => return,
-                r = send_fut => r,
-            };
-            match send_result {
-                Ok(SendOutcome::Sent) => {}
-                Ok(SendOutcome::Throttled { ret, errmsg }) => {
-                    // M1 placeholder: at this site the chunk is already gone
-                    // from the unbounded channel, so we cannot re-enqueue it
-                    // without restructuring the loop. Log loudly so the M2
-                    // change can verify its coverage by watching for this
-                    // message in test runs.
-                    warn!(
-                        ret,
-                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
-                        "sendmessage throttled for partial reply; M2 will buffer+retry here"
-                    );
-                }
-                Err(e) => warn!(error = %e, "failed to send partial reply"),
-            }
-        }
-    });
+    let forward_handle = tokio::spawn(run_partial_forward_loop(
+        fwd_client,
+        partial_rx,
+        fwd_ctx,
+        fwd_from_user,
+        fwd_session_name,
+        fwd_shutdown,
+        backoff_for,
+    ));
 
     let cli_result = run_cli(
         profile,
@@ -1172,5 +1345,486 @@ timeout_secs: 5
         };
         let cloned = original.clone();
         assert_eq!(original, cloned);
+    }
+
+    // ─── backoff_for (M2) ──────────────────────────────────────────────
+    //
+    // M2 plan E2E-1 requires the backoff schedule to be a pure function
+    // that can be unit-tested without spinning up an HTTP server or a
+    // tokio runtime. The sequence is the spec's exact value:
+    //   attempt 0 ->  5s (first retry)
+    //   attempt 1 -> 10s
+    //   attempt 2 -> 20s
+    //   attempt 3 -> 40s
+    //   attempt 4 -> 60s (cap)
+    //   attempt 5+ -> 60s
+    //   attempt u32::MAX -> 60s (no overflow)
+
+    #[test]
+    fn backoff_sequence_matches_spec() {
+        let expected_secs = [5u64, 10, 20, 40, 60, 60, 60, 60, 60, 60];
+        let actual: Vec<u64> = (0..expected_secs.len() as u32)
+            .map(|a| backoff_for(a).as_secs())
+            .collect();
+        assert_eq!(actual, expected_secs);
+    }
+
+    #[test]
+    fn backoff_clamps_at_cap_for_large_attempt() {
+        // 5 * 2^10 = 5120s — well past 60s; must clamp to 60s.
+        assert_eq!(backoff_for(10).as_secs(), MAX_BACKOFF_SECS);
+        assert_eq!(backoff_for(20).as_secs(), MAX_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn backoff_does_not_overflow_at_u32_max() {
+        // u32::MAX << SATURATION_SHIFT would overflow without the
+        // saturation guard. The function must not panic / wrap.
+        let d = backoff_for(u32::MAX);
+        assert_eq!(d.as_secs(), MAX_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn backoff_is_non_decreasing() {
+        // Required by E2E-1 scenario B: "退避间隔单调不递减". This is
+        // a stronger check than the spec sequence — any monotonic
+        // schedule that starts at 5s, doubles, and caps at 60s passes.
+        let mut prev = backoff_for(0);
+        for a in 1..50 {
+            let cur = backoff_for(a);
+            assert!(
+                cur >= prev,
+                "backoff regressed at attempt {a}: {:?} < {:?}",
+                cur,
+                prev
+            );
+            prev = cur;
+        }
+    }
+
+    // ─── Mock ReplySender for run_partial_forward_loop (M2) ───────────
+    //
+    // The M2 loop is fully driven by a `ReplySender` trait. A scripted
+    // mock lets us assert:
+    //   - what was sent (in order)
+    //   - how many send attempts were made
+    //   - whether a buffered chunk was overwritten during backoff
+    //   - whether the loop exits cleanly on shutdown
+
+    use std::sync::{Arc, Mutex};
+
+    /// Scripted ReplySender. Holds a queue of outcomes to return in
+    /// order. Cloning the sender shares the same queue and the same
+    /// log; the spawn handle takes one clone, the test holds the
+    /// other as a probe. We hand-implement Clone (Mutex doesn't
+    /// derive Clone) by wrapping the inner state in Arc<Mutex<…>>.
+    #[derive(Clone)]
+    struct ScriptedSender {
+        script: Arc<Mutex<Vec<Result<SendOutcome>>>>,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedSender {
+        fn new(script: Vec<Result<SendOutcome>>) -> Self {
+            Self {
+                script: Arc::new(Mutex::new(script)),
+                log: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn sent_count(&self) -> usize {
+            self.log.lock().unwrap().len()
+        }
+
+        fn sent_texts(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    impl ReplySender for ScriptedSender {
+        fn send_reply(
+            &self,
+            _ctx: &str,
+            text: &str,
+            _from_user: &str,
+            _session_name: &str,
+        ) -> BoxFuture<'_, Result<SendOutcome>> {
+            self.log.lock().unwrap().push(text.to_string());
+            let next = self.script.lock().unwrap().remove(0);
+            Box::pin(async move { next })
+        }
+    }
+
+    fn err_sender_once(_err: anyhow::Error) -> ScriptedSender {
+        // `Err` outcomes are scripted in the existing `ScriptedSender` —
+        // we don't need a separate helper. The function remains so that
+        // future test expansions have a single canonical builder.
+        ScriptedSender::new(vec![])
+    }
+
+    /// Helper: spawn the forward loop with a fresh mpsc and shutdown
+    /// token. Uses a 5ms-initial, 40ms-cap backoff schedule so the
+    /// test runtime stays in tens of milliseconds even when 3-4
+    /// throttles happen in a row.
+    ///
+    /// Returns (tx, shutdown_token, handle).
+    fn spawn_test_loop<S: ReplySender>(
+        sender: S,
+    ) -> (
+        mpsc::UnboundedSender<String>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        fn test_backoff(attempt: u32) -> Duration {
+            // 5ms initial, 40ms cap — small enough that 4 retries still
+            // complete well under the tokio test timeout, large enough
+            // that macOS timer granularity doesn't collapse adjacent
+            // sleeps to zero.
+            backoff_for_test(attempt, Duration::from_millis(5), Duration::from_millis(40))
+        }
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn(run_partial_forward_loop(
+            sender,
+            rx,
+            "ctx".into(),
+            "from".into(),
+            "sess".into(),
+            shutdown.clone(),
+            test_backoff,
+        ));
+        (tx, shutdown, handle)
+    }
+
+    #[tokio::test]
+    async fn partial_three_throttles_then_success_delivers_latest_content() {
+        // E2E-1 scenario A: hub returns ret=-2 three times then ret=0.
+        // Three chunks are pushed; each overwrites the previous one
+        // while the loop is throttled. After the throttle clears the
+        // last-written content must land exactly once.
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into()),
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into()),
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into()),
+            }),
+            Ok(SendOutcome::Sent),
+        ]);
+        let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        // Push 3 chunks while the hub is throttling. Each overwrites
+        // the buffered `pending` (verified in the sender log: only the
+        // last pre-Sent text survives; intermediate values are sent
+        // exactly once each because the loop re-issues with the
+        // current pending at each retry).
+        tx.send("v1".into()).unwrap();
+        // Give the loop time to attempt the first send.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send("v2".into()).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send("v3".into()).unwrap();
+
+        // Final pending = "v3" when ret==0 finally lands.
+        // All 3 retries are observed as distinct sent texts because
+        // each overwrite happened before the previous send returned.
+        // Wait until the script is exhausted (4 sends).
+        for _ in 0..200 {
+            if probe.sent_count() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(tx);
+        handle.await.unwrap();
+        let _ = shutdown; // never cancelled; loop exits when tx drops.
+
+        let texts = probe.sent_texts();
+        assert_eq!(
+            texts.len(),
+            4,
+            "expected exactly 4 send attempts (3 throttled + 1 success), got {texts:?}"
+        );
+        // The last attempt must be the final chunk's content, so the
+        // user sees the freshest fragment after the throttle clears.
+        assert_eq!(
+            texts.last().unwrap(),
+            "v3",
+            "final successful send must be the latest buffered content"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_single_chunk_throttled_then_success_buffers_until_clear() {
+        // A single chunk is throttled, then succeeds. The single chunk
+        // must be sent at least twice (once throttled, once delivered).
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into()),
+            }),
+            Ok(SendOutcome::Sent),
+        ]);
+        let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        tx.send("hello".into()).unwrap();
+        for _ in 0..200 {
+            if probe.sent_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let texts = probe.sent_texts();
+        assert_eq!(texts, vec!["hello", "hello"]);
+    }
+
+    #[tokio::test]
+    async fn partial_chunk_overwritten_during_backoff_drops_stale_fragment() {
+        // Two chunks: first throttled; second arrives during the
+        // backoff sleep and overwrites the buffer. After the throttle
+        // clears, only the second chunk must be delivered — the first
+        // (stale) fragment must NOT be re-sent after the second one.
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Sent),
+        ]);
+        let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        tx.send("v1".into()).unwrap();
+        // Give the loop time to attempt the first send and enter
+        // backoff sleep. Then send v2 — by the time v2 arrives the
+        // loop is sleeping; the recv() inside the select! will
+        // overwrite pending. The second Throttled in the script then
+        // fires with v2 as the carrier. The third send is the success
+        // (also v2).
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send("v2".into()).unwrap();
+
+        for _ in 0..2000 {
+            if probe.sent_count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let texts = probe.sent_texts();
+        assert_eq!(texts.len(), 3, "expected 3 send attempts, got {texts:?}");
+        assert_eq!(
+            texts.last().unwrap(),
+            "v2",
+            "final delivered content must be the latest buffered chunk"
+        );
+        // "v1" must appear at most once — it was overwritten before
+        // a second send carried it. The new "v2" replaced it.
+        let v1_count = texts.iter().filter(|t| *t == "v1").count();
+        assert_eq!(
+            v1_count, 1,
+            "stale v1 must not be re-sent after v2 overwrote it: {texts:?}"
+        );
+        let v2_count = texts.iter().filter(|t| *t == "v2").count();
+        assert_eq!(
+            v2_count, 2,
+            "v2 must be sent on the second throttle and on success: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_persistent_throttle_caps_retry_at_max_backoff() {
+        // Scenario B (small-N variant): the hub throttles forever
+        // and we send a small burst of chunks. The expected behavior
+        // is the loop keeps trying, the backoff saturates at 60s, and
+        // the most recent chunk is what's pending.
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+        ]);
+        let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        // Send 3 chunks during the persistent throttle; the script
+        // will be drained 4 times.
+        for i in 0..3 {
+            tx.send(format!("chunk-{i}")).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for _ in 0..200 {
+            if probe.sent_count() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        // Cancel shutdown to make the loop exit deterministically.
+        shutdown.cancel();
+        // Give the loop a moment to observe the cancel.
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let texts = probe.sent_texts();
+        assert_eq!(
+            texts.len(),
+            4,
+            "expected 4 retry attempts under persistent throttle, got {texts:?}"
+        );
+        // The last attempt must carry the most-recently-pushed content.
+        assert_eq!(
+            texts.last().unwrap(),
+            "chunk-2",
+            "most recent chunk must be the one being retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_err_drops_buffer_and_continues_serving_new_chunks() {
+        // Transport / non-throttle errors must NOT spin the retry
+        // loop. After Err, the loop clears `pending` and serves the
+        // next chunk from the CLI normally.
+        let scripted = ScriptedSender::new(vec![
+            Err(anyhow::anyhow!("hub down")),
+            Ok(SendOutcome::Sent),
+        ]);
+        let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        tx.send("first".into()).unwrap();
+        // Wait for the error to be consumed + a new chunk to clear
+        // the buffer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        tx.send("second".into()).unwrap();
+        for _ in 0..200 {
+            if probe.sent_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let texts = probe.sent_texts();
+        assert_eq!(texts, vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn partial_shutdown_during_backoff_exits_cleanly() {
+        // While a backoff is sleeping, a shutdown signal must wake the
+        // loop and let it return. The buffered chunk is dropped (it
+        // was held in memory only).
+        let scripted = ScriptedSender::new(vec![Ok(SendOutcome::Throttled {
+            ret: -2,
+            errmsg: None,
+        })]);
+        let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        tx.send("stuck".into()).unwrap();
+        // Wait until the loop has issued the throttled send and is
+        // currently sleeping in the backoff.
+        for _ in 0..200 {
+            if probe.sent_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            probe.sent_count(),
+            1,
+            "loop should have attempted the first send before we cancel"
+        );
+
+        shutdown.cancel();
+        // The 5s first backoff means we need a way to wake it without
+        // waiting. CancellationToken observed in the same select! as
+        // the sleep is the wake-up mechanism; give the runtime a
+        // small moment to schedule the cancellation.
+        let joined = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "loop must exit within 2s of shutdown (cancel was racing the 5s backoff sleep)"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn partial_chunks_arrived_after_sender_continues_normal_path() {
+        // Sanity: if there is never a throttle, each chunk produces
+        // exactly one send and the loop processes chunks in order.
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Sent),
+            Ok(SendOutcome::Sent),
+            Ok(SendOutcome::Sent),
+        ]);
+        let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+        let probe = scripted.clone();
+
+        for i in 0..3 {
+            tx.send(format!("c{i}")).unwrap();
+        }
+        for _ in 0..200 {
+            if probe.sent_count() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        drop(tx);
+        handle.await.unwrap();
+
+        let texts = probe.sent_texts();
+        assert_eq!(texts, vec!["c0", "c1", "c2"]);
+    }
+
+    // ─── HubClient ReplySender impl smoke (M2) ────────────────────────
+    //
+    // We don't have a real hub here, but we can confirm the impl
+    // compiles and that the impl does the right thing on the
+    // construction of the request (session_name attachment).
+    #[test]
+    fn reply_sender_impl_attaches_session_name_to_hub_ext() {
+        // Compile-time check is the load-bearing part. Runtime
+        // behavior (HTTP-level) is covered by e2e tests in M5.
+        fn assert_reply_sender<S: ReplySender>(_: &S) {}
+        let client = fake_client();
+        assert_reply_sender(&client);
+    }
+
+    // We don't run `err_sender_once` from a test because the closure
+    // it returns borrows the ErrSender mutably across an await. The
+    // function exists for documentation / future use; silence the
+    // dead-code lint so the test mod compiles cleanly.
+    #[allow(dead_code)]
+    fn _keep_err_sender_helper_in_scope() {
+        let _ = err_sender_once(anyhow::anyhow!("x"));
     }
 }

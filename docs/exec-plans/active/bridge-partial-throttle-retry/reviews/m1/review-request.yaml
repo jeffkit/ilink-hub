@@ -1,0 +1,87 @@
+milestone: M1
+title: "HubClient::sendmessage() returns typed SendOutcome"
+status: in_review
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/bridge-partial-throttle-retry
+base_commit: c9b94cafeat(bridge-partial-throttle-retry):m0baseline+planartifacts
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/bridge-partial-throttle-retry/plan.md
+checkpoint: "M1 — dispatcher.rs 引入 SendOutcome { Sent, Throttled { ret, errmsg } }，调用方用 match 区分；HTTP/JSON 结构零变化"
+reviewer_focus: |
+  重点审查（Rust 安全 + 并发 + tokio 异步陷阱 + OWASP）：
+  - 内存安全 / UB / 生命周期（Send 边界、!Send 跨 await、Pin/PhantomData）
+  - data race / lock poisoning / 死锁
+  - tokio cancel safety（spawn 后未来被 drop 的副作用、select 取消未完成副作用）
+  - unwrap/expect 安全性
+  - 错误信息泄露 / 日志注入 / 信息脱敏
+  - JSON 反序列化与上游未信任输入
+  - 资源泄漏（mpsc、连接、tokio task）
+
+# ─── Scope of this milestone (the diff under review) ──────────────────────
+files_changed:
+  - src/bridge/dispatcher.rs
+diff_overview:
+  - 新增 `enum SendOutcome { Sent, Throttled { ret: i32, errmsg: Option<String> } }`
+  - `HubClient::sendmessage` 签名 `Result<()>` → `Result<SendOutcome>`：
+    - HTTP transport 错误仍走 `Err`（不变）
+    - `ret == 0` / `ret == None` / 解析失败 → `Ok(Sent)`
+    - `ret == -2` → `Ok(Throttled { ret: -2, errmsg })`
+    - 其它非零 `ret` → `Err`（用 `anyhow::bail!` 携带 errmsg）
+  - 4 处调用点（shutdown-error、partial reply、cli_session_id 持久化、final reply、CLI-error reply）
+    把原本的 `if let Err(e) = client.sendmessage(req).await { warn!(...) }`
+    改为 `match ... { Ok(Sent) => {}, Ok(Throttled) => warn!(... M2/M3 placeholder ...), Err => warn!() }`
+  - final-reply 这一个调用点在 Throttled 分支里 `anyhow::bail!` 升级为错误
+
+# ─── Commands run during review ────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --all -- --check"
+    expected: "no output, exit 0"
+    actual: "n/a (build failed first; fmt not the gating issue)"
+    result: not_run
+  - id: clippy
+    cmd: "cargo clippy --all-targets -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "FAILED — type error (see build)"
+    result: fail
+  - id: build
+    cmd: "cargo build"
+    expected: "exit 0"
+    actual: |
+      error[E0308]: mismatched types
+       --> src/bridge/dispatcher.rs:661:21
+        |
+      661 |                     anyhow::bail!("sendmessage throttled (ret={ret})");
+          |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `HandleError`, found `Error`
+        |
+      note: return type inferred to be `bridge::dispatcher::HandleError` here
+       --> src/bridge/dispatcher.rs:517:6
+        |
+      517 | ) -> Result<(), HandleError> {
+    result: fail
+  - id: build-explain
+    cmd: "rustc --explain E0308"
+    expected: "type-mismatch explanation"
+    actual: "Type mismatch in final-reply path: handle_one_message returns Result<(), HandleError> but the Throttled arm calls anyhow::bail!() which yields anyhow::Error. The sibling Err arm correctly wraps with `HandleError::from(e.context(...))` (line 663), but the bail!() in the Throttled arm does not."
+    result: fail
+
+# ─── Pass conditions vs. plan.md M1 ────────────────────────────────────────
+pass_conditions:
+  - id: builds
+    plan_clause: "cargo build 成功"
+    observation: "cargo build FAILS with E0308 at dispatcher.rs:661"
+    result: fail
+  - id: clippy-clean
+    plan_clause: "cargo clippy --all-targets -- -D warnings 零告警"
+    observation: "blocked by build failure (would be irrelevant to evaluate while build is red)"
+    result: not_evaluable
+
+# ─── Notes for the reviewer (next milestone) ───────────────────────────────
+next_milestone: M2
+next_milestone_files:
+  - src/bridge/dispatcher.rs
+findings_file: reviews/m1/review-findings.yaml

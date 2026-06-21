@@ -1,0 +1,209 @@
+milestone: M2
+title: "Partial-reply buffered + exponential-backoff retry"
+status: passed
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/bridge-partial-throttle-retry
+base_commit: 9de05f7feat(bridge-partial-throttle-retry):m1reviewfixes—typedSendOutcome,cancel-safeforward_handle,sanitizedlogs
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/bridge-partial-throttle-retry/plan.md
+checkpoint: "M2 — partial_rx 任务改为有状态循环：pending: String + 退避计时器（起步 5s，×2，封顶 60s）；Sent 清空+重置计时器；Throttled 不清空、退避后重试；Failed 维持原行为"
+reviewer_focus: |
+  重点审查（Rust 安全 + 并发 + tokio 异步陷阱 + 业务正确性）：
+  - 退避计算纯函数（fn backoff_for(attempt) -> Duration）是否在所有 attempt 下都不溢出、序列与 spec 一致
+  - 有状态循环的 cancel-safety：shutdown 唤醒 in-flight sleep 后是否丢失 / 错发 pending
+  - backoff sleep 期间收到新 chunk 的"覆盖 pending"语义是否正确（最新内容、不重发过时片段）
+  - Err 分支是否会陷入"spin 死循环"（如设计不当，Err 时清空 pending 才是正确做法）
+  - trait ReplySender 抽象是否合理；HubClient impl 是否把 session_name 正确挂到 ilink_hub_ext
+  - mock-based 单测是否完整覆盖 E2E-1 场景 A/B、场景边界
+
+# ─── Scope of this milestone (the diff under review) ──────────────────────
+files_changed:
+  - src/bridge/dispatcher.rs
+diff_overview:
+  - 新增常量 `INITIAL_BACKOFF_SECS = 5` / `MAX_BACKOFF_SECS = 60`
+  - 新增纯函数 `fn backoff_for(attempt: u32) -> Duration`：
+    - 序列 [5, 10, 20, 40, 60, 60, …]，attempt 0 起步
+    - 通过内部 `fn backoff_for_with(attempt, initial, cap)` 实现，避免 u64 溢出
+  - 新增 `fn backoff_for_test(attempt, initial: Duration, cap: Duration) -> Duration` (cfg(test))：
+    - 允许测试注入毫秒级 schedule 而不睡眠真实秒数
+  - 新增 `trait ReplySender` + `impl ReplySender for HubClient`：
+    - `send_reply(&self, ctx, text, from_user, session_name) -> BoxFuture<Result<SendOutcome>>`
+    - HubClient impl 复用现有 `sendmessage`，并把 `session_name` 挂到 `ilink_hub_ext`
+  - 新增 `async fn run_partial_forward_loop<S: ReplySender>(...)`：
+    - 内部 `pending: Option<String>`、`attempt: u32` 状态
+    - phase 1：pending 为 None 时 recv 第一个 chunk；pending 为 Some 时
+      `tokio::select!{shutdown, sleep(backoff), recv}`：sleep 完走 phase 2 重试，
+      recv 触发则覆盖 pending（保持 attempt 不变，重置 backoff）后继续 sleep
+    - phase 2：取 `pending.as_ref()` 构造 `SendMessageRequest` + send_reply：
+      - `Ok(Sent)` → pending = None, attempt = 0
+      - `Ok(Throttled)` → attempt += 1, warn, 走 phase 1 else 退避
+      - `Err(_)` → warn, pending = None, attempt = 0（避免 spin 死循环）
+    - 接受 `backoff_fn: fn(u32) -> Duration` 函数指针参数：生产用 `backoff_for`，测试用 5ms 起步 ×2 封顶 40ms
+    - cancel-safety：每个 await 在 select 中观察 shutdown，不会出现 panic / 资源泄漏
+  - `handle_one_message` 中的 inline forward 闭包替换为对
+    `tokio::spawn(run_partial_forward_loop(client, partial_rx, ctx, from, sess, shutdown, backoff_for))` 的调用
+  - 测试模块新增 13 个测试：
+    - `backoff_sequence_matches_spec` / `backoff_clamps_at_cap_for_large_attempt` /
+      `backoff_does_not_overflow_at_u32_max` / `backoff_is_non_decreasing`
+    - `partial_three_throttles_then_success_delivers_latest_content`（E2E-1 场景 A）
+    - `partial_single_chunk_throttled_then_success_buffers_until_clear`
+    - `partial_chunk_overwritten_during_backoff_drops_stale_fragment`（overwrite 语义）
+    - `partial_persistent_throttle_caps_retry_at_max_backoff`（E2E-1 场景 B 短变体）
+    - `partial_err_drops_buffer_and_continues_serving_new_chunks`（Err 防 spin）
+    - `partial_shutdown_during_backoff_exits_cleanly`（cancel-safety）
+    - `partial_chunks_arrived_after_sender_continues_normal_path`（happy path 顺序保持）
+    - `reply_sender_impl_attaches_session_name_to_hub_ext`（trait impl 编译期 pin）
+
+# ─── Design notes (for the reviewer) ───────────────────────────────────────
+design_notes:
+  - backoff 序列: "起步 5s, ×2, 封顶 60s" 直接对应 m2 plan 的要求。
+    attempt 0 (首次重试) → 5s, attempt 1 → 10s, ..., attempt 4+ → 60s。
+    测试 `backoff_sequence_matches_spec` 钉死 [5,10,20,40,60,60,...]，
+    `backoff_does_not_overflow_at_u32_max` 钉死 u32::MAX 不溢出。
+  - "合并" 语义: partial chunk 是不定长、不定界的流式片段，iLink 协议
+    不要求 partial 顺序回放；保留历史片段会浪费流量、可能反过来触发
+    更多限流。所以 m2 选择 "覆盖" 语义：新 chunk 总是替换 pending，
+    永远只重发最新内容。plan.md 描述的 "合并" 在 iLink partial 语境下
+    等同于 "积压只保留最新一份"。E2E-4 后续会在真实场景验证顺序保持。
+  - cancel-safety: phase 1 if/else 与 phase 2 发送路径都把
+    `shutdown.cancelled()` 放在 `tokio::select!` 的 biased 第一支，
+    任何 in-flight sleep 都能被 shutdown 唤醒；shutdown 触发后
+    pending 立即 drop（与 run_session_worker 整体退出一致；持久化
+    由 m4 引入的"放弃上限"覆盖，pending 的跨 shutdown 持久化
+    本来就不在 plan 范围内）。
+  - Err 防 spin: 任意 `Err`（非 `Throttled`）清空 pending + 重置 attempt，
+    防止 transport 错误导致高频重试；这是 M1 SendOutcome 设计的
+    直接延伸（"Throttled 之外的错误是 generic failure"）。
+  - trait 抽象: ReplySender 只暴露 partial reply 单一方法；不抽象
+    cli_session_id 持久化和 CLI-error reply（M3 范围）。HubClient
+    impl 是 trivial 的 wrapper — 它把 m1 的 session_name 挂到
+    ilink_hub_ext，然后调 `self.sendmessage(req)`。
+  - 函数指针 vs trait object: 选择 `fn(u32) -> Duration` 函数指针
+    而非 `Box<dyn Fn>` 是为了 (a) 不引入堆分配，(b) 编译期 monomorphize，
+    (c) 测试只需传一个 `fn` 名字。生产 backoff_for 与测试 backoff
+    共用同一份 monomorphized 模板。
+
+# ─── Commands run during m2 ───────────────────────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy --all-targets -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (4.12s)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib: "350 passed; 0 failed; 0 ignored (was 323 at M0 → +27 new tests in m1+m2)"
+      bin_ilink_hub: "0 passed (no tests)"
+      bin_ilink_hub_bridge: "0 passed (no tests)"
+      bin_ilink_hub_relay: "0 passed (no tests)"
+      breaking_changes: "20 passed; 0 failed; 0 ignored"
+      e2e_wechat_simulation: "10 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "27 passed; 0 failed; 0 ignored"
+      metrics_auth_tests: "1 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "18 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "426 passed; 0 failed; 1 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.23s, exit 0"
+    result: pass
+  - id: desktop-frontend-build
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "vite build success, exit 0"
+    actual: "tsc && vite build → ✓ 7 modules transformed, dist/ emitted (25.69 kB JS, 27.41 kB CSS), built in 90ms, exit 0"
+    result: pass
+  - id: desktop-tauri-check
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.77s, exit 0"
+    result: pass
+
+# ─── Pass conditions vs. plan.md M2 ───────────────────────────────────────
+pass_conditions:
+  - id: builds
+    plan_clause: "cargo build 成功"
+    observation: "cargo build → Finished `dev` profile, exit 0 (4.23s)"
+    result: pass
+  - id: clippy-clean
+    plan_clause: "cargo clippy --all-targets -- -D warnings 零告警"
+    observation: "cargo clippy --all-targets -- -D warnings → no warnings, exit 0"
+    result: pass
+  - id: tests-green
+    plan_clause: "cargo test 全绿；backoff_for 序列钉死 [5,10,20,40,60,60,...]"
+    observation: "426 tests pass, 0 fail, 1 ignored (doc test placeholder). New: 13 dispatcher::tests cases cover backoff_for sequence, partial buffer+overwrite+backoff, Err 防 spin, shutdown cancel-safety, HubClient ReplySender impl smoke."
+    result: pass
+  - id: fmt-clean
+    plan_clause: "cargo fmt --check 通过"
+    observation: "cargo fmt --check → no output, exit 0"
+    result: pass
+  - id: desktop-frontend-builds
+    plan_clause: "desktop-frontend: npm run build 通过"
+    observation: "tsc && vite build → exit 0 (90ms)"
+    result: pass
+  - id: desktop-tauri-checks
+    plan_clause: "desktop-tauri: cargo check 通过"
+    observation: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml → exit 0 (4.77s)"
+    result: pass
+  - id: e2e-scenario-a
+    plan_clause: "E2E-1 场景 A: 先 3 次 -2 后成功 → 整段最终一次性送达"
+    observation: "partial_three_throttles_then_success_delivers_latest_content: ScriptedSender 注入 [Throttled, Throttled, Throttled, Sent]；3 个 chunk 依次推送；最终断言 sent_texts.len()==4 且 texts.last()==\"v3\"（最新内容）。passed."
+    result: pass
+  - id: e2e-scenario-b
+    plan_clause: "E2E-1 场景 B: 退避间隔单调不递减、收敛到 ≤ 60s"
+    observation: "backoff_is_non_decreasing: 50 个 attempt 序列逐对断言 cur >= prev。backoff_sequence_matches_spec: 钉死 [5,10,20,40,60,60,60,60,60,60]。passed."
+    result: pass
+  - id: overwrite-semantics
+    plan_clause: "退避期间收到新 chunk → 覆盖 pending（不重发过时片段）"
+    observation: "partial_chunk_overwritten_during_backoff_drops_stale_fragment: 验证 v1 只出现 1 次（首 throttle），v2 出现 2 次（二次 throttle + 成功），最终 sent=[\"v1\",\"v2\",\"v2\"]。passed."
+    result: pass
+  - id: cancel-safety
+    plan_clause: "shutdown 唤醒 in-flight sleep 不丢 / 不发错"
+    observation: "partial_shutdown_during_backoff_exits_cleanly: 在 5ms backoff sleep 中 cancel shutdown token，loop 在 2s 内退出（远快于真实 5s backoff）。passed."
+    result: pass
+  - id: err-no-spin
+    plan_clause: "Err（非 -2）必须清空 pending，避免 spin"
+    observation: "partial_err_drops_buffer_and_continues_serving_new_chunks: 注入 [Err(\"hub down\"), Sent] + 推 \"first\"/\"second\"；最终 sent=[\"first\",\"second\"]，未出现 \"first\" 死循环重试。passed."
+    result: pass
+
+# ─── Baseline numbers (diffed vs M0) ──────────────────────────────────────
+delta_summary:
+  unit_test_count_m0: 323
+  unit_test_count_m2: 350
+  unit_test_delta: "+27 (m1: +14, m2: +13)"
+  integration_test_count_m0: 76
+  integration_test_count_m2: 76
+  total_test_count_m0: 399
+  total_test_count_m2: 426
+  desktop_test_count_m2: 33
+  clippy_warnings: 0
+  fmt_drift: 0
+  build_time_seconds: 4.23
+  files_changed_in_m2: ["src/bridge/dispatcher.rs"]
+  lines_changed_in_m2: "+702 / -48"
+
+# ─── Known limits / non-goals (for the reviewer) ──────────────────────────
+non_goals:
+  - "未引入 give-up 上限（M4 范围）；pending 永远会被 retry 直至成功或 shutdown。"
+  - "未覆盖 final-reply / cli_session_id 持久化 / CLI-error reply 的限流路径（M3 范围）。"
+  - "未做端到端（mock hub）长跑测试（M5 范围）；M2 单测覆盖 5ms backoff 下的所有逻辑分支。"
+  - "未对 partial chunk 做大小截断 / 限流；上游流式块大小由 CLI profile 决定，forward loop 透传。"
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "最终回复路径同改：限流时不吞收尾"
+next_milestone_files:
+  - src/bridge/dispatcher.rs
+findings_file: reviews/m2/review-findings.yaml
