@@ -176,6 +176,31 @@ impl PairingRegistry {
         false
     }
 
+    pub fn pre_check_confirm(&mut self, code: &str, csrf_header: &str) -> Result<(), PairingError> {
+        self.purge_expired();
+
+        if self.confirmed_sessions.contains_key(code) {
+            return Err(PairingError::AlreadyConfirmed);
+        }
+
+        let session = self.sessions.get(code).ok_or(PairingError::NotFound)?;
+
+        if session.is_expired() {
+            return Err(PairingError::Expired);
+        }
+        if session.status == PairingStatus::Confirmed {
+            return Err(PairingError::AlreadyConfirmed);
+        }
+        match session.csrf.as_deref() {
+            Some(token) if constant_time_eq(token.as_bytes(), csrf_header.as_bytes()) => {}
+            _ => return Err(PairingError::CsrfMismatch),
+        }
+        if session.status != PairingStatus::Scanned {
+            return Err(PairingError::NotScanned);
+        }
+        Ok(())
+    }
+
     pub fn confirm(
         &mut self,
         code: &str,
@@ -222,6 +247,10 @@ impl PairingRegistry {
             .insert(code.to_string(), (session, Instant::now()));
         Ok(())
     }
+
+    pub fn remove_confirmed(&mut self, code: &str) {
+        self.confirmed_sessions.remove(code);
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -232,6 +261,7 @@ pub enum PairingError {
     NotScanned,
     CsrfMismatch,
     TooManySessions,
+    NameCollision,
 }
 
 /// Generate a 32-character hex CSRF token (128 bits of entropy from OS CSPRNG).

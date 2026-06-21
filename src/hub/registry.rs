@@ -30,12 +30,13 @@ pub struct ClientInfo {
 }
 
 impl ClientInfo {
-    /// Build a `ClientInfo` for a freshly-issued plaintext vtoken. The
-    /// `vtoken` field is hashed before being stored; the plaintext is
-    /// dropped.
-    pub fn new(name: String, label: Option<String>) -> Self {
+    /// Build a `ClientInfo` for a freshly-issued plaintext vtoken. Returns a tuple
+    /// of the constructed `ClientInfo` (holding the hashed token) and the `String`
+    /// plaintext token.
+    pub fn new(name: String, label: Option<String>) -> (Self, String) {
         let plain = format!("vhub_{}", Uuid::new_v4().simple());
-        Self::with_hashed_vtoken(name, label, hash_vtoken(&plain))
+        let hashed = hash_vtoken(&plain);
+        (Self::with_hashed_vtoken(name, label, hashed), plain)
     }
 
     /// Build a `ClientInfo` whose `vtoken` field is already the canonical
@@ -104,9 +105,8 @@ impl ClientRegistry {
             }
             return (String::new(), existing_hash, false);
         }
-        let plain = format!("vhub_{}", Uuid::new_v4().simple());
-        let hashed = hash_vtoken(&plain);
-        let info = ClientInfo::with_hashed_vtoken(name.clone(), label, hashed.clone());
+        let (info, plain) = ClientInfo::new(name.clone(), label);
+        let hashed = info.vtoken.clone();
         self.by_name.insert(name, hashed.clone());
         self.by_vtoken.insert(hashed.clone(), info);
         (plain, hashed, true)
@@ -141,24 +141,40 @@ impl ClientRegistry {
             return (existing_vtoken, false);
         }
 
-        let info = match vtoken {
+        let (info, plain_or_hash) = match vtoken {
             Some(hashed) => {
-                // Caller is the load path or a re-registration; the value is
-                // already the canonical hash.
-                ClientInfo::with_hashed_vtoken(name.clone(), label, hashed)
+                // Caller is the load path; the value is already the canonical hash.
+                let info = ClientInfo::with_hashed_vtoken(name.clone(), label, hashed.clone());
+                (info, hashed)
             }
             None => {
-                // Fresh registration: generate plaintext, hash, store.
-                ClientInfo::new(name.clone(), label)
+                // Fresh registration: generate plaintext, hash, store, and return plaintext.
+                let (info, plain) = ClientInfo::new(name.clone(), label);
+                (info, plain)
             }
         };
         let stored = info.vtoken.clone();
         self.by_name.insert(name, stored.clone());
-        self.by_vtoken.insert(stored.clone(), info);
-        // Match the original semantics: is_new is true when we just
-        // inserted, false only when the name was already present. The
-        // caller never branches on the returned string.
-        (stored, true)
+        self.by_vtoken.insert(stored, info);
+        (plain_or_hash, true)
+    }
+
+    /// Register a client that has been confirmed via pairing. This inserts the
+    /// client directly into the registry using the pre-computed hash.
+    /// Returns `Err(UpdateClientError::NameTaken)` if the name is already registered.
+    pub fn register_confirmed(
+        &mut self,
+        name: String,
+        label: Option<String>,
+        vtoken_hash: String,
+    ) -> Result<(), UpdateClientError> {
+        if self.by_name.contains_key(&name) {
+            return Err(UpdateClientError::NameTaken);
+        }
+        let info = ClientInfo::with_hashed_vtoken(name.clone(), label, vtoken_hash.clone());
+        self.by_name.insert(name, vtoken_hash.clone());
+        self.by_vtoken.insert(vtoken_hash, info);
+        Ok(())
     }
 
     /// Look up a client by the **hashed** form of its vtoken. HTTP handlers

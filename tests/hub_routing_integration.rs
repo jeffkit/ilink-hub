@@ -563,40 +563,38 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
         reg.get(&code).and_then(|s| s.csrf).unwrap()
     };
 
-    // Replicate the fixed handler: register → confirm under the lock; on
-    // non-Ok, rollback the speculative register (gated on `is_new`).
+    // Replicate the fixed handler: generate vtoken → confirm under the lock; on
+    // Ok, register confirmed client; on registration failure, rollback pairing confirm.
     let try_confirm = |name: String, s: Arc<HubState>| {
         let code = code.clone();
         let csrf = csrf.clone();
         async move {
-            let outcome =
-                ilink_hub::server::pairing::register_client_in_hub(s.as_ref(), name.clone(), None)
-                    .await;
-            let vtoken_plain = outcome.plaintext;
-            let vtoken_hash = outcome.hashed;
-            let is_new = outcome.is_new;
-            let res = {
+            let vtoken_plain = format!("vhub_{}", uuid::Uuid::new_v4().simple());
+            let confirm_res = {
                 let mut reg = s.clients.pairing.write().await;
                 reg.confirm(&code, name.clone(), None, vtoken_plain.clone(), &csrf)
             };
-            if res.is_err() && is_new {
-                // Mirror the handler's rollback call (F-M1-A: only when fresh).
-                let new_default = {
-                    let mut registry = s.clients.registry.write().await;
-                    if registry.remove(&name) {
-                        registry.pick_default_after_remove(&vtoken_hash)
-                    } else {
-                        None
+
+            let res = match confirm_res {
+                Ok(()) => {
+                    match ilink_hub::server::pairing::register_confirmed_client_in_hub(
+                        s.as_ref(),
+                        name.clone(),
+                        None,
+                        vtoken_plain,
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let mut reg = s.clients.pairing.write().await;
+                            reg.remove_confirmed(&code);
+                            Err(e)
+                        }
                     }
-                };
-                {
-                    let mut router = s.routing.router.lock().await;
-                    router.remove_routes_for_vtoken(&vtoken_hash, new_default);
                 }
-                let _ = s.clients.queue.remove_client(&vtoken_hash).await;
-                let _ = s.store.clear_routes_for_vtoken(&vtoken_hash).await;
-                let _ = s.store.delete_client_by_name(&name).await;
-            }
+                Err(e) => Err(e),
+            };
             (name, res)
         }
     };
@@ -1412,4 +1410,101 @@ async fn test_pair_confirm_auth_bypass_lockout_adversarial() {
         client.vtoken, legitimate_vtoken,
         "vtoken must not be overwritten"
     );
+}
+
+#[tokio::test]
+async fn adversarial_pair_confirm_prevent_eviction_of_legitimate_client() {
+    use axum::extract::{ConnectInfo, Path, State};
+    use axum::http::HeaderMap;
+    use ilink_hub::server::pairing::{pair_confirm, PairConfirmRequest};
+    use std::net::SocketAddr;
+
+    // pair_public_url() uses relay URL by default; set ILINKHUB_RELAY=0 so it
+    // resolves to http://127.0.0.1:8765, matching the origin header in this test.
+    std::env::set_var("ILINKHUB_RELAY", "0");
+
+    let state = make_state().await;
+
+    // 1. Setup legit code and scanned state
+    let legit_code = {
+        let mut reg = state.clients.pairing.write().await;
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        code
+    };
+    let legit_csrf = {
+        let reg = state.clients.pairing.read().await;
+        reg.get(&legit_code).and_then(|s| s.csrf).unwrap()
+    };
+
+    // 2. Setup evil code and scanned state
+    let evil_code = {
+        let mut reg = state.clients.pairing.write().await;
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        code
+    };
+
+    let peer: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+    let state_clone1 = Arc::clone(&state);
+    let state_clone2 = Arc::clone(&state);
+
+    let evil_headers_bad = {
+        let mut h = HeaderMap::new();
+        h.insert("x-pair-csrf", "bad_evil_csrf".parse().unwrap());
+        h.insert("origin", "http://127.0.0.1:8765".parse().unwrap());
+        h
+    };
+
+    let legit_headers = {
+        let mut h = HeaderMap::new();
+        h.insert("x-pair-csrf", legit_csrf.parse().unwrap());
+        h.insert("origin", "http://127.0.0.1:8765".parse().unwrap());
+        h
+    };
+
+    let evil_task = tokio::spawn(async move {
+        pair_confirm(
+            State(state_clone1),
+            Path(evil_code),
+            evil_headers_bad,
+            ConnectInfo(peer),
+            Json(PairConfirmRequest {
+                name: "my-client".to_string(),
+                label: None,
+            }),
+        )
+        .await
+    });
+
+    let legit_task = tokio::spawn(async move {
+        pair_confirm(
+            State(state_clone2),
+            Path(legit_code),
+            legit_headers,
+            ConnectInfo(peer),
+            Json(PairConfirmRequest {
+                name: "my-client".to_string(),
+                label: None,
+            }),
+        )
+        .await
+    });
+
+    let (res_evil, res_legit) = tokio::join!(evil_task, legit_task);
+    let (evil_status, _) = res_evil.unwrap();
+    let (legit_status, legit_body) = res_legit.unwrap();
+
+    assert_ne!(evil_status, StatusCode::OK);
+    assert_eq!(legit_status, StatusCode::OK);
+
+    let body_val: serde_json::Value = serde_json::from_value(legit_body.0).unwrap();
+    let legit_vtoken = body_val.get("vtoken").unwrap().as_str().unwrap();
+    assert!(!legit_vtoken.is_empty());
+
+    let registry = state.clients.registry.read().await;
+    let client = registry
+        .get_by_name("my-client")
+        .expect("legit client must survive");
+    assert_eq!(client.vtoken, ilink_hub::hub::hash_vtoken(legit_vtoken));
 }
