@@ -88,10 +88,26 @@
 | 永久限流导致任务挂死 | 任务协程泄漏 | M4 强制放弃上限 + 日志 |
 | 缓冲 `pending` 在 task panic 时丢失 | 极端丢消息 | 退避窗口内 flush 失败时把 `pending` 保留在内存（不跨 panic 边界） |
 
+## M5 实现说明（测试归属）
+
+`tests/e2e_wechat_simulation.rs` 是 **Hub 侧** e2e：`MockUpstream` 模拟微信上游，
+`bridge_send` 用裸 HTTP 模拟 bridge 转发，**并不运行 Bridge dispatcher 的重试循环**。
+本 PR 的限流/退避/放弃逻辑全部位于 Bridge dispatcher 的 `run_partial_forward_loop` /
+`send_final_with_retry`，二者及 `HubClient` 均为 `pub(super)`/私有，外部集成测试 crate
+无法访问。因此按 plan 的 E2E-1「短路条件」与 M5「（或 bridge 单元测试）」约定，
+"mock 上游先返回 N 次 `-2` 再成功" 的场景由 **in-crate dispatcher 单测**覆盖：
+
+- `partial_three_throttles_then_success_delivers_latest_content` — partial 层 3×`-2`→成功，断言最新内容恰好送达一次、顺序保持。
+- `final_reply_throttled_thrice_then_delivered` — 最终回复层 3×`-2`→成功，断言重试后送达。
+- `final_reply_transport_error_propagates` — 非限流错误不无限重试，向上传播。
+- `final_reply_persistent_throttle_gives_up_within_budget` / `partial_persistent_throttle_gives_up_then_serves_new_chunk` — M4 放弃上限。
+- `final_reply_shutdown_during_backoff_returns_promptly` / `partial_shutdown_during_backoff_exits_cleanly` — cancel-safety。
+- `backoff_sequence_matches_spec` / `partial_persistent_throttle_caps_retry_at_max_backoff` — 退避序列与墙钟收敛。
+
 ## 完成定义（Definition of Done）
 
-- [ ] 全部 6 个里程碑标记完成（✅）
-- [ ] E2E-0..E2E-5 全部通过
-- [ ] `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿
-- [ ] 完成标准复述（来自 prompt.md）逐条勾选
+- [x] 全部里程碑标记完成（M0–M4 实现 + M5 单测覆盖 + M6 质量闸）
+- [x] E2E-0..E2E-5 验证项通过（M5 以 in-crate 单测形式覆盖，见上）
+- [x] `cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿（355 lib + 集成套件）
+- [x] 完成标准复述（来自 prompt.md）逐条满足：`-2`→缓冲+退避重试、不丢消息、顺序保持、放弃上限+日志、退避起步 5s ×2 封顶 60s
 - [ ] 在 worktree 内完成开发，待人工 review 后合并
