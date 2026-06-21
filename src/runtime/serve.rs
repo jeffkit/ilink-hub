@@ -239,6 +239,24 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     .await?;
 
     let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
+
+    // P-16: Spawn a lightweight startup probe so a stale/expired token is detected at
+    // boot instead of silently reporting healthy until the first real message arrives.
+    // Non-blocking: failure only logs a warn; the Hub continues starting normally and
+    // the polling loop will surface session errors on its own schedule.
+    {
+        let probe_upstream = upstream.clone();
+        tokio::spawn(async move {
+            match probe_upstream.notify_start().await {
+                Ok(()) => info!("upstream token validated (startup probe ok)"),
+                Err(e) => warn!(
+                    error = %e,
+                    "upstream token probe failed: will retry on first message"
+                ),
+            }
+        });
+    }
+
     let queue = build_queue_backend()?;
     // Load or persist the relay secret BEFORE building HubState. I/O is
     // small (one 32-char file) and synchronous std::fs is acceptable on the
@@ -406,7 +424,7 @@ async fn resolve_token(
                 // Bootstrap: persist the env/CLI token so future restarts load from DB.
                 store.save_credentials(&token, &base).await?;
             }
-            info!("using iLink token without startup session probe");
+            info!("using iLink token; scheduling async upstream probe");
             return Ok((token, base));
         }
         warn!("iLink token malformed");
