@@ -30,15 +30,27 @@
 
 ### Decisions
 
-_待填写_
+- **N-02 类型改造**：`LatencyHistogram.sum_ms: AtomicU64` 改名为 `sum_us: AtomicU64`，`observe()` 参数由 `u64 ms` 改为 `std::time::Duration`。内部 `as_micros()` 写入 `sum_us`，`as_millis() as u64` 仍然用于桶边界——桶布局和 Prometheus `le=` 标签保持不变，只有内部精度提升。plan §M2 提供「保留 sum_ms 或直接废弃」二选一；选直接废弃（删字段，不保留双计数），原因：双字段永远互相推导，徒增原子写次数且容易出现二者漂移；外部唯一读取点 `render_histogram` 是同仓可同步改造的。
+- **调用点改造**：`LatencyGuard::drop` 改为 `self.histogram.observe(self.start.elapsed())`；`src/server/routes.rs` 上游 observe（line 594）改为 `observe(upstream_start.elapsed())`。`HistoGuard` 是 `LatencyGuard` 的 type alias，无需单独改。
+- **Prometheus 渲染**：`render_histogram` 输出 `_sum` 时读 `h.sum_us`，渲染为 `sum_us / 1000`——线协议单位仍是毫秒，存量 Grafana 仪表盘不受影响。`# HELP` 文案与桶循环未动。
+- **新单测**：5 个单元测试覆盖 N-02 契约——`sum_us > 0` 头号不变量、桶边界不变（500μs 仍进 `le=1` 桶）、毫秒级观测仍正确（42 ms → sum_us == 42_000）、渲染侧 `sum_us / 1000` 契约、`LatencyGuard::drop` 真实传 Duration。
 
 ### Problems
 
-_待填写_
+- plan §M2 验证命令第 1 条 `cargo test --lib hub::state` 实际匹配 0 个测试——`state` 是私有 `mod state`（hub/mod.rs:57），其单元测试写在 `src/hub/tests.rs` 的 `mod tests`（即 `hub::tests`）。绕过办法是按测试名过滤：`cargo test --lib latency`，5 个新测试全数命中。review 中已说明，不改 plan 文本。
+- m1 review 报告总测试数 408，本次跑出 439——差额来自 m1 范围之外的两个集成测试 binary（`breaking_changes` 5→20，`regression_http_smoke` 新出现 10），不在本里程碑改动范围，按实记录即可。
 
 ### Outcome
 
-_待填写_
+- ✅ `cargo fmt --check`
+- ✅ `cargo clippy -- -D warnings`
+- ✅ `cargo test`（5 个新增测试 + 全部历史测试绿；lib 363 / metrics_auth 1 / breaking_changes 20 / regression_http_smoke 10 / hub_routing_integration 27 / queue_trait 18 / doc_tests 0+1 ignored；合计 439 passed / 0 failed / 1 ignored）
+- ✅ `cargo build`
+- ✅ `desktop-frontend` `npm run build`
+- ✅ `desktop-tauri` `cargo check`
+- E2E checkpoint: not-ready（plan 已定；Prometheus 线协议单位不变，单测已覆盖契约）
+- Visual Review: not-needed（plan 已定）
+- Reviewer handoff: `docs/exec-plans/active/arch-cleanup-p1/reviews/m2/review-request.yaml`
 
 ---
 

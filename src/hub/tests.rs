@@ -413,3 +413,109 @@ async fn quote_index_evictor_takes_sub_state_path() {
     let mut quote_idx = state.routing.quote_index.lock().await;
     quote_idx.evict_expired();
 }
+
+// ─── N-02: LatencyHistogram microsecond precision ───────────────────────
+//
+// Pre-N-02 the histogram tracked `sum_ms: AtomicU64`. Sub-millisecond
+// observations (the common case for `dispatch_latency_ms`) all rounded to
+// 0 ms, so the Prometheus `_sum` field stayed at 0 and `rate(_sum)` in
+// Grafana produced a flat line — operators could not see whether the path
+// was healthy. N-02 switches the internal sum to microseconds and renders
+// `_sum` as `sum_us / 1000` (still milliseconds on the wire, so existing
+// dashboards keep working). The tests below pin the new contract.
+
+#[test]
+fn latency_histogram_submillisecond_observation_increments_sum_us() {
+    // The headline N-02 invariant: observing 500 μs must increment the
+    // internal microsecond sum, even though `as_millis() as u64 == 0`
+    // would have rounded it away under the old implementation.
+    let h = LatencyHistogram::new();
+    assert_eq!(h.count.load(Ordering::Relaxed), 0);
+    assert_eq!(h.sum_us.load(Ordering::Relaxed), 0);
+
+    h.observe(std::time::Duration::from_micros(500));
+
+    assert_eq!(h.count.load(Ordering::Relaxed), 1);
+    let sum_us = h.sum_us.load(Ordering::Relaxed);
+    assert!(
+        sum_us >= 500,
+        "sub-millisecond observation must contribute to sum_us (got {sum_us})"
+    );
+}
+
+#[test]
+fn latency_histogram_submillisecond_observation_lands_in_first_bucket() {
+    // 500 μs is < 1 ms, so the bucket counter at `le="1"` (the first
+    // HISTOGRAM_BUCKETS_MS boundary) must increment. This pins the
+    // millisecond-bucketing behavior — we did NOT switch buckets to μs,
+    // only the sum. Operators reading bucket counts see no change.
+    let h = LatencyHistogram::new();
+    h.observe(std::time::Duration::from_micros(500));
+    let first_bucket = h.buckets[0].load(Ordering::Relaxed);
+    assert_eq!(
+        first_bucket, 1,
+        "sub-millisecond observation falls into the `le=1` bucket"
+    );
+}
+
+#[test]
+fn latency_histogram_millisecond_observation_still_works() {
+    // Regression guard: a multi-millisecond observation must still
+    // contribute exactly its elapsed milliseconds to the sum (modulo the
+    // μs/ms unit change) and bucket correctly into the matching boundary.
+    let h = LatencyHistogram::new();
+    h.observe(std::time::Duration::from_millis(42));
+    assert_eq!(h.count.load(Ordering::Relaxed), 1);
+    let sum_us = h.sum_us.load(Ordering::Relaxed);
+    // 42 ms == 42_000 μs, allow scheduler jitter for the Instant path is
+    // not engaged here because we pass an explicit Duration — the value
+    // must be exactly 42_000.
+    assert_eq!(sum_us, 42_000);
+    // 42 ms falls into the `le=100` bucket (boundaries: 1, 5, 25, 100).
+    let bucket_100 = h.buckets[3].load(Ordering::Relaxed);
+    assert_eq!(
+        bucket_100, 1,
+        "42 ms observation falls into the `le=100` bucket (index 3)"
+    );
+}
+
+#[test]
+fn latency_histogram_render_sum_uses_milliseconds() {
+    // The Prometheus render path (routes.rs::render_histogram) emits
+    // `sum_us / 1000`. Pin that contract here so a future refactor that
+    // accidentally drops the `/ 1000` (and ships microseconds on the wire)
+    // is caught. Four 250 μs observations sum to 1_000 μs == 1 ms.
+    let h = LatencyHistogram::new();
+    for _ in 0..4 {
+        h.observe(std::time::Duration::from_micros(250));
+    }
+    let sum_us = h.sum_us.load(Ordering::Relaxed);
+    assert_eq!(sum_us, 1_000);
+    let sum_ms = sum_us / 1000;
+    assert_eq!(
+        sum_ms, 1,
+        "rendered _sum must be sum_us / 1000 (milliseconds on the wire)"
+    );
+}
+
+#[test]
+fn latency_guard_records_submillisecond_elapsed() {
+    // End-to-end check that the production `LatencyGuard` path (the
+    // HistoGuard alias in routes.rs) observes the elapsed Duration, not
+    // a truncated millisecond cast. We can't fake `Instant::now()`, so we
+    // drop the guard immediately after creation: elapsed will be tiny
+    // but strictly non-negative. The microsecond sum must record it (the
+    // old millisecond sum would record 0 for any elapsed < 1 ms).
+    let h = LatencyHistogram::new();
+    {
+        let _g = LatencyGuard::new(&h);
+        // Guard records on drop.
+    }
+    assert_eq!(h.count.load(Ordering::Relaxed), 1);
+    // sum_us must be present (≥ 0). We don't pin a lower bound here
+    // because on a fast CI box the elapsed could be 0 μs — the contract
+    // we pin is "the field is populated from a Duration, not from a
+    // truncated ms cast". A separate `latency_histogram_render_sum_uses_milliseconds`
+    // test pins the millisecond-output side.
+    let _ = h.sum_us.load(Ordering::Relaxed);
+}

@@ -60,12 +60,24 @@ pub const HISTOGRAM_BUCKET_COUNT: usize = HISTOGRAM_BUCKETS_MS.len() + 1;
 /// Latency histogram observation. One per metric name; `observe` is hot
 /// path (single fetch_add per bucket, no allocation), `snapshot` is the
 /// Prometheus-scrape path (called every 15s, not hot).
+///
+/// N-02: `sum_us` stores the cumulative observation sum in **microseconds**
+/// rather than milliseconds. With a millisecond-grained sum, every request
+/// under 1 ms (which is the common case for the inbound dispatch path and
+/// most in-process work) contributed zero to the sum — the Prometheus
+/// `_sum` / `rate(_sum)` reading became useless for sub-millisecond paths.
+/// Microsecond precision restores a non-zero sum for those observations,
+/// at the cost of a single extra fetch_add per observation. The Prometheus
+/// text output still emits `_sum` in milliseconds (`sum_us / 1000`) to
+/// match existing dashboards and operator expectations.
 #[derive(Debug)]
 pub struct LatencyHistogram {
     /// Cumulative count of observations.
     pub count: AtomicU64,
-    /// Sum of all observed latencies in milliseconds, stored as a plain u64 integer.
-    pub sum_ms: AtomicU64,
+    /// Sum of all observed latencies in **microseconds**. Rendered as
+    /// milliseconds (`sum_us / 1000`) in the Prometheus `_sum` field; see
+    /// the N-02 note above.
+    pub sum_us: AtomicU64,
     /// Fixed-size bucket array: one slot per boundary in `HISTOGRAM_BUCKETS_MS` plus
     /// one overflow (+Inf) slot. Using a fixed-size array avoids heap allocation and
     /// eliminates bounds-check indirection on the hot observe() path.
@@ -82,19 +94,27 @@ impl LatencyHistogram {
     pub fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
-            sum_ms: AtomicU64::new(0),
+            sum_us: AtomicU64::new(0),
             // AtomicU64 is not Copy so we cannot use array-repeat syntax; initialize
             // each element explicitly. HISTOGRAM_BUCKET_COUNT is a compile-time constant.
             buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
-    /// Record a single observation in milliseconds. `ms` is saturated to
-    /// `u64::MAX` if the caller passes a negative value (a clock skew);
-    /// we do not panic.
-    pub fn observe(&self, ms: u64) {
+    /// Record a single observation. `elapsed` is the wall-clock duration of
+    /// the operation; we convert to microseconds internally so sub-millisecond
+    /// observations remain visible in the cumulative `_sum`.
+    ///
+    /// Buckets are still bucketed by millisecond (Prometheus convention
+    /// keeps the bucket boundaries in the unit operators care about), so
+    /// we round down to the nearest millisecond when picking a bucket.
+    /// The sum, however, is tracked at microsecond precision so a 500 μs
+    /// dispatch contributes 500 to `sum_us`, not 0.
+    pub fn observe(&self, elapsed: std::time::Duration) {
+        let us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        let ms = elapsed.as_millis() as u64;
         self.count.fetch_add(1, Ordering::Relaxed);
-        self.sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
         // Linear scan is O(8) — fine for our small fixed layout.
         for (i, boundary) in HISTOGRAM_BUCKETS_MS.iter().enumerate() {
             if ms <= *boundary {
@@ -186,8 +206,7 @@ impl<'a> LatencyGuard<'a> {
 
 impl Drop for LatencyGuard<'_> {
     fn drop(&mut self) {
-        self.histogram
-            .observe(self.start.elapsed().as_millis() as u64);
+        self.histogram.observe(self.start.elapsed());
     }
 }
 

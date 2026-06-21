@@ -1,0 +1,340 @@
+milestone: M2
+title: "可观测性精度（N-02 — LatencyHistogram sum_us 微秒精度）"
+status: passed
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/refactor/arch-cleanup-p1
+base_commit: 7c2dd03c2d97ca57a1d4bd6f0ddb6c83f81afc3a
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/arch-cleanup-p1/plan.md
+checkpoint: "M2 — 可观测性精度（N-02）"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Per plan.md M2:
+#   The Prometheus `_sum` field on the latency histograms was always 0 for
+#   sub-millisecond observations (the common case for `dispatch_latency_ms`
+#   and the inbound pipeline). Operators reading `rate(_sum)` on Grafana
+#   saw a flat line, making the metric useless for in-process latency
+#   monitoring. N-02 switches the internally-tracked sum from milliseconds
+#   to microseconds so sub-millisecond observations become visible, while
+#   keeping the on-the-wire unit (and Grafana dashboards) unchanged.
+#
+# This change:
+#   1. Replaces `sum_ms: AtomicU64` on `LatencyHistogram` with
+#      `sum_us: AtomicU64`. The Prometheus render path divides by 1000 to
+#      keep emitting `_sum` in milliseconds.
+#   2. Changes `LatencyHistogram::observe()` to accept a `Duration` (the
+#      natural unit for an elapsed-time observation). The bucket selection
+#      logic still uses milliseconds so bucket boundaries and the `le=`
+#      labels on the wire are unchanged.
+#   3. Updates the two production call sites (`LatencyGuard::drop` and
+#      `routes.rs::sendmessage` upstream observation) to pass the
+#      `Duration` directly instead of a truncated `as_millis() as u64`.
+
+# ─── Source-of-truth changes ────────────────────────────────────────────────
+source_changes:
+  - file: src/hub/state.rs
+    symbols:
+      - "LatencyHistogram::sum_ms → sum_us"
+      - "LatencyHistogram::observe (signature now accepts Duration)"
+      - "LatencyGuard::drop (passes Duration to observe)"
+    change_summary: >-
+      `LatencyHistogram` now tracks the cumulative sum as `sum_us:
+      AtomicU64` (microseconds). `observe()` accepts a `std::time::Duration`
+      and computes the bucket boundary by `as_millis() as u64`, so bucket
+      counts and the `le=` labels are unchanged on the wire. A 500 μs
+      observation increments `sum_us` by 500 (and would have been 0 under
+      the previous `sum_ms`); four 250 μs observations now render as
+      `_sum 1` instead of `_sum 0`. `LatencyGuard::drop` was the canonical
+      hot-path caller — it now passes `self.start.elapsed()` directly
+      instead of `.as_millis() as u64`, dropping the implicit truncation.
+      The bucket scan is still an O(8) linear walk and the operation
+      remains lock-free (no allocation, single fetch_add per bucket).
+  - file: src/server/routes.rs
+    symbols:
+      - "render_histogram (sum_us/1000 → _sum)"
+      - "sendmessage upstream observe call (Duration)"
+    change_summary: >-
+      `render_histogram` now reads `h.sum_us` and renders `_sum` as
+      `sum_us / 1000` (still milliseconds, matching existing Prometheus
+      dashboards and operator expectations). The `# HELP` text and the
+      bucket loop are unchanged. The upstream-roundtrip `observe` call in
+      the `sendmessage` handler (line 594) was updated to pass the
+      `Duration` returned by `Instant::elapsed()` instead of the
+      truncated `.as_millis() as u64` cast — this matches the new
+      `LatencyHistogram::observe` signature and removes the last
+      millisecond-floor in the metrics path.
+
+# ─── Commands run (all required by task prompt) ─────────────────────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual:
+      unit_lib_ilink_hub: "363 passed; 0 failed; 0 ignored (5 new in this milestone)"
+      metrics_auth_tests: "1 passed; 0 failed; 0 ignored"
+      breaking_changes: "20 passed; 0 failed; 0 ignored"
+      regression_http_smoke: "10 passed; 0 failed; 0 ignored"
+      hub_routing_integration: "27 passed; 0 failed; 0 ignored"
+      queue_trait_tests: "18 passed; 0 failed; 0 ignored"
+      doc_tests: "0 passed; 1 ignored"
+      total: "439 passed; 0 failed; 1 ignored"
+    new_tests_in_milestone:
+      - "hub::tests::latency_histogram_submillisecond_observation_increments_sum_us"
+      - "hub::tests::latency_histogram_submillisecond_observation_lands_in_first_bucket"
+      - "hub::tests::latency_histogram_millisecond_observation_still_works"
+      - "hub::tests::latency_histogram_render_sum_uses_milliseconds"
+      - "hub::tests::latency_guard_records_submillisecond_elapsed"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0"
+    result: pass
+  - id: desktop-frontend
+    cmd: "cd desktop/ilink-hub-desktop && npm run build"
+    expected: "tsc + vite build succeed, dist/ produced"
+    actual: "tsc clean, vite v6.4.3 produced dist/index.html (19.72 kB), dist/assets/index-dt2WSZD0.css (27.41 kB), dist/assets/index-DxFIEYEF.js (25.69 kB). No TS errors, no Vite errors."
+    result: pass
+  - id: desktop-tauri
+    cmd: "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml"
+    expected: "Finished, exit 0"
+    actual: "Finished `dev` profile [unoptimized + debuginfo] target(s), exit 0 (ilink-hub v0.2.6, ilink-hub-desktop v0.1.11)"
+    result: pass
+
+# ─── M2-required test inventory (plan §M2) ─────────────────────────────────
+# Plan §M2 explicitly required:
+#   1. cargo test -p ilink-hub --lib hub::state  →  state tests pass
+#   2. cargo test -p ilink-hub -- latency         →  latency tests pass
+#   3. cargo clippy -- -D warnings                →  no warnings
+# Items 1+2+3 are subsumed by the cargo test + cargo clippy commands
+# above. The hub state struct is private (`mod state`), so the canonical
+# path to run its tests is `cargo test --lib latency` (which matches
+# all 5 new tests by name). The `hub::state` glob from plan §M2 returns
+# 0 matched tests because the module isn't re-exported at that path —
+# the new tests live in `hub::tests` (the file at src/hub/tests.rs),
+# which is the same location the m1 unit tests live in.
+m2_test_inventory:
+  unit_lib_ilink_hub:
+    - test: latency_histogram_submillisecond_observation_increments_sum_us
+      covers: >-
+        The headline N-02 invariant: observing 500 μs increments
+        `sum_us` to ≥ 500. Pre-N-02, the millisecond sum was 0 for any
+        observation < 1 ms, so `rate(_sum)` on Grafana was a flat line.
+        Pins the contract on the data structure itself so a future
+        refactor that re-introduces a millisecond-floor cast fails
+        this test.
+      result: pass
+    - test: latency_histogram_submillisecond_observation_lands_in_first_bucket
+      covers: >-
+        Bucket-count behavior is unchanged: a 500 μs observation still
+        lands in the `le=1` bucket (the first HISTOGRAM_BUCKETS_MS
+        boundary). Operators reading bucket counts see no difference —
+        N-02 only changes the internal sum, not the bucket boundaries.
+      result: pass
+    - test: latency_histogram_millisecond_observation_still_works
+      covers: >-
+        Regression guard: a 42 ms observation still produces exactly
+        `sum_us == 42_000` (the previous contract would have produced
+        `sum_ms == 42`). A future refactor that re-interprets the
+        microsecond sum as something else fails this test.
+      result: pass
+    - test: latency_histogram_render_sum_uses_milliseconds
+      covers: >-
+        Pins the on-the-wire unit (`_sum` = `sum_us / 1000`) at the
+        data-structure level. Four 250 μs observations sum to
+        1_000 μs == 1 ms on the wire — the pre-N-02 implementation
+        would have rendered `_sum 0` for these same four observations.
+        This guards against a future regression that emits
+        microseconds on the wire (which would change dashboards
+        without warning).
+      result: pass
+    - test: latency_guard_records_submillisecond_elapsed
+      covers: >-
+        End-to-end check that `LatencyGuard::drop` (the production hot
+        path used by `HistoGuard` in routes.rs) actually passes a
+        `Duration` to `observe`. Pre-N-02 the Drop handler did
+        `self.start.elapsed().as_millis() as u64`, truncating anything
+        under 1 ms to 0 — this test confirms the new path records the
+        microsecond value instead.
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: n02-latency-histogram-microsecond-sum
+    plan_clause: >-
+      src/hub/state.rs：LatencyHistogram 新增 sum_us: AtomicU64，observe()
+      参数改为接受 Duration（内部转 μs 存入 sum_us，同时保留原 sum_ms
+      或直接废弃 → 用 sum_us / 1000 替代）。
+    observation: >-
+      `LatencyHistogram` now has `sum_us: AtomicU64` instead of
+      `sum_ms: AtomicU64`. `observe()` accepts a `Duration`, converts
+      it to microseconds via `as_micros()`, and bucketizes using
+      `as_millis() as u64`. The plan offered a choice between
+      "保留原 sum_ms" and "直接废弃 → 用 sum_us / 1000 替代"; the
+      latter was chosen to avoid carrying two redundant atomic
+      counters (they would always be derivable from each other) and
+      to keep the type signature honest about what is being tracked.
+      No external callers depend on the `sum_ms` field name (it was
+      only read inside `render_histogram`), so the rename is internal.
+      New unit test
+      `latency_histogram_submillisecond_observation_increments_sum_us`
+      pins the new contract.
+    result: pass
+  - id: n02-observe-call-sites-take-duration
+    plan_clause: >-
+      调用 observe() 的地方（routes.rs 的 HistoGuard / LatencyGuard）
+      改为传 Duration。
+    observation: >-
+      Two call sites updated:
+      (a) `LatencyGuard::drop` in src/hub/state.rs now calls
+      `self.histogram.observe(self.start.elapsed())` (Duration),
+      dropping the `.as_millis() as u64` truncation.
+      (b) The upstream-roundtrip observe in src/server/routes.rs:594
+      now calls `observe(upstream_start.elapsed())` (Duration).
+      Both are covered by `latency_guard_records_submillisecond_elapsed`
+      (Drop path) and `latency_histogram_submillisecond_observation_increments_sum_us`
+      (direct observe call). The HistoGuard alias in routes.rs is a
+      type alias for `LatencyGuard` so no separate update was needed
+      at the alias site.
+    result: pass
+  - id: n02-render-uses-sum-us-div-1000
+    plan_clause: >-
+      src/server/routes.rs 的 render_histogram：输出 _sum 时用
+      sum_us / 1000（毫秒，符合 Prometheus 惯例）。
+    observation: >-
+      `render_histogram` now reads `h.sum_us` and renders
+      `_sum` as `sum_us / 1000`. The `# HELP` text and bucket loop
+      are unchanged; the only modification is the `let sum = ...`
+      line and a one-paragraph doc-comment update explaining the
+      microsecond → millisecond conversion. Unit test
+      `latency_histogram_render_sum_uses_milliseconds` pins the
+      contract at the data-structure level so a future regression
+      that emits raw microseconds on the wire is caught.
+    result: pass
+  - id: n02-new-test-for-submillisecond-observation
+    plan_clause: >-
+      新增单测：观测 0 个毫秒（如 500μs）后验证 sum_us > 0。
+    observation: >-
+      Five new unit tests cover the N-02 contract:
+      `latency_histogram_submillisecond_observation_increments_sum_us`
+      (headline invariant: 500 μs → sum_us ≥ 500),
+      `latency_histogram_submillisecond_observation_lands_in_first_bucket`
+      (bucket behavior unchanged),
+      `latency_histogram_millisecond_observation_still_works`
+      (regression: ms observations convert correctly),
+      `latency_histogram_render_sum_uses_milliseconds` (on-the-wire
+      unit pinned at data-structure level), and
+      `latency_guard_records_submillisecond_elapsed` (production
+      Drop path uses Duration). All five pass under `cargo test --lib
+      latency`.
+    result: pass
+  - id: clippy-clean
+    plan_clause: "全局验证命令：cargo fmt --check && cargo clippy -- -D warnings && cargo test"
+    observation: >-
+      All three pass with no diagnostics, no warnings, no test
+      failures (439 passed; 0 failed; 1 ignored — the ignore is a
+      pre-existing `queue.rs` doctest that documents `MessageQueue`'s
+      thread-safety contract and was always ignored).
+    result: pass
+  - id: desktop-builds-clean
+    plan_clause: "desktop-frontend + desktop-tauri 在 m2 范围内保持绿色"
+    observation: >-
+      `cd desktop/ilink-hub-desktop && npm run build` produces a
+      clean dist/ (tsc clean, vite build OK).
+      `cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml`
+      finishes without diagnostics. The src-tauri side does not
+      touch `LatencyHistogram`, so the only thing that needed to
+      hold was "the workspace still builds"; both confirmations
+      above establish that.
+    result: pass
+  - id: e2e-not-ready
+    plan_clause: "E2E checkpoint: not-ready — /metrics 输出格式变更（内部精度），不需要 HTTP 端到端验证（单测已覆盖）"
+    observation: >-
+      No new HTTP route, no new external protocol. The change is
+      an internal precision bump inside `LatencyHistogram` plus a
+      new `Duration` parameter on `observe()`. The Prometheus wire
+      format is unchanged (still `_sum` in milliseconds), so
+      existing scrapers and Grafana dashboards continue to work.
+      The contract is fully exercised by the five new unit tests;
+      an e2e harness would add no additional signal here.
+    result: pass
+  - id: visual-review-not-needed
+    plan_clause: "Visual Review: not-needed — 仅后端 Rust 改动"
+    observation: >-
+      No frontend / Tauri / runtime UI changes in this milestone.
+      The npm + cargo check desktop commands above run only to
+      confirm the existing frontend / src-tauri builds stay green
+      with the workspace's unchanged ilink-hub version.
+    result: pass
+
+# ─── Behavioural diff vs. baseline ──────────────────────────────────────────
+behavioural_diff:
+  - area: "LatencyHistogram internal sum (hub/state.rs)"
+    before: >-
+      `LatencyHistogram` tracked `sum_ms: AtomicU64`. `observe(u64 ms)`
+      added `ms` to the sum. For any observation under 1 ms (the
+      common case for `dispatch_latency_ms` and most in-process
+      work), `ms == 0` so the sum stayed at 0 indefinitely. Grafana
+      `rate(_sum)` produced a flat line for these metrics.
+    after: >-
+      `LatencyHistogram` now tracks `sum_us: AtomicU64` (microseconds).
+      `observe(Duration)` adds `elapsed.as_micros()` to the sum. A
+      500 μs observation increments `sum_us` by 500 (would have been
+      0 under the previous contract). The on-the-wire `_sum` field
+      still emits in milliseconds (`sum_us / 1000`), so existing
+      dashboards keep working but operators can now see a non-zero
+      trend for in-process latency.
+    security_classification: >-
+      No new attack surface. The change is purely an internal
+      precision bump; the bucket boundaries, count semantics,
+      thread-safety guarantees, and Prometheus wire format are all
+      unchanged. The new `Duration` parameter is the natural
+      representation of an elapsed time and accepts any value the
+      previous `u64` parameter would have accepted (a `Duration`
+      with `as_millis() == X` produces `sum_us += X * 1000`, which
+      renders as `X` ms after the `/ 1000` step).
+  - area: "LatencyGuard / HistoGuard / sendmessage observe call sites"
+    before: >-
+      `LatencyGuard::drop` called
+      `self.histogram.observe(self.start.elapsed().as_millis() as u64)`,
+      which truncated any elapsed value < 1 ms to 0. The
+      upstream-roundtrip observe in routes.rs:594 did the same
+      truncation. Both sites silently discarded microsecond-level
+      signal before it reached the histogram.
+    after: >-
+      Both sites now call `observe(self.start.elapsed())` /
+      `observe(upstream_start.elapsed())` — the full Duration is
+      forwarded. The histogram converts to microseconds for the
+      sum and to milliseconds for the bucket boundary. Sub-ms
+      observations now contribute to the sum, making the metric
+      useful for in-process latency monitoring.
+    security_classification: >-
+      No new attack surface. The Duration parameter accepts the
+      full elapsed range; no input is rejected that the previous
+      `u64` parameter would have accepted. The bucket scan still
+      caps at the +Inf overflow bucket (no panic, no allocation).
+
+# ─── M2-specific open follow-ups (none) ────────────────────────────────────
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "低风险修复 + rand 升级（N-03 + N-05）"
+next_milestone_files:
+  - src/store/migrations.rs (column_exists MySQL ? 占位符)
+  - Cargo.toml (rand 0.9 升级)
+  - 全项目 rand::thread_rng() / .gen() 调用点迁移

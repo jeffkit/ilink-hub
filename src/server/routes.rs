@@ -617,7 +617,7 @@ pub async fn sendmessage(
     state
         .metrics
         .sendmessage_upstream_latency_ms
-        .observe(upstream_start.elapsed().as_millis() as u64);
+        .observe(upstream_start.elapsed());
 
     match result {
         Ok(resp) => Json(resp),
@@ -1365,7 +1365,9 @@ type HistoGuard<'a> = crate::hub::LatencyGuard<'a>;
 /// Emits:
 /// - `<name>_bucket{le="N"} <cumulative_count>` for each boundary + `+Inf`
 /// - `<name>_count` total observations
-/// - `<name>_sum` total observed milliseconds
+/// - `<name>_sum` total observed **milliseconds** (rounded down from the
+///   internally-tracked microsecond sum; see N-02 note on
+///   `LatencyHistogram::sum_us`)
 /// - `<name>_created` process start timestamp (OpenMetrics convention)
 fn render_histogram(
     out: &mut String,
@@ -1390,8 +1392,14 @@ fn render_histogram(
     out.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {cumulative}\n"));
     let total = h.count.load(Ordering::Relaxed);
     out.push_str(&format!("{name}_count {total}\n"));
-    let sum = h.sum_ms.load(Ordering::Relaxed);
-    out.push_str(&format!("{name}_sum {sum}\n"));
+    // sum_us / 1000 keeps the on-the-wire unit (milliseconds) stable for
+    // existing Prometheus dashboards while preserving sub-millisecond
+    // resolution internally. Sub-millisecond observations now contribute a
+    // positive amount after enough observations accumulate (e.g. four
+    // 250 μs dispatches contribute 1 to the displayed sum).
+    let sum_us = h.sum_us.load(Ordering::Relaxed);
+    let sum_ms = sum_us / 1000;
+    out.push_str(&format!("{name}_sum {sum_ms}\n"));
     out.push_str(&format!("{name}_created {created}\n"));
 }
 
