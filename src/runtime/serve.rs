@@ -430,13 +430,24 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
     match store.list_clients().await {
         Ok(clients) => {
             let count = clients.len();
-            let mut registry = state.clients.registry.write().await;
-            for c in clients {
-                registry.register_with_vtoken(
-                    c.name.clone(),
-                    c.label.clone(),
-                    Some(c.vtoken.clone()),
-                );
+            // Capture the first client's vtoken to use as the startup default.
+            // This ensures that after a restart with no routing_state rows, inbound
+            // messages still go to a single deterministic client rather than broadcasting
+            // to all registered backends.
+            let first_vtoken = clients.first().map(|c| c.vtoken.clone());
+            {
+                let mut registry = state.clients.registry.write().await;
+                for c in &clients {
+                    registry.register_with_vtoken(
+                        c.name.clone(),
+                        c.label.clone(),
+                        Some(c.vtoken.clone()),
+                    );
+                }
+            }
+            if let Some(vtoken) = first_vtoken {
+                let mut router = state.routing.router.lock().await;
+                router.set_default(vtoken);
             }
             info!(count, "loaded clients from database");
         }
