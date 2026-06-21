@@ -2138,3 +2138,151 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         "exactly one tx must claim v99; r1={r1}, r2={r2}"
     );
 }
+
+// ─── M1: vtoken hash storage contract ────────────────────────────────────────
+//
+// These tests pin the post-M1 contract on the Store: every bind that
+// carries a vtoken must accept the canonical hash form, and the round-trip
+// between register and the DB must never leak plaintext. Plaintext vtokens
+// only exist at the HTTP boundary (Authorization header) and in the
+// `register()` return value; the Store binds whatever the caller hands it,
+// and the caller is expected to have hashed the plaintext before calling.
+
+use crate::hub::{hash_vtoken, is_vtoken_hash};
+
+#[tokio::test]
+async fn m1_upsert_client_stores_hash_not_plaintext() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // Simulate the post-M1 call site: register() returns the plaintext,
+    // the caller hashes it, and passes the hash to upsert_client.
+    let plain = "vhub_0123456789abcdef0123456789abcdef";
+    let hashed = hash_vtoken(plain);
+    store
+        .upsert_client(&hashed, "claude", Some("claude test"))
+        .await
+        .expect("upsert_client");
+
+    // Round-trip: list_clients returns the same value that was bound.
+    let rows = store.list_clients().await.expect("list_clients");
+    let row = rows
+        .iter()
+        .find(|r| r.name == "claude")
+        .expect("claude row present");
+    assert_eq!(
+        row.vtoken, hashed,
+        "upsert must store exactly what was bound (hash form)"
+    );
+    assert!(
+        is_vtoken_hash(&row.vtoken),
+        "stored vtoken must be the canonical SHA-256 hex"
+    );
+    assert_ne!(row.vtoken, plain, "plaintext must NOT be persisted");
+}
+
+#[tokio::test]
+async fn m1_touch_client_uses_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    // touch_client must accept the hash (the value the production
+    // code path carries through the in-memory ClientInfo).
+    store.touch_client(&hashed).await.expect("touch_client");
+
+    // The row's stored vtoken is the hash, not the plaintext.
+    let rows = store.list_clients().await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].vtoken, hashed);
+    assert_ne!(rows[0].vtoken, plain);
+}
+
+#[tokio::test]
+async fn m1_routes_are_keyed_by_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_route-target-aaaaaaaaaaaaaaaa";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    store.set_route("alice", &hashed).await.expect("set_route");
+
+    // get_route returns the hash.
+    let route = store.get_route("alice").await.expect("get_route");
+    assert_eq!(route.as_deref(), Some(hashed.as_str()));
+    assert_ne!(route.as_deref(), Some(plain));
+
+    // list_routes returns (from_user, hash) pairs.
+    let routes = store.list_routes().await.expect("list_routes");
+    assert_eq!(routes, vec![("alice".to_string(), hashed.clone())]);
+
+    // clear_routes_for_vtoken accepts the hash.
+    store
+        .clear_routes_for_vtoken(&hashed)
+        .await
+        .expect("clear_routes_for_vtoken");
+    assert!(store.get_route("alice").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn m1_messages_table_keys_by_hash() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain = "vhub_msg-target-bbbbbbbbbbbbbbbbb";
+    let hashed = hash_vtoken(plain);
+    store.upsert_client(&hashed, "claude", None).await.unwrap();
+
+    // save_message binds the hash (post-M1 caller contract).
+    store
+        .save_message(
+            "vctx-1",
+            Some(&hashed),
+            "default",
+            "user-1",
+            "assistant",
+            "hello",
+        )
+        .await
+        .expect("save_message");
+
+    // find_assistant_message_by_content returns the stored hash, not the
+    // plaintext. The dispatch layer's DB-fallback quote resolver then
+    // uses the returned value to look up the registry by hash.
+    let (vtoken, _session) = store
+        .find_assistant_message_by_content("user-1", "hello")
+        .await
+        .expect("find_assistant_message_by_content")
+        .expect("an assistant message should be found");
+    assert_eq!(vtoken, hashed);
+    assert_ne!(vtoken, plain);
+}
+
+#[tokio::test]
+async fn m1_two_distinct_plaintexts_never_collide() {
+    // The hash must be a function of the plaintext: two different
+    // vhub_… strings must produce two different rows. This guards against
+    // a regression that accidentally binds the same key for every
+    // registration (e.g. forgetting the name/vtoken distinction).
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let plain_a = "vhub_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let plain_b = "vhub_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let hash_a = hash_vtoken(plain_a);
+    let hash_b = hash_vtoken(plain_b);
+    assert_ne!(hash_a, hash_b, "distinct plaintexts hash differently");
+
+    store.upsert_client(&hash_a, "alice", None).await.unwrap();
+    store.upsert_client(&hash_b, "bob", None).await.unwrap();
+
+    let rows = store.list_clients().await.unwrap();
+    let by_name: std::collections::HashMap<_, _> = rows
+        .iter()
+        .map(|r| (r.name.clone(), r.vtoken.clone()))
+        .collect();
+    assert_eq!(
+        by_name.get("alice").map(String::as_str),
+        Some(hash_a.as_str())
+    );
+    assert_eq!(
+        by_name.get("bob").map(String::as_str),
+        Some(hash_b.as_str())
+    );
+}

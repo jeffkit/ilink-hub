@@ -1,14 +1,26 @@
 //! Client registry — tracks registered backend clients and their virtual tokens.
+//!
+//! Post-M1: `ClientInfo::vtoken` and the `by_vtoken` map key are the
+//! SHA-256 hex of the plaintext vtoken issued at registration. The plaintext
+//! is returned to the bridge exactly once (via [`ClientRegistry::register`])
+//! and is not retained anywhere — DB, registry, queue keys, and last-seen
+//! DashMap all use the hash form. Callers that have the plaintext (HTTP
+//! bearer credentials from the bridge) must hash it before invoking
+//! `get_by_vtoken` / `mark_online` / `mark_offline`.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
 use uuid::Uuid;
 
+use super::hash_vtoken;
+
 #[derive(Debug, Clone)]
 pub struct ClientInfo {
     /// Stable name chosen by the client (e.g. "mac-workspace", "server")
     pub name: String,
-    /// Virtual token issued by the Hub; client uses this as its `bot_token`
+    /// SHA-256 hex of the plaintext virtual token issued at registration.
+    /// The plaintext is returned to the caller by `register` exactly once
+    /// and is not stored in this struct.
     pub vtoken: String,
     /// Human-readable label shown in `/list`
     pub label: Option<String>,
@@ -18,10 +30,22 @@ pub struct ClientInfo {
 }
 
 impl ClientInfo {
+    /// Build a `ClientInfo` for a freshly-issued plaintext vtoken. The
+    /// `vtoken` field is hashed before being stored; the plaintext is
+    /// dropped.
     pub fn new(name: String, label: Option<String>) -> Self {
+        let plain = format!("vhub_{}", Uuid::new_v4().simple());
+        Self::with_hashed_vtoken(name, label, hash_vtoken(&plain))
+    }
+
+    /// Build a `ClientInfo` whose `vtoken` field is already the canonical
+    /// hash. Used by the startup loader (`load_clients_from_db`) which
+    /// reads hash values directly from the `clients` table and must NOT
+    /// re-hash them.
+    fn with_hashed_vtoken(name: String, label: Option<String>, vtoken_hash: String) -> Self {
         Self {
             name,
-            vtoken: format!("vhub_{}", Uuid::new_v4().simple()),
+            vtoken: vtoken_hash,
             label,
             registered_at: SystemTime::now(),
             online: false,
@@ -37,9 +61,9 @@ pub enum UpdateClientError {
 
 #[derive(Debug)]
 pub struct ClientRegistry {
-    /// vtoken → ClientInfo
+    /// hashed vtoken → ClientInfo
     by_vtoken: HashMap<String, ClientInfo>,
-    /// name → vtoken
+    /// name → hashed vtoken
     by_name: HashMap<String, String>,
 }
 
@@ -51,21 +75,55 @@ impl ClientRegistry {
         }
     }
 
-    /// Register a new client, returning its virtual token.
-    /// If a client with the same name already exists, its vtoken is reused.
-    /// Returns `(vtoken, is_new)`. `is_new = true` only when this call inserted
-    /// a fresh row; if the name was already registered, the existing entry is
-    /// preserved and `is_new = false`. Callers that need to roll back a
-    /// speculative register MUST honour `is_new`: rolling back a reused
-    /// entry evicts the legitimate client (F-M1-A).
-    pub fn register(&mut self, name: String, label: Option<String>) -> (String, bool) {
-        self.register_with_vtoken(name, label, None)
+    /// Register a new client.
+    /// If a client with the same name already exists, its existing entry
+    /// is updated (label / online) and the existing hash is returned; the
+    /// plaintext is the empty string since the original plaintext is
+    /// unknown to the registry.
+    /// If the name is new, a fresh plaintext is generated, hashed, and
+    /// stored. The returned tuple is `(plaintext, hashed, is_new)`:
+    /// - `plaintext` is the bearer credential the bridge should use. It
+    ///   is only set on the fresh-registration path; on the existing-name
+    ///   path it is `""` because the original plaintext was returned in a
+    ///   previous call and the registry never retains it.
+    /// - `hashed` is the SHA-256 hex stored in `by_vtoken` / `ClientInfo`.
+    ///   Callers that need to write to the store should use this value
+    ///   (the store binds the hash, never the plaintext).
+    /// - `is_new` is `true` only when this call inserted a fresh row. If
+    ///   the name was already registered, the existing entry is preserved
+    ///   and `is_new = false`. Callers that need to roll back a
+    ///   speculative register MUST honour `is_new`: rolling back a reused
+    ///   entry evicts the legitimate client (F-M1-A).
+    pub fn register(&mut self, name: String, label: Option<String>) -> (String, String, bool) {
+        if let Some(existing_hash) = self.by_name.get(&name).cloned() {
+            if let Some(info) = self.by_vtoken.get_mut(&existing_hash) {
+                if label.is_some() {
+                    info.label = label;
+                }
+                info.online = true;
+            }
+            return (String::new(), existing_hash, false);
+        }
+        let plain = format!("vhub_{}", Uuid::new_v4().simple());
+        let hashed = hash_vtoken(&plain);
+        let info = ClientInfo::with_hashed_vtoken(name.clone(), label, hashed.clone());
+        self.by_name.insert(name, hashed.clone());
+        self.by_vtoken.insert(hashed.clone(), info);
+        (plain, hashed, true)
     }
 
     /// Register a client with a specific vtoken (used when loading from DB on startup).
-    /// If name already exists, the existing entry is updated; vtoken argument is ignored.
-    /// If name is new and vtoken is provided, that vtoken is used; otherwise a fresh one is generated.
-    /// Returns `(vtoken, is_new)` — see `register` for the `is_new` contract.
+    /// If name already exists, the existing entry is updated; the supplied
+    /// vtoken is ignored in that case.
+    /// If name is new and vtoken is provided, that vtoken is treated as the
+    /// canonical hash (the DB has already hashed plaintexts at write time)
+    /// and stored verbatim — no second hash pass.
+    /// If name is new and vtoken is None, a fresh plaintext is generated,
+    /// hashed, and stored (the returned value is the plaintext, identical
+    /// to `register`).
+    /// Returns `(stored_vtoken, is_new)`. The string is the plaintext when
+    /// freshly generated, and the hash when supplied (load path) or when
+    /// the name was already registered.
     pub fn register_with_vtoken(
         &mut self,
         name: String,
@@ -83,16 +141,29 @@ impl ClientRegistry {
             return (existing_vtoken, false);
         }
 
-        let mut info = ClientInfo::new(name.clone(), label);
-        if let Some(vt) = vtoken {
-            info.vtoken = vt;
-        }
-        let vtoken = info.vtoken.clone();
-        self.by_name.insert(name, vtoken.clone());
-        self.by_vtoken.insert(vtoken.clone(), info);
-        (vtoken, true)
+        let info = match vtoken {
+            Some(hashed) => {
+                // Caller is the load path or a re-registration; the value is
+                // already the canonical hash.
+                ClientInfo::with_hashed_vtoken(name.clone(), label, hashed)
+            }
+            None => {
+                // Fresh registration: generate plaintext, hash, store.
+                ClientInfo::new(name.clone(), label)
+            }
+        };
+        let stored = info.vtoken.clone();
+        self.by_name.insert(name, stored.clone());
+        self.by_vtoken.insert(stored.clone(), info);
+        // Match the original semantics: is_new is true when we just
+        // inserted, false only when the name was already present. The
+        // caller never branches on the returned string.
+        (stored, true)
     }
 
+    /// Look up a client by the **hashed** form of its vtoken. HTTP handlers
+    /// that receive the plaintext bearer credential must hash it before
+    /// calling this.
     pub fn get_by_vtoken(&self, vtoken: &str) -> Option<&ClientInfo> {
         self.by_vtoken.get(vtoken)
     }
@@ -101,9 +172,9 @@ impl ClientRegistry {
         self.by_name.get(name).and_then(|vt| self.by_vtoken.get(vt))
     }
 
-    /// Mark a client as online (called on registration or first getupdates contact).
-    /// The precise last-seen timestamp is tracked separately in `ClientState::last_seen`
-    /// (a lock-free DashMap) so `getupdates` never needs to acquire a write lock.
+    /// Mark a client as online. The `vtoken` argument must be the hashed
+    /// form (callers receive the plaintext bearer credential over HTTP and
+    /// must hash before calling).
     pub fn mark_online(&mut self, vtoken: &str) {
         if let Some(info) = self.by_vtoken.get_mut(vtoken) {
             info.online = true;
@@ -111,7 +182,9 @@ impl ClientRegistry {
     }
 
     /// Mark a client as offline. Called by the health checker after it detects
-    /// the last-seen timestamp has exceeded the stale threshold.
+    /// the last-seen timestamp has exceeded the stale threshold. The
+    /// `vtoken` argument is the hashed form (the DashMap key under
+    /// `state.clients.last_seen` is the hash, so the same value reaches us).
     pub fn mark_offline(&mut self, vtoken: &str) {
         if let Some(info) = self.by_vtoken.get_mut(vtoken) {
             info.online = false;
@@ -135,7 +208,8 @@ impl ClientRegistry {
         }
     }
 
-    /// Update a client's name and/or label. Returns the client's vtoken on success.
+    /// Update a client's name and/or label. Returns the client's hashed
+    /// vtoken on success.
     pub fn update_client(
         &mut self,
         old_name: &str,
@@ -192,30 +266,73 @@ impl Default for ClientRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::is_vtoken_hash;
 
     #[test]
     fn registered_count_single_vs_multi() {
         let mut reg = ClientRegistry::new();
         assert_eq!(reg.all_clients().len(), 0);
-        let (v1, is_new1) = reg.register("a".into(), None);
+        let (plain1, _, is_new1) = reg.register("a".into(), None);
         assert!(is_new1);
-        assert!(!v1.is_empty());
+        assert!(!plain1.is_empty());
+        assert!(
+            plain1.starts_with("vhub_"),
+            "plaintext vtoken must be returned exactly once"
+        );
         assert_eq!(reg.all_clients().len(), 1);
-        let (v2, is_new2) = reg.register("b".into(), Some("B".into()));
+        let (plain2, _, is_new2) = reg.register("b".into(), Some("B".into()));
         assert!(is_new2);
-        assert!(!v2.is_empty());
+        assert!(!plain2.is_empty());
+        assert!(plain2.starts_with("vhub_"));
         assert_eq!(reg.all_clients().len(), 2);
     }
 
     #[test]
     fn register_same_name_reuses_vtoken() {
         let mut reg = ClientRegistry::new();
-        let (v1, is_new1) = reg.register("w".into(), None);
+        let (_plain1, hash1, is_new1) = reg.register("w".into(), None);
         assert!(is_new1);
-        let (v2, is_new2) = reg.register("w".into(), Some("lbl".into()));
+        // Re-registration of the same name does not mint a new plaintext;
+        // the registry returns the existing hash and an empty plaintext.
+        let (plain2, hash2, is_new2) = reg.register("w".into(), Some("lbl".into()));
         assert!(!is_new2, "second register of same name is NOT new");
-        assert_eq!(v1, v2);
+        assert!(plain2.is_empty(), "no new plaintext on re-registration");
+        assert_eq!(hash1, hash2, "same name reuses hashed vtoken");
         assert_eq!(reg.all_clients().len(), 1);
+    }
+
+    #[test]
+    fn stored_vtoken_is_hash_not_plaintext() {
+        let mut reg = ClientRegistry::new();
+        let (plain, hashed, _) = reg.register("echo".into(), Some("echo test".into()));
+        let c = reg.get_by_name("echo").expect("client");
+        assert_ne!(
+            c.vtoken, plain,
+            "ClientInfo.vtoken must NOT hold the plaintext"
+        );
+        assert_eq!(
+            c.vtoken, hashed,
+            "stored vtoken must equal the hashed return value"
+        );
+        assert!(
+            is_vtoken_hash(&c.vtoken),
+            "stored vtoken must be a SHA-256 hex; got {:?}",
+            c.vtoken
+        );
+        // Round-trip: hash(plain) == stored hash
+        assert_eq!(c.vtoken, crate::hub::hash_vtoken(&plain));
+    }
+
+    #[test]
+    fn get_by_vtoken_uses_hash() {
+        let mut reg = ClientRegistry::new();
+        let (plain, _, _) = reg.register("a".into(), None);
+        let hashed = crate::hub::hash_vtoken(&plain);
+        assert!(reg.get_by_vtoken(&hashed).is_some());
+        assert!(
+            reg.get_by_vtoken(&plain).is_none(),
+            "get_by_vtoken must NOT match plaintext"
+        );
     }
 
     #[test]
@@ -225,18 +342,36 @@ mod tests {
         let c = reg.get_by_name("echo").expect("client");
         assert_eq!(c.name, "echo");
         assert_eq!(c.label.as_deref(), Some("echo test"));
+        // already-hashed lookup should also work
         assert!(reg.get_by_vtoken(&c.vtoken).is_some());
+    }
+
+    #[test]
+    fn mark_online_offline_uses_hash() {
+        let mut reg = ClientRegistry::new();
+        let (_plain, hashed, _) = reg.register("a".into(), None);
+        reg.mark_online(&hashed);
+        assert!(reg.get_by_name("a").unwrap().online);
+        reg.mark_offline(&hashed);
+        assert!(!reg.get_by_name("a").unwrap().online);
+        // plaintext must NOT flip the state
+        let (plain2, _, _) = reg.register("b".into(), None);
+        reg.mark_online(&plain2);
+        assert!(
+            !reg.get_by_name("b").unwrap().online,
+            "mark_online with plaintext must be a no-op"
+        );
     }
 
     #[test]
     fn update_client_renames_and_updates_label() {
         let mut reg = ClientRegistry::new();
-        let (vtoken, _is_new) = reg.register("old".into(), Some("old label".into()));
+        let (_, hashed, _) = reg.register("old".into(), Some("old label".into()));
         reg.update_client("old", "new", Some("new label".into()))
             .unwrap();
         assert!(reg.get_by_name("old").is_none());
         let c = reg.get_by_name("new").expect("renamed");
-        assert_eq!(c.vtoken, vtoken);
+        assert_eq!(c.vtoken, hashed);
         assert_eq!(c.label.as_deref(), Some("new label"));
     }
 
@@ -248,6 +383,30 @@ mod tests {
         assert_eq!(
             reg.update_client("a", "b", None),
             Err(UpdateClientError::NameTaken)
+        );
+    }
+
+    #[test]
+    fn register_with_vtoken_load_path_does_not_rehash() {
+        // Simulate the load_clients_from_db path: caller has the DB-side hash
+        // and wants to insert it without hashing a second time.
+        let mut reg = ClientRegistry::new();
+        let (_, _, _) = reg.register("first".into(), None);
+        let stored_first_hash = reg.get_by_name("first").unwrap().vtoken.clone();
+
+        // A different name + the SAME hash: the load path takes the supplied
+        // value as the canonical hash and does not double-hash.
+        let (stored, is_new) =
+            reg.register_with_vtoken("second".into(), None, Some(stored_first_hash.clone()));
+        assert!(is_new);
+        assert_eq!(
+            stored, stored_first_hash,
+            "register_with_vtoken must return the supplied value verbatim"
+        );
+        let c = reg.get_by_name("second").unwrap();
+        assert_eq!(
+            c.vtoken, stored_first_hash,
+            "register_with_vtoken must store the supplied value verbatim"
         );
     }
 }

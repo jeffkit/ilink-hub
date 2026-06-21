@@ -283,32 +283,51 @@ pub async fn register_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
-) -> (String, bool) {
+) -> RegisterClientOutcome {
     // Lock order: registry → router (always). MUST NOT be called while
     // `state.clients.pairing.write()` is held; doing so would introduce a new
     // `pairing → registry → router` lock order that deadlocks against any
     // future code path that takes registry+router and then pairing. (F-M1-1)
-    let (vtoken, is_new, is_first) = {
+    let (plaintext, hashed, is_new, is_first) = {
         let mut registry = state.clients.registry.write().await;
-        let (vtoken, is_new) = registry.register(name.clone(), label.clone());
+        let (plaintext, hashed, is_new) = registry.register(name.clone(), label.clone());
         let is_first = is_new && registry.all_clients().len() == 1;
-        (vtoken, is_new, is_first)
+        (plaintext, hashed, is_new, is_first)
     };
 
     if is_first {
         let mut router = state.routing.router.lock().await;
-        router.set_default(vtoken.clone());
+        router.set_default(hashed.clone());
     }
 
     if let Err(e) = state
         .store
-        .upsert_client(&vtoken, &name, label.as_deref())
+        .upsert_client(&hashed, &name, label.as_deref())
         .await
     {
         warn!(error = %e, name = %name, "failed to persist paired client");
     }
 
-    (vtoken, is_new)
+    RegisterClientOutcome {
+        plaintext,
+        hashed,
+        is_new,
+    }
+}
+
+/// Outcome of a single [`register_client_in_hub`] call.
+///
+/// The two vtoken views coexist by design: `plaintext` is the bearer
+/// credential the bridge needs (returned to the caller exactly once and
+/// never persisted), `hashed` is the SHA-256 form the registry / store /
+/// queue use as the canonical key. Re-registration of an existing name
+/// yields `plaintext = ""` and `hashed = existing_hash`, since the
+/// original plaintext is no longer recoverable.
+#[derive(Debug, Clone)]
+pub struct RegisterClientOutcome {
+    pub plaintext: String,
+    pub hashed: String,
+    pub is_new: bool,
 }
 
 #[derive(Debug)]
@@ -807,8 +826,12 @@ pub async fn pair_confirm(
     // confirm (CSRF / state / AlreadyConfirmed), but rolling back in that
     // case would evict the legitimate client (F-M1-A). We MUST gate the
     // rollback on `is_new`.
-    let (vtoken, is_new) =
-        register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
+    let outcome = register_client_in_hub(state.as_ref(), name.clone(), label.clone()).await;
+    let RegisterClientOutcome {
+        plaintext,
+        hashed,
+        is_new,
+    } = outcome;
 
     // Atomic check + commit under the pairing write lock. On any non-Ok
     // result, roll back the speculative register so we don't leak a
@@ -816,7 +839,7 @@ pub async fn pair_confirm(
     // (F-M1-A) to prevent evicting a legitimate pre-existing client.
     let confirm_result = {
         let mut pairing = state.clients.pairing.write().await;
-        pairing.confirm(&code, name.clone(), label, vtoken.clone(), &csrf_header)
+        pairing.confirm(&code, name.clone(), label, plaintext.clone(), &csrf_header)
     };
     if confirm_result.is_ok() {
         state.clients.pairing_notify.notify_waiters();
@@ -832,7 +855,7 @@ pub async fn pair_confirm(
                 Json(serde_json::json!({
                     "ret": 0,
                     "name": name,
-                    "vtoken": vtoken,
+                    "vtoken": plaintext,
                 })),
             )
         }
@@ -842,8 +865,14 @@ pub async fn pair_confirm(
             // a fresh row (F-M1-A). If the name was already registered, the
             // speculative call was a no-op merge and the rollback would
             // evict the legitimate client. `is_new` is the gate.
+            //
+            // The rollback compares against the registry's stored hash, so
+            // we pass the hashed form (not the plaintext). Re-registration
+            // (is_new=false) has the existing hash so the registry-side
+            // CAS is still correct; the gate is `is_new`, not the
+            // presence of a plaintext.
             if is_new {
-                rollback_speculative_register(state.as_ref(), &name, &vtoken).await;
+                rollback_speculative_register(state.as_ref(), &name, &hashed).await;
             } else {
                 debug!(
                     name = %name,

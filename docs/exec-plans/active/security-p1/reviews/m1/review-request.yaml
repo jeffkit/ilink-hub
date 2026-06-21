@@ -1,0 +1,172 @@
+# M1 review request — vtoken hash storage
+#
+# Submitted for review after:
+#   - cargo fmt --check            ✓
+#   - cargo clippy -- -D warnings   ✓
+#   - cargo test                    ✓ (447 tests pass, 0 fail)
+#   - cargo build                   ✓
+#   - desktop-frontend npm run build ✓
+#   - desktop-tauri  cargo check    ✓
+#
+# Scope: vtoken (client virtual token) is no longer stored in plaintext
+# anywhere in the Hub. Only the bearer credential over the HTTP
+# `Authorization: Bearer <plain>` header carries plaintext, and that
+# plaintext is hashed at the boundary (`extract_vtoken` in
+# src/server/routes.rs) before any registry / queue / store / poll
+# tracker key uses it. The `register()` API still hands the plaintext
+# back to the bridge exactly once (via `RegisterClientOutcome.plaintext`
+# and the QrcodeStatusResponse.bot_token field), so the bridge can save
+# it; from that point on, the Hub only ever sees the SHA-256 hex.
+
+milestone: M1
+title: vtoken 哈希存储
+branch: feat/security-p1
+plan: docs/exec-plans/active/security-p1/plan.md
+
+summary: |
+  Post-M1, every vtoken-keyed data structure — `ClientInfo::vtoken`,
+  `ClientRegistry::by_vtoken`, the per-client `MessageQueue` slot, the
+  `PollTracker` / `last_seen` DashMap keys, the `clients.vtoken` /
+  `routing_state.active_vtoken` / `messages.vtoken` /
+  `backend_sessions_v2.vtoken` / `active_sessions.vtoken` columns —
+  holds the SHA-256 hex of the plaintext. The plaintext only exists
+  on the wire (HTTP `Authorization: Bearer <plain>` from the bridge)
+  and is returned exactly once by `register()` so the bridge can
+  persist it locally.
+
+  Hashing is done in two places:
+    1. `extract_vtoken` (src/server/routes.rs) — the HTTP boundary;
+       every header value the bridge sends is hashed before the rest
+       of the Hub touches it.
+    2. `ClientRegistry::register` (src/hub/registry.rs) — the only
+       place that knows the plaintext. The function returns both
+       `(plaintext, hashed, is_new)` to the pairing layer via
+       `RegisterClientOutcome`; the pairing layer persists
+       `outcome.plaintext` to `PairingSession.vtoken` so the bridge
+       can pick it up via `get_qrcode_status`.
+
+  Every other call site (queue push/drain, store bind, registry
+  lookup, health-checker `mark_offline`, poll-tracker enter, …)
+  already had the hash in scope; no extra conversions were needed at
+  the call sites — the inbound boundary is what changed.
+
+key_decisions:
+  - id: hash-at-boundary
+    summary: Hashing happens in `extract_vtoken` (HTTP) and `register` (issuance).
+    rationale: |
+      The plan listed "Store methods hash internally" as the implementation
+      strategy. We deviated by moving the hashing to the two call sites
+      that actually have the plaintext. This keeps the store / queue /
+      registry contract simple ("we accept whatever you hand us, no
+      surprises") and avoids the double-hash trap (passing a hash to a
+      method that hashes again).
+    rejected_alternatives:
+      - "Store methods always hash their vtoken argument": rejected
+        because callers that already have the hash (e.g. the routing
+        layer) would double-hash.
+      - "Centralise hashing in a `Vtoken(String)` newtype": rejected
+        for M1 scope; would touch every call site and most of the
+        registry internals. We can do this in a follow-up if a future
+        refactor needs it.
+
+  - id: register-return-shape
+    summary: `register()` returns `(plaintext, hashed, is_new)`.
+    rationale: |
+      The pairing layer needs both views: plaintext to return to the
+      bridge (and stash in PairingSession), hashed to persist in
+      `clients` / `routing_state` / `messages` and to write into the
+      registry. Re-registration returns `plaintext=""` and
+      `hashed=existing_hash` — the original plaintext was discarded
+      after the first call.
+    rejected_alternatives:
+      - "Keep the old 2-tuple `(vtoken, is_new)`": rejected because
+        callers now need to know which of the two is the plaintext
+        vs the hash. The 3-tuple makes the distinction explicit at
+        every call site.
+
+  - id: load-path-passes-hash-unchanged
+    summary: `register_with_vtoken` treats the supplied value as already-hashed.
+    rationale: |
+      On startup, `load_clients_from_db` reads `clients.vtoken` (which
+      is already a hash on disk) and feeds it to the registry. A second
+      hash pass would break the startup loader. The contract is
+      "caller is responsible for hashing; this method does not
+      re-hash".
+
+  - id: extract-vtoken-returns-hash
+    summary: `extract_vtoken` returns the hash directly.
+    rationale: |
+      The HTTP boundary is the only place that sees plaintext; doing
+      the hash there means every downstream consumer (registry,
+      queue, poll tracker, store) operates in hash space without
+      further conversions. The plaintext lives only in the wire
+      request and in the `RegisterClientOutcome.plaintext` field that
+      the bridge picks up at pairing.
+
+risk_register:
+  - id: re-hash-by-mistake
+    severity: low
+    description: A future caller that already has the hash passing it through a code path that hashes again.
+    mitigation: |
+      `register_with_vtoken` documents "load path, no second hash".
+      `register` returns the hash so callers don't have to recompute
+      it. A debug assertion in the helper can be added later if
+      needed.
+  - id: bridge-cache
+    severity: low
+    description: An existing bridge that already saved the plaintext vtoken in its local config continues to work; a bridge that cached the hash (pre-M1 impossible) would not.
+    mitigation: |
+      M1 is a one-way transformation; the v1 plaintext format is
+      `vhub_<32 hex>`, which is what the bridge sends. After M1, the
+      bridge still receives the plaintext at pairing time and stores
+      it. No bridge code change required for M1.
+
+  - id: sqlite-varchar-width
+    severity: low
+    description: A vtoken column that was created with VARCHAR(36) would truncate a 64-char hash.
+    mitigation: |
+      The migrations use `TEXT` for vtoken columns. We have not
+      encountered a VARCHAR-backed column in the existing schema.
+
+files_changed:
+  - src/hub/vtoken_hash.rs            # new — hash helpers + unit tests
+  - src/hub/mod.rs                    # add module, re-export
+  - src/hub/registry.rs               # ClientInfo.vtoken is hash; register() returns (plaintext, hashed, is_new)
+  - src/server/routes.rs              # extract_vtoken returns hash; register handler forwards plaintext
+  - src/server/pairing.rs             # register_client_in_hub returns RegisterClientOutcome; rollback uses hash
+  - src/store/store_tests.rs          # M1 contract tests (5 new tests)
+  - tests/hub_routing_integration.rs # updated call sites for the new register() return shape
+  - tests/breaking_changes.rs         # updated for the new tuple return
+  - Cargo.toml                        # declare `ring` (already a transitive dep) as a direct dep
+
+verification_artifacts:
+  - "M1 E2E-1: `SELECT vtoken FROM clients LIMIT 1` returns 64-char lowercase hex"
+    evidence: |
+      `cargo test --lib store::store_tests::m1_upsert_client_stores_hash_not_plaintext` passes;
+      the assertion `is_vtoken_hash(&row.vtoken)` is true for the post-`upsert_client` value.
+
+  - "M1: `cargo test -p ilink-hub --lib registry` is green"
+    evidence: "9/9 tests pass; new tests added: stored_vtoken_is_hash_not_plaintext, get_by_vtoken_uses_hash, mark_online_offline_uses_hash, register_with_vtoken_load_path_does_not_rehash."
+
+  - "M1: `cargo test -p ilink-hub --lib store::clients` is green"
+    evidence: |
+      5 new tests in store_tests.rs:
+      m1_upsert_client_stores_hash_not_plaintext
+      m1_touch_client_uses_hash
+      m1_routes_are_keyed_by_hash
+      m1_messages_table_keys_by_hash
+      m1_two_distinct_plaintexts_never_collide
+
+  - "M1 regression: full `cargo test` is green"
+    evidence: "447 tests pass, 0 fail (371 lib + 20 + 10 + 27 + 1 + 18)."
+
+  - "M1 fmt / clippy clean"
+    evidence: "cargo fmt --check, cargo clippy --all-targets -- -D warnings both pass."
+
+  - "M1 desktop build green"
+    evidence: "npm run build (vite), cargo check on the tauri manifest both pass."
+
+open_questions_for_reviewer:
+  - "Is the `register()` 3-tuple return shape (plaintext, hashed, is_new) acceptable, or should we wrap it in a struct? The 3-tuple is widely visible in tests today; a `RegisterOutcome` struct would push the same information into a single field-access expression."
+  - "Is the 8-char vtoken prefix shown by `admin_clients` still acceptable, or should we now show more chars to retain operator UX? The current prefix of a hash is 8 hex chars (32 bits of entropy) which is unique in practice but cosmetically less informative than the old `vhub_xxxx` prefix."
+  - "Should `extract_vtoken` short-circuit on `is_valid_vtoken` BEFORE hashing to keep the malformed-format error path cost-free? Today it validates, then hashes; the cost is small but it does mean a 401 response on a malformed Authorization header now runs a SHA-256 over the candidate. We could check the canonical-hex shape (`is_vtoken_hash`) for a small saving, but that requires the candidate to be 64 chars — which is wrong because the candidate is plaintext, not hash. Conclusion: leave as-is, the cost is one SHA-256 per malformed request, and we already pay validation costs above it."

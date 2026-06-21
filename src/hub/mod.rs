@@ -51,6 +51,7 @@ pub mod queue;
 pub mod quote_route;
 pub mod registry;
 pub mod router;
+pub mod vtoken_hash;
 
 mod commands;
 mod dispatch;
@@ -93,6 +94,7 @@ pub use state::{
     LatencyHistogram, Metrics, PollGuard, PollTracker, RoutingState, HISTOGRAM_BUCKETS_MS,
     MAX_CONCURRENT_POLLS_PER_VTOKEN, MAX_HUB_POLLS_DEFAULT,
 };
+pub use vtoken_hash::{hash_vtoken, is_vtoken_hash};
 
 #[cfg(test)]
 mod tests;

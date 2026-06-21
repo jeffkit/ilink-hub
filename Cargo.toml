@@ -70,6 +70,11 @@ base64 = "0.22"
 dashmap = "6"
 lru = "0.12"
 
+# Crypto: AES-256-GCM for bot_token encryption (M2) and SHA-256 for vtoken
+# hashing (M1). ring is also pulled transitively by rustls; declaring it
+# here lets us import its primitives directly.
+ring = "0.17"
+
 # Storage — sqlx with SQLite (default) and PostgreSQL backends via DATABASE_URL
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "chrono", "uuid", "migrate"] }
 

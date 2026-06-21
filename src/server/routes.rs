@@ -47,7 +47,7 @@ fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .filter(|s| is_valid_vtoken(s))
-        .map(str::to_string)
+        .map(crate::hub::hash_vtoken)
 }
 
 fn check_admin_auth(admin: &crate::hub::AdminConfig, headers: &HeaderMap) -> bool {
@@ -150,14 +150,13 @@ pub async fn register(
         }
     }
 
-    let (vtoken, _is_new) =
-        register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let outcome = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
 
     (
         StatusCode::OK,
         Json(RegisterResponse {
             ret: 0,
-            vtoken: vtoken.clone(),
+            vtoken: outcome.plaintext.clone(),
             base_url: String::new(),
             errmsg: None,
         }),
