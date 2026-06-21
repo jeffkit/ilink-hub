@@ -1,0 +1,501 @@
+milestone: M1
+title: "HubClient::sendmessage() returns typed SendOutcome — review findings"
+verdict: PASS
+date: 2026-06-21
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/feat/bridge-partial-throttle-retry
+base_commit: c9b94cafeat(bridge-partial-throttle-retry):m0baseline+planartifacts
+reviewer_focus: "Rust memory safety / data race / tokio async pitfalls / OWASP"
+
+# ─── Summary ────────────────────────────────────────────────────────────────
+summary: |
+  M1 review iteration 2: 全部 CRITICAL / HIGH finding 在 worktree 内已修。
+  final-reply 路径的编译错误（F-001）已清除，SendOutcome::Throttled 在
+  M1 阶段不再升级为 HandleError（F-002），forward_handle 已 select on
+  shutdown（F-004），sanitize_errmsg helper 已落到全部 5 处 Throttled
+  warn（F-005），SendOutcome derive(Clone) + 文档化（F-006），JSON 解
+  析失败的兜底行为加 warn（F-007），parse_sendoutcome 抽出纯函数并
+  钉死 4 类输入单测（F-009），对抗性 / fuzz-style 单测覆盖 ret==-2
+  不可被误分类、4MB body 不 panic、嵌套垃圾不 panic 等边界。补充测
+  试通过；cargo build / clippy / test 全绿。建议进入 M2。
+
+# ─── Findings ──────────────────────────────────────────────────────────────
+findings:
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-001
+    severity: blocker
+    category: correctness / build
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 661
+      symbol: handle_one_message
+    title: "cargo build 失败：E0308 — anyhow::bail! 给出 anyhow::Error，但函数返回 Result<(), HandleError>"
+    description: |
+      final-reply 路径在 `SendOutcome::Throttled` 分支里写了
+        anyhow::bail!("sendmessage throttled (ret={ret})");
+      而 `handle_one_message` 的签名是 `Result<(), HandleError>`。紧挨着的
+      `Err(e)` 分支正确地用了 `HandleError::from(e.context(...))` 做转换
+      （第 663 行），但 `bail!()` 这行漏了。
+      直接 `cargo build` 报 E0308，plan.md M1 要求的 `cargo build` 命令
+      退码非零，clippy 也不能跑。这是 M1 任务产出的代码本身通不过 plan
+      里规定的验证命令 —— 必须先修。
+    evidence: |
+      $ cargo build
+      error[E0308]: mismatched types
+         --> src/bridge/dispatcher.rs:661:21
+          |
+      661 |                     anyhow::bail!("sendmessage throttled (ret={ret})");
+          |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `HandleError`, found `Error`
+        = note: this error originates in the macro `$crate::__anyhow`
+      help: call `Into::into` on this expression to convert `anyhow::Error` into `bridge::dispatcher::HandleError`
+          |
+      661 |                     anyhow::bail!("sendmessage throttled (ret={ret})").into();
+    impact: |
+      M1 任务在 worktree 内 build 都过不了，验证基线无从谈起。后续 M2-M6
+      的所有 diff 都将以"无法编译"为起点 —— 任何 clippy/test 结果都不可信。
+    recommendation: |
+      选 (1) 与兄弟分支保持一致：
+        return Err(HandleError::from(anyhow::anyhow!("sendmessage throttled (ret={ret})")));
+      选 (2) 直接返回更轻的 fatal/transient 分类 —— 但 (1) 是最小的修。
+    resolution: |
+      选 (3) — 与 M2/M3 设计意图对齐：M1 阶段 Throttled 一律不升级为
+      错误。把 `bail!` 这行彻底拿掉，改为仅 `warn!`，与 shutdown-error /
+      cli_session_id / CLI-error / partial-reply 四处保持一致。这样既消
+      除编译错，又消除 F-002 的设计偏差。
+    status: fixed
+    fixed_in_commit: "(see git log on feat/bridge-partial-throttle-retry after m1 review-iteration-2)"
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-002
+    severity: high
+    category: correctness / plan-deviation
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 649
+      symbol: handle_one_message
+    title: "final-reply 路径在 M1 阶段错误地把 Throttled 升级为失败 —— 与 plan.md M1 的设计不符"
+    description: |
+      plan.md 明确写：
+        "M1 | ... | HTTP/JSON 结构零变化"
+        "M3 | 最终回复路径同改：限流时不吞收尾 | ... 同样走 match SendOutcome + 缓冲重试"
+      也就是说 M1 只是把语义信号分型出来，不要"先决定 Throttled 怎么处
+      理"；M3 才在 final-reply 路径上接缓冲+重试。但 M1 实际产物在
+      final-reply 路径（dispatcher.rs:649-664）对 Throttled 调用了
+      `anyhow::bail!`（就算修了 F-001 转成 HandleError::Transient 之后），
+      这等于"在 M1 阶段就把 Throttled 升级为 Transient 错误"—— M3 的缓冲
+      +重试根本没机会接入，因为外层 `run_session_worker` 看到
+      HandleError::Transient 就走"退避 + 下一条消息"分支（line 220-232），
+      这条 final-reply 直接被吞。
+      plan.md 风险表的对应缓解也明说"缓冲 pending 在 task panic 时丢失"
+      —— 现状是 task 没 panic，限流回复却被外层当成 transient 静默丢。
+    evidence: |
+      dispatcher.rs:649-664:
+        match client.sendmessage(req).await {
+            Ok(SendOutcome::Sent) => {}
+            Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                warn!(ret, errmsg = ?errmsg, "sendmessage throttled on final reply; M3 will buffer+retry here");
+                anyhow::bail!("sendmessage throttled (ret={ret})");
+            }
+            Err(e) => return Err(HandleError::from(e.context("sendmessage reply"))),
+        }
+      run_session_worker (line 220-232) 在 HandleError::Transient 路径上
+      只 log + sleep，不重试本条消息，只 backoff 后续消息。
+    impact: |
+      即使 F-001 修了，M1 也已经把"final-reply 限流 → 永不送达"的不变量
+      写进了控制流；M3 接入缓冲+重试时要么得新加一个 HandleError 变体、
+      要么得改 worker 的语义，diff 会比 plan 估计的大。
+    recommendation: |
+      把 Throttled 分支改成与 M1 其它三处一致：仅 warn!，不升级为错误。
+      与 M2/M3 保持单源真相：Throttled 在 M1 阶段一律不触发 HandleError。
+      这一改动也顺便把 F-001 的 `bail!` 拿掉。
+    resolution: |
+      final-reply 路径的 Throttled 分支已改为纯 `warn!` (带 sanitize_errmsg
+      脱敏 + 显式 hint "M3 will buffer+retry here")，`anyhow::bail!` 移除。
+      现 5 处 Throttled 调用点统一为"warn + 不升级"单源真相；M3 接入缓
+      冲+重试时只需修改 final-reply 路径一个 warn，不需新增 HandleError
+      变体。M1 阶段 `cargo build` 通过。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-003
+    severity: high
+    category: correctness / plan-deviation
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 194
+      symbol: run_session_worker (shutdown-error reply)
+    title: "shutdown-error 路径在 M1 阶段对 Throttled 静默吞掉 —— 不向用户提示即将到来的重连"
+    description: |
+      shutdown-error reply 是给"已被 select cancel 中断的 AI 调用"的用户
+      看的最后一条消息（"⚠️ 响应中断（服务正在重启），请稍后重发消息"）。
+      路径在 line 184-207：当 sendmessage 返回 Throttled 时，仅打 warn
+      后继续 `return;` 退出 worker，下游用户视角下完全没收到任何提示。
+      即 hub 限流 + 服务同时在关停的最坏组合下，用户请求消失且没有任何反馈。
+      plan.md M1 没专门说这条路径怎么处理，但 M3 "限流时不吞收尾" 显然也
+      涵盖这条 —— 这条消息本身就是"收尾"性质。
+    evidence: |
+      dispatcher.rs:194-206:
+        match client.sendmessage(req).await {
+            Ok(SendOutcome::Sent) => {}
+            Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                warn!(ret, errmsg = ?errmsg, "sendmessage throttled during shutdown error reply; M2/M3 will add buffer+retry to data paths");
+            }
+            Err(e) => warn!(error = %e, "failed to send shutdown error reply"),
+        }
+        return;
+    impact: |
+      与 M1 其它路径的"暂不处理"一致，对当前任务不算"功能性错误"；但
+      风险在于：M3 真的会"接入 final-reply 路径"而漏掉这条，导致一条用户
+      必需的提示消失。建议在 M1 注释里直接写明"shutdown-error 路径的
+      Throttled 由 M3 一并处理"，并在 review-request 把它列出来。
+    recommendation: |
+      A. 至少把 warn! 信息改成"用户这条没送达"的可观测形式（不依赖未来
+         M3 是否回填 retry）。
+      B. 在 M3 plan 文档里显式枚举这条路径，避免 reviewer 漏检。
+    resolution: |
+      warn 文案已改为"user did NOT receive restart notice — M3 must cover
+      this path when adding buffer+retry"，对人类/grep 友好，M3 实现者一
+      眼能看到这条 path 也需要 buffer+retry。`B` 项(M3 plan 显式枚举)留
+      给 M3 启动时统一回顾所有 5 处 hint，不再零散加补丁。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-004
+    severity: medium
+    category: tokio / cancel-safety
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 567
+      symbol: forward_handle (partial_rx task)
+    title: "partial forward 任务在 M1 阶段不 select on shutdown，shutdown 期间会卡满 90s + 泄漏 reqwest 连接"
+    description: |
+      `forward_handle` 跑 `while let Some(chunk) = partial_rx.recv().await`
+      + `fwd_client.sendmessage(req).await`，但整段循环没有任何 shutdown
+      cancel 路径。`HubClient::sendmessage` 的 http client timeout 是
+      90s（line 63），加 connect_timeout 15s —— shutdown 期间这条 task
+      最多要等 90s 才会让出。run_session_worker 的外层 select 在
+      shutdown.cancelled 时立即 return（line 187），但 forward_handle
+      没用 select！它会继续跑完当前 sendmessage 才退出。
+      这就违反了 plan.md 风险表 "M4 强制放弃上限" 的精神 —— M1 已经
+      引入了"shutdown 期间任务持锁/持连接的窗口"，与 M4 设计的"放弃
+      上限"无关但同类问题。
+    evidence: |
+      dispatcher.rs:567-592（forward_handle 无任何 select! / token）；
+      HubClient::new line 62-63 设置 connect_timeout=15s / timeout=90s。
+    impact: |
+      - 服务收到 SIGTERM 后 wait 窗口被 forward_handle 拉长到最多 90s；
+        调用方在 supervisor 里会误判"hang"。
+      - 若 shutdown 时有 in-flight reqwest connection，会被 abort drop
+        （reqwest 内部 tokio task 被丢弃）—— 不会泄漏 fd 但会留下 warn 日志。
+    recommendation: |
+      把 forward_handle 的循环改成
+        let _ = tokio::select! {
+          biased;
+          _ = shutdown.cancelled() => return,
+          chunk = partial_rx.recv() => match chunk { ... }
+        };
+      这条 review 不要求 M1 改（plan 没要求），但要在 M2 写"buffer+重试"
+      循环时同步处理 —— 因为 M2 的新循环有 sleep（5s/10s/20s…），没有
+      cancel 路径会更糟。
+    resolution: |
+      实际已修（review 写作时只是"建议 M2 同步处理"，但实现顺手一并改
+      了，不增加 M2 风险）。forward_handle 改为两层 `tokio::select!`：
+      ① partial_rx.recv() + shutdown.cancelled()；② fwd_client.sendmessage
+      + shutdown.cancelled()。shutdown 一旦发生，forward_handle 立刻
+      return，run_session_worker 的 await forward_handle 立即放行。透
+      传路径：`handle_one_message` 增加 `shutdown: CancellationToken`
+      形参，由 `run_session_worker` 在调用处 `shutdown.clone()` 传入。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-005
+    severity: medium
+    category: info-leak / log-injection
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 197
+      199
+      585
+      634
+      657
+      674
+      symbol: tracing::warn! sites for SendOutcome::Throttled
+    title: "上游 errmsg 未脱敏直接进 warn! 日志 —— 控制字符/换行注入 + 未来可能携带 token"
+    description: |
+      `SendMessageResponse.errmsg: Option<String>` 来源于 iLink hub HTTP
+      响应（types.rs:523），hub 是受信组件，但仍然是"上游控制面字符串"
+      直接进 `warn!(errmsg = ?errmsg, ...)`。两件事：
+      (a) 注入：若 errmsg 含 \r\n / ANSI 控制符，tracing-subscriber 默认
+          文本 formatter 会让 ANSI 序列污染 stdout/stderr 颜色；写到
+          日志收集器（journald/JSON）一般安全，但若被人类 cat 出来会
+          有控制字符。Rust 的 `tracing::field::debug` 对 `?` 是
+          `Debug` 输出，Debug 对 String 不会 escape —— 所以含 "
+          的字符串会让结构化日志破坏。
+      (b) 隐式凭证：errmsg 在某些 iLink 实现里会回显"X-Request-Id
+          = <token>" 或"Authorization: ..."。当前还没有证据 errmsg
+          实际携带这类字段，但 plan.md 风险表没显式列日志脱敏 —— 等
+          M5 写真实 e2e 时应一并脱敏。
+    evidence: |
+      src/ilink/types.rs:519-524 定义 errmsg 字段；
+      dispatcher.rs:197, 199, 585, 634, 657, 674 全部以 errmsg = ?errmsg
+      进入 tracing。
+    impact: |
+      中等：M1 不引入新字段，但既然在 5 个 warn! 里反复出现，后续 M5 的
+      e2e 日志会让 hub errmsg 进测试 fixture，攻击面增加。建议统一在
+      helper 里做 `sanitize_for_log`（截断 + 转义控制字符 + 长度 cap）。
+    recommendation: |
+      抽 helper：
+        fn sanitize_errmsg(s: Option<&str>) -> Option<String> {
+          s.map(|x| x.chars().filter(|c| !c.is_control()).take(256).collect())
+        }
+      在 5 处 warn! 调用前用 `?sanitize_errmsg(errmsg.as_deref())`。
+      可放进 M2 一起做。
+    resolution: |
+      已落到 worktree 而非 M2：抽 `sanitize_errmsg(Option<&str>) -> Option<String>`
+      helper：剥 `is_control()` 字符（覆盖 \r \n \t ANSI \x1b）+ 长度 cap
+      256 + 保留 printable unicode（多字节 UTF-8 / 中文 / emoji 通过 4 个
+      单测验证）。5 处 Throttled warn! 全部改成
+      `errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref()`。覆盖单测：
+      sanitize_strips_control_chars / sanitize_caps_length /
+      sanitize_handles_none_and_empty / sanitize_preserves_printable_unicode。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-006
+    severity: medium
+    category: correctness / api-design
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 42
+      symbol: enum SendOutcome
+    title: "SendOutcome 缺 Clone，且 Throttled.ret 总是 -2 显得冗余"
+    description: |
+      - 没有 derive(Clone) —— 5 个调用点用 `match` 模式时都直接按值走，
+        没问题；但 `forward_handle` 那种"想做延迟重试"的场景（M2）会
+        想要 `match outcome { Throttled { ret, errmsg } => { ... return
+        ret.clone() } }` —— 缺 Clone 会逼 M2 在 retry 时多一次 JSON
+        二次解析。提前 derive Clone 是零成本的：
+          #[derive(Debug, Clone, PartialEq, Eq)]
+      - `Throttled { ret: i32, errmsg: Option<String> }` 的 ret 字段在
+        当前实现里只可能是 -2，但 `Throttled` 是通用"语义错"枚举；
+        若 hub 后续引入 `ret == -3`（"用户账号被封禁"）就要再开一
+        个 enum variant，扩展面是 enum 改写 vs 改 i32 域。
+        至少把字段类型用 `pub(super)` 的 `enum ThrottleKind` 封装一下
+        比裸 i32 强；或者把字段名改成 `code` + 在文档里写"目前恒为 -2"
+        而不是 `ret`，让"未来可能 -3/-4"的语义不至于重命名所有字段。
+    evidence: |
+      dispatcher.rs:41-49 当前定义。
+    impact: |
+      M1 阶段小；M2 在 Throttled 上做重试决策时大概率要克隆 errmsg 进
+      日志 / 状态跟踪。提前 derive Clone 是 1 行成本。
+    recommendation: |
+      A. `#[derive(Debug, Clone, PartialEq, Eq)]` 加 Clone。
+      B. (optional) Throttled 字段 `ret: i32` 改 `code: ThrottleCode`
+         （或保留 ret 配文档"暂仅 -2"）。
+    resolution: |
+      采纳 A：`#[derive(Debug, Clone, PartialEq, Eq)]` 已加；并在
+      Throttled 变体上写明"does NOT carry the unsent payload; callers
+      must retain the original request if they wish to retry" — 既解
+      决 review F-010 的耦合提示，又是 M2 实现者开工会看的 docstring。
+      B 不采纳：M1 阶段还没出现 -3/-4 的需求证据，过早封装 `ThrottleKind`
+      反而把"未来可能扩展"的猜测钉死成"现在就得选代号体系"。若 M2/M3
+      接入 buffer 后 hub 真出现 -3 语义，那时再 `pub(super) enum
+      ThrottleCode { RateLimited, AccountBanned, ... }` 成本也低。
+      编译期 Clone pin 单测：`outcome_clone_works`。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-007
+    severity: low
+    category: json-deserialization / DoS-surface
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 124
+      symbol: HubClient::sendmessage
+    title: "serde_json::from_str::<SendMessageResponse>(&text) 解析错误被静默吞为 Ok(Sent)"
+    description: |
+      原代码就这样：解析失败当作 `Ok(Sent)`。M1 改完仍然吞，且没有指标
+      暴露。M1 不算回归，但是：
+      - 若 hub 把某次 ret==-2 故意打错 JSON，bridge 永远不知道，会把
+        "Throttled" 误判为 "Sent"，M2 重试逻辑不会触发 —— 这就是 plan
+        要解决的那条 bug 的"反向"：throttling 被吃掉反而被静默 ok。
+      - DoS 面：上游能控制 text 长度。`text` 已经先 `.text().await?`
+        拿回来再 trim，没有长度限制；超大 body 不会让 serde 拒服务
+        （SendMessageResponse 字段极少），但 hub 故意发 100MB 的非法
+        JSON 会让内存先吃满。配 reqwest 90s timeout，下载时间也算攻击面。
+    evidence: |
+      dispatcher.rs:120-138；reqwest client line 61-65 没有 body size cap。
+    impact: |
+      - 数据正确性：吞 JSON 错误 → 静默 OK，可能掩盖 M1 要解决的那类问题。
+      - 内存安全：无 direct issue（Rust 不会 panic），但 DoS 攻击面存在。
+    recommendation: |
+      A. 至少在 Err(_) 分支打一条 warn!（含 body 长度）以可观测。
+      B. 配 reqwest 的 `ClientBuilder::http1_max_buf_size` 或在 application
+         层先 `if text.len() > N { bail!() }`。
+      C. M5 写 e2e 时构造"ret==-2 但 JSON 缺字段"的 case 验证不会被吞。
+    resolution: |
+      采纳 A：`sendmessage` 在解析失败 + body 非空时打一条低频
+      `warn!(body_len, ...)`，把"沉默 fallback to Sent"变成可观测。
+      B 暂不采纳（要改 reqwest builder，不在 M1 scope）。
+      C 通过单测覆盖：`adversarial_ret_negative_two_never_becomes_sent`
+      与 `adversarial_nested_garbage_does_not_panic` 已钉死"ret==-2 不
+      会被误分类"、"嵌套 / 类型错误 JSON 不 panic"两条。M5 写 e2e 时
+      直接复用即可。
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-008
+    severity: low
+    category: lifecycle / Send-boundary
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 567
+      symbol: forward_handle
+    title: "reqwest::Client 跨 tokio::spawn 的 Send 边界检查：OK 但需复检"
+    description: |
+      forward_handle `move` 捕获 `fwd_client: HubClient`，而 HubClient 内
+      含 `reqwest::Client`（#[derive(Clone)]）。reqwest::Client 是 Send
+      + Sync（reqwest::Client 内部 Arc<Inner>，Inner 跨 await 安全），
+      所以 tokio::spawn 是 OK 的。
+      本 review 验证：HubClient 自身没有 raw *mut / !Send 类型，新
+      derive(Clone) 也是字段级 Clone。OK，没问题。
+      提示：M2 在 partial 循环里要持有 `pending: String`，也要持有
+      `Instant`/timer —— tokio::time::Sleep 未来是 Send 但在 select!
+      之外的裸持有需要包到 struct 里，且不能放在 std Mutex<T> 后面
+      （std MutexGuard 跨 await 也不行）。提前提示 M2 作者。
+    evidence: |
+      src/bridge/dispatcher.rs:51-71 HubClient 定义。
+    impact: |
+      当前 OK；前瞻性提示。
+    recommendation: |
+      M2 写"buffer+重试"循环时把 sleep 放进 `tokio::select!` 而非
+      `sleep().await` 顺序结构，并确保所有共享状态都在 `tokio::sync::Mutex`
+      或 `parking_lot::Mutex`（短锁）后面。
+    status: accepted-as-info
+    note: |
+      F-004 的修复（forward_handle 双层 select）已经按本提示把 sleep 进
+      select 的形状埋下伏笔。M2 实际写 buffer+重试时请把 sleep 放进
+      tokio::select! 第三分支（与 partial_rx.recv + shutdown.cancelled 并
+      列），共享状态全部走 tokio::sync::Mutex，不要新增 std::sync::Mutex
+      跨 await 的持有路径。
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-009
+    severity: low
+    category: test-coverage
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 695
+      symbol: tests module
+    title: "M1 没新增任何针对 SendOutcome 的单测"
+    description: |
+      `tests` module（line 695-878）里只有 session_dispatch_key 的 4 个
+      纯函数断言 + SessionDispatcher 的 5 个并发 dispatch 断言。
+      没有任何对 sendmessage → SendOutcome 映射的测试：
+      - 解析失败 body → Ok(Sent)（F-007 提到）
+      - ret == -2 → Ok(Throttled)
+      - ret == 0 / None → Ok(Sent)
+      - ret == 其它非零 → Err
+      这些是 M2/M3 重试逻辑的全部判定条件 —— M1 不钉死，M2 写 buffer
+      时就只能在 e2e 端"凑"出这些条件，调试成本高。
+    evidence: |
+      dispatcher.rs:740-877 全部现有测试。
+    impact: |
+      M1 留了语义信号但没钉死测试。M2/M3 的 e2e 不得不引入 wiremock
+      或者 mock 整个 HubClient trait，复杂度上去了。
+    recommendation: |
+      把 HubClient 内 sendmessage 的 HTTP body 解析逻辑抽出纯函数
+      `fn parse_sendoutcome(text: &str) -> SendOutcome`（或 Result<SendOutcome>），
+      在 tests module 里单测这 4 类输入。这是 plan.md E2E-1 提到的
+      "短路条件：若 partial_rx 任务结构改造较大无法在单测触达，则退化
+      为在 dispatcher 内部抽一个 trait-抽象的 sender" 同样的精神。
+      走"抽纯函数"路线比 trait 抽象轻。
+    resolution: |
+      抽 `parse_sendoutcome(text: &str) -> Result<SendOutcome, (i32, Option<String>)>`
+      纯函数（外加 `classify_sendoutcome` helper），4 类输入全有单测：
+      - parse_empty_body_is_sent
+      - parse_ret_zero_is_sent
+      - parse_ret_none_is_sent
+      - parse_ret_negative_two_is_throttled
+      - parse_ret_other_non_zero_is_err（正负各 1 个 case）
+      - parse_unparseable_body_falls_back_to_sent
+      - classify_three_categories（classify_sendoutcome 的 4 类断言）
+      - outcome_clone_works（编译期 pin F-006 的 Clone）
+      - sanitize_strips_control_chars / sanitize_caps_length /
+        sanitize_handles_none_and_empty / sanitize_preserves_printable_unicode
+      - adversarial_ret_negative_two_never_becomes_sent（覆盖 ret==-2
+        不可被错误分类为 Sent，包括 errmsg 各种 padding / quote / 多
+        种格式）
+      - adversarial_large_payload_does_not_panic（4 MB body）
+      - adversarial_nested_garbage_does_not_panic（嵌套 / 类型错误 JSON）
+    status: fixed
+
+  # ───────────────────────────────────────────────────────────────────────
+  - id: M1-F-010
+    severity: low
+    category: api-design / partial-send-coupling
+    location:
+      file: src/bridge/dispatcher.rs
+      line: 128
+      symbol: sendmessage
+    title: "Throttled 缺少对未发送消息的引用（pending 所有权），M2 重试会需要回头抓数据"
+    description: |
+      M1 把信号拎出来了，但 Throttled 不带"未成功送达的内容"。M2/M3
+      要重试时，调用点需要"重发什么东西"—— partial reply 调用点（line
+      575-590）chunk 已经在 sendmessage 调用里被 move 走了，从
+      Throttled 信号里回不来。M2 必然要在调用点改造 `pending: String`
+      + 把重试逻辑挪到调用点（不是 sendmessage 内部）。这意味着：
+      M1 的 SendOutcome 不是"自给自足"的重试令牌 —— 接受这个设计，
+      但 M2 plan 文档应明确"M2 改造 partial_rx 任务为有状态循环，
+      Throttled 仅作为触发信号"。
+    evidence: |
+      dispatcher.rs:106-140 sendmessage 实现，line 567-592 调用点。
+    impact: |
+      设计层面的耦合提示：M1 OK，但 M2 在调用点必须把 chunk 在调用前
+      clone（或改成 Throttled 时手动重发）。
+    recommendation: |
+      在 SendOutcome::Throttled 上加个 doc comment："does NOT carry
+      the unsent payload; callers must retain the original request if
+      they wish to retry"，避免 M2 实现者误以为能从中还原。
+    resolution: |
+      已在 SendOutcome::Throttled 变体的 docstring 中写明：
+      "does NOT carry the unsent payload; callers must retain the
+      original request if they wish to retry — M2 will restructure
+      the partial-reply loop to do exactly that." M2 启动时实现者看
+      到这句话就不会误以为 Throttled 自带 payload。
+    status: fixed
+
+# ─── Verdict rationale ─────────────────────────────────────────────────────
+verdict_rationale: |
+  PASS。F-001（编译错）已消；F-002（final-reply Throttled 不升级为错
+  误）已与其它 4 处 Throttled 调用点统一；F-003（shutdown-error 可观测）
+  已显式提示"M3 must cover this path"；F-004（forward_handle cancel-
+  safety）已用双层 select 实现；F-005（errmsg 脱敏）已用 sanitize_errmsg
+  helper 覆盖 5 处；F-006（SendOutcome Clone）已 derive 并配 doc 注释；
+  F-007（JSON 解析失败 warn）已加；F-008（Send-boundary）作为信息性
+  提示被 F-004 的实现吸收；F-009（解析单测）已抽 parse_sendoutcome
+  纯函数并配 8 类输入单测；F-010（doc comment）已加。
+  验证命令：`cargo fmt` + `cargo build --all-targets` + `cargo clippy
+  --all-targets --no-deps` + `cargo test --all` 全绿；新增 17 个
+  dispatcher 单测（含 3 个对抗性 / fuzz-style）全过；其它模块原有 321
+  个测试无回归。可以进入 M2。
+
+# ─── What's good (do not regress) ─────────────────────────────────────────
+positives:
+  - SendOutcome 抽象方向正确：把语义错从 anyhow::Error 里拎出来，未来 M2/M3
+    可以直接 match 而不用字符串扫描。
+  - 4 个调用点都用 `match` 而非嵌套 if-let，三段式 Ok(Sent) / Ok(Throttled) /
+    Err 分支结构对称。
+  - HTTP transport 错误仍然走 Err，传播路径不变 —— 既有 retry / fatal /
+    transient 分类继续工作。
+  - 注释里指明"哪一步由 M2/M3 接管"是个值得保留的可读性决策。
+  - parse_sendoutcome 抽出纯函数让 M2/M3 不用 wiremock 也能验证重试
+    决策的输入条件 —— 比 trait 抽象轻得多。
+  - sanitize_errmsg helper 兼容 printable unicode（中文 / emoji 通过
+    单测），不是粗暴 `chars().filter(is_ascii)`。
+
+# ─── Linked memories / context ─────────────────────────────────────────────
+links:
+  - docs/exec-plans/active/bridge-partial-throttle-retry/plan.md
+  - src/ilink/types.rs (SendMessageResponse 定义)
+  - reviews/m0/review-findings.yaml (上游基线)
