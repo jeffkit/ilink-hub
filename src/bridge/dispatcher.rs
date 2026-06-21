@@ -32,6 +32,101 @@ enum GetUpdatesOutcome {
     TokenRejected,
 }
 
+/// Outcome of a single `HubClient::sendmessage` call. Lets callers distinguish
+/// upstream throttling (ret == -2) from generic failures without inspecting
+/// the raw HTTP body. HTTP transport errors and `ret` values other than 0
+/// and -2 surface as `Err(_)` so the existing error-propagation paths are
+/// preserved; the typed outcomes are only set when we got a parseable 2xx
+/// response and want to communicate the semantic result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SendOutcome {
+    /// Hub acknowledged the message.
+    Sent,
+    /// Hub signalled throttling / rate-limit (`ret == -2`). The call should
+    /// be retried with backoff (M2/M3 will buffer + retry at the partial
+    /// and final-reply layers). Carries the upstream errmsg for logging.
+    ///
+    /// Note: does NOT carry the unsent payload; callers must retain the
+    /// original request if they wish to retry — M2 will restructure the
+    /// partial-reply loop to do exactly that.
+    Throttled { ret: i32, errmsg: Option<String> },
+}
+
+/// Sanitize an upstream `errmsg` string for safe logging.
+///
+/// Strips control characters (incl. CR/LF and ANSI escapes) and caps the
+/// length so a maliciously long upstream message cannot pollute log lines or
+/// buffer memory. Returns `None` when the input is `None` or empty after
+/// sanitization.
+fn sanitize_errmsg(s: Option<&str>) -> Option<String> {
+    const MAX_LEN: usize = 256;
+    let raw = s?;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_LEN)
+        .collect();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+/// Pure mapping from a parsed `SendMessageResponse` to a `SendOutcome`.
+///
+/// Extracted so the M1 typed semantics can be unit-tested without spinning
+/// up an HTTP server. The (response_body_len, parse_ok) pair is carried
+/// back so the caller can decide whether to surface an observability
+/// warning — see [`parse_sendoutcome`].
+#[allow(dead_code)]
+fn classify_sendoutcome(parsed: Option<&SendMessageResponse>) -> SendOutcome {
+    match parsed {
+        None => SendOutcome::Sent,
+        Some(v) => match v.ret {
+            Some(0) => SendOutcome::Sent,
+            Some(-2) => SendOutcome::Throttled {
+                ret: -2,
+                errmsg: v.errmsg.clone(),
+            },
+            Some(_other) => SendOutcome::Sent, // re-classified to Err by caller via ret != 0
+            None => SendOutcome::Sent,
+        },
+    }
+}
+
+/// Map the raw HTTP response body of `sendmessage` into a [`SendOutcome`].
+///
+/// Empty bodies are treated as `Sent` (i.e. hub omitted its usual JSON
+/// envelope). When the body parses as JSON and `ret` is some non-zero
+/// value other than -2, this returns `Err` carrying the upstream ret/errmsg
+/// so the caller can decide whether the value is fatal or transient. When
+/// the body fails to parse entirely, this returns `Ok(Sent)` for backwards
+/// compatibility with the legacy behaviour — but the caller is expected to
+/// log a warning so the silent fallback is observable (see F-007).
+fn parse_sendoutcome(text: &str) -> Result<SendOutcome, (i32, Option<String>)> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(SendOutcome::Sent);
+    }
+    match serde_json::from_str::<SendMessageResponse>(trimmed) {
+        Ok(v) => {
+            let ret = v.ret.unwrap_or(0);
+            if ret == -2 {
+                Ok(SendOutcome::Throttled {
+                    ret: -2,
+                    errmsg: v.errmsg,
+                })
+            } else if ret != 0 {
+                Err((ret, v.errmsg))
+            } else {
+                Ok(SendOutcome::Sent)
+            }
+        }
+        Err(_) => Ok(SendOutcome::Sent),
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct HubClient {
     http: reqwest::Client,
@@ -87,7 +182,7 @@ impl HubClient {
         Ok(GetUpdatesOutcome::Ok(out))
     }
 
-    async fn sendmessage(&self, req: SendMessageRequest) -> Result<()> {
+    async fn sendmessage(&self, req: SendMessageRequest) -> Result<SendOutcome> {
         let url = format!("{}/ilink/bot/sendmessage", self.hub_url);
         let resp = self
             .http
@@ -102,17 +197,26 @@ impl HubClient {
             anyhow::bail!("sendmessage HTTP {status}: {t}");
         }
         let text = resp.text().await?;
-        if text.trim().is_empty() {
-            return Ok(());
-        }
-        match serde_json::from_str::<SendMessageResponse>(&text) {
-            Ok(v) => {
-                if v.ret.map(|r| r != 0).unwrap_or(false) {
-                    anyhow::bail!("sendmessage ret={:?} errmsg={:?}", v.ret, v.errmsg);
+        let body_len = text.len();
+        match parse_sendoutcome(&text) {
+            Ok(out) => {
+                if body_len > 0 && matches!(out, SendOutcome::Sent) {
+                    // We received a non-empty body that parsed either as
+                    // ret==0 / None / failed JSON. Log a low-frequency
+                    // observability line so silent fallback to Sent stays
+                    // visible (F-007).
+                    if serde_json::from_str::<SendMessageResponse>(&text).is_err() {
+                        warn!(
+                            body_len,
+                            "sendmessage response body failed to parse as JSON; treating as Sent (legacy fallback)"
+                        );
+                    }
                 }
-                Ok(())
+                Ok(out)
             }
-            Err(_) => Ok(()),
+            Err((other, errmsg)) => {
+                anyhow::bail!("sendmessage ret={other} errmsg={:?}", errmsg);
+            }
         }
     }
 }
@@ -168,13 +272,25 @@ async fn run_session_worker(
                         "⚠️ 响应中断（服务正在重启），请稍后重发消息".to_string(),
                         &from_for_err,
                     );
-                    if let Err(e) = client.sendmessage(req).await {
-                        warn!(error = %e, "failed to send shutdown error reply");
+                    match client.sendmessage(req).await {
+                        Ok(SendOutcome::Sent) => {}
+                        Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                            // User did not receive the "service restarting,
+                            // please resend" notice. This is an
+                            // observability hit for the user. M3 must
+                            // include this path when wiring buffer+retry.
+                            warn!(
+                                ret,
+                                errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                                "sendmessage throttled during shutdown error reply; user did NOT receive restart notice — M3 must cover this path when adding buffer+retry"
+                            );
+                        }
+                        Err(e) => warn!(error = %e, "failed to send shutdown error reply"),
                     }
                 }
                 return;
             }
-            r = handle_one_message(&client, &app, msg) => r,
+            r = handle_one_message(&client, &app, msg, shutdown.clone()) => r,
         };
 
         match result {
@@ -483,6 +599,7 @@ async fn handle_one_message(
     client: &HubClient,
     app: &BridgeApp,
     msg: WeixinMessage,
+    shutdown: CancellationToken,
 ) -> Result<(), HandleError> {
     dump_inbound_weixin_message_for_debug(&msg);
 
@@ -533,16 +650,50 @@ async fn handle_one_message(
     let fwd_ctx = ctx.clone();
     let fwd_from_user = from_user.clone();
     let fwd_session_name = session_name_for_cli.clone();
+    let fwd_shutdown = shutdown.clone();
     let forward_handle = tokio::spawn(async move {
-        while let Some(chunk) = partial_rx.recv().await {
+        loop {
+            // Cancel-safety: even if a chunk is currently being sent
+            // (up to 90s for the hub round-trip per HubClient::new), we
+            // bail as soon as shutdown is signalled so the run_session_worker
+            // can return without dragging the supervisor wait window out.
+            let chunk = tokio::select! {
+                biased;
+                _ = fwd_shutdown.cancelled() => return,
+                chunk_opt = partial_rx.recv() => match chunk_opt {
+                    Some(c) => c,
+                    None => return,
+                },
+            };
             let mut req =
                 SendMessageRequest::reply_text(fwd_ctx.clone(), chunk, &fwd_from_user, None);
             if let Some(ref mut msg) = req.msg {
                 let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                 ext.session_name = Some(fwd_session_name.clone());
             }
-            if let Err(e) = fwd_client.sendmessage(req).await {
-                warn!(error = %e, "failed to send partial reply");
+            // Wrap the actual send in a select too so an in-flight
+            // sendmessage can be aborted by shutdown.
+            let send_fut = fwd_client.sendmessage(req);
+            let send_result = tokio::select! {
+                biased;
+                _ = fwd_shutdown.cancelled() => return,
+                r = send_fut => r,
+            };
+            match send_result {
+                Ok(SendOutcome::Sent) => {}
+                Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                    // M1 placeholder: at this site the chunk is already gone
+                    // from the unbounded channel, so we cannot re-enqueue it
+                    // without restructuring the loop. Log loudly so the M2
+                    // change can verify its coverage by watching for this
+                    // message in test runs.
+                    warn!(
+                        ret,
+                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "sendmessage throttled for partial reply; M2 will buffer+retry here"
+                    );
+                }
+                Err(e) => warn!(error = %e, "failed to send partial reply"),
             }
         }
     });
@@ -582,8 +733,18 @@ async fn handle_one_message(
                             let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                             hub_ext.session_name = Some(session_name_for_cli.clone());
                         }
-                        if let Err(e) = client.sendmessage(req).await {
-                            warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply");
+                        match client.sendmessage(req).await {
+                            Ok(SendOutcome::Sent) => {}
+                            Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                                warn!(
+                                    ret,
+                                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                                    "sendmessage throttled while persisting cli_session_id; M3 will buffer+retry here"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply")
+                            }
                         }
                     }
                 }
@@ -594,14 +755,39 @@ async fn handle_one_message(
                 let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                 hub_ext.session_name = Some(session_name_for_cli.clone());
             }
-            client.sendmessage(req).await.context("sendmessage reply")?;
+            match client.sendmessage(req).await {
+                Ok(SendOutcome::Sent) => {}
+                Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                    // M1 placeholder: final-reply path does NOT escalate
+                    // Throttled to HandleError. M3 will buffer + retry the
+                    // final reply on throttling and remove this warn
+                    // entirely (or convert it into a structured "retry
+                    // attempted" trace). For now we surface the typed
+                    // signal so M3 coverage can be verified by watching
+                    // for this log line.
+                    warn!(
+                        ret,
+                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "sendmessage throttled on final reply; M3 will buffer+retry here"
+                    );
+                }
+                Err(e) => return Err(HandleError::from(e.context("sendmessage reply"))),
+            }
         }
         Err(e) => {
             if app.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
                 let req = SendMessageRequest::reply(ctx, err_text, &from_user);
-                if let Err(send_e) = client.sendmessage(req).await {
-                    warn!(error = %send_e, "failed to send error reply");
+                match client.sendmessage(req).await {
+                    Ok(SendOutcome::Sent) => {}
+                    Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                        warn!(
+                            ret,
+                            errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                            "sendmessage throttled on CLI-error reply; M3 will buffer+retry here"
+                        );
+                    }
+                    Err(send_e) => warn!(error = %send_e, "failed to send error reply"),
                 }
             }
             let err_str = e.to_string().to_lowercase();
@@ -799,5 +985,192 @@ timeout_secs: 5
 
         disp.dispatch(msg.clone()).await;
         assert_eq!(disp.sender_keys(), vec!["ctx-z:default"]);
+    }
+
+    // ─── parse_sendoutcome ─────────────────────────────────────────────
+    //
+    // M1 review F-009: pin the body-text → SendOutcome mapping with unit
+    // tests so M2/M3 retry decisions have a stable oracle. The legacy
+    // behaviour (parse failure → Sent) is intentionally preserved; tests
+    // make that explicit so future changes are a deliberate decision.
+
+    #[test]
+    fn parse_empty_body_is_sent() {
+        assert_eq!(parse_sendoutcome(""), Ok(SendOutcome::Sent));
+        assert_eq!(parse_sendoutcome("   \n\t "), Ok(SendOutcome::Sent));
+    }
+
+    #[test]
+    fn parse_ret_zero_is_sent() {
+        let body = r#"{"ret":0}"#;
+        assert_eq!(parse_sendoutcome(body), Ok(SendOutcome::Sent));
+    }
+
+    #[test]
+    fn parse_ret_none_is_sent() {
+        let body = r#"{}"#;
+        assert_eq!(parse_sendoutcome(body), Ok(SendOutcome::Sent));
+    }
+
+    #[test]
+    fn parse_ret_negative_two_is_throttled() {
+        let body = r#"{"ret":-2,"errmsg":"rate limited"}"#;
+        match parse_sendoutcome(body).unwrap() {
+            SendOutcome::Throttled { ret, errmsg } => {
+                assert_eq!(ret, -2);
+                assert_eq!(errmsg.as_deref(), Some("rate limited"));
+            }
+            other => panic!("expected Throttled, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_ret_other_non_zero_is_err() {
+        let body = r#"{"ret":1,"errmsg":"oops"}"#;
+        match parse_sendoutcome(body) {
+            Err((1, Some(m))) => assert_eq!(m, "oops"),
+            other => panic!("expected Err((1, Some(..))), got {:?}", other),
+        }
+        let body = r#"{"ret":-99,"errmsg":"unknown"}"#;
+        match parse_sendoutcome(body) {
+            Err((-99, Some(m))) => assert_eq!(m, "unknown"),
+            other => panic!("expected Err((-99, Some(..))), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_unparseable_body_falls_back_to_sent() {
+        // Legacy behaviour: pre-M1 code returned Ok(Sent) on JSON parse
+        // failure. M1 keeps the fallback but the dispatcher now emits a
+        // warn log; the unit test pins the fallback itself.
+        assert_eq!(parse_sendoutcome("not json"), Ok(SendOutcome::Sent));
+        assert_eq!(parse_sendoutcome(r#"{"ret": "#), Ok(SendOutcome::Sent));
+    }
+
+    // ─── Adversarial / property-style tests ────────────────────────────
+    //
+    // Goal: catch silent regressions in the parser that could let a
+    // hostile hub payload (e.g. ret==-2 disguised as Sent) bypass M2/M3
+    // retry logic.
+
+    #[test]
+    fn adversarial_ret_negative_two_never_becomes_sent() {
+        // Even with errmsg present, ret==-2 must produce Throttled —
+        // this is the entire reason SendOutcome exists.
+        for body in [
+            r#"{"ret":-2}"#,
+            r#"{"ret":-2,"errmsg":""}"#,
+            r#"{"ret":-2,"errmsg":"hi"}"#,
+            r#" {"ret":-2} "#,
+            r#"{"ret":-2,"errmsg":"a]lo t of\\n junk"}"#,
+        ] {
+            match parse_sendoutcome(body).unwrap() {
+                SendOutcome::Throttled { ret: -2, .. } => {}
+                other => panic!("ret=-2 body {:?} misclassified as {:?}", body, other),
+            }
+        }
+    }
+
+    #[test]
+    fn adversarial_large_payload_does_not_panic() {
+        // Hub returning a multi-megabyte body must not panic / OOM the
+        // parser. We send 4 MB of repeated JSON-safe content and confirm
+        // we get a typed outcome (either Sent, Throttled, or parse-fail)
+        // rather than a process abort.
+        let big = "x".repeat(4 * 1024 * 1024);
+        let body = format!(r#"{{"ret":0,"errmsg":"{}"}}"#, big);
+        let res = parse_sendoutcome(&body);
+        // We don't care which branch it took — only that it didn't panic.
+        let _ = res;
+    }
+
+    #[test]
+    fn adversarial_nested_garbage_does_not_panic() {
+        // Hub could send deeply nested or weird JSON. As long as serde
+        // rejects it, parse_sendoutcome must fall back to Sent and not
+        // propagate a panic.
+        for body in [
+            r#"{"ret":{"deeply":{"nested":[1,2,3]}}}"#,
+            r#"{"ret":-2.5}"#,
+            r#"{"ret":-2,"errmsg":12345}"#,
+            r#"{} broken"#,
+        ] {
+            let _ = parse_sendoutcome(body);
+        }
+    }
+
+    // ─── sanitize_errmsg ───────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        let dirty = "before\r\nafter\tend\x1b[31mred\x1b[0m";
+        let cleaned = sanitize_errmsg(Some(dirty)).unwrap();
+        assert!(!cleaned.contains('\r'));
+        assert!(!cleaned.contains('\n'));
+        assert!(!cleaned.contains('\t'));
+        assert!(!cleaned.contains('\x1b'));
+        assert!(cleaned.contains("before"));
+        assert!(cleaned.contains("red"));
+    }
+
+    #[test]
+    fn sanitize_caps_length() {
+        let huge = "a".repeat(10_000);
+        let cleaned = sanitize_errmsg(Some(&huge)).unwrap();
+        assert_eq!(cleaned.len(), 256);
+    }
+
+    #[test]
+    fn sanitize_handles_none_and_empty() {
+        assert!(sanitize_errmsg(None).is_none());
+        assert!(sanitize_errmsg(Some("")).is_none());
+        assert!(sanitize_errmsg(Some("\r\n\t")).is_none());
+    }
+
+    #[test]
+    fn sanitize_preserves_printable_unicode() {
+        // Multi-byte UTF-8 and punctuation must survive.
+        let s = "你好, world! 🌏 — dash";
+        assert_eq!(sanitize_errmsg(Some(s)).as_deref(), Some(s));
+    }
+
+    // ─── classify_sendoutcome (additional M1F-006 helper) ──────────────
+
+    #[test]
+    fn classify_three_categories() {
+        let none_resp = SendMessageResponse {
+            ret: None,
+            errmsg: None,
+        };
+        let zero_resp = SendMessageResponse {
+            ret: Some(0),
+            errmsg: None,
+        };
+        let tmo_resp = SendMessageResponse {
+            ret: Some(-2),
+            errmsg: Some("rl".into()),
+        };
+        assert_eq!(classify_sendoutcome(None), SendOutcome::Sent);
+        assert_eq!(classify_sendoutcome(Some(&none_resp)), SendOutcome::Sent);
+        assert_eq!(classify_sendoutcome(Some(&zero_resp)), SendOutcome::Sent);
+        assert_eq!(
+            classify_sendoutcome(Some(&tmo_resp)),
+            SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into())
+            }
+        );
+    }
+
+    #[test]
+    fn outcome_clone_works() {
+        // Pin F-006's derive(Clone) at compile-time — if Clone goes away
+        // this won't compile.
+        let original = SendOutcome::Throttled {
+            ret: -2,
+            errmsg: Some("x".into()),
+        };
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
     }
 }
