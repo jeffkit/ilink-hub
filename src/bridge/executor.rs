@@ -524,5 +524,8 @@ mod tests {
             sanitize_env_value("test", "hello\0\nworld\r"),
             "hello world "
         );
+        assert_eq!(sanitize_env_value("test", "\0\0\0"), "");
+        assert_eq!(sanitize_env_value("test", "\n\n\r\r"), "    ");
+        assert_eq!(sanitize_env_value("test", "a\0b\nc\rd"), "ab c d");
     }
 }

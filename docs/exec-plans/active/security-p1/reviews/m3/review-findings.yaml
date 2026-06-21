@@ -1,0 +1,179 @@
+milestone: M3
+title: quote_index 启动预热对抗性审查结果
+verdict: PASS
+review_date: 2026-06-21
+reviewer: Antigravity (AI Auditor)
+
+summary: |
+  对 M3 里程碑（`QuoteRouteIndex` 启动预热）的实现代码执行了对抗性安全与并发审查。
+  审查范围覆盖了三个新组件的 5 个文件、相关 dispatch 路径、锁获取顺序与 HubState 约束、
+  SQL 注入面、env 变量解析、tokio 异步模式（spawn / 锁竞争 / shutdown）以及整数运算。
+
+  整体结论：本里程碑的实现符合 "M3 review request" 中声明的设计意图；安全性、并发性、
+  持久化一致性均未发现 Critical 或 High 级别缺陷。M3 在测试、fmt、clippy、build 与
+  E2E-3 round-trip 路径上均为绿色（详见 review-request.yaml 的 verification_artifacts）。
+
+  本次审查标注 4 条 Medium/Low 级观察项，均为非阻塞性建议，可在后续 M-阶段或维护
+  窗口中处理；其中两条与既有行为一致（非本次回归），另两条为文档/估算层面的精化。
+  所有标记为 MEDIUM 的项均有具体修复路径，不影响 M3 准入合并。
+
+  审查路径概览：
+  1. src/store/messages.rs       (RecentOutboundRow + recent_outbound_messages)
+  2. src/hub/quote_route.rs      (WarmItem + warm_from_history + warm_item_from_recent_row)
+  3. src/runtime/serve.rs        (parse_env_warmup_limit + warm_quote_index_from_db)
+  4. src/store/store_tests.rs    (3 个 M3 集成测试)
+  5. src/hub/mod.rs              (re-export)
+  6. src/store/mod.rs            (re-export)
+  7. src/hub/dispatch.rs         (实时 quote_index 使用模式 / lock-order 校验)
+  8. src/hub/state.rs            (RoutingState 定义与 lock-order 约束)
+  9. src/hub/commands.rs         (register_outbound_content 实时调用)
+  10. src/server/routes.rs       (register_outbound_content 实时调用)
+  11. migrations/0005_messages.sql (索引可用性)
+
+findings:
+  - id: SEC-M3-001
+    title: warmup 未在 shutdown 信号下优雅取消，存在轻量级资源浪费
+    severity: Low
+    status: OBSERVATION
+    description: |
+      在 `src/runtime/serve.rs` 第 285 行，warmup 任务以裸 `tokio::spawn` 启动，未订阅
+      `state.ilink.shutdown` 的 `watch::Receiver`，对比 `spawn_quote_index_evictor`
+      （dispatch.rs:19-35）在内部 `tokio::select!` 监听 shutdown 后再退出。如果 Hub
+      在 warmup 完成前收到 Ctrl+C（特别是当 `recent_outbound_messages` 因慢 DB 而
+      耗时较长时），warmup 任务会被 tokio runtime 在 axum 退出后直接 drop，而不是
+      收到 shutdown 信号后停止读取 DB。
+
+      影响范围：
+      - 功能层面：warmup 产物仅写入 `state.routing.quote_index`（纯 in-memory），
+        被 drop 后只会让 SQL fallback 继续覆盖冷启动窗口，无数据丢失风险；
+      - 资源层面：drop 会中断一次进行中的 SELECT 查询，在长事务或 row-lock 持有
+        场景下可能留下未完成的 DB 副作用；但 SELECT 本身不写，副作用为空；
+      - 用户可观察层：在 `axum::serve.with_graceful_shutdown` 已经进入 drain 流程
+        后，Hub 进程仍会被 tokio runtime 阻塞到 warmup 任务结束，导致 Ctrl+C 到
+        进程退出之间出现"看起来卡住"的窗口，最大可达单次 SELECT 的延迟。
+    resolution: |
+      在 `warm_quote_index_from_db` 内部使用 `tokio::select!` 让 DB 查询与 shutdown
+      信号竞争：`tokio::select! { _ = shutdown.changed() => return, rows = store.recent_outbound_messages(limit) => { ... } }`。
+      这样在用户 Ctrl+C 时 warmup 立即放弃，不会拖慢进程退出。
+      可接受的不修：本里程碑的设计意图就是"warmup 失败也不能阻塞 listener"，
+      而 graceful shutdown 期间 hub 已经停止接收新消息，warmup 是否完成对正确性
+      没有影响；本条仅作为可观察性问题提示。
+
+  - id: SEC-M3-002
+    title: recent_outbound_messages 缺少针对 (role, id DESC) 的复合索引，大表场景下退化为全表扫描
+    severity: Medium
+    status: OBSERVATION
+    description: |
+      `src/store/messages.rs:83-105` 中 `recent_outbound_messages` 的查询是：
+        SELECT peer_user_id, content, vtoken, session_name, created_at
+        FROM messages
+        WHERE role = 'assistant' AND content IS NOT NULL AND content != ''
+        ORDER BY id DESC LIMIT $1
+      该查询没有 `peer_user_id` 前缀，因此现有的 `idx_messages_peer_role_created`
+      (peer_user_id, role, created_at DESC)（migrations/0005_messages.sql:28-29）
+      不能被前缀匹配利用。SQLite/Postgres 在大表场景下只能退化为：
+      - SQLite：扫描主键逆序或全表扫描后 LIMIT stop；
+      - Postgres：在 role 选择性较低时（assistant 行占比可能 > 50%）退化为 Seq Scan。
+      这会让 warmup 的延迟从声明的"几百 µs" 变成秒级，间接破坏 M3 的核心
+      SLO（不阻塞 listener 启动后的 cold-start 体验），且 review-request.yaml 中
+      风险登记表里"lock hold time is far below the dispatcher's 10 ms budget"的
+      估算未考虑 DB 端 O(N) 扫描成本。
+    resolution: |
+      添加新 migration `0008_messages_role_id_index.sql`，建立针对 warmup 查询的
+      复合索引：
+        CREATE INDEX IF NOT EXISTS idx_messages_role_id_desc
+          ON messages (role, id DESC);
+      注意：SQLite/Postgres 的 `DESC` 在 CREATE INDEX 中受支持；MySQL 8.0+ 也支持
+      `INDEX (role, id DESC)`。migration runner 需要在三个 backend 上分别验证语法
+      与执行计划，可参考 migrations/0005_messages.sql 中已有的 driver-specific
+      DDL 处理模式。
+      可接受的不修（短期）：当前 messages 表通常不大（数千到数万行），全表扫描
+      仍在可接受范围内；本条作为后续性能优化项保留。
+
+  - id: SEC-M3-003
+    title: warmup 写入 quote_index 的 vtoken 未经 registry 校验，可能为已删除的客户端保留 phantom 路由
+    severity: Medium
+    status: OBSERVATION
+    description: |
+      `src/hub/quote_route.rs::warm_item_from_recent_row` 在第 396、404 行直接把
+      `row.vtoken` 写进 `QuoteOrigin::Client`，没有验证该 vtoken 是否仍对应一个
+      已注册的客户端。`load_clients_from_db` 已经在 warmup 之前调用，但 warmup
+      任务没有读取 `state.clients.registry` 来过滤。
+
+      安全/正确性影响：
+      - 若 messages 表残留的 vtoken 在某次升级中被删除（或 DB 被外部直接修改），
+        warmup 会向 in-memory index 注入一个指向"不存在客户端"的 QuoteOrigin；
+      - 一个 quote-reply 在解析后，下游 `merge_routing_with_quote` 会把它转成
+        `RoutingDecision::ForwardTo { vtoken, session_override }`，最终被
+        `resolve_vctx_for_message` / `build_hub_ext_for_vctx` 使用——具体后续
+        行为取决于下游对未知 vtoken 的处理；
+      - 注意：实时 dispatch 路径（`server/routes.rs:553` 的 register_outbound_content）
+        同样不验证 vtoken，因为 vtoken 是 backend 在 send_message 时刚刚提供的，
+        实时窗口内总是有效的。所以本条更准确的描述是"warmup 把实时窗口的隐式
+        不变量暴露成了持久化的弱保证"，而非新的回归。
+
+      同时观察到 `warm_item_from_recent_row` 第 411 行 `session_name: Some(row.session_name.clone())`
+      也是从 DB 列直接拿，不做 session 是否存在校验；不过 session_name 只是
+      RoutingDecision 的可选覆盖字段，错误填充只会让后续新建 session 而不会破坏
+      客户端定位。
+    resolution: |
+      在 `warm_quote_index_from_db` 中，对每行 `RecentOutboundRow` 增加可选过滤：
+      若 `row.vtoken` 存在但不在 `state.clients.registry` 当前快照中，跳过该行
+      （或至少降级为 QuoteOrigin::Hub，与缺 vtoken 的情况一致）。可在调用
+      `warm_item_from_recent_row` 之前用一次 `registry.read().await` 完成批量
+      校验，registry 是 RwLock，并发读无锁开销。
+      可接受的不修：本条与既有实时路径行为一致，未引入新的攻击面；可作为后续
+      "warmup 健全性检查"统一改进项。
+
+  - id: SEC-M3-004
+    title: warmup 期间 evict_expired 被调用 N 次，复杂度 O(N×M)；risk_register 估算偏低
+    severity: Low
+    status: OBSERVATION
+    description: |
+      `src/hub/quote_route.rs::warm_from_history` 对每个 warm item 调用
+      `register_outbound_content`，而 `register_outbound_content`（line 144）在
+      每个 key 写入前都调用一次 `self.evict_expired()`（line 144）。
+
+      `evict_expired`（line 267-300）的实现是 O(M) —— 遍历整个 `by_content` map
+      并对每个 bucket 做线性 retain。Warmup 写入 N=500 条，每条内容平均生成 2 个
+      key（"full:" 和 "pre:"），所以总 evict_expired 调用次数约 1000 次，每次
+      遍历 by_content 当前大小（默认空，逐步增长）。
+
+      复杂度量级：
+      - 早期：by_content 几乎为空，单次 evict_expired 是 O(0)；
+      - 后期：当达到 500 条且大多 key 不重复，evict_expired 仍然是 O(500)；
+      - 最坏场景：warmup 期间 iframes 全部命中已存在的 key，evict_expired 在
+        1000 次调用中分别扫描 0, 1, 2, ..., 500 个 bucket，总成本 O(N²) = O(500²) ≈
+        250k 操作，加 BTreeSet 重建与 by_age remove 等常数后，量级在 10ms~50ms 范围，
+        而非 review-request.yaml risk_register 中声明的"a few hundred µs"。
+
+      影响：
+      - 仅影响 warmup 期间持锁时长（其余锁请求会公平排队）；
+      - 不会触发 deadlock，因为 QuoteRouteIndex 锁是单一 Mutex，无嵌套；
+      - 不会突破 dispatcher 的 10ms 单消息预算，因为 warmup 是 detached 任务，
+        不阻塞任何请求路径。
+    resolution: |
+      若后续想把 warmup 持锁时长压到 µs 级，可改 warm_from_history 直接调用一个
+      `register_outbound_content_no_evict` 变体，并在 warmup 末尾做一次 batch
+      evict_expired。但当前实现已经满足"不阻塞 listener"的最低设计目标，性能
+      精化属于优化项。可在 SEC-M3-002 的索引优化落地后一并 benchmark 验证。
+
+verification_artifacts_reviewed:
+  - "代码 diff 涉及文件均已 read。"
+  - "store_tests.rs M3 测试覆盖了 role 过滤、id DESC 排序、limit clamp [1, 10000]、round-trip 通过 in-memory 路径解析；未覆盖 warm_item_from_recent_row 的 footer 缺失路径，但 quote_route.rs 的 unit tests 已覆盖 (warm_item_from_recent_row_missing_footer_uses_placeholder_name)。"
+  - "quote_route.rs 的 6 个新 unit tests 覆盖：与 register_loop 等价、空 slice noop、空白文本跳过、scope 隔离、footer+session 正常路径、footer 缺失使用 <warmup>、vtoken 缺失降级为 Hub。"
+  - "rustc 编译：fmt/clippy/test/build 在 review-request.yaml 已声明全部绿色。"
+  - "HubState::routing 锁顺序：本次 warmup 仅获取 quote_index 单锁，不嵌套 router/registry，未违反 hub/mod.rs 第 16-44 行的锁顺序约定。"
+  - "SQL 注入面：recent_outbound_messages 使用 bind($1)，无字符串拼接；parse_env_warmup_limit 仅解析为整数后 bind，无 SQL 路径。"
+
+non_findings_checked:
+  - "tokio::spawn detach 模式：warmup 不阻塞 axum::serve 的 listener bind，与 review-request.yaml 设计意图一致。"
+  - "锁跨越 .await：warm_quote_index_from_db 在 lock().await 后仅做同步 Rust 操作 (warm_from_history 内部都是同步)，未持锁跨网络 I/O。"
+  - "整数溢出：resolve_by_content line 228 使用 i128 中间值处理 i64 相减减绝对值，已通过 overflow_protection_min/max 单元测试覆盖。"
+  - "u64 序列号回绕：next_seq 使用 wrapping_add，语义合理；seq 仅作为同 created_ms 的 tiebreaker，回绕周期 2^64 在 7 天 TTL 内不可达。"
+  - "Vec<u8>/String 内存安全：parse_footer_from_quoted_text 的 rfind/split 均基于切片操作，无 unsafe。"
+  - "HubState::routing.quote_index 锁在 dispatch.rs:113 的获取方式是短临界区（仅 resolve_user_quote 同步调用），与 hub/mod.rs 第 32 行的'Drop the guard before any .await'规则一致。"
+  - "BTreeSet (i64, u64, u64) 元组等价性：三个字段都实现了 Ord，不会出现重复但 tuple 不相等的情况。"
+  - "<warmup> 占位符名字的 grep 友好性：与 design 决策一致。"
+  - "QuoteOrigin::Hub { cmd: HubCommand::Help } 的降级行为：vtoken 缺失路径下保留进 index 是有意为之（避免 silent drop），且 merge_routing_with_quote 在 line 39 把 Hub 变体转成 RoutingDecision::HubInternal，与 live 路径一致。"
+  - "env var ILINK_QUOTE_INDEX_WARMUP_LIMIT 的解析：clamp 到 [1, 10000]，与 SQL LIMIT clamp 完全对齐；非法值 fall back to default + WARN，不 panic。"

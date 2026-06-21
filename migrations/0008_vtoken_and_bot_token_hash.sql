@@ -1,0 +1,6 @@
+-- Migration 0008: Hash vtoken and encrypt bot_token.
+--
+-- This migration data conversion is executed in Rust code (migrate_to_v8_tx in migrations.rs)
+-- to perform inline cryptographic hashing (SHA-256) of clients.vtoken and symmetric
+-- encryption (AES-256-GCM) of bot_credentials.token in memory before writing back.
+-- A pure SQL migration is not portable or secure for these operations.

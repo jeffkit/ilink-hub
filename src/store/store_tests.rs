@@ -1,5 +1,4 @@
 use super::*;
-use sqlx::Row;
 
 static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -2757,6 +2756,7 @@ async fn m3_warmup_round_trip_through_quote_index() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
     let _guard = ENV_MUTEX.lock().unwrap();
     let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
@@ -2877,6 +2877,7 @@ async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn test_migration_v8_missing_master_key_fails() {
     let _guard = ENV_MUTEX.lock().unwrap();
     let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
@@ -2931,4 +2932,100 @@ async fn test_migration_v8_missing_master_key_fails() {
     assert!(res.is_err());
     let err_msg = res.unwrap_err().to_string();
     assert!(err_msg.contains("ILINK_HUB_MASTER_KEY is required"));
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn test_migration_v8_idempotency_does_not_double_encrypt() {
+    let _guard = ENV_MUTEX.lock().unwrap();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version     INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .unwrap();
+
+    store.migrate_to_v1().await.unwrap();
+    store.migrate_to_v2().await.unwrap();
+    store.migrate_to_v3().await.unwrap();
+    store.migrate_to_v4().await.unwrap();
+    store.migrate_to_v5().await.unwrap();
+    store.migrate_to_v6().await.unwrap();
+    store.migrate_to_v7().await.unwrap();
+
+    let plain_bot_token = "plain_bot_token_secret_value";
+    sqlx::query("INSERT INTO bot_credentials (id, token, base_url) VALUES (1, $1, $2)")
+        .bind(plain_bot_token)
+        .bind("https://dummy.url")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let old_key = std::env::var("ILINK_HUB_MASTER_KEY");
+    let temp_key = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    std::env::set_var("ILINK_HUB_MASTER_KEY", temp_key);
+
+    // 1. Run migration first time
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 first run should succeed");
+
+    let migration_key =
+        crate::runtime::crypto::load_or_derive_master_key().expect("master key loadable");
+
+    let cred_token_1: String = sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_ne!(cred_token_1, plain_bot_token);
+    assert_eq!(
+        crate::runtime::crypto::decrypt_token(&cred_token_1, &migration_key).unwrap(),
+        plain_bot_token
+    );
+
+    // 2. Clear version tracking for v8 to force re-migration over already-encrypted data
+    sqlx::query("DELETE FROM schema_version WHERE version = 8")
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    // 3. Run migration second time
+    store
+        .migrate_to_v8()
+        .await
+        .expect("migrate_to_v8 second run should succeed");
+
+    let cred_token_2: String = sqlx::query_scalar("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+
+    // The token should remain exactly the same, no double-encryption!
+    assert_eq!(cred_token_2, cred_token_1);
+    assert_eq!(
+        crate::runtime::crypto::decrypt_token(&cred_token_2, &migration_key).unwrap(),
+        plain_bot_token
+    );
+
+    if let Ok(ref k) = old_key {
+        std::env::set_var("ILINK_HUB_MASTER_KEY", k);
+    } else {
+        std::env::remove_var("ILINK_HUB_MASTER_KEY");
+    }
 }

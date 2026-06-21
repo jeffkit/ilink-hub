@@ -1194,6 +1194,13 @@ pub async fn metrics(
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
 
+    let quote_index_ready = state.quote_index_warmed.load(Ordering::Relaxed) as u8;
+    out.push_str("# HELP ilink_hub_quote_index_ready 1 if the in-memory quote-reply index has finished warming up from DB, 0 during cold-start window\n");
+    out.push_str("# TYPE ilink_hub_quote_index_ready gauge\n");
+    out.push_str(&format!(
+        "ilink_hub_quote_index_ready {quote_index_ready}\n"
+    ));
+
     // Histograms. We render them in Prometheus text format (cumulative
     // bucket counts, plus `_count`, `_sum`, and `_created` siblings). The bucket layout
     // is defined in [`crate::hub::HISTOGRAM_BUCKETS_MS`].

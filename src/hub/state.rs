@@ -3,7 +3,7 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
@@ -515,6 +515,9 @@ pub struct HubState {
     pub relay_secret: String,
     /// Admin authentication config, parsed once at startup.
     pub admin: AdminConfig,
+    /// Set to `true` once the quote-reply index warmup from DB completes.
+    /// Exposed in `/metrics` as `ilink_hub_quote_index_ready`.
+    pub quote_index_warmed: Arc<AtomicBool>,
 }
 
 impl HubState {
@@ -541,6 +544,7 @@ impl HubState {
             persist_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PERSIST_TASKS)),
             relay_secret,
             admin,
+            quote_index_warmed: Arc::new(AtomicBool::new(false)),
         })
     }
 

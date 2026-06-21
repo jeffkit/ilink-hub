@@ -282,8 +282,10 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     let warmup_store = store.clone();
     let warmup_limit = parse_env_warmup_limit()
         .unwrap_or(crate::hub::quote_route::DEFAULT_QUOTE_INDEX_WARMUP_LIMIT);
+    let warmup_flag = state.quote_index_warmed.clone();
     tokio::spawn(async move {
         warm_quote_index_from_db(warmup_state, warmup_store, warmup_limit).await;
+        warmup_flag.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
     let (tx, rx) =

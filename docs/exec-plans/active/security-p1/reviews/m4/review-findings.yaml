@@ -1,0 +1,80 @@
+milestone: M4
+title: 迁移兼容与环境变量防截断对抗性审查结果
+verdict: NEEDS_FIX
+review_date: 2026-06-21
+reviewer: Antigravity (AI Auditor)
+
+summary: |
+  对 M4 里程碑（包含 v8 数据迁移、环境变量净化、Relay 断开重连公钥清理等）的实现代码执行了对抗性安全与并发审查。
+  审查中发现了若干个严重的逻辑与安全缺陷，包含 1 个 Critical、2 个 High、2 个 Medium 级别缺陷。
+  此外，新增的 v8 迁移导致单元测试与集成测试中存在大量的硬编码版本断言失效、未配置 mysql 特性时构建崩溃，导致质量门禁不通过（10 个测试失败）。
+  因此最终审查评定结果为 NEEDS_FIX，需要首先解决这些安全与代码质量缺陷。
+
+findings:
+  - id: SEC-M4-001
+    title: Relay 拔线处理中将绑定的公钥擦除，导致设备名被冒用与请求劫持漏洞
+    severity: Critical
+    status: NEED_FIX
+    description: |
+      在 `src/relay/server.rs` 的 handle_hub_socket 断开逻辑中，新增了 `state.device_keys.write().await.remove(&id);` 这一行。
+      这行原本是为了释放 `MAX_REGISTERED_HUBS` 的空闲插槽，但是却在 Hub 断开时，把该 `device_id` 绑定的公钥也一并从 `device_keys` 内存表中删除了。
+      这彻底破坏了“设备 ID 首次与特定公钥绑定后，不允许再绑定到其他公钥”的安全设计。
+      若合法的 Hub 临时掉线，攻击者可立刻使用相同的 `device_id` 和攻击者自己的公钥发起一次 Register 握手注册，由于原来的公钥绑定已被擦除，Relay 会成功将此设备 ID 绑定到攻击者的公钥上。
+      
+      影响范围：
+      - 流量与敏感请求劫持：Relay 之后所有发往该 `device_id` 的微信/AI 消息转发请求都会被错误路由到攻击者伪造的 Hub 客户端上。
+      - 拒绝服务攻击（DoS）：合法 Hub 重连时，由于此时 `device_id` 已被攻击者的公钥抢占，合法 Hub 会被拒绝连接。
+    resolution: |
+      立即移除 `state.device_keys.write().await.remove(&id);`。
+      若需防范 `device_keys` 占满，可以通过实现管理员主动解除绑定、或者仅在经过签名校验的更新请求中允许修改公钥绑定，而决不能在拔线断开时无条件删除绑定。
+
+  - id: SEC-M4-002
+    title: 环境变量过滤逻辑过于简单粗暴，含有换行符的消息被错误替换为空字符串
+    severity: High
+    status: NEED_FIX
+    description: |
+      In `src/bridge/executor.rs` 的 `sanitize_env_value` 函数中，对环境变量的合法性做了检查。若值中含有 `NUL('\0')`, `LF('\n')`, `CR('\r')` 时，直接返回空字符串 `""`。
+      但在实际运行场景中，用户的消息文本环境变量 `ILINK_MESSAGE` 中非常频繁地包含换行符（如多行对话、排版等）。
+      
+      影响范围：
+      - 任何含有换行符的消息都会被一刀切地格式化为空字符串 `""` 发送给子进程 CLI，造成严重的业务功能缺失和静默失效。
+    resolution: |
+      `NUL` 字符在环境变量中确实会导致截断，必须拦截（可以过滤或替换）；而对于 `LF` 和 `CR`，仅需要过滤或者替换为单个空格，或者在双引号中保留，而绝对不能将整个环境变量清空。
+
+  - id: SEC-M4-003
+    title: 升级迁移 v8 中判断是否已加密的启发式算法不安全，可能发生二次加密致解密崩溃
+    severity: High
+    status: NEED_FIX
+    description: |
+      在 `src/store/migrations.rs` 的 `migrate_to_v8_tx` 函数中，使用启发式条件：
+      `let is_encrypted = token.len() > 80 && (token.contains('/') || token.contains('+') || token.contains('='));`
+      来判断 `bot_credentials.token` 是否已被 AES-256-GCM (Base64) 加密。
+      实际上，即使密文已被正确 Base64 编码，其字符集中依然有概率不包含 `/`、`+` 或 `=`（特别是短密文或者刚好对齐的密文）。此时 `is_encrypted` 会错误返回 `false`。
+      
+      影响范围：
+      - 已加密的密文 token 会被二次加密。在运行时 Hub 读取此数据解密时只会剥离一层加密，得到的结果是一串无法识别的脏数据，直接导致解密 panic 或启动崩溃。
+    resolution: |
+      不使用字符匹配启发式算法。应当使用 `decrypt_token(&token, &master_key)` 尝试对 token 执行解密。若能成功解密，说明已经是加密过的密文且密钥正确，不需再次加密；若解密失败，才认为其是明文并进行加密。
+
+  - id: SEC-M4-004
+    title: 迁移 v8 缺少对 clients 等表存在性的保护，导致单元测试在增量运行时报错崩溃
+    severity: Medium
+    status: NEED_FIX
+    description: |
+      在 `migrate_to_v8_tx` 中直接在事务内查询了 `clients` 等表。但像 `test_migration_v6_normalizes_peer_user_id_format` 这样的渐进式迁移测试，只在内存 SQLite 中创建了局部表并用 Mock 标记了 schema_version，导致当运行到 v8 迁移时由于 `clients`、`routing_state` 或 `messages` 表不存在直接发生 DB 语法错误（`no such table: clients`）。
+      
+      影响范围：
+      - 目前已导致 10 个已有的数据库/迁移测试用例无法通过，破坏了质量门禁。
+    resolution: |
+      在执行 `SELECT` 之前，通过 DDL 或者判断系统 catalog 确认 `clients` 等表是否存在，如果表不存在则说明这是渐进式局部测试环境，无需进行相应的数据升级；或者在 DDL 执行后再做相关的数据哈希与加密。
+
+  - id: SEC-M4-005
+    title: 单元测试中版本号断言未更新，且没有隔离 mysql 特性的测试
+    severity: Medium
+    status: NEED_FIX
+    description: |
+      1. 在 `src/store/store_tests.rs` 的大量测试用例中，存在硬编码的断言 `assert_eq!(version, 7)`，现在引入 v8 之后这些断言均发生了失败。
+      2. 增加了对于 `mysql` 特性的配置检查，但 `adversarial_database_kind_from_url` 测试用例直接对 `mysql://` 进行 `unwrap()`，若编译时未启用 mysql 特性会直接抛出 bail 错误引发恐慌。
+    resolution: |
+      1. 将 store_tests.rs 中硬编码的版本号断言升级为 8。
+      2. 在 `adversarial_database_kind_from_url` 中，对于 mysql 相关的断言使用 `#[cfg(feature = "mysql")]` 宏隔离。
