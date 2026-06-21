@@ -171,7 +171,9 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 let metrics = Arc::clone(&state.metrics);
                 tokio::spawn(async move {
                     let Ok(_permit) = sem.try_acquire() else {
-                        metrics.messages_persist_dropped.fetch_add(1, Ordering::Relaxed);
+                        metrics
+                            .messages_persist_dropped
+                            .fetch_add(1, Ordering::Relaxed);
                         return;
                     };
                     if let Err(e) = store
@@ -269,6 +271,12 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 }
             };
 
+            // Share the unchanged fields of the message across recipients —
+            // only `context_token` and `ilink_hub_ext` differ per vtoken, so
+            // we pass the base through `Arc` and let the queue clone it once
+            // per recipient instead of doing N full `WeixinMessage::clone`s
+            // on the broadcast path.
+            let shared_msg: Arc<WeixinMessage> = Arc::new(msg);
             for (vtoken, vctx) in vctx_by_vtoken {
                 let hub_ext = hub_ext_data.get(&(vctx.clone(), vtoken.clone())).map(
                     |(session_name, session_id)| HubExt {
@@ -277,10 +285,15 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         cli_session_id: None,
                     },
                 );
-                let mut msg_clone = msg.clone();
-                msg_clone.context_token = Some(vctx);
-                msg_clone.ilink_hub_ext = hub_ext;
-                push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg_clone).await;
+                push_shared_to_queue(
+                    &state.clients.queue,
+                    &state.metrics,
+                    &vtoken,
+                    Arc::clone(&shared_msg),
+                    Some(vctx),
+                    hub_ext,
+                )
+                .await;
             }
         }
     }
@@ -447,6 +460,35 @@ async fn push_to_queue(
         }
         Err(e) => {
             error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push message to queue");
+            metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Broadcast variant: shares the unchanged base via `Arc` and only supplies
+/// the per-recipient `context_token` and `ilink_hub_ext`. This is the hot
+/// path for the broadcast routing decision; cloning the base through `Arc`
+/// keeps the per-recipient cost down to a small owned `String` (the vctx).
+async fn push_shared_to_queue(
+    queue: &Arc<dyn MessageQueue>,
+    metrics: &Metrics,
+    vtoken: &str,
+    base: Arc<WeixinMessage>,
+    context_token: Option<String>,
+    hub_ext: Option<HubExt>,
+) {
+    match queue
+        .push_shared(vtoken, base, context_token, hub_ext)
+        .await
+    {
+        Ok(false) => {
+            metrics.messages_dispatched.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(true) => {
+            metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push shared message to queue");
             metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }

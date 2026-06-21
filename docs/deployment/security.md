@@ -137,3 +137,36 @@ cp ./ilink-hub.db ~/backups/ilink-hub-$(date +%Y%m%d).db
 ```
 
 数据库中存储的是敏感数据（Token 映射），请妥善保管备份文件。
+
+## 7. 危险配置：绝对禁止的组合
+
+以下任意一项与 `--addr 0.0.0.0`（或公网监听）组合都构成生产环境灾难：
+
+| 危险项 | 后果 | 缓解 |
+|---|---|---|
+| `ILINK_ADMIN_INSECURE_NO_AUTH=1` | 任何能访问 Hub 的人都能注册任意客户端、读取 `/hub/clients`、查看 `/hub/ui` | 永不设置此环境变量；`src/runtime/serve.rs` 会在 0.0.0.0 时打印 `SECURITY RISK` 警告，但仍允许启动 |
+| 未设置 `ILINK_ADMIN_TOKEN` | 同上 | 必须设置 ≥ 32 字节随机 secret |
+| Hub 直连公网（无反向代理） | vtoken 在 HTTP 明文传输；管理端点可被远程探测 | 永远套 TLS 反代（见 §2），`/hub/*` 必须 IP 白名单 |
+| 旧版 vtoken 校验（修复前）| 任意字符串都会被当作 vtoken 查找，错误配置客户端可注入 iLink 风格 token | 0.2.5+ 已加 `^vhub_[a-f0-9]{32}$` schema 过滤，**升级即可** |
+| `apply_placeholders` + `bash -c` wrapper | 用户消息含 NUL/换行可能跳出 argv | 0.2.5+ 在替换前拒绝 NUL/CR/LF；profile 文档应明示禁止 `bash -c`/`sh -c` 包装 |
+
+### 升级检查清单
+
+升级到带本节所列修复的版本时，**先在 staging 跑**：
+
+1. `ILINK_HUB_ADDR=0.0.0.0:8765 ILINK_ADMIN_INSECURE_NO_AUTH=1 ./ilink-hub serve` —— 应该看到 `SECURITY RISK` 警告
+2. `curl -X POST -H 'Content-Type: application/json' -d '{"name":"attacker"}' http://<hub>:8765/hub/register` —— 未带 admin token 时应返回 401
+3. `curl -H 'Authorization: Bearer botid@im.bot:secret' http://<hub>:8765/ilink/bot/getupdates -d '{}'` —— 应返回 401（vtoken schema 过滤）
+4. 给 bridge profile 喂一条含 `\n` 的 message —— 应在 `apply_placeholders` 阶段返回错误而非启动 CLI
+
+如果使用 SQLite，定期备份数据文件：
+
+```bash
+# 简单备份（路径与 DATABASE_URL 一致；本机默认常为当前目录下的 ilink-hub.db）
+cp ./ilink-hub.db ~/backups/ilink-hub-$(date +%Y%m%d).db
+
+# cron 每日备份（Docker 常见挂载路径）
+0 2 * * * cp /data/ilink-hub.db /backup/ilink-hub-$(date +\%Y\%m\%d).db
+```
+
+数据库中存储的是敏感数据（Token 映射），请妥善保管备份文件。

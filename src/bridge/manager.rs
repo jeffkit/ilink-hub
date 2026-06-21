@@ -324,8 +324,13 @@ impl BridgeManager {
                     let admin_token = self.opts.admin_token.clone();
                     let http_client = self.http_client.clone();
                     tokio::spawn(async move {
-                        match deregister_from_hub(&http_client, &hub_url, &register_name, admin_token.as_deref())
-                            .await
+                        match deregister_from_hub(
+                            &http_client,
+                            &hub_url,
+                            &register_name,
+                            admin_token.as_deref(),
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 info!(profile = %register_name, "auto-deregistered deleted profile from Hub")
@@ -569,7 +574,15 @@ impl BridgeManager {
         #[cfg(unix)]
         for child in &children {
             if let Some(pid) = child.id() {
-                // SAFETY: kill() is a simple syscall with no memory-safety concerns.
+                // SAFETY: `pid` is the OS-assigned pid of a `tokio::process::Child`
+                // we own — we spawned it, we never reaped it, and we are the
+                // only writer. PIDs are not reused within the brief window
+                // between signal delivery and `wait()` since the same kernel
+                // holds the live task struct. `kill` is a pure syscall with
+                // no memory-safety surface. The call is racing against the
+                // child exiting on its own, which is harmless: an
+                // `ESRCH` (no such process) is the expected outcome and is
+                // already handled below.
                 let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
                 if rc != 0 {
                     let errno = std::io::Error::last_os_error();
@@ -702,7 +715,10 @@ async fn stop_child(child: &mut Child) {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
-            // SAFETY: kill() is a simple syscall with no memory-safety concerns.
+            // SAFETY: see the symmetric note in `stop_removed_profile`: the
+            // `pid` comes from a child we own, `kill` is a pure syscall, and
+            // any `ESRCH` is the expected "child already exited" case
+            // handled below.
             let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
             if rc != 0 {
                 let errno = std::io::Error::last_os_error();

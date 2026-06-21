@@ -8,7 +8,7 @@ use reqwest::Client;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc::UnboundedSender};
+use tokio::sync::{broadcast, mpsc, mpsc::UnboundedSender};
 use tracing::{debug, error, info, warn};
 
 use crate::store::Store;
@@ -50,7 +50,10 @@ pub struct SessionRenewal {
     /// Web admin SSE broadcast.
     pub qr_tx: Option<broadcast::Sender<QrLoginUiEvent>>,
     /// Cache of the last QR Ready event for late SSE subscribers.
-    pub qr_last_ready: Option<Arc<tokio::sync::Mutex<Option<QrLoginUiEvent>>>>,
+    /// Synchronous `std::sync::Mutex` because the SSE handler copies the
+    /// value into the response stream before returning; no async work
+    /// happens under the lock.
+    pub qr_last_ready: Option<Arc<std::sync::Mutex<Option<QrLoginUiEvent>>>>,
     /// Current connection status (see `crate::hub::ilink_status`).
     pub ilink_status: Option<Arc<AtomicU8>>,
     /// Receives manual re-login triggers from the admin API.
@@ -265,7 +268,7 @@ impl UpstreamClient {
     /// Continuous polling loop — sends received messages to `tx`.
     pub async fn run_polling_loop(
         self: Arc<Self>,
-        tx: broadcast::Sender<WeixinMessage>,
+        tx: mpsc::Sender<WeixinMessage>,
         shutdown: tokio::sync::watch::Receiver<bool>,
         mut renewal: Option<SessionRenewal>,
     ) {
@@ -375,15 +378,11 @@ impl UpstreamClient {
                                 has_item_list = msg.item_list.is_some(),
                                 "received upstream message"
                             );
-                            if let Err(e) = tx.send(msg) {
-                                // `broadcast::Sender::send` only errors when there are
-                                // zero receivers (the dispatcher task is gone). The
-                                // message is lost — surface it loudly instead of
-                                // dropping it silently.
-                                warn!(
-                                    from = e.0.from_user_id.as_deref().unwrap_or("?"),
-                                    "dropped upstream message: no dispatcher subscribed to broadcast channel"
-                                );
+                            if tx.send(msg).await.is_err() {
+                                // mpsc::Sender::send errors only when the receiver is dropped
+                                // (dispatcher task exited). Nothing to do — stop polling.
+                                warn!("dispatcher channel closed, upstream polling loop exiting");
+                                return;
                             }
                         }
                     }
@@ -485,13 +484,21 @@ async fn renew_expired_session(
                 tokio::spawn(async move {
                     while let Some(evt) = unbounded_rx.recv().await {
                         // Cache the Ready event so late SSE subscribers can catch up.
+                        // `qr_last_ready` is a synchronous `std::sync::Mutex` so
+                        // we use the blocking `lock()` here; the critical
+                        // section is a single `Option::clone` or `None`
+                        // assignment and never held across an `.await`.
                         if let QrLoginUiEvent::Ready { .. } = &evt {
                             if let Some(ref cache) = last_ready {
-                                *cache.lock().await = Some(evt.clone());
+                                if let Ok(mut guard) = cache.lock() {
+                                    *guard = Some(evt.clone());
+                                }
                             }
                         } else if matches!(evt, QrLoginUiEvent::Done | QrLoginUiEvent::Expired) {
                             if let Some(ref cache) = last_ready {
-                                *cache.lock().await = None;
+                                if let Ok(mut guard) = cache.lock() {
+                                    *guard = None;
+                                }
                             }
                         }
                         let _ = broadcast_tx.send(evt);

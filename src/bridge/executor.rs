@@ -18,16 +18,45 @@ use crate::paths::expand_user_path;
 pub const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Replace `{{MESSAGE}}`, `{{SESSION_ID}}`, and `{{SESSION_NAME}}` in a template string.
+///
+/// SEC-003: `message` is user-controlled (forwarded WeChat message text). We
+/// refuse to inject any string that contains bytes which would be interpreted
+/// by a shell-style wrapper (`bash -c`, `sh -c`, `env` parsing) — NUL,
+/// newlines, or carriage returns. Callers that route `message` into argv or
+/// env vars should reject when this returns an error rather than silently
+/// passing through, to prevent a user message from breaking out of its
+/// intended slot.
 pub(super) fn apply_placeholders(
     template: &str,
     message: &str,
     session_id: &str,
     session_name: &str,
-) -> String {
-    template
+) -> Result<String, PlaceholderError> {
+    validate_safe_value("message", message)?;
+    validate_safe_value("session_id", session_id)?;
+    validate_safe_value("session_name", session_name)?;
+    Ok(template
         .replace("{{MESSAGE}}", message)
         .replace("{{SESSION_ID}}", session_id)
-        .replace("{{SESSION_NAME}}", session_name)
+        .replace("{{SESSION_NAME}}", session_name))
+}
+
+/// Reject values that contain characters unsafe for shell-style wrappers.
+fn validate_safe_value(field: &str, value: &str) -> Result<(), PlaceholderError> {
+    for b in value.bytes() {
+        if b == 0 || b == b'\n' || b == b'\r' {
+            return Err(PlaceholderError::UnsafeValue {
+                field: field.to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PlaceholderError {
+    #[error("placeholder value for `{field}` contains NUL/newline; refusing to inject")]
+    UnsafeValue { field: String },
 }
 
 /// If the first line of `stdout` starts with `prefix`, the remainder of that line is the CLI session id
@@ -126,8 +155,11 @@ pub(super) async fn run_cli(
     let args: Vec<String> = cfg
         .args
         .iter()
-        .map(|a| apply_placeholders(a, message, session_id, session_name))
-        .collect();
+        .map(|a| {
+            apply_placeholders(a, message, session_id, session_name)
+                .with_context(|| format!("unsafe placeholder value in args template `{a}`"))
+        })
+        .collect::<Result<_>>()?;
 
     let command = super::paths::resolve_spawn_command(&cfg.command);
 
@@ -136,7 +168,10 @@ pub(super) async fn run_cli(
     cmd.kill_on_drop(true);
 
     if let Some(dir) = &cfg.cwd {
-        let dir = expand_user_path(&apply_placeholders(dir, message, session_id, session_name));
+        let dir = expand_user_path(
+            &apply_placeholders(dir, message, session_id, session_name)
+                .with_context(|| format!("unsafe placeholder value in cwd template `{dir}`"))?,
+        );
         cmd.current_dir(&dir);
     }
 
@@ -152,7 +187,8 @@ pub(super) async fn run_cli(
     }
 
     for (k, v) in &cfg.env {
-        let v = apply_placeholders(v, message, session_id, session_name);
+        let v = apply_placeholders(v, message, session_id, session_name)
+            .with_context(|| format!("unsafe placeholder value in env var `{k}`"))?;
         let v = crate::bridge::config::expand_env_var_named(
             &v,
             &std::env::vars().collect(),
@@ -239,15 +275,27 @@ pub(super) async fn run_cli(
                             }
                         }
                     }
-                } else if accumulated_bytes <= MAX_CLI_CAPTURE_BYTES {
-                    accumulated_bytes = accumulated_bytes.saturating_add(line.len());
+                    continue;
+                }
+                if accumulated_bytes >= MAX_CLI_CAPTURE_BYTES {
+                    // Drop further reads entirely; previously-captured buffer
+                    // is already at the cap so we must not grow it.
+                    continue;
+                }
+                let projected = accumulated_bytes.saturating_add(line.len());
+                if projected > MAX_CLI_CAPTURE_BYTES {
+                    // Trim the line so the *total* buffer stays at the cap.
+                    let remaining = MAX_CLI_CAPTURE_BYTES - accumulated_bytes;
+                    line.truncate(remaining);
                     final_lines.push(line.clone());
-                    if accumulated_bytes > MAX_CLI_CAPTURE_BYTES {
-                        warn!(
-                            limit_bytes = MAX_CLI_CAPTURE_BYTES,
-                            "CLI stdout exceeded capture limit; truncating accumulated reply"
-                        );
-                    }
+                    accumulated_bytes = MAX_CLI_CAPTURE_BYTES;
+                    warn!(
+                        limit_bytes = MAX_CLI_CAPTURE_BYTES,
+                        "CLI stdout exceeded capture limit; hard-truncating accumulated reply"
+                    );
+                } else {
+                    accumulated_bytes = projected;
+                    final_lines.push(line.clone());
                 }
             }
             drop(partial_tx);
@@ -317,15 +365,37 @@ mod tests {
                 "hi",
                 "sid-9",
                 "feat-a"
-            ),
+            )
+            .unwrap(),
             "hi|sid-9|feat-a"
         );
     }
 
     #[test]
+    fn placeholders_reject_nul_in_message() {
+        let err = apply_placeholders("{{MESSAGE}}", "evil\0payload", "sid", "name").unwrap_err();
+        assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
+    }
+
+    #[test]
+    fn placeholders_reject_newline_in_session_id() {
+        // A newline in SESSION_ID could break out of a quoted arg slot.
+        let err = apply_placeholders("session={{SESSION_ID}}", "msg", "sid\nrm -rf /", "name")
+            .unwrap_err();
+        assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
+    }
+
+    #[test]
+    fn placeholders_reject_carriage_return_in_session_name() {
+        let err =
+            apply_placeholders("name={{SESSION_NAME}}", "msg", "sid", "feat\r\noops").unwrap_err();
+        assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
+    }
+
+    #[test]
     fn placeholder_session_name_defaults_to_default() {
         assert_eq!(
-            apply_placeholders("name={{SESSION_NAME}}", "", "", "default"),
+            apply_placeholders("name={{SESSION_NAME}}", "", "", "default").unwrap(),
             "name=default"
         );
     }

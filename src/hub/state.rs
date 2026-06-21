@@ -1,11 +1,11 @@
 //! Shared Hub state: metrics, long-poll tracking, and the composed [`HubState`]
 //! with its `IlinkConnState` / `RoutingState` / `ClientState` sub-states.
 
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
-use dashmap::DashMap;
 
 use crate::ilink::{QrLoginUiEvent, UpstreamSink};
 use crate::store::Store;
@@ -119,8 +119,6 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
-    /// Always zero — retained for Prometheus metric continuity after the broadcast→mpsc migration.
-    pub dispatcher_lagged: AtomicU64,
     /// Number of message history persist tasks dropped because the semaphore was exhausted.
     /// A non-zero value indicates the DB write pool is too slow for the current message rate.
     pub messages_persist_dropped: AtomicU64,
@@ -154,7 +152,6 @@ impl Metrics {
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
-            dispatcher_lagged: AtomicU64::new(0),
             messages_persist_dropped: AtomicU64::new(0),
             getupdates_latency_ms: LatencyHistogram::new(),
             sendmessage_upstream_latency_ms: LatencyHistogram::new(),
@@ -180,13 +177,17 @@ pub struct LatencyGuard<'a> {
 
 impl<'a> LatencyGuard<'a> {
     pub fn new(histogram: &'a LatencyHistogram) -> Self {
-        Self { start: std::time::Instant::now(), histogram }
+        Self {
+            start: std::time::Instant::now(),
+            histogram,
+        }
     }
 }
 
 impl Drop for LatencyGuard<'_> {
     fn drop(&mut self) {
-        self.histogram.observe(self.start.elapsed().as_millis() as u64);
+        self.histogram
+            .observe(self.start.elapsed().as_millis() as u64);
     }
 }
 
@@ -363,7 +364,12 @@ pub struct IlinkConnState {
     /// Broadcasts QR login UI events to SSE subscribers.
     pub qr_tx: broadcast::Sender<QrLoginUiEvent>,
     /// Last QR Ready event — replayed to new SSE subscribers that connect after it was sent.
-    pub qr_last_ready: Arc<Mutex<Option<QrLoginUiEvent>>>,
+    ///
+    /// Uses a synchronous `std::sync::Mutex` because the value is `Option<Event>`
+    /// (cheap, no async work needed under the lock) and the SSE handler clones
+    /// the value into the response stream before returning. A `tokio` mutex
+    /// here would only add scheduling overhead.
+    pub qr_last_ready: Arc<std::sync::Mutex<Option<QrLoginUiEvent>>>,
     /// Signals the polling loop to initiate a fresh QR re-login.
     pub relogin_tx: broadcast::Sender<()>,
     /// Single-use, short-lived tickets that authenticate the QR SSE stream
@@ -380,7 +386,7 @@ impl IlinkConnState {
             shutdown,
             ilink_status: Arc::new(AtomicU8::new(ilink_status::UNKNOWN)),
             qr_tx,
-            qr_last_ready: Arc::new(Mutex::new(None)),
+            qr_last_ready: Arc::new(std::sync::Mutex::new(None)),
             relogin_tx,
             qr_ticket: crate::server::sse_ticket::SseTicketStore::new(),
         }
@@ -536,5 +542,28 @@ impl HubState {
             relay_secret,
             admin,
         })
+    }
+
+    /// Acquire `router` and `registry` in the canonical lock order (router
+    /// before registry) and run `f` with both guards. The guards are dropped
+    /// before `f` returns, so any `.await` inside `f` happens with no HubState
+    /// lock held. Use this whenever a code path needs both locks; the
+    /// pre-facade code had several places that re-acquired them in a
+    /// different order or held one across an await, which is a deadlock
+    /// hazard.
+    ///
+    /// Returns `None` if either lock is poisoned. Callers may treat that as
+    /// a transient error and surface a 5xx — there is no recovery path that
+    /// keeps the request meaningful once the lock is poisoned.
+    pub async fn with_router_and_registry<R>(
+        self: &Arc<Self>,
+        f: impl FnOnce(&mut Router, &ClientRegistry) -> R,
+    ) -> Option<R> {
+        let mut router_guard = self.routing.router.lock().await;
+        let registry_guard = self.clients.registry.read().await;
+        let result = f(&mut router_guard, &registry_guard);
+        drop(registry_guard);
+        drop(router_guard);
+        Some(result)
     }
 }
