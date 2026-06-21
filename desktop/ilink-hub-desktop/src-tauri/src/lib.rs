@@ -602,7 +602,7 @@ async fn hub_delete_client(app: tauri::AppHandle, name: String) -> DeleteClientR
         Err(err) => return err,
     };
 
-    match unregister_client_in_hub(state.as_ref(), &name).await {
+    match unregister_client_in_hub(state.as_ref(), &name, true).await {
         Ok(()) => DeleteClientResult {
             ok: true,
             auth_required: false,
