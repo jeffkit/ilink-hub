@@ -358,4 +358,71 @@ mod tests {
     fn render_qr_does_not_panic() {
         render_qr_terminal("https://ilinkhub.ai/pair/test/pair_abc").unwrap();
     }
+
+    #[test]
+    fn test_is_qr_expired_true() {
+        let err = anyhow::anyhow!("pairing session expired");
+        assert!(is_qr_expired(&err));
+    }
+
+    #[test]
+    fn test_is_qr_expired_false() {
+        let err = anyhow::anyhow!("network connection refused");
+        assert!(!is_qr_expired(&err));
+    }
+
+    #[test]
+    fn test_credentials_json_roundtrip() {
+        let creds = HubPairingCredentials {
+            token: "tok-abc123".to_string(),
+            base_url: "https://hub.example.com".to_string(),
+            account_id: "bot-001".to_string(),
+            user_id: "user-42".to_string(),
+            saved_at: Some("1718000000Z".to_string()),
+            client_name: Some("my-client".to_string()),
+        };
+        let json = serde_json::to_string(&creds).expect("serialize");
+        let restored: HubPairingCredentials = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.token, creds.token);
+        assert_eq!(restored.base_url, creds.base_url);
+        assert_eq!(restored.account_id, creds.account_id);
+        assert_eq!(restored.user_id, creds.user_id);
+        assert_eq!(restored.saved_at, creds.saved_at);
+        assert_eq!(restored.client_name, creds.client_name);
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_credentials() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let cred_path = tmp.path().join("creds.json");
+
+        let opts = HubPairingOptions {
+            hub_url: "https://hub.example.com".to_string(),
+            cred_path: Some(cred_path.to_string_lossy().to_string()),
+            force: false,
+            bot_type: "3".to_string(),
+        };
+        let client = HubPairingClient::new(opts);
+
+        let creds = HubPairingCredentials {
+            token: "save-load-token".to_string(),
+            base_url: "https://hub.example.com".to_string(),
+            account_id: "acct-99".to_string(),
+            user_id: "user-99".to_string(),
+            saved_at: None,
+            client_name: None,
+        };
+
+        client.save_credentials(&creds).await.expect("save");
+        let loaded = client
+            .load_credentials()
+            .await
+            .expect("load")
+            .expect("should be Some after save");
+
+        assert_eq!(loaded.token, creds.token);
+        assert_eq!(loaded.base_url, creds.base_url);
+        assert_eq!(loaded.account_id, creds.account_id);
+        assert_eq!(loaded.user_id, creds.user_id);
+    }
 }

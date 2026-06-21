@@ -1472,6 +1472,22 @@ fn adversarial_database_kind_from_url() {
     assert!(DatabaseKind::from_url("file:/tmp/x.db").is_err());
     assert!(DatabaseKind::from_url("postgress://u:p@h/db").is_err());
     assert!(DatabaseKind::from_url("http://example.com/db").is_err());
+    // N-12: bare absolute file paths produce a friendly "looks like a file path" hint.
+    let err = DatabaseKind::from_url("/home/user/db.sqlite").unwrap_err();
+    assert!(
+        err.to_string().contains("looks like a file path"),
+        "expected 'looks like a file path' hint, got: {err}"
+    );
+    let err = DatabaseKind::from_url("./relative/db.sqlite").unwrap_err();
+    assert!(
+        err.to_string().contains("looks like a file path"),
+        "expected 'looks like a file path' hint for relative path, got: {err}"
+    );
+    let err = DatabaseKind::from_url("~/db.sqlite").unwrap_err();
+    assert!(
+        err.to_string().contains("looks like a file path"),
+        "expected 'looks like a file path' hint for tilde path, got: {err}"
+    );
 }
 
 /// F-M3-01 (`Store::connect` populates the driver kind from the URL):

@@ -618,6 +618,10 @@ fn build_queue_backend() -> Result<Arc<dyn MessageQueue>> {
         .unwrap_or("")
     {
         "memory" | "" => {
+            warn!(
+                backend = "memory",
+                "in-memory queue is not persisted; pending messages will be lost on restart"
+            );
             info!(
                 backend = "memory",
                 max_queue_size = max_queue_size,

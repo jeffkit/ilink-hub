@@ -169,6 +169,7 @@ impl Store {
     /// Uses `MAX(id)` (autoincrement, strictly monotone) as the "latest row" selector,
     /// which is stable even when two rows share the same `created_at` second — portable
     /// across SQLite, PostgreSQL, and MySQL.
+    #[allow(dead_code)]
     pub async fn get_session_status_per_vtoken(
         &self,
         vtokens: &[String],

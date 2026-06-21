@@ -62,6 +62,14 @@ impl DatabaseKind {
         } else if url.starts_with("sqlite:") || url.is_empty() {
             Ok(DatabaseKind::Sqlite)
         } else {
+            if (url.starts_with('/') || url.starts_with("./") || url.starts_with("~/"))
+                && !url.contains("://")
+            {
+                anyhow::bail!(
+                    "DATABASE_URL {:?} looks like a file path; use the sqlite: scheme instead, e.g. `sqlite:{}`",
+                    url, url
+                );
+            }
             anyhow::bail!(
                 "unsupported DATABASE_URL scheme in {:?}; \
                  supported schemes: sqlite:, postgres://, postgresql://, mysql://, mariadb://",
