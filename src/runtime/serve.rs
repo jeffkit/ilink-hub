@@ -232,6 +232,42 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     spawn_health_checker(state.clone());
     spawn_quote_index_evictor(state.clone());
 
+    // Bind the listen socket BEFORE spawning the WeChat polling/login loop.
+    // An invalid listen address (e.g. derived from a domain WEIXIN_BASE_URL)
+    // must fail fast with a friendly EADDRNOTAVAIL hint deterministically,
+    // instead of racing the polling loop's QR-login error output.
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
+                let is_from_env = std::env::var("WEIXIN_BASE_URL")
+                    .ok()
+                    .and_then(|val| extract_host_port(&val))
+                    .map(|parsed| parsed == addr)
+                    .unwrap_or(false);
+                if is_from_env {
+                    eprintln!(
+                        "❌ Failed to bind to address '{}' (EADDRNOTAVAIL).\n\
+                         This listen address was derived from WEIXIN_BASE_URL which contains a domain/external URL.\n\
+                         To fix this, please specify a local address to listen on, for example:\n\
+                         --addr 127.0.0.1:8765 or --addr 0.0.0.0:8765",
+                        addr
+                    );
+                }
+            }
+            return Err(e.into());
+        }
+    };
+    let local_display = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| addr.clone());
+    if let Some(tx) = on_listening {
+        let _ = tx.send(local_display);
+    }
+    info!(%addr, "iLink Hub listening");
+    runtime_cfg.warn_if_insecure(&addr);
+
     {
         let upstream_clone = upstream.clone();
         let tx_clone = tx.clone();
@@ -277,37 +313,6 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     let state_for_drain = Arc::clone(&state);
     let router = build_router(state);
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            if e.kind() == std::io::ErrorKind::AddrNotAvailable {
-                let is_from_env = std::env::var("WEIXIN_BASE_URL")
-                    .ok()
-                    .and_then(|val| extract_host_port(&val))
-                    .map(|parsed| parsed == addr)
-                    .unwrap_or(false);
-                if is_from_env {
-                    eprintln!(
-                        "❌ Failed to bind to address '{}' (EADDRNOTAVAIL).\n\
-                         This listen address was derived from WEIXIN_BASE_URL which contains a domain/external URL.\n\
-                         To fix this, please specify a local address to listen on, for example:\n\
-                         --addr 127.0.0.1:8765 or --addr 0.0.0.0:8765",
-                        addr
-                    );
-                }
-            }
-            return Err(e.into());
-        }
-    };
-    let local_display = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| addr.clone());
-    if let Some(tx) = on_listening {
-        let _ = tx.send(local_display);
-    }
-    info!(%addr, "iLink Hub listening");
-    runtime_cfg.warn_if_insecure(&addr);
 
     axum::serve(
         listener,
