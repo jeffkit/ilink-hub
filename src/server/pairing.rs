@@ -420,6 +420,14 @@ pub async fn unregister_client_in_hub(
         router.remove_routes_for_vtoken(&vtoken, new_default);
     }
 
+    // N-01 / F-M1-N01: drop the per-vtoken `last_seen` timestamp alongside
+    // the registry entry. Otherwise the timestamp accumulates forever as
+    // clients are deleted and re-registered (each `register_client_in_hub`
+    // gets a fresh UUID-based vtoken, so the old key is never overwritten).
+    // `last_seen` is a `DashMap<String, AtomicU64>` and `remove` is a cheap,
+    // lock-free fast-path.
+    state.clients.last_seen.remove(&vtoken);
+
     if let Err(e) = state.clients.queue.remove_client(&vtoken).await {
         warn!(error = %e, vtoken = %crate::redact_token(&vtoken), "failed to remove client queue");
     }
@@ -732,6 +740,10 @@ pub async fn rollback_speculative_register(state: &HubState, name: &str, vtoken:
         let mut router = state.routing.router.lock().await;
         router.remove_routes_for_vtoken(vtoken, new_default);
     }
+    // N-01 / F-M1-N01: mirror the cleanup done in `unregister_client_in_hub`
+    // so a rolled-back speculative registration does not leave a stale
+    // `last_seen` timestamp behind either.
+    state.clients.last_seen.remove(vtoken);
     if let Err(e) = state.clients.queue.remove_client(vtoken).await {
         warn!(
             error = %e,

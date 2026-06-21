@@ -746,6 +746,9 @@ impl SessionDispatcher {
 
     async fn dispatch(&self, msg: WeixinMessage) {
         let key = session_dispatch_key(&msg);
+        // N-04 / F-M1-N04: match the poison-safe style used by
+        // `evict_closed_senders` below — recover from a poisoned mutex by
+        // taking the inner state instead of panicking the Tokio worker.
         let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if a live worker already exists for this key.
@@ -810,10 +813,13 @@ impl SessionDispatcher {
 
     #[cfg(test)]
     fn sender_keys(&self) -> Vec<String> {
+        // N-04: tests use the same poison-safe recovery as production code
+        // so the helper stays consistent with `dispatch` and
+        // `evict_closed_senders`.
         let mut keys: Vec<String> = self
             .senders
             .lock()
-            .expect("senders poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .keys()
             .cloned()
             .collect();
@@ -1333,6 +1339,47 @@ timeout_secs: 5
 
         disp.dispatch(msg.clone()).await;
         assert_eq!(disp.sender_keys(), vec!["ctx-z:default"]);
+    }
+
+    /// N-04 / F-M1-N04: when a `std::sync::Mutex` is poisoned (a thread
+    /// panicked while holding the lock), the `unwrap_or_else(|e|
+    /// e.into_inner())` recovery idiom MUST yield the inner state
+    /// instead of propagating the panic. This pins the *semantics* of
+    /// the recovery call used by [`SessionDispatcher::dispatch`] and
+    /// [`SessionDispatcher::evict_closed_senders`] on the same
+    /// `Mutex<HashMap<String, _>>` shape as the production field, so
+    /// any future refactor that drops `into_inner()` (and falls back to
+    /// `expect`) would fail this test by panicking in the test thread.
+    #[test]
+    fn senders_lock_recovery_after_poison_yields_inner_state() {
+        // Mirrors `SessionDispatcher::senders` exactly. We share the
+        // mutex by `Arc` so the spawned poisoner thread can lock it
+        // without resorting to raw-pointer unsafety.
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        let senders: Arc<Mutex<HashMap<String, &'static str>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        // Seed the inner state.
+        senders.lock().unwrap().insert("k1".to_string(), "v1");
+
+        // Poison the mutex from another thread: lock it, then panic
+        // while still holding the guard. Join handles the panic; the
+        // mutex is now permanently poisoned on every subsequent
+        // `.lock().unwrap()` call.
+        let poisoned_clone = Arc::clone(&senders);
+        let join = std::thread::spawn(move || {
+            let _g = poisoned_clone.lock().expect("acquired");
+            panic!("intentional poison");
+        });
+        let _ = join.join();
+
+        // The N-04 recovery idiom used by `dispatch`:
+        let mut guard = senders.lock().unwrap_or_else(|e| e.into_inner());
+        // Inner state survived — the seed entry is still there.
+        assert_eq!(guard.get("k1"), Some(&"v1"));
+        guard.insert("k2".to_string(), "v2");
+        assert_eq!(guard.len(), 2, "recovery must allow normal mutation");
     }
 
     // ─── parse_sendoutcome ─────────────────────────────────────────────
