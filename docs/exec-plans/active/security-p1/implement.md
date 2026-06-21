@@ -12,9 +12,9 @@
 | M1        | vtoken 哈希存储                  | ✅ done   |
 | M2        | bot_token 静态加密               | ✅ done   |
 | M3        | quote_index 启动预热            | ✅ done   |
-| M4        | 迁移兼容                         | ⏳ todo   |
-| M5        | 测试                             | ⏳ todo   |
-| M6        | 文档与回归                       | ⏳ todo   |
+| M4        | 迁移兼容                         | ✅ done   |
+| M5        | 测试                             | ✅ done   |
+| M6        | 文档与回归                       | ✅ done   |
 
 ## M1 — vtoken 哈希存储 (2026-06-21)
 
@@ -352,3 +352,59 @@ $ cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
   `resolve_user_quote`，验证两条不同 footer / session 的
   outbound 行都能在重启后被 quote-reply 命中，且不触发
   `find_assistant_message_by_content`（SQL fallback）。
+
+## M4 — 迁移兼容 (2026-06-21)
+
+### 实现摘要
+
+- 实现了第 8 版数据库迁移逻辑 `migrate_to_v8_tx`（对应 `0008_vtoken_and_bot_token_hash.sql`）。
+- 在 Rust 侧完成了就地数据迁移：
+  - 针对 `clients`、`routing_state` 和 `messages` 等涉及 `vtoken` 的表，读取现有明文数据并在内存中计算 SHA-256 哈希值，然后再将其安全写回。
+  - 针对 `bot_credentials.token`，自动读取现有的明文 token，利用 AES-256-GCM 进行静态加密，以 base64 格式保存写回数据库。
+- 迁移过程中对未配置 `ILINK_HUB_MASTER_KEY` 的空数据库环境进行容错处理（不阻断初始构建和测试运行）。
+
+### 验证
+
+- 运行 `cargo test` 中相关的集成迁移测试全部通过。
+- 对包含旧明文 DB 行的数据集运行迁移，确认迁移后数据库中 `vtoken` 长度全部升级至 64 位且原 bridge 功能不受影响。
+
+## M5 — 测试 (2026-06-21)
+
+### 实现摘要
+
+- 在 `src/store/store_tests.rs` 中补充了针对第 8 版迁移的多角度测试用例：
+  - `test_migration_v8_hash_vtoken_and_encrypt_bot_token`：验证旧明文 vtoken 和 bot_token 在迁移后能够正确转换为哈希/密文，并且对解密后的 token 进行一致性校验。
+  - `test_migration_v8_idempotency_does_not_double_encrypt`：验证迁移的幂等性，保证重复迁移不会造成二次加密。
+  - `test_migration_v8_missing_master_key_fails`：验证当缺失 `ILINK_HUB_MASTER_KEY` 时，如果数据库需要被迁移，迁移过程会抛出错误导致 panic/error 拦截，防止静默启动。
+  - `test_bot_credentials_decryption_adversarial_wrong_key` 与 `test_bot_credentials_decryption_adversarial_tampered_ciphertext`：在非对称异常场景下测试 AEAD 的解密容错与拦截能力。
+
+### 验证
+
+- `cargo test` 396 passed，单元与集成测试全绿。
+
+## M6 — 文档与回归 (2026-06-21)
+
+### 实现摘要
+
+- 更新了项目文档，确保安全性改动有清晰的部署和操作指引：
+  - **`README.md`**：强调敏感凭据静态加密与哈希存储的必要性，并明确将 `ILINK_HUB_MASTER_KEY` 作为启动时的强制环境变量，且修改 `/hub/clients` 返回描述以反映哈希值存储。
+  - **`docs/knowledge/api/configuration.md`**：将 `ILINK_HUB_MASTER_KEY` 加入核心变量表格并作出详细说明。
+  - **`docs/knowledge/ops/deployment-hardening.md`**：在加固指引的“凭证与日志”一节新增了静态加密和哈希存储的技术概述，并在上线前安全检查清单中新增了校验主密钥配置的项。
+- 进行了回归验证，确认所有回归命令全绿。
+- 创建了 `review-request.yaml` 归档到 `docs/exec-plans/active/security-p1/reviews/m6/` 中。
+
+### 验证
+
+- `cargo fmt --all -- --check` 结果：Clean。
+- `cargo clippy -- -D warnings` 结果：Clean。
+- `cargo test` 结果：396 passed, 0 failed。
+- `cargo build` 结果：Workspace 编译通过。
+- Desktop 编译：
+  - 桌面端前端：`npm run build` 成功。
+  - 桌面端 Tauri 容器检测：`cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` 成功通过。
+
+### E2E Checkpoint
+
+- **E2E-4（迁移兼容）**：`test_migration_v8_hash_vtoken_and_encrypt_bot_token` 执行正常，旧数据库顺利升级。
+- **E2E-5（回归）**：`cargo fmt --check && cargo clippy -- -D warnings && cargo test` 所有校验全绿。
+
