@@ -43,10 +43,14 @@ pub enum HubError {
 
 impl From<anyhow::Error> for HubError {
     fn from(e: anyhow::Error) -> Self {
-        // Attempt to downcast to known typed errors before falling back to string.
-        if let Some(db_err) = e.downcast_ref::<sqlx::Error>() {
-            return HubError::Upstream(format!("database: {db_err}"));
+        // Prefer downcasting to the owned value so we preserve the original
+        // sqlx::Error variant (unique constraint, not-found, etc.) rather than
+        // collapsing it into a string-only Protocol error. downcast() consumes
+        // `e` on success and returns it back on failure, so chain the fallback
+        // via the Err branch.
+        match e.downcast::<sqlx::Error>() {
+            Ok(db_err) => HubError::Database(db_err),
+            Err(e) => HubError::Upstream(e.to_string()),
         }
-        HubError::Upstream(e.to_string())
     }
 }

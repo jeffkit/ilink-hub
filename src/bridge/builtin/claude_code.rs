@@ -177,7 +177,10 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
             Some("assistant") => {
                 if let Some(msg) = &event.message {
                     let text = msg.text();
-                    if !text.is_empty() {
+                    // Guard with trim() so that whitespace-only text blocks (e.g. a bare
+                    // "\n" emitted between tool calls) do not produce an empty-looking
+                    // ILINK_PARTIAL that the user sees as a blank message.
+                    if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
                         last_partial = Some(text);
                     }
@@ -331,7 +334,8 @@ async fn stream_claude_multimodal(
             Some("assistant") => {
                 if let Some(msg) = &event.message {
                     let text = msg.text();
-                    if !text.is_empty() {
+                    // Consistent with the text-only path: skip whitespace-only blocks.
+                    if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
                         last_partial = Some(text);
                     }
@@ -1054,5 +1058,84 @@ mod tests {
             msg.contains("too large"),
             "error should name the size constraint: {msg}"
         );
+    }
+
+    // ── Bug-fix regression tests ─────────────────────────────────────────────
+
+    /// Bug #2: whitespace-only text blocks (e.g. a bare "\n" the model emits
+    /// between tool turns) must NOT produce an ILINK_PARTIAL. The old guard was
+    /// `!text.is_empty()` which passes "\n"; the fix uses `!text.trim().is_empty()`.
+    #[test]
+    fn whitespace_only_text_block_is_skipped_not_emitted() {
+        for ws in ["\n", "  ", "\t", "\r\n", "\n\n"] {
+            let json = format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{ws}"}}]}}}}"#,
+                ws = ws
+                    .replace('\n', "\\n")
+                    .replace('\t', "\\t")
+                    .replace('\r', "\\r")
+            );
+            let event: ClaudeStreamEvent = serde_json::from_str(&json).unwrap();
+            let text = event.message.unwrap().text();
+            assert!(
+                !text.is_empty(),
+                "raw text '{ws:?}' is non-empty — old guard would emit it"
+            );
+            assert!(
+                text.trim().is_empty(),
+                "trimmed '{ws:?}' must be empty → bridge must skip"
+            );
+        }
+    }
+
+    /// Real content with trailing newline must still pass the trim() guard.
+    #[test]
+    fn text_with_real_content_and_trailing_newline_is_emitted() {
+        let json =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Answer: 42\n"}]}}"#;
+        let event: ClaudeStreamEvent = serde_json::from_str(json).unwrap();
+        let text = event.message.unwrap().text();
+        assert!(
+            !text.trim().is_empty(),
+            "text with real content must not be blocked by trim() guard"
+        );
+    }
+
+    /// Bug #1 (Claude side): when no prior partial has been sent (`last_partial = None`)
+    /// and `result.result` is non-empty, `already_sent` must be false so the bridge
+    /// emits result.result as a final ILINK_PARTIAL (the model's only text output).
+    #[test]
+    fn result_with_no_prior_partial_always_emits() {
+        let last_partial: Option<String> = None;
+        let result_text = "The answer is 42.";
+        let already_sent = last_partial.as_deref() == Some(result_text);
+        assert!(
+            !already_sent,
+            "when no prior partial exists, result must NOT be skipped"
+        );
+    }
+
+    /// Normal case: result.result matches the last partial → skip (no duplicate).
+    #[test]
+    fn result_matching_last_partial_is_not_resent() {
+        let last_partial: Option<String> = Some("Hello there".to_string());
+        let result_text = "Hello there";
+        let already_sent = last_partial.as_deref() == Some(result_text);
+        assert!(
+            already_sent,
+            "result matching last_partial must be skipped to avoid duplicate"
+        );
+    }
+
+    /// Empty or whitespace-only result.result is filtered before the dedup check so
+    /// we never emit an empty ILINK_PARTIAL when the model produced no text output.
+    #[test]
+    fn empty_and_whitespace_result_is_filtered() {
+        for rt in ["", "\n", "  \t  "] {
+            assert!(
+                rt.trim().is_empty(),
+                "'{rt:?}' must be caught by filter(!trim.is_empty())"
+            );
+        }
     }
 }

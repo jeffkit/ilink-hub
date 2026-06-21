@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::hub::{
-    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, HubState, InMemoryQueue,
-    MessageQueue,
+    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, AdminConfig, HubState,
+    InMemoryQueue, MessageQueue,
 };
 use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
@@ -28,14 +28,15 @@ use crate::store::Store;
 /// surfaces immediately at launch rather than silently using a wrong default at runtime.
 #[derive(Debug)]
 pub struct RuntimeConfig {
-    /// Capacity of the broadcast channel between the upstream polling loop and the
-    /// dispatcher task. Overflow causes silent message drops. Default: 1024.
+    /// Capacity of the mpsc channel between the upstream polling loop and the
+    /// dispatcher task. When full, the polling loop blocks (backpressure) rather
+    /// than dropping messages. Default: 1024.
     pub dispatch_channel_size: usize,
     /// Seconds to wait for in-flight bridge polls to drain before shutdown. Default: 3.
     pub shutdown_drain_secs: u64,
-    /// Whether admin auth is deliberately disabled via ILINK_ADMIN_INSECURE_NO_AUTH.
-    /// Stored here so run_serve can emit a startup-time warning with the actual bind address.
-    pub insecure_no_auth: bool,
+    /// Admin auth config — parsed once here so it can be injected into HubState
+    /// and used by routes without re-reading env vars at request time.
+    pub admin: AdminConfig,
     /// Hub-wide cap on concurrent `getupdates` long-polls. Defaults to
     /// [`crate::hub::state::MAX_HUB_POLLS_DEFAULT`] (8192). Operators can
     /// raise this via `ILINK_MAX_HUB_POLLS`.
@@ -58,18 +59,14 @@ impl RuntimeConfig {
             anyhow::bail!("ILINK_MAX_HUB_POLLS must be > 0");
         }
 
-        let insecure_no_auth = std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
-            .ok()
-            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-            .unwrap_or(false);
+        let admin = AdminConfig::from_env();
 
-        // Validate that admin security is not silently disabled.
-        let admin_token_set = std::env::var("ILINK_ADMIN_TOKEN")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .is_some();
-
-        if insecure_no_auth && admin_token_set {
+        if admin.insecure_no_auth
+            && std::env::var("ILINK_ADMIN_TOKEN")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .is_some()
+        {
             // ILINK_ADMIN_TOKEN takes precedence; the insecure flag is redundant but harmless.
             tracing::warn!(
                 "Both ILINK_ADMIN_TOKEN and ILINK_ADMIN_INSECURE_NO_AUTH are set. \
@@ -80,7 +77,7 @@ impl RuntimeConfig {
         Ok(Self {
             dispatch_channel_size,
             shutdown_drain_secs,
-            insecure_no_auth,
+            admin,
             max_hub_polls,
         })
     }
@@ -88,14 +85,15 @@ impl RuntimeConfig {
     /// Emit a startup warning if admin auth is disabled, scaled to the actual risk level.
     /// Called after the listen address is known so the message can be actionable.
     pub fn warn_if_insecure(&self, bind_addr: &str) {
-        if !self.insecure_no_auth {
+        if !self.admin.insecure_no_auth {
             return;
         }
         let is_public = bind_addr.starts_with("0.0.0.0");
         if is_public {
             tracing::error!(
                 addr = %bind_addr,
-                "⚠️  SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
+                is_public = true,
+                "SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
                  0.0.0.0 (all interfaces). Admin endpoints are accessible with NO authentication. \
                  Set ILINK_ADMIN_TOKEN or restrict the listen address to 127.0.0.1."
             );
@@ -205,6 +203,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         queue,
         shutdown_rx.clone(),
         relay_secret,
+        runtime_cfg.admin.clone(),
     );
     // Apply operator-tuned Hub-wide poll cap. ClientState::new defaults this to
     // MAX_HUB_POLLS_DEFAULT; we override only if the operator set a custom value.
@@ -226,7 +225,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     load_clients_from_db(state.clone(), store.clone()).await;
 
     let (tx, rx) =
-        broadcast::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
+        mpsc::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
@@ -560,89 +559,50 @@ mod tests {
         std::env::remove_var("ILINK_MAX_QUEUE_SIZE");
     }
 
-    #[tokio::test]
-    async fn test_build_queue_backend_max_size_clamp() {
-        // Custom valid value: 15
+    // Each clamp variant is its own test so env-var mutation never crosses an
+    // `.await` point while ENV_LOCK is held. make_queue_for() acquires and
+    // releases the lock *before* returning, so the queue is safe to .await.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_custom_value() {
         let q = make_queue_for("15");
         for i in 0..15 {
-            let msg = WeixinMessage {
-                message_id: Some(i),
-                ..Default::default()
-            };
-            let dropped = q.push("vtoken", msg).await.unwrap();
+            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
             assert!(!dropped);
         }
-        let dropped = q
-            .push(
-                "vtoken",
-                WeixinMessage {
-                    message_id: Some(15),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(15), ..Default::default() }).await.unwrap();
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 15);
         assert_eq!(drained[0].message_id, Some(1));
+        clear_env();
+    }
 
-        // Lower bound clamping: 5 -> clamped to 10
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_lower_bound() {
+        // 5 -> clamped to MIN (10)
         let q = make_queue_for("5");
         for i in 0..10 {
-            let dropped = q
-                .push(
-                    "vtoken",
-                    WeixinMessage {
-                        message_id: Some(i),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
+            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
             assert!(!dropped);
         }
-        let dropped = q
-            .push(
-                "vtoken",
-                WeixinMessage {
-                    message_id: Some(10),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(10), ..Default::default() }).await.unwrap();
         assert!(dropped);
         let drained = q.drain("vtoken").await.unwrap();
         assert_eq!(drained.len(), 10);
+        clear_env();
+    }
 
-        // Upper bound clamping: 20000 -> clamped to 10000
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_build_queue_backend_clamp_upper_bound() {
+        // 20000 -> clamped to MAX (10000)
         let q = make_queue_for("20000");
         for i in 0..10_000 {
-            let dropped = q
-                .push(
-                    "vtoken",
-                    WeixinMessage {
-                        message_id: Some(i),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .unwrap();
+            let dropped = q.push("vtoken", WeixinMessage { message_id: Some(i), ..Default::default() }).await.unwrap();
             assert!(!dropped);
         }
-        let dropped = q
-            .push(
-                "vtoken",
-                WeixinMessage {
-                    message_id: Some(10_000),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
+        let dropped = q.push("vtoken", WeixinMessage { message_id: Some(10_000), ..Default::default() }).await.unwrap();
         assert!(dropped);
-
         clear_env();
     }
 
@@ -867,7 +827,14 @@ mod drain_tests {
         let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        HubState::new(upstream, store, queue, rx, "test-relay-secret".to_string())
+        HubState::new(
+            upstream,
+            store,
+            queue,
+            rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
     }
 
     #[tokio::test]

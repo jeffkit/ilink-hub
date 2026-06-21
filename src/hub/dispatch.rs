@@ -3,7 +3,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
@@ -36,22 +36,15 @@ pub fn spawn_quote_index_evictor(state: Arc<HubState>) {
 
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
 
-pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<WeixinMessage>) {
+pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: mpsc::Receiver<WeixinMessage>) {
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(msg) => {
+                Some(msg) => {
                     dispatch_message(state.clone(), msg).await;
                 }
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(skipped = n, "dispatcher lagged behind upstream");
-                    state
-                        .metrics
-                        .dispatcher_lagged
-                        .fetch_add(n, Ordering::Relaxed);
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!("upstream broadcast channel closed, dispatcher exiting");
+                None => {
+                    info!("upstream channel closed, dispatcher exiting");
                     return;
                 }
             }
@@ -68,28 +61,11 @@ pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: broadcast::Receiver<Weixin
     )
 )]
 async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
-    // RAII guard records dispatch latency on every return path — including
-    // early returns for bot copies, @-mention shortcuts, and missing context_token.
-    // The `tokio::spawn` persist task below is excluded because the guard drops
-    // when *this* async frame returns, before the spawned task runs.
-    // We clone the Arc<Metrics> so the guard owns an independent reference and
-    // doesn't borrow `state` — `state` is moved into `handle_at_mention` on the
-    // @-mention early-return path, which would otherwise conflict with the borrow.
-    struct DispatchLatencyGuard {
-        start: std::time::Instant,
-        metrics: Arc<crate::hub::Metrics>,
-    }
-    impl Drop for DispatchLatencyGuard {
-        fn drop(&mut self) {
-            self.metrics
-                .dispatch_latency_ms
-                .observe(self.start.elapsed().as_millis() as u64);
-        }
-    }
-    let _latency_guard = DispatchLatencyGuard {
-        start: std::time::Instant::now(),
-        metrics: Arc::clone(&state.metrics),
-    };
+    // RAII guard: records dispatch latency on every return path.
+    // Clones metrics Arc so the guard doesn't borrow `state` (state is moved
+    // into handle_at_mention on the @-mention path, which conflicts with a borrow).
+    let metrics_arc = Arc::clone(&state.metrics);
+    let _latency_guard = crate::hub::LatencyGuard::new(&metrics_arc.dispatch_latency_ms);
 
     // iLink does not echo bot-authored messages back through getupdates in practice, but
     // guard regardless: a bot copy (message_type == 2) must never be routed as a user message
@@ -192,8 +168,10 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 let store = state.store.clone();
                 let (vctx3, vtoken3, peer3) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
                 let sem = state.persist_sem.clone();
+                let metrics = Arc::clone(&state.metrics);
                 tokio::spawn(async move {
                     let Ok(_permit) = sem.try_acquire() else {
+                        metrics.messages_persist_dropped.fetch_add(1, Ordering::Relaxed);
                         return;
                     };
                     if let Err(e) = store
@@ -516,44 +494,52 @@ pub(super) async fn build_hub_ext_for_vctx(
     vtoken: &str,
     session_override: Option<String>,
 ) -> Option<HubExt> {
-    let session_name = match session_override {
-        Some(name) if !name.is_empty() => name,
-        _ => match tokio::time::timeout(
+    // When a session is pinned via quote-reply, we still need its backend_session_id but
+    // can skip the active-session lookup — fetch only the session ID for the pinned name.
+    if let Some(name) = session_override.filter(|n| !n.is_empty()) {
+        let session_id = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            store.get_active_session_name(vctx, vtoken),
+            store.get_backend_session(vctx, vtoken, &name),
         )
         .await
         {
-            Ok(Ok(name)) => name,
+            Ok(Ok(Some(s))) => {
+                let t = s.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            }
+            Ok(Ok(None)) => None,
             Ok(Err(e)) => {
-                warn!("Failed to get active session name from DB for {vctx}: {e}");
-                "default".to_string()
+                warn!("Failed to get backend session from DB for {vctx}/{name}: {e}");
+                None
             }
             Err(_) => {
-                warn!("Timeout getting active session name from DB for {vctx}");
-                "default".to_string()
+                warn!("Timeout getting backend session from DB for {vctx}/{name}");
+                None
             }
-        },
-    };
+        };
+        return Some(HubExt {
+            session_id,
+            session_name: Some(name),
+            cli_session_id: None,
+        });
+    }
 
-    let session_id = match tokio::time::timeout(
+    // No session override: single JOIN query resolves active session name + backend session ID
+    // atomically, eliminating the TOCTOU window between the two separate lookups.
+    let (session_name, session_id) = match tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        store.get_backend_session(vctx, vtoken, &session_name),
+        store.get_hub_ext_single(vctx, vtoken),
     )
     .await
     {
-        Ok(Ok(Some(s))) => {
-            let t = s.trim().to_string();
-            (!t.is_empty()).then_some(t)
-        }
-        Ok(Ok(None)) => None,
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
-            warn!("Failed to get backend session from DB for {vctx}/{session_name}: {e}");
-            None
+            warn!("Failed to get hub ext from DB for {vctx}: {e}");
+            ("default".to_string(), None)
         }
         Err(_) => {
-            warn!("Timeout getting backend session from DB for {vctx}/{session_name}");
-            None
+            warn!("Timeout getting hub ext from DB for {vctx}");
+            ("default".to_string(), None)
         }
     };
 
@@ -573,19 +559,8 @@ fn build_no_backend_reply(user_text: Option<&str>) -> String {
         .unwrap_or(false);
 
     if is_command {
-        // User tried a command — give a hint that /help is available
         return messages::UNRECOGNIZED_COMMAND.to_string();
     }
 
-    "你好！我是 iLink Hub 消息路由服务。\n\
-     \n\
-     当前暂无 AI 助手后端在线，您的消息暂时无法被处理。\n\
-     \n\
-     您可以：\n\
-     • 发送 /status 查看服务状态\n\
-     • 发送 /list   查看已注册的后端\n\
-     • 发送 /help   查看完整帮助\n\
-     \n\
-     如需接入 AI 助手，请联系管理员配置后端服务。"
-        .to_string()
+    messages::NO_BACKEND_ONLINE.to_string()
 }

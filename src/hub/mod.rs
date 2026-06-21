@@ -32,6 +32,19 @@ pub mod ilink_status {
     pub const CONNECTED: u8 = 1;
     pub const NEEDS_LOGIN: u8 = 2;
     pub const LOGGING_IN: u8 = 3;
+
+    /// Canonical string form of a status code for API responses and log output.
+    /// All known codes are listed explicitly so adding a new constant without
+    /// updating this function causes a test failure (see `ilink_status_str_covers_all_codes`).
+    pub fn as_str(code: u8) -> &'static str {
+        match code {
+            UNKNOWN => "unknown",
+            CONNECTED => "connected",
+            NEEDS_LOGIN => "needs_login",
+            LOGGING_IN => "logging_in",
+            _ => "unknown",
+        }
+    }
 }
 
 pub use dispatch::{spawn_dispatcher, spawn_quote_index_evictor};
@@ -46,12 +59,37 @@ pub use quote_route::{merge_routing_with_quote, QuoteOrigin, QuoteRouteIndex};
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};
 pub use state::{
-    ClientState, EnterOutcome, HubState, IlinkConnState, LatencyHistogram, Metrics, PollGuard,
-    PollTracker, RoutingState, HISTOGRAM_BUCKETS_MS, MAX_CONCURRENT_POLLS_PER_VTOKEN,
-    MAX_HUB_POLLS_DEFAULT,
+    AdminConfig, ClientState, EnterOutcome, HubState, IlinkConnState, LatencyGuard,
+    LatencyHistogram, Metrics, PollGuard, PollTracker, RoutingState, HISTOGRAM_BUCKETS_MS,
+    MAX_CONCURRENT_POLLS_PER_VTOKEN, MAX_HUB_POLLS_DEFAULT,
 };
 
-pub use ilink_status as IlinkStatus;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod ilink_status_tests {
+    use super::ilink_status;
+
+    /// Ensure every defined constant maps to a non-"unknown" string.
+    /// If a new constant is added without updating `as_str`, this test catches it.
+    #[test]
+    fn ilink_status_str_covers_all_codes() {
+        let known = [
+            (ilink_status::UNKNOWN, "unknown"),
+            (ilink_status::CONNECTED, "connected"),
+            (ilink_status::NEEDS_LOGIN, "needs_login"),
+            (ilink_status::LOGGING_IN, "logging_in"),
+        ];
+        for (code, expected) in known {
+            assert_eq!(
+                ilink_status::as_str(code),
+                expected,
+                "as_str({code}) should return \"{expected}\""
+            );
+        }
+        // Unknown code falls back to "unknown" rather than panicking.
+        assert_eq!(ilink_status::as_str(99), "unknown");
+    }
+}

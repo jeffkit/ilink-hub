@@ -2,7 +2,8 @@
 //!
 //! Split out of `mod.rs`. The canonical transactional migrators
 //! (`migrate_to_vN_tx`) run inside `run_migrations`; the non-`_tx`
-//! variants are exercised by the unit-test surface in isolation.
+//! variants are thin wrappers that open their own transaction and delegate,
+//! used only by unit tests that exercise individual migrators in isolation.
 
 use anyhow::Result;
 use sqlx::{Acquire, Row};
@@ -142,7 +143,6 @@ impl Store {
     /// the row is invisible to other connections until the transaction
     /// commits — which is exactly the cross-version race closure we
     /// need (F-M3-02).
-    #[allow(dead_code)] // used by the test surface via `migrate_to_vN`
     pub(super) async fn try_claim_migration_in_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -189,8 +189,9 @@ impl Store {
         // We implement our own lightweight version-tracking table (`schema_version`)
         // so each migration step is applied exactly once and can be safely re-run.
         //
-        // The migration SQL files under migrations/ are the canonical human-readable
-        // reference. The Rust code here must stay in sync with those files.
+        // SQL for each version lives in migrations/000N_*.sql and is embedded at
+        // compile time via include_str!. The Rust code here handles driver-specific
+        // branching that cannot be expressed in a single portable SQL file.
         //
         // Concurrency model: a single connection, held for the entire migration
         // walk, runs the per-version migrators inside a single transaction.
@@ -244,13 +245,6 @@ impl Store {
             anyhow::anyhow!("DDL failed: CREATE TABLE IF NOT EXISTS schema_version\n  Error: {e}")
         })?;
 
-        // Dispatch to the per-version migrators on the same transaction.
-        // Each step is gated by `try_claim_migration_in_tx`, so a step that
-        // has already been applied (i.e. its row is present in
-        // `schema_version`) is a no-op. Steps that fail (DDL error, decode
-        // error) propagate `Err` straight up to `Store::connect`, blocking
-        // the program from starting in a half-migrated state. The whole
-        // walk commits atomically at the end.
         self.migrate_to_v1_tx(&mut tx).await?;
         self.migrate_to_v2_tx(&mut tx).await?;
         self.migrate_to_v3_tx(&mut tx).await?;
@@ -264,12 +258,6 @@ impl Store {
     }
 
     // ─── Per-version migrators (transactional, used by `run_migrations`) ───
-    //
-    // These are the canonical migrators. The non-suffixed `migrate_to_vN`
-    // methods (below) are the pre-M3 versions used by unit tests that call
-    // a single migrator on a partial state without setting up a
-    // transaction. The transactional variants take `&mut sqlx::Transaction`
-    // and run every DDL and claim on that transaction.
 
     pub(super) async fn migrate_to_v1_tx(
         &self,
@@ -396,20 +384,6 @@ impl Store {
         Ok(())
     }
 
-    /// v6: Normalize `peer_user_id` format on `context_token_map`.
-    ///
-    /// A pre-v6 code path stored `peer_user_id` as the bare WeChat peer ID
-    /// (e.g. `"o9cq80_ZyXuz1vAtG-TMbQjwQPW8@im.wechat"`). The current
-    /// `find_or_create_vctx` writes a `conv_key` with a `peer:` / `group:`
-    /// prefix (e.g. `"peer:o9cq80_..."`) and queries by that prefixed value.
-    /// On a pre-v6 database, the query never matched the existing row, so
-    /// every new message minted a fresh vctx — orphaning the previous
-    /// conversation and all its backend sessions.
-    ///
-    /// This migration prepends `peer:` to any non-empty `peer_user_id`
-    /// that does not already start with `peer:` or `group:`. It is
-    /// idempotent (re-running matches no rows), and `find_or_create_vctx`
-    /// remains the single source of truth for the format going forward.
     pub(super) async fn migrate_to_v6_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -430,110 +404,15 @@ impl Store {
         Ok(())
     }
 
-    // Non-transactional single-version migrators.
-    // Called only from test code that exercises individual migrators in isolation.
-    // Production code uses the transactional `migrate_to_vN_tx` variants via `run_migrations`.
-    // Each method reuses the SQL constants defined below to avoid drift between the two paths.
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v1(&self) -> Result<()> {
-        if !self.try_claim_migration(1).await? {
-            return Ok(());
-        }
-        for sql in V1_DDLS {
-            self.ddl(sql).await?;
-        }
-        tracing::info!(version = 1, "migration applied: initial schema");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v2(&self) -> Result<()> {
-        if !self.try_claim_migration(2).await? {
-            return Ok(());
-        }
-        for sql in V2_DDLS {
-            self.ddl(sql).await?;
-        }
-        tracing::info!(version = 2, "migration applied: backend session tables");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v3(&self) -> Result<()> {
-        if !self.try_claim_migration(3).await? {
-            return Ok(());
-        }
-        self.ddl(V3_CREATE_IDX).await?;
-        tracing::info!(version = 3, "migration applied: real_ctx unique index");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v4(&self) -> Result<()> {
-        if !self.try_claim_migration(4).await? {
-            return Ok(());
-        }
-        if !self
-            .column_exists("context_token_map", "created_at")
-            .await?
-        {
-            self.ddl(V4_ALTER_ADD_CREATED_AT).await?;
-        } else {
-            tracing::debug!(
-                "v4 migration: created_at column already present (pre-check), skipping ALTER"
-            );
-        }
-        self.ddl(V4_CREATE_IDX).await?;
-        tracing::info!(
-            version = 4,
-            "migration applied: context_token_map created_at column + index"
-        );
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v5(&self) -> Result<()> {
-        if !self.try_claim_migration(5).await? {
-            return Ok(());
-        }
-        let create_messages = Self::v5_create_messages_sql(self.kind);
-        self.ddl(&create_messages).await?;
-        for sql in V5_INDEXES {
-            self.ddl(sql).await?;
-        }
-        tracing::info!(version = 5, "migration applied: messages table + indexes");
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(super) async fn migrate_to_v6(&self) -> Result<()> {
-        if !self.try_claim_migration(6).await? {
-            return Ok(());
-        }
-        self.ddl(V6_NORMALIZE_PEER_USER_ID).await?;
-        tracing::info!(
-            version = 6,
-            "migration applied: normalize context_token_map.peer_user_id to peer:/group: form"
-        );
-        Ok(())
-    }
-
     /// v7: Unique index on non-empty `peer_user_id` in `context_token_map`.
     ///
-    /// This makes `find_or_create_vctx` race-free on multi-connection pools
-    /// (PostgreSQL, MySQL) by allowing a single-statement
-    /// `INSERT ... ON CONFLICT (peer_user_id) DO UPDATE` upsert instead of
-    /// the two-step SELECT + INSERT that had a TOCTOU window.
+    /// SQLite and PostgreSQL support partial WHERE clauses on the index;
+    /// MySQL does not support partial indexes and is skipped here — the
+    /// serialised single-connection write pool provides equivalent protection.
     ///
-    /// SQLite and PostgreSQL support a partial WHERE clause on the index
-    /// (`WHERE peer_user_id != ''`) so that multiple empty-string rows are
-    /// still allowed (conversations with no known peer_user_id).
-    ///
-    /// MySQL does not support partial indexes; we skip the migration there
-    /// and fall back to the existing SELECT + INSERT path (which is safe on
-    /// MySQL because the single-connection write pool serialises concurrent
-    /// writers at the pool level).
+    /// De-duplication of historical rows runs before the index is created,
+    /// using driver-specific SQL (SQLite: rowid, PostgreSQL: ctid) that
+    /// cannot be expressed portably in a single SQL file.
     pub(super) async fn migrate_to_v7_tx(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
@@ -543,9 +422,6 @@ impl Store {
         }
         match self.kind {
             DatabaseKind::Sqlite | DatabaseKind::Postgres => {
-                // De-duplicate any rows with the same non-empty peer_user_id before
-                // creating the unique index. Historical data anomalies (race conditions
-                // on pre-v7 schemas) may have produced duplicate conv_keys.
                 let dedup_sql = match self.kind {
                     DatabaseKind::Sqlite => V7_DEDUP_PEER_USER_ID_SQLITE,
                     _ => V7_DEDUP_PEER_USER_ID_POSTGRES,
@@ -578,48 +454,85 @@ impl Store {
         Ok(())
     }
 
+    // ─── Non-transactional single-version migrators (test surface only) ───
+    //
+    // These open their own transaction and delegate to the `_tx` variants,
+    // so the SQL logic is never duplicated. Production code uses `run_migrations`.
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v1(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v1_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v2(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v2_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v3(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v3_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v4(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v4_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v5(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v5_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v6(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v6_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(super) async fn migrate_to_v7(&self) -> Result<()> {
-        if !self.try_claim_migration(7).await? {
-            return Ok(());
-        }
-        match self.kind {
-            DatabaseKind::Sqlite | DatabaseKind::Postgres => {
-                let dedup_sql = match self.kind {
-                    DatabaseKind::Sqlite => V7_DEDUP_PEER_USER_ID_SQLITE,
-                    _ => V7_DEDUP_PEER_USER_ID_POSTGRES,
-                };
-                self.ddl(dedup_sql).await?;
-                self.ddl(V7_UNIQUE_IDX_PEER_USER_ID).await?;
-                tracing::info!(
-                    version = 7,
-                    "migration applied: de-dup + unique index on non-empty peer_user_id"
-                );
-            }
-            DatabaseKind::MySql => {
-                tracing::info!(
-                    version = 7,
-                    "migration skipped on MySQL: partial unique indexes are not supported"
-                );
-            }
-        }
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v7_tx(&mut tx).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
-    /// Pulled out of `migrate_to_v5` so the m3 test surface can call all three
+    /// Pulled out of `migrate_to_v5` so the test surface can call all three
     /// branches directly without spinning up a Postgres or MySQL connection.
     ///
-    /// Each form is portable to the named driver only. Field types, default
-    /// values (`CURRENT_TIMESTAMP`), and table-level shape are identical to
-    /// the `migrations/0005_messages.sql` reference (which documents the
-    /// SQLite form); the only divergence between the three forms is the
-    /// `id` clause and, for MySQL, the column type (`BIGINT` is required
-    /// because MySQL's `AUTO_INCREMENT` on `INTEGER` is silently truncated
-    /// to `INT(11)`, which then collides with the sqlx `i64` decoder used
-    /// by `save_message`'s `last_insert_id` path).
+    /// Each form is portable to the named driver only. The only divergence
+    /// between the three forms is the `id` clause and, for MySQL, the column
+    /// type (`BIGINT` is required because MySQL's `AUTO_INCREMENT` on `INTEGER`
+    /// is silently truncated to `INT(11)`, which then collides with the sqlx
+    /// `i64` decoder used by `save_message`'s `last_insert_id` path).
     pub(super) fn v5_create_messages_sql(kind: DatabaseKind) -> String {
         let id_clause = match kind {
             DatabaseKind::Sqlite => "id           INTEGER PRIMARY KEY AUTOINCREMENT",
@@ -647,30 +560,14 @@ impl Store {
     /// SQLite does not implement standard `information_schema`, so we use the
     /// SQLite-specific `pragma_table_info` for the SQLite driver and the
     /// portable `information_schema.columns` query for Postgres / MySQL.
-    /// The driver is taken from `self.kind` (parsed at `Store::connect`
-    /// time from the URL scheme) rather than probed at runtime — the
-    /// previous `SELECT current_database()` probe returned `Err` on
-    /// BOTH SQLite and MySQL, producing a false-positive
-    /// `is_sqlite == true` on MySQL and breaking the catalog query
-    /// (F-M3-01).
-    ///
-    /// Returns Ok(false) on any error reading the catalog (caller treats the
-    /// column as not present and lets the DDL surface the real error).
     #[allow(dead_code)]
     pub(super) async fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
-        // The `pragma_table_info` form works on SQLite. `pragma` cannot be
-        // parameterised, so we validate identifiers before splicing.
         if !is_safe_identifier(table) || !is_safe_identifier(column) {
             return Ok(false);
         }
 
         match self.kind {
             DatabaseKind::Sqlite => {
-                // SQLite: `pragma_table_info('<table>')` returns one row per column.
-                // - Ok(Some(_)) → column found
-                // - Ok(None)    → column absent (or table absent)
-                // - Err(_)      → treat as absent so the DDL surfaces the real error
-                //                 (e.g. "no such table") to the caller
                 let pragma_sql =
                     format!("SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}'");
                 let row = sqlx::query(&pragma_sql)
@@ -680,7 +577,6 @@ impl Store {
                 Ok(row.is_some())
             }
             DatabaseKind::Postgres | DatabaseKind::MySql => {
-                // Postgres / MySQL: standard information_schema.
                 let row = sqlx::query(
                     "SELECT 1 FROM information_schema.columns \
                      WHERE table_name = $1 AND column_name = $2 LIMIT 1",
@@ -695,11 +591,7 @@ impl Store {
     }
 
     /// Execute a single DDL statement through a pool connection.
-    ///
-    /// `AnyPool::execute` silently ignores DDL on the pool level. Using an
-    /// explicit `PoolConnection` and calling `execute` on the dereffed connection
-    /// works correctly, including for SQLite in-memory databases where all
-    /// operations must go through the same physical connection.
+    #[allow(dead_code)]
     pub(super) async fn ddl(&self, sql: &str) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query(sql)
@@ -710,58 +602,17 @@ impl Store {
     }
 }
 
-// ─── Migration SQL constants ───────────────────────────────────────────────────
+// ─── Migration SQL constants (embedded from migrations/ directory) ─────────────
 //
-// Shared between the transactional (`migrate_to_vN_tx`) and non-transactional
-// (`migrate_to_vN`) paths so the two execution routes can never drift apart.
+// SQL lives in migrations/000N_*.sql for editor support (syntax highlighting,
+// formatting). Driver-specific SQL that cannot be expressed in a single
+// portable file remains inline above (v5 CREATE TABLE, v7 de-dup).
 
-const V1_DDLS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS clients (
-        vtoken      TEXT PRIMARY KEY,
-        name        TEXT NOT NULL UNIQUE,
-        label       TEXT,
-        created_at  TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        last_seen   TEXT
-    )",
-    "CREATE TABLE IF NOT EXISTS routing_state (
-        from_user     TEXT PRIMARY KEY,
-        active_vtoken TEXT NOT NULL,
-        updated_at    TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-    )",
-    "CREATE TABLE IF NOT EXISTS context_token_map (
-        vctx         TEXT PRIMARY KEY,
-        real_ctx     TEXT NOT NULL,
-        peer_user_id TEXT NOT NULL DEFAULT '',
-        expires_at   TEXT
-    )",
-    "CREATE TABLE IF NOT EXISTS bot_credentials (
-        id         INTEGER PRIMARY KEY,
-        token      TEXT NOT NULL,
-        base_url   TEXT NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
-        updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
-    )",
-];
+const V1_DDLS: &[&str] = &[include_str!("../../migrations/0001_initial_schema.sql")];
 
-const V2_DDLS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS backend_sessions_v2 (
-        vctx               TEXT NOT NULL,
-        vtoken             TEXT NOT NULL,
-        session_name       TEXT NOT NULL,
-        backend_session_id TEXT NOT NULL DEFAULT '',
-        created_at         TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        PRIMARY KEY (vctx, vtoken, session_name)
-    )",
-    "CREATE TABLE IF NOT EXISTS active_sessions (
-        vctx         TEXT NOT NULL,
-        vtoken       TEXT NOT NULL,
-        session_name TEXT NOT NULL DEFAULT 'default',
-        updated_at   TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP),
-        PRIMARY KEY (vctx, vtoken)
-    )",
-];
+const V2_DDLS: &[&str] = &[include_str!("../../migrations/0002_backend_sessions.sql")];
 
-const V3_CREATE_IDX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_real_ctx \
-     ON context_token_map (real_ctx)";
+const V3_CREATE_IDX: &str = include_str!("../../migrations/0003_context_token_real_ctx_index.sql");
 
 const V4_ALTER_ADD_CREATED_AT: &str = "ALTER TABLE context_token_map ADD COLUMN created_at TEXT";
 
@@ -775,19 +626,16 @@ const V5_INDEXES: &[&str] = &[
      ON messages (peer_user_id, role, created_at DESC)",
 ];
 
-const V6_NORMALIZE_PEER_USER_ID: &str = "UPDATE context_token_map
-     SET peer_user_id = 'peer:' || peer_user_id
-     WHERE peer_user_id != ''
-       AND peer_user_id NOT LIKE 'peer:%'
-       AND peer_user_id NOT LIKE 'group:%'";
+const V6_NORMALIZE_PEER_USER_ID: &str =
+    include_str!("../../migrations/0006_normalize_peer_user_id.sql");
 
 /// SQLite-specific: remove duplicate non-empty peer_user_id rows before creating
-/// the unique index. Keeps the row with the highest rowid per conv_key.
-/// Safe to re-run: if no duplicates exist the DELETE is a no-op.
+/// the unique index. Keeps the row with the lowest rowid per conv_key (oldest entry),
+/// consistent with the PostgreSQL path which also keeps the oldest (MIN ctid).
 const V7_DEDUP_PEER_USER_ID_SQLITE: &str = "DELETE FROM context_token_map \
      WHERE peer_user_id != '' \
        AND rowid NOT IN ( \
-           SELECT MAX(rowid) FROM context_token_map \
+           SELECT MIN(rowid) FROM context_token_map \
            WHERE peer_user_id != '' \
            GROUP BY peer_user_id \
        )";
@@ -801,9 +649,5 @@ const V7_DEDUP_PEER_USER_ID_POSTGRES: &str = "DELETE FROM context_token_map \
            GROUP BY peer_user_id \
        )";
 
-/// Partial unique index on `context_token_map.peer_user_id` (non-empty rows only).
-/// SQLite and PostgreSQL only — MySQL does not support partial indexes.
 const V7_UNIQUE_IDX_PEER_USER_ID: &str =
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_context_token_map_peer_user_id \
-     ON context_token_map (peer_user_id) \
-     WHERE peer_user_id != ''";
+    include_str!("../../migrations/0007_peer_user_id_unique_index.sql");

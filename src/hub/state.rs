@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
+use dashmap::DashMap;
 
 use crate::ilink::{QrLoginUiEvent, UpstreamSink};
 use crate::store::Store;
@@ -53,32 +54,38 @@ pub const MAX_HUB_POLLS_DEFAULT: usize = 8192;
 /// care about (HTTP round-trips, upstream long-poll cadence, CLI exec).
 pub const HISTOGRAM_BUCKETS_MS: &[u64] = &[1, 5, 25, 100, 500, 2_500, 10_000];
 
+/// Number of histogram buckets: one per boundary plus the overflow (+Inf) bucket.
+pub const HISTOGRAM_BUCKET_COUNT: usize = HISTOGRAM_BUCKETS_MS.len() + 1;
+
 /// Latency histogram observation. One per metric name; `observe` is hot
 /// path (single fetch_add per bucket, no allocation), `snapshot` is the
 /// Prometheus-scrape path (called every 15s, not hot).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct LatencyHistogram {
     /// Cumulative count of observations.
     pub count: AtomicU64,
-    /// Sum of all observed latencies in milliseconds (saturating; tracked
-    /// as f64 bits to keep the field an `AtomicU64` for lock-free updates).
+    /// Sum of all observed latencies in milliseconds, stored as a plain u64 integer.
     pub sum_ms: AtomicU64,
-    /// Bucket counts. The last entry counts observations strictly greater
-    /// than the last explicit bucket boundary (i.e. the `+Inf` overflow).
-    pub buckets: Vec<AtomicU64>,
+    /// Fixed-size bucket array: one slot per boundary in `HISTOGRAM_BUCKETS_MS` plus
+    /// one overflow (+Inf) slot. Using a fixed-size array avoids heap allocation and
+    /// eliminates bounds-check indirection on the hot observe() path.
+    pub buckets: [AtomicU64; HISTOGRAM_BUCKET_COUNT],
+}
+
+impl Default for LatencyHistogram {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LatencyHistogram {
-    pub fn new(buckets_ms: &[u64]) -> Self {
-        // N explicit boundaries + 1 overflow bucket.
-        let mut buckets = Vec::with_capacity(buckets_ms.len() + 1);
-        for _ in 0..=buckets_ms.len() {
-            buckets.push(AtomicU64::new(0));
-        }
+    pub fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
             sum_ms: AtomicU64::new(0),
-            buckets,
+            // AtomicU64 is not Copy so we cannot use array-repeat syntax; initialize
+            // each element explicitly. HISTOGRAM_BUCKET_COUNT is a compile-time constant.
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
         }
     }
 
@@ -112,11 +119,13 @@ pub struct Metrics {
     pub sendmessage_errors: AtomicU64,
     /// Number of QR re-login attempts triggered (manual or automatic).
     pub relogin_attempts: AtomicU64,
-    /// Number of messages missed because the dispatcher lagged behind the broadcast channel.
+    /// Always zero — retained for Prometheus metric continuity after the broadcast→mpsc migration.
     pub dispatcher_lagged: AtomicU64,
+    /// Number of message history persist tasks dropped because the semaphore was exhausted.
+    /// A non-zero value indicates the DB write pool is too slow for the current message rate.
+    pub messages_persist_dropped: AtomicU64,
     /// Latency of `getupdates` long-polls, measured from handler entry to
-    /// handler exit (covers both the wakeup wait and the drain). Includes
-    /// the time spent holding the registry write lock.
+    /// handler exit (covers both the wakeup wait and the drain).
     pub getupdates_latency_ms: LatencyHistogram,
     /// Latency of upstream `sendmessage` HTTP round-trips. Excludes Hub
     /// internal bookkeeping (context translation, footer append, etc.).
@@ -126,10 +135,18 @@ pub struct Metrics {
     /// synchronous time from `dispatch_message` entry to its first
     /// `push_to_queue` call.
     pub dispatch_latency_ms: LatencyHistogram,
+    /// Unix timestamp (seconds) when this `Metrics` instance was created — emitted as
+    /// `*_created` in Prometheus text format so scrape tools can compute per-second rates
+    /// correctly even after a process restart.
+    pub process_start_unix_secs: f64,
 }
 
 impl Metrics {
     pub fn new() -> Self {
+        let process_start_unix_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         Self {
             messages_dispatched: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
@@ -138,9 +155,11 @@ impl Metrics {
             sendmessage_errors: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
             dispatcher_lagged: AtomicU64::new(0),
-            getupdates_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
-            sendmessage_upstream_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
-            dispatch_latency_ms: LatencyHistogram::new(HISTOGRAM_BUCKETS_MS),
+            messages_persist_dropped: AtomicU64::new(0),
+            getupdates_latency_ms: LatencyHistogram::new(),
+            sendmessage_upstream_latency_ms: LatencyHistogram::new(),
+            dispatch_latency_ms: LatencyHistogram::new(),
+            process_start_unix_secs,
         }
     }
 }
@@ -148,6 +167,26 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII guard that records elapsed time into a `LatencyHistogram` on drop.
+/// Shared between the `getupdates` handler (`HistoGuard` alias in routes.rs)
+/// and the inbound dispatch pipeline (`dispatch.rs`).
+pub struct LatencyGuard<'a> {
+    start: std::time::Instant,
+    histogram: &'a LatencyHistogram,
+}
+
+impl<'a> LatencyGuard<'a> {
+    pub fn new(histogram: &'a LatencyHistogram) -> Self {
+        Self { start: std::time::Instant::now(), histogram }
+    }
+}
+
+impl Drop for LatencyGuard<'_> {
+    fn drop(&mut self) {
+        self.histogram.observe(self.start.elapsed().as_millis() as u64);
     }
 }
 
@@ -377,6 +416,10 @@ pub struct ClientState {
     /// Tracks concurrent `getupdates` long-polls per vtoken to detect bridges that share one
     /// credential/token (queue split-brain).
     pub poll_tracker: Arc<PollTracker>,
+    /// Lock-free last-seen timestamps (Unix seconds) per vtoken.
+    /// `getupdates` updates this atomically without acquiring the registry write lock.
+    /// `spawn_health_checker` reads it to mark clients offline.
+    pub last_seen: Arc<DashMap<String, AtomicU64>>,
 }
 
 impl ClientState {
@@ -391,6 +434,7 @@ impl ClientState {
             pairing_notify: Arc::new(tokio::sync::Notify::new()),
             queue,
             poll_tracker,
+            last_seen: Arc::new(DashMap::new()),
         }
     }
 }
@@ -412,6 +456,39 @@ const MAX_CONCURRENT_PERSIST_TASKS: usize = 32;
 /// compatibility. New code is encouraged to take `&RoutingState` /
 /// `&IlinkConnState` / `&ClientState` parameters to make the dependency
 /// explicit.
+/// Admin authentication configuration, parsed once at startup from env vars and
+/// stored in `HubState`. Routes call `state.admin.check(headers)` instead of
+/// reading env vars at request time via `OnceLock`.
+#[derive(Debug, Clone)]
+pub struct AdminConfig {
+    /// The required Bearer token value, or `None` if `ILINK_ADMIN_TOKEN` is unset.
+    pub token: Option<String>,
+    /// True when `ILINK_ADMIN_INSECURE_NO_AUTH` is set and no token is configured.
+    pub insecure_no_auth: bool,
+    /// Parsed once at startup from `ILINKHUB_OUTBOUND_ORIGIN_LABEL`.
+    /// `None` = env var absent (default behaviour); `Some(v)` = explicit override.
+    pub outbound_origin_label: Option<String>,
+}
+
+impl AdminConfig {
+    pub fn from_env() -> Self {
+        let token = std::env::var("ILINK_ADMIN_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let insecure_no_auth = token.is_none()
+            && std::env::var("ILINK_ADMIN_INSECURE_NO_AUTH")
+                .ok()
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+        let outbound_origin_label = std::env::var("ILINKHUB_OUTBOUND_ORIGIN_LABEL").ok();
+        Self {
+            token,
+            insecure_no_auth,
+            outbound_origin_label,
+        }
+    }
+}
+
 pub struct HubState {
     /// iLink upstream connection and shutdown signal.
     pub ilink: IlinkConnState,
@@ -430,6 +507,8 @@ pub struct HubState {
     /// The relay client injects `X-Ilink-Relay-Secret: <secret>` on every forwarded
     /// request; Hub's pair_confirm trusts X-Forwarded-For only when this matches.
     pub relay_secret: String,
+    /// Admin authentication config, parsed once at startup.
+    pub admin: AdminConfig,
 }
 
 impl HubState {
@@ -445,6 +524,7 @@ impl HubState {
         queue: Arc<dyn MessageQueue>,
         shutdown: watch::Receiver<bool>,
         relay_secret: String,
+        admin: AdminConfig,
     ) -> Arc<Self> {
         Arc::new(Self {
             ilink: IlinkConnState::new(upstream, shutdown),
@@ -454,6 +534,7 @@ impl HubState {
             metrics: Arc::new(Metrics::new()),
             persist_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PERSIST_TASKS)),
             relay_secret,
+            admin,
         })
     }
 }

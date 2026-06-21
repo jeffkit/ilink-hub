@@ -1,7 +1,7 @@
 //! Client registry — tracks registered backend clients and their virtual tokens.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::SystemTime;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -14,7 +14,6 @@ pub struct ClientInfo {
     pub label: Option<String>,
     /// Wall-clock registration time; survives display across restarts.
     pub registered_at: SystemTime,
-    pub last_seen: Option<Instant>,
     pub online: bool,
 }
 
@@ -25,7 +24,6 @@ impl ClientInfo {
             vtoken: format!("vhub_{}", Uuid::new_v4().simple()),
             label,
             registered_at: SystemTime::now(),
-            last_seen: None,
             online: false,
         }
     }
@@ -81,7 +79,6 @@ impl ClientRegistry {
                     info.label = label;
                 }
                 info.online = true;
-                info.last_seen = Some(Instant::now());
             }
             return (existing_vtoken, false);
         }
@@ -104,21 +101,20 @@ impl ClientRegistry {
         self.by_name.get(name).and_then(|vt| self.by_vtoken.get(vt))
     }
 
-    pub fn mark_seen(&mut self, vtoken: &str) {
+    /// Mark a client as online (called on registration or first getupdates contact).
+    /// The precise last-seen timestamp is tracked separately in `ClientState::last_seen`
+    /// (a lock-free DashMap) so `getupdates` never needs to acquire a write lock.
+    pub fn mark_online(&mut self, vtoken: &str) {
         if let Some(info) = self.by_vtoken.get_mut(vtoken) {
-            info.last_seen = Some(Instant::now());
             info.online = true;
         }
     }
 
-    pub fn evict_stale(&mut self, timeout: Duration) {
-        let now = Instant::now();
-        for info in self.by_vtoken.values_mut() {
-            if let Some(last) = info.last_seen {
-                if now.duration_since(last) > timeout {
-                    info.online = false;
-                }
-            }
+    /// Mark a client as offline. Called by the health checker after it detects
+    /// the last-seen timestamp has exceeded the stale threshold.
+    pub fn mark_offline(&mut self, vtoken: &str) {
+        if let Some(info) = self.by_vtoken.get_mut(vtoken) {
+            info.online = false;
         }
     }
 
