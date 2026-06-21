@@ -2394,3 +2394,104 @@ fn test_load_or_derive_master_key_scenarios() {
         Err(_) => std::env::remove_var("ILINK_HUB_MASTER_KEY"),
     }
 }
+
+#[tokio::test]
+async fn test_bot_credentials_decryption_adversarial_wrong_key() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Set master key A
+    let raw_key_a = [0u8; 32];
+    let unbound_key_a = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key_a).unwrap();
+    let key_a = ring::aead::LessSafeKey::new(unbound_key_a);
+    store
+        .set_master_key(std::sync::Arc::new(key_a))
+        .expect("set_master_key");
+
+    // 2. Save credentials under key A
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+
+    // 3. Create another Store instance with Master Key B sharing the same pool
+    let raw_key_b = [1u8; 32];
+    let unbound_key_b = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key_b).unwrap();
+    let key_b = ring::aead::LessSafeKey::new(unbound_key_b);
+
+    let store_b = Store {
+        pool: store.pool.clone(),
+        rpool: store.pool.clone(),
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    store_b
+        .set_master_key(std::sync::Arc::new(key_b))
+        .expect("set_master_key");
+
+    // 4. Loading credentials with key B must fail (should return Err)
+    let res = store_b.load_credentials().await;
+    assert!(res.is_err());
+    let err_msg = res.unwrap_err().to_string();
+    assert!(err_msg.contains("Decryption failed"));
+}
+
+#[tokio::test]
+async fn test_bot_credentials_decryption_adversarial_tampered_ciphertext() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+
+    // 1. Set master key
+    let raw_key = [0u8; 32];
+    let unbound_key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &raw_key).unwrap();
+    let key = ring::aead::LessSafeKey::new(unbound_key);
+    store
+        .set_master_key(std::sync::Arc::new(key))
+        .expect("set_master_key");
+
+    // 2. Save credentials
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+
+    // Case A: Ciphertext replaced by invalid base64 (e.g. invalid characters)
+    sqlx::query("UPDATE bot_credentials SET token = 'not-base64-at-all-$$$' WHERE id = 1")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store.load_credentials().await.is_err());
+
+    // Case B: Ciphertext is too short to contain nonce + tag
+    sqlx::query("UPDATE bot_credentials SET token = 'c2hvcnQ=' WHERE id = 1") // "short" in base64
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let res = store.load_credentials().await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("data too short"));
+
+    // Case C: Ciphertext base64-decodes fine but is corrupted (one bit flipped in the payload/tag)
+    store
+        .save_credentials("my-secret-token", "https://api.example.com")
+        .await
+        .unwrap();
+    let row: (String,) = sqlx::query_as("SELECT token FROM bot_credentials WHERE id = 1")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+
+    use base64::{engine::general_purpose::STANDARD as B64, Engine};
+    let mut bytes = B64.decode(&row.0).unwrap();
+    // Flip a bit in the ciphertext or tag (not the nonce)
+    bytes[20] ^= 1;
+    let corrupted_b64 = B64.encode(&bytes);
+
+    sqlx::query("UPDATE bot_credentials SET token = $1 WHERE id = 1")
+        .bind(corrupted_b64)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let res = store.load_credentials().await;
+    assert!(res.is_err());
+    assert!(res.unwrap_err().to_string().contains("Decryption failed"));
+}
