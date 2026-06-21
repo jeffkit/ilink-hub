@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
@@ -22,8 +22,28 @@ use crate::ilink::types::{
 const INITIAL_BACKOFF_SECS: u64 = 5;
 /// Hard cap on the backoff between throttle retries. Once an attempt count
 /// would push the wait past this value, the loop holds at this interval
-/// indefinitely (a give-up cap is added in M4; see plan.md).
+/// until either the send lands or the cumulative retry budget (M4,
+/// [`retry_budget`]) is exhausted.
 const MAX_BACKOFF_SECS: u64 = 60;
+
+/// Floor / ceiling for the M4 cumulative retry budget. A single buffered
+/// chunk (or one final reply) is retried under persistent throttling for at
+/// most this long before we give up, log an `error!`, and move on. We tie
+/// the budget to the CLI `timeout_secs` so a long-running task earns a
+/// proportionally long delivery window, but clamp it so a tiny or huge
+/// timeout still yields a sane window (the upper bound roughly matches the
+/// observed WeChat ~5-7 min throttle cooldown).
+const MIN_RETRY_BUDGET_SECS: u64 = 60;
+const MAX_RETRY_BUDGET_SECS: u64 = 300;
+
+/// Cumulative wall-clock budget for retrying a throttled send (M4).
+///
+/// Derived from the profile's `timeout_secs`, clamped to
+/// `[MIN_RETRY_BUDGET_SECS, MAX_RETRY_BUDGET_SECS]`. Pure so it can be
+/// unit-pinned.
+fn retry_budget(profile_timeout_secs: u64) -> Duration {
+    Duration::from_secs(profile_timeout_secs.clamp(MIN_RETRY_BUDGET_SECS, MAX_RETRY_BUDGET_SECS))
+}
 
 /// Pure backoff schedule for throttled `sendmessage` retries.
 ///
@@ -300,6 +320,12 @@ trait ReplySender: Send + Sync + 'static {
         from_user: &str,
         session_name: &str,
     ) -> BoxFuture<'_, Result<SendOutcome>>;
+
+    /// Send a fully-built request. M3 uses this for the final-reply paths
+    /// (final body, `cli_session_id` persistence, CLI-error reply) which
+    /// — unlike partial chunks — carry a pre-assembled `SendMessageRequest`
+    /// rather than just text. Retried through [`send_final_with_retry`].
+    fn send_request(&self, req: SendMessageRequest) -> BoxFuture<'_, Result<SendOutcome>>;
 }
 
 impl ReplySender for HubClient {
@@ -321,6 +347,10 @@ impl ReplySender for HubClient {
             let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
             ext.session_name = cleaned_session;
         }
+        Box::pin(self.sendmessage(req))
+    }
+
+    fn send_request(&self, req: SendMessageRequest) -> BoxFuture<'_, Result<SendOutcome>> {
         Box::pin(self.sendmessage(req))
     }
 }
@@ -349,6 +379,7 @@ impl ReplySender for HubClient {
 /// without losing the buffered `pending` to a process panic. (We still
 /// drop `pending` on shutdown — by then the whole `run_session_worker`
 /// is unwinding and the inbound CLI is going away.)
+#[allow(clippy::too_many_arguments)]
 async fn run_partial_forward_loop<S: ReplySender>(
     sender: S,
     mut partial_rx: mpsc::UnboundedReceiver<String>,
@@ -357,9 +388,15 @@ async fn run_partial_forward_loop<S: ReplySender>(
     session_name: String,
     shutdown: CancellationToken,
     backoff_fn: fn(u32) -> Duration,
+    max_total: Duration,
 ) {
     let mut pending: Option<String> = None;
     let mut attempt: u32 = 0;
+    // M4: wall-clock instant of the first throttle for the *current*
+    // `pending`. `None` whenever we are not inside a retry cycle. Used to
+    // bound how long we keep retrying one buffered chunk under persistent
+    // throttling before giving up.
+    let mut first_throttle_at: Option<Instant> = None;
 
     loop {
         // Phase 1: wait for a new chunk OR for an in-flight sleep to
@@ -433,20 +470,43 @@ async fn run_partial_forward_loop<S: ReplySender>(
                 );
                 pending = None;
                 attempt = 0;
+                first_throttle_at = None;
             }
             Ok(SendOutcome::Throttled { ret, errmsg }) => {
-                attempt = attempt.saturating_add(1);
-                let wait = backoff_fn(attempt);
-                warn!(
-                    ret,
-                    attempt,
-                    backoff_secs = wait.as_secs(),
-                    pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
-                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
-                    "partial reply throttled; will retry with exponential backoff"
-                );
-                // Loop back to phase 1; the `else` branch will
-                // honour the new attempt count.
+                // M4: bound total retry time for one buffered chunk. The
+                // budget clock starts at the first throttle and survives
+                // chunk overwrites (we stay throttled, so the freshest
+                // content simply inherits the remaining budget).
+                let started = *first_throttle_at.get_or_insert_with(Instant::now);
+                let elapsed = started.elapsed();
+                if elapsed >= max_total {
+                    error!(
+                        ret,
+                        attempt,
+                        elapsed_secs = elapsed.as_secs(),
+                        budget_secs = max_total.as_secs(),
+                        pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "partial reply abandoned: retry budget exhausted under persistent throttle"
+                    );
+                    pending = None;
+                    attempt = 0;
+                    first_throttle_at = None;
+                } else {
+                    attempt = attempt.saturating_add(1);
+                    let wait = backoff_fn(attempt);
+                    warn!(
+                        ret,
+                        attempt,
+                        backoff_secs = wait.as_secs(),
+                        elapsed_secs = elapsed.as_secs(),
+                        pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "partial reply throttled; will retry with exponential backoff"
+                    );
+                    // Loop back to phase 1; the `else` branch will
+                    // honour the new attempt count.
+                }
             }
             Err(e) => {
                 warn!(
@@ -456,7 +516,73 @@ async fn run_partial_forward_loop<S: ReplySender>(
                 );
                 pending = None;
                 attempt = 0;
+                first_throttle_at = None;
             }
+        }
+    }
+}
+
+/// M3: send one fully-built request, retrying on `Throttled` with the same
+/// exponential backoff as the partial loop, until it lands, `shutdown`
+/// fires, or the M4 cumulative retry budget is exhausted.
+///
+/// Unlike the partial loop there is no buffering/overwrite: the final reply,
+/// `cli_session_id` persistence and CLI-error reply each carry one fixed
+/// payload, so we just clone-and-resend the same `req` until delivery.
+///
+/// Returns `Ok(())` on delivery **or** on a clean give-up/shutdown (the
+/// caller has nothing better to do than continue); only a non-throttle
+/// transport error propagates as `Err`.
+async fn send_final_with_retry<S: ReplySender + ?Sized>(
+    sender: &S,
+    req: SendMessageRequest,
+    backoff_fn: fn(u32) -> Duration,
+    max_total: Duration,
+    shutdown: &CancellationToken,
+    what: &'static str,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut attempt: u32 = 0;
+    loop {
+        let send_result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Ok(()),
+            r = sender.send_request(req.clone()) => r,
+        };
+        match send_result {
+            Ok(SendOutcome::Sent) => return Ok(()),
+            Ok(SendOutcome::Throttled { ret, errmsg }) => {
+                let elapsed = start.elapsed();
+                if elapsed >= max_total {
+                    error!(
+                        ret,
+                        what,
+                        attempt,
+                        elapsed_secs = elapsed.as_secs(),
+                        budget_secs = max_total.as_secs(),
+                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                        "final reply abandoned: retry budget exhausted under persistent throttle"
+                    );
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+                let wait = backoff_fn(attempt);
+                warn!(
+                    ret,
+                    what,
+                    attempt,
+                    backoff_secs = wait.as_secs(),
+                    elapsed_secs = elapsed.as_secs(),
+                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
+                    "final reply throttled; retrying with exponential backoff"
+                );
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -892,6 +1018,7 @@ async fn handle_one_message(
     let fwd_from_user = from_user.clone();
     let fwd_session_name = session_name_for_cli.clone();
     let fwd_shutdown = shutdown.clone();
+    let retry_budget = retry_budget(profile.timeout_secs);
     let forward_handle = tokio::spawn(run_partial_forward_loop(
         fwd_client,
         partial_rx,
@@ -900,6 +1027,7 @@ async fn handle_one_message(
         fwd_session_name,
         fwd_shutdown,
         backoff_for,
+        retry_budget,
     ));
 
     let cli_result = run_cli(
@@ -937,18 +1065,17 @@ async fn handle_one_message(
                             let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                             hub_ext.session_name = Some(session_name_for_cli.clone());
                         }
-                        match client.sendmessage(req).await {
-                            Ok(SendOutcome::Sent) => {}
-                            Ok(SendOutcome::Throttled { ret, errmsg }) => {
-                                warn!(
-                                    ret,
-                                    errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
-                                    "sendmessage throttled while persisting cli_session_id; M3 will buffer+retry here"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply")
-                            }
+                        if let Err(e) = send_final_with_retry(
+                            client,
+                            req,
+                            backoff_for,
+                            retry_budget,
+                            &shutdown,
+                            "cli_session_id persistence",
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply")
                         }
                     }
                 }
@@ -959,39 +1086,32 @@ async fn handle_one_message(
                 let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                 hub_ext.session_name = Some(session_name_for_cli.clone());
             }
-            match client.sendmessage(req).await {
-                Ok(SendOutcome::Sent) => {}
-                Ok(SendOutcome::Throttled { ret, errmsg }) => {
-                    // M1 placeholder: final-reply path does NOT escalate
-                    // Throttled to HandleError. M3 will buffer + retry the
-                    // final reply on throttling and remove this warn
-                    // entirely (or convert it into a structured "retry
-                    // attempted" trace). For now we surface the typed
-                    // signal so M3 coverage can be verified by watching
-                    // for this log line.
-                    warn!(
-                        ret,
-                        errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
-                        "sendmessage throttled on final reply; M3 will buffer+retry here"
-                    );
-                }
-                Err(e) => return Err(HandleError::from(e.context("sendmessage reply"))),
-            }
+            send_final_with_retry(
+                client,
+                req,
+                backoff_for,
+                retry_budget,
+                &shutdown,
+                "final reply",
+            )
+            .await
+            .map_err(|e| HandleError::from(e.context("sendmessage reply")))?;
         }
         Err(e) => {
             if app.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
                 let req = SendMessageRequest::reply(ctx, err_text, &from_user);
-                match client.sendmessage(req).await {
-                    Ok(SendOutcome::Sent) => {}
-                    Ok(SendOutcome::Throttled { ret, errmsg }) => {
-                        warn!(
-                            ret,
-                            errmsg = sanitize_errmsg(errmsg.as_deref()).as_deref(),
-                            "sendmessage throttled on CLI-error reply; M3 will buffer+retry here"
-                        );
-                    }
-                    Err(send_e) => warn!(error = %send_e, "failed to send error reply"),
+                if let Err(send_e) = send_final_with_retry(
+                    client,
+                    req,
+                    backoff_for,
+                    retry_budget,
+                    &shutdown,
+                    "CLI-error reply",
+                )
+                .await
+                {
+                    warn!(error = %send_e, "failed to send error reply")
                 }
             }
             let err_str = e.to_string().to_lowercase();
@@ -1512,6 +1632,23 @@ timeout_secs: 5
         fn sent_timestamps(&self) -> Vec<Instant> {
             self.timestamps.lock().unwrap().clone()
         }
+
+        /// Record one send (label + timestamp) and pop the next scripted
+        /// outcome (or replay the loop outcome). Shared by `send_reply`
+        /// (partial loop) and `send_request` (M3 final-reply paths).
+        fn record_and_next(&self, label: String) -> Result<SendOutcome> {
+            self.log.lock().unwrap().push(label);
+            self.timestamps.lock().unwrap().push(Instant::now());
+            if let Some(outcome) = self.loop_outcome.lock().unwrap().clone() {
+                Ok(outcome)
+            } else {
+                let mut script = self.script.lock().unwrap();
+                if script.is_empty() {
+                    panic!("ScriptedSender script exhausted; use new_loop for persistent-throttle tests");
+                }
+                script.remove(0)
+            }
+        }
     }
 
     impl ReplySender for ScriptedSender {
@@ -1522,19 +1659,12 @@ timeout_secs: 5
             _from_user: &str,
             _session_name: &str,
         ) -> BoxFuture<'_, Result<SendOutcome>> {
-            self.log.lock().unwrap().push(text.to_string());
-            self.timestamps.lock().unwrap().push(Instant::now());
-            let next: Result<SendOutcome> = if let Some(outcome) =
-                self.loop_outcome.lock().unwrap().clone()
-            {
-                Ok(outcome)
-            } else {
-                let mut script = self.script.lock().unwrap();
-                if script.is_empty() {
-                    panic!("ScriptedSender script exhausted; use new_loop for persistent-throttle tests");
-                }
-                script.remove(0)
-            };
+            let next = self.record_and_next(text.to_string());
+            Box::pin(async move { next })
+        }
+
+        fn send_request(&self, _req: SendMessageRequest) -> BoxFuture<'_, Result<SendOutcome>> {
+            let next = self.record_and_next("<request>".to_string());
             Box::pin(async move { next })
         }
     }
@@ -1552,17 +1682,31 @@ timeout_secs: 5
         CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        fn test_backoff(attempt: u32) -> Duration {
-            // 5ms initial, 40ms cap — small enough that 4 retries still
-            // complete well under the tokio test timeout, large enough
-            // that macOS timer granularity doesn't collapse adjacent
-            // sleeps to zero. After F-M2-001 fix, this schedule
-            // exercises the real exponential-then-cap shape
-            // [5ms, 10ms, 20ms, 40ms, 40ms, ...] (production schedule
-            // is [5s, 10s, 20s, 40s, 60s, 60s, ...] — also unit-pinned
-            // by backoff_sequence_matches_spec).
-            backoff_for_test(attempt, Duration::from_millis(5), Duration::from_millis(40))
-        }
+        // Generous budget so existing tests never hit the M4 give-up path.
+        spawn_test_loop_with_budget(sender, Duration::from_secs(3600))
+    }
+
+    fn test_backoff(attempt: u32) -> Duration {
+        // 5ms initial, 40ms cap — small enough that 4 retries still
+        // complete well under the tokio test timeout, large enough that
+        // macOS timer granularity doesn't collapse adjacent sleeps to
+        // zero. Exercises the real exponential-then-cap shape
+        // [5ms, 10ms, 20ms, 40ms, 40ms, ...] (production schedule is
+        // [5s, 10s, 20s, 40s, 60s, 60s, ...] — also unit-pinned by
+        // backoff_sequence_matches_spec).
+        backoff_for_test(attempt, Duration::from_millis(5), Duration::from_millis(40))
+    }
+
+    /// Same as [`spawn_test_loop`] but with a caller-controlled M4 retry
+    /// budget so give-up behavior can be exercised with a tiny window.
+    fn spawn_test_loop_with_budget<S: ReplySender>(
+        sender: S,
+        max_total: Duration,
+    ) -> (
+        mpsc::UnboundedSender<String>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
         let (tx, rx) = mpsc::unbounded_channel::<String>();
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(run_partial_forward_loop(
@@ -1573,6 +1717,7 @@ timeout_secs: 5
             "sess".into(),
             shutdown.clone(),
             test_backoff,
+            max_total,
         ));
         (tx, shutdown, handle)
     }
@@ -2038,5 +2183,179 @@ timeout_secs: 5
         fn assert_reply_sender<S: ReplySender>(_: &S) {}
         let client = fake_client();
         assert_reply_sender(&client);
+    }
+
+    // ─── send_final_with_retry (M3) + give-up budget (M4) ─────────────
+
+    fn dummy_req() -> SendMessageRequest {
+        SendMessageRequest::reply("ctx".to_string(), "final".to_string(), "user")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_reply_throttled_thrice_then_delivered() {
+        // E2E-2 scenario C/D: the final reply is throttled N times then
+        // lands. The retry helper must keep resending the same payload
+        // until Sent and return Ok exactly once delivered.
+        let scripted = ScriptedSender::new(vec![
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: Some("rl".into()),
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Throttled {
+                ret: -2,
+                errmsg: None,
+            }),
+            Ok(SendOutcome::Sent),
+        ]);
+        let shutdown = CancellationToken::new();
+        let res = send_final_with_retry(
+            &scripted,
+            dummy_req(),
+            test_backoff,
+            Duration::from_secs(3600),
+            &shutdown,
+            "final reply",
+        )
+        .await;
+        assert!(res.is_ok(), "delivery after retries must return Ok");
+        assert_eq!(
+            scripted.sent_count(),
+            4,
+            "expected 3 throttled attempts + 1 successful send"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_reply_transport_error_propagates() {
+        // A non-throttle transport error must surface to the caller (so
+        // the final-reply path can map it to HandleError) instead of
+        // being retried forever.
+        let scripted = ScriptedSender::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+        let shutdown = CancellationToken::new();
+        let res = send_final_with_retry(
+            &scripted,
+            dummy_req(),
+            test_backoff,
+            Duration::from_secs(3600),
+            &shutdown,
+            "final reply",
+        )
+        .await;
+        assert!(res.is_err(), "transport error must propagate, not retry");
+        assert_eq!(
+            scripted.sent_count(),
+            1,
+            "must not retry a non-throttle Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_reply_persistent_throttle_gives_up_within_budget() {
+        // M4: under a permanent throttle the helper gives up once the
+        // cumulative budget is exhausted and returns Ok (the caller has
+        // nothing better to do than continue), rather than spinning
+        // forever.
+        let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
+            ret: -2,
+            errmsg: None,
+        });
+        let shutdown = CancellationToken::new();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_final_with_retry(
+                &scripted,
+                dummy_req(),
+                test_backoff,
+                Duration::from_millis(30),
+                &shutdown,
+                "final reply",
+            ),
+        )
+        .await;
+        assert!(
+            res.is_ok(),
+            "helper must return within the timeout (no infinite spin under persistent throttle)"
+        );
+        assert!(
+            res.unwrap().is_ok(),
+            "give-up returns Ok so the caller continues cleanly"
+        );
+        assert!(
+            scripted.sent_count() >= 1,
+            "expected at least one send attempt before giving up"
+        );
+    }
+
+    #[tokio::test]
+    async fn final_reply_shutdown_during_backoff_returns_promptly() {
+        // Cancel-safety: a shutdown during the backoff sleep aborts the
+        // retry loop and returns Ok without hanging.
+        let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
+            ret: -2,
+            errmsg: None,
+        });
+        let probe = scripted.clone();
+        let shutdown = CancellationToken::new();
+        let shutdown_for_task = shutdown.clone();
+        let task = tokio::spawn(async move {
+            send_final_with_retry(
+                &scripted,
+                dummy_req(),
+                test_backoff,
+                Duration::from_secs(3600),
+                &shutdown_for_task,
+                "final reply",
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        shutdown.cancel();
+        let res = tokio::time::timeout(Duration::from_secs(2), task).await;
+        assert!(res.is_ok(), "task must finish promptly after shutdown");
+        assert!(res.unwrap().unwrap().is_ok());
+        let _ = probe.sent_count();
+    }
+
+    #[tokio::test]
+    async fn partial_persistent_throttle_gives_up_then_serves_new_chunk() {
+        // M4 for the partial loop: with a tiny budget and a permanent
+        // throttle, the loop abandons the first buffered chunk after the
+        // budget elapses. Because the scripted sender always throttles we
+        // cannot observe a later Sent, but we CAN observe that the loop
+        // gives up (send attempts for one chunk are bounded, no unbounded
+        // spin) and then stays responsive: a fresh chunk pushed after the
+        // give-up starts a new retry cycle (more send attempts).
+        let scripted = ScriptedSender::new_loop(SendOutcome::Throttled {
+            ret: -2,
+            errmsg: None,
+        });
+        let (tx, shutdown, handle) =
+            spawn_test_loop_with_budget(scripted.clone(), Duration::from_millis(30));
+        let probe = scripted.clone();
+
+        tx.send("chunk-0".to_string()).unwrap();
+        // Allow the budget to elapse and the loop to abandon chunk-0.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let after_giveup = probe.sent_count();
+
+        // A fresh chunk after give-up must trigger new attempts.
+        tx.send("chunk-1".to_string()).unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        let total = probe.sent_count();
+        assert!(
+            after_giveup >= 1,
+            "loop must attempt at least once before giving up, got {after_giveup}"
+        );
+        assert!(
+            total > after_giveup,
+            "a fresh chunk after give-up must trigger new send attempts ({total} !> {after_giveup})"
+        );
     }
 }

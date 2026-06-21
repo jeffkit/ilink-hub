@@ -468,7 +468,7 @@ pub struct GetUpdatesResponse {
 // ─── SendMessage ─────────────────────────────────────────────────────────────
 
 /// Request body for `POST /ilink/bot/sendmessage`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg: Option<WeixinMessage>,
