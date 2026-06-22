@@ -344,7 +344,7 @@ fn default_cred_path() -> String {
 fn chrono_now() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap();
+        .unwrap_or(Duration::ZERO);
     format!("{}Z", dur.as_secs())
 }
 

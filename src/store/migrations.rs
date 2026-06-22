@@ -509,7 +509,7 @@ impl Store {
             match crate::runtime::crypto::load_or_derive_master_key() {
                 Ok(k) => {
                     local_key = Some(k);
-                    local_key.as_ref().unwrap()
+                    local_key.as_ref().expect("just assigned above")
                 }
                 Err(e) => {
                     return Err(anyhow::anyhow!(

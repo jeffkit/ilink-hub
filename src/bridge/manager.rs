@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(unix)]
@@ -14,7 +14,7 @@ extern crate libc;
 
 use anyhow::{Context, Result};
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
@@ -82,7 +82,7 @@ pub struct BridgeChildStatus {
 #[derive(Clone)]
 pub struct BridgeManagerHandle {
     shutdown: watch::Sender<bool>,
-    status: Arc<Mutex<BridgeManagerStatus>>,
+    status: Arc<RwLock<BridgeManagerStatus>>,
 }
 
 impl BridgeManagerHandle {
@@ -90,15 +90,8 @@ impl BridgeManagerHandle {
         let _ = self.shutdown.send(true);
     }
 
-    pub fn status(&self) -> BridgeManagerStatus {
-        self.status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| BridgeManagerStatus {
-                state: "error".into(),
-                last_error: Some("bridge manager status lock poisoned".into()),
-                ..Default::default()
-            })
+    pub async fn status(&self) -> BridgeManagerStatus {
+        self.status.read().await.clone()
     }
 }
 
@@ -141,7 +134,7 @@ enum ManagedBridgeState {
 /// Run the bridge manager until Ctrl-C.
 pub async fn run_bridge_manager(opts: BridgeManagerOptions) -> Result<()> {
     let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-    let status = Arc::new(Mutex::new(BridgeManagerStatus::default()));
+    let status = Arc::new(RwLock::new(BridgeManagerStatus::default()));
     run_bridge_manager_with_shutdown(opts, shutdown_rx, status, true).await
 }
 
@@ -150,7 +143,7 @@ pub fn spawn_bridge_manager(
     opts: BridgeManagerOptions,
 ) -> (BridgeManagerHandle, JoinHandle<Result<()>>) {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let status = Arc::new(Mutex::new(BridgeManagerStatus::default()));
+    let status = Arc::new(RwLock::new(BridgeManagerStatus::default()));
     let handle = BridgeManagerHandle {
         shutdown: shutdown_tx,
         status: Arc::clone(&status),
@@ -168,7 +161,7 @@ pub fn spawn_bridge_manager(
 pub async fn run_bridge_manager_with_shutdown(
     opts: BridgeManagerOptions,
     mut shutdown_rx: watch::Receiver<bool>,
-    status: Arc<Mutex<BridgeManagerStatus>>,
+    status: Arc<RwLock<BridgeManagerStatus>>,
     listen_ctrl_c: bool,
 ) -> Result<()> {
     tokio::fs::create_dir_all(&opts.profiles_dir)
@@ -217,7 +210,7 @@ pub async fn run_bridge_manager_with_shutdown(
                 }
                 _ = tokio::time::sleep(manager.opts.scan_interval) => {
                     if let Err(e) = manager.reconcile_once().await {
-                        manager.set_error(e.to_string());
+                        manager.set_error(e.to_string()).await;
                         error!(error = %e, "bridge manager reconcile failed");
                     }
                 }
@@ -233,7 +226,7 @@ pub async fn run_bridge_manager_with_shutdown(
                 }
                 _ = tokio::time::sleep(manager.opts.scan_interval) => {
                     if let Err(e) = manager.reconcile_once().await {
-                        manager.set_error(e.to_string());
+                        manager.set_error(e.to_string()).await;
                         error!(error = %e, "bridge manager reconcile failed");
                     }
                 }
@@ -244,13 +237,13 @@ pub async fn run_bridge_manager_with_shutdown(
 
 struct BridgeManager {
     opts: BridgeManagerOptions,
-    status: Arc<Mutex<BridgeManagerStatus>>,
+    status: Arc<RwLock<BridgeManagerStatus>>,
     children: HashMap<String, ManagedBridge>,
     http_client: reqwest::Client,
 }
 
 impl BridgeManager {
-    fn new(opts: BridgeManagerOptions, status: Arc<Mutex<BridgeManagerStatus>>) -> Result<Self> {
+    fn new(opts: BridgeManagerOptions, status: Arc<RwLock<BridgeManagerStatus>>) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -274,7 +267,7 @@ impl BridgeManager {
         self.mark_exited_children().await;
         self.restart_ready_children().await;
         self.start_new_children(desired);
-        self.publish_status("running", None);
+        self.publish_status("running", None).await;
         Ok(())
     }
 
@@ -612,14 +605,14 @@ impl BridgeManager {
             let _ = handle.await;
         }
 
-        self.publish_status("stopped", None);
+        self.publish_status("stopped", None).await;
     }
 
-    fn set_error(&self, error: String) {
-        self.publish_status("error", Some(error));
+    async fn set_error(&self, error: String) {
+        self.publish_status("error", Some(error)).await;
     }
 
-    fn publish_status(&self, state: &str, last_error: Option<String>) {
+    async fn publish_status(&self, state: &str, last_error: Option<String>) {
         let now = Instant::now();
         let mut children = self
             .children
@@ -665,16 +658,15 @@ impl BridgeManager {
         let running = children.iter().filter(|c| c.state == "running").count();
         let restarting = children.iter().filter(|c| c.state == "restarting").count();
 
-        if let Ok(mut status) = self.status.lock() {
-            *status = BridgeManagerStatus {
-                state: state.to_string(),
-                profiles_total: children.len(),
-                running,
-                restarting,
-                children,
-                last_error,
-            };
-        }
+        let mut status = self.status.write().await;
+        *status = BridgeManagerStatus {
+            state: state.to_string(),
+            profiles_total: children.len(),
+            running,
+            restarting,
+            children,
+            last_error,
+        };
     }
 }
 
@@ -1112,7 +1104,7 @@ stdin: none
                 profiles.clone(),
                 creds.clone(),
             ),
-            Arc::new(Mutex::new(BridgeManagerStatus::default())),
+            Arc::new(RwLock::new(BridgeManagerStatus::default())),
         )
         .expect("test http client");
         manager.children.insert(
@@ -1246,7 +1238,7 @@ stdin: none
 
         let (handle, task) = spawn_bridge_manager(opts);
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let status = handle.status();
+        let status = handle.status().await;
         assert_eq!(status.profiles_total, 0);
 
         handle.stop();
@@ -1305,7 +1297,7 @@ args: ["1"]
                 temp_dir.clone(),
                 temp_dir.clone(),
             ),
-            Arc::new(Mutex::new(BridgeManagerStatus::default())),
+            Arc::new(RwLock::new(BridgeManagerStatus::default())),
         )
         .expect("test http client");
 
