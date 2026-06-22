@@ -104,14 +104,30 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     };
 
     let quoted = {
-        let scope = msg.from_user_id.as_deref().unwrap_or_default();
+        // Normalise the conversation scope to match what `find_or_create_vctx`
+        // stores in `context_token_map.peer_user_id` and what `resolve_send_context`
+        // returns for the outbound registration path: "group:<id>" for group chats,
+        // "peer:<id>" for DMs.  Previously we used the raw `from_user_id` ("o9cq80…")
+        // which never matched the "peer:o9cq80…" form used during registration →
+        // every quote-reply silently missed the in-memory index and the DB fallback.
+        let scope = {
+            let group_id = msg.group_id.as_deref().unwrap_or_default();
+            let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+            if !group_id.is_empty() {
+                format!("group:{group_id}")
+            } else if !from_user_id.is_empty() {
+                format!("peer:{from_user_id}")
+            } else {
+                String::new()
+            }
+        };
         // Only the in-memory index lookup needs the `quote_index` lock. Release it
         // BEFORE the DB/footer fallbacks: those await on the store and registry, and
         // holding `quote_index` across them would serialise every quote-routed message
         // and block the outbound index (sendmessage) and the periodic evictor.
         let from_index = {
             let mut q = state.routing.quote_index.lock().await;
-            q.resolve_user_quote(scope, &msg)
+            q.resolve_user_quote(&scope, &msg)
         };
         if from_index.is_some() {
             from_index
@@ -307,7 +323,20 @@ async fn resolve_quote_from_db(
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
     let (quoted_text, _) = quote_route::QuoteRouteIndex::collect_quoted(msg)?;
-    let peer_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+    // Use the same scope normalisation as the quote-index lookup path so the DB
+    // query uses the same "peer:<id>" / "group:<id>" format stored by
+    // `find_or_create_vctx` / `resolve_send_context`.
+    let peer_user_id = {
+        let group_id = msg.group_id.as_deref().unwrap_or_default();
+        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+        if !group_id.is_empty() {
+            format!("group:{group_id}")
+        } else if !from_user_id.is_empty() {
+            format!("peer:{from_user_id}")
+        } else {
+            String::new()
+        }
+    };
     if peer_user_id.is_empty() {
         return None;
     }
@@ -318,7 +347,7 @@ async fn resolve_quote_from_db(
     }
     match state
         .store
-        .find_assistant_message_by_content(peer_user_id, &prefix)
+        .find_assistant_message_by_content(&peer_user_id, &prefix)
         .await
     {
         Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
@@ -353,24 +382,82 @@ async fn resolve_quote_from_db(
 /// Fallback quote resolver: parse the origin footer from the quoted message text and look up
 /// the backend by name in the client registry. Used when the in-memory quote index is cold
 /// (e.g. after a Hub restart).
+///
+/// Handles both footer formats:
+/// - Full: `---\nilink-claude · at-20260615-114019`  → name = "ilink-claude"
+/// - Persona (session-only): `---\nat-20260615-114019` → the "name" starts with `at-` or `session-`,
+///   meaning it is actually the session identifier from `build_session_only_footer`.
+///   In this case look up which backend registered the session in `backend_sessions_v2`.
 async fn resolve_quote_from_footer(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
     let (name, session_name) = quote_route::QuoteRouteIndex::footer_from_user_quote(msg)?;
-    let registry = state.clients.registry.read().await;
-    let client = registry.get_by_name(&name)?;
-    debug!(
-        backend = %name,
-        session = ?session_name,
-        "quote index miss — resolved via footer fallback"
-    );
-    Some(QuoteOrigin::Client {
-        vtoken: client.vtoken.clone(),
-        name: client.name.clone(),
-        label: client.label.clone(),
-        session_name,
-    })
+
+    // Fast path: the footer contains an explicit backend name.
+    {
+        let registry = state.clients.registry.read().await;
+        if let Some(client) = registry.get_by_name(&name) {
+            debug!(
+                backend = %name,
+                session = ?session_name,
+                "quote index miss — resolved via footer fallback"
+            );
+            return Some(QuoteOrigin::Client {
+                vtoken: client.vtoken.clone(),
+                name: client.name.clone(),
+                label: client.label.clone(),
+                session_name,
+            });
+        }
+    }
+
+    // Slow path: the "name" is actually a session identifier (persona-mode footer like
+    // `---\nat-YYYYMMDD-*`).  Look up the owner vtoken via backend_sessions_v2.
+    let session_key = if name.starts_with("at-") || name.starts_with("session-") {
+        Some(name.as_str())
+    } else {
+        session_name.as_deref()
+    };
+    let skey = session_key?;
+    let vctx = {
+        let group_id = msg.group_id.as_deref().unwrap_or_default();
+        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+        let scope = if !group_id.is_empty() {
+            format!("group:{group_id}")
+        } else if !from_user_id.is_empty() {
+            format!("peer:{from_user_id}")
+        } else {
+            return None;
+        };
+        match state.store.find_vctx_for_scope(&scope).await {
+            Ok(Some(v)) => v,
+            _ => return None,
+        }
+    };
+    match state.store.find_vtoken_for_session(&vctx, skey).await {
+        Ok(Some(vtoken)) => {
+            let (client_name, label) = {
+                let registry = state.clients.registry.read().await;
+                registry
+                    .get_by_vtoken(&vtoken)
+                    .map(|c| (c.name.clone(), c.label.clone()))
+                    .unwrap_or_else(|| (vtoken.clone(), None))
+            };
+            debug!(
+                session = %skey,
+                vtoken = %crate::redact_token(&vtoken),
+                "quote index miss — resolved via persona-footer session lookup"
+            );
+            Some(QuoteOrigin::Client {
+                vtoken,
+                name: client_name,
+                label,
+                session_name: Some(skey.to_string()),
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Handle an `@<backend> <message>` shortcut: forward `payload` to `vtoken` on a brand-new,

@@ -81,8 +81,8 @@ pub mod ilink_status {
 pub use dispatch::{spawn_dispatcher, spawn_quote_index_evictor};
 pub use health::spawn_health_checker;
 pub use outbound_label::{
-    append_outbound_origin_footer_to_first_text_item, format_outbound_origin_line,
-    should_append_outbound_origin_label,
+    append_outbound_origin_footer_to_first_text_item, apply_persona_and_footer_to_first_text_item,
+    format_outbound_origin_line, should_append_outbound_origin_label,
 };
 pub use pairing::PairingRegistry;
 pub use queue::{InMemoryQueue, MessageQueue};
