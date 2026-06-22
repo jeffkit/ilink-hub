@@ -24,7 +24,7 @@ async fn make_state() -> Arc<HubState> {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
-    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     HubState::new(
@@ -354,10 +354,10 @@ async fn sendtyping_error_propagation_test() {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
-    let upstream = Arc::new(UpstreamClient::new(
-        "sk-test:key".to_string(),
-        Some(base_url),
-    ));
+    let upstream = Arc::new(
+        UpstreamClient::new("sk-test:key".to_string(), Some(base_url))
+            .expect("test upstream client"),
+    );
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = HubState::new(

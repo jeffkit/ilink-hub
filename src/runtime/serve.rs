@@ -238,7 +238,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     )
     .await?;
 
-    let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone())));
+    let upstream = Arc::new(UpstreamClient::new(token, Some(base_url.clone()))?);
 
     // P-16: Spawn a lightweight startup probe so a stale/expired token is detected at
     // boot instead of silently reporting healthy until the first real message arrives.
@@ -452,7 +452,7 @@ async fn perform_qr_login(
     default_base: &str,
 ) -> Result<(String, String)> {
     let login_base = ilink_base_url.clone();
-    let login_client = LoginClient::new(ilink_base_url);
+    let login_client = LoginClient::new(ilink_base_url)?;
     let token = login_client.login_with_qr_ui(qr_login_ui).await?;
     let base = login_base.unwrap_or_else(|| default_base.to_string());
     store.save_credentials(&token, &base).await?;
@@ -1033,7 +1033,9 @@ mod drain_tests {
 
     async fn make_minimal_state() -> Arc<HubState> {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-        let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+        let upstream = Arc::new(
+            UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"),
+        );
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, rx) = tokio::sync::watch::channel(false);
         HubState::new(

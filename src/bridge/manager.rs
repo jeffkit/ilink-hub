@@ -184,7 +184,7 @@ pub async fn run_bridge_manager_with_shutdown(
         "bridge manager started"
     );
 
-    let mut manager = BridgeManager::new(opts, status);
+    let mut manager = BridgeManager::new(opts, status)?;
     manager.reconcile_once().await?;
 
     // On Unix, build a SIGTERM future so the manager can stop gracefully when
@@ -250,17 +250,17 @@ struct BridgeManager {
 }
 
 impl BridgeManager {
-    fn new(opts: BridgeManagerOptions, status: Arc<Mutex<BridgeManagerStatus>>) -> Self {
+    fn new(opts: BridgeManagerOptions, status: Arc<Mutex<BridgeManagerStatus>>) -> Result<Self> {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .expect("build reqwest client for BridgeManager");
-        Self {
+            .context("failed to build reqwest client for BridgeManager")?;
+        Ok(Self {
             opts,
             status,
             children: HashMap::new(),
             http_client,
-        }
+        })
     }
 
     async fn reconcile_once(&mut self) -> Result<()> {
@@ -1113,7 +1113,8 @@ stdin: none
                 creds.clone(),
             ),
             Arc::new(Mutex::new(BridgeManagerStatus::default())),
-        );
+        )
+        .expect("test http client");
         manager.children.insert(
             "old-profile".into(),
             ManagedBridge {
@@ -1305,7 +1306,8 @@ args: ["1"]
                 temp_dir.clone(),
             ),
             Arc::new(Mutex::new(BridgeManagerStatus::default())),
-        );
+        )
+        .expect("test http client");
 
         // Spawn a child process that exits immediately
         let mut cmd = tokio::process::Command::new("true");

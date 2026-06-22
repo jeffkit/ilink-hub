@@ -346,7 +346,7 @@ pub async fn resolve_hub_connection(
         let mut opts = HubPairingOptions::new(&hub);
         opts.cred_path = Some(path.to_string_lossy().into_owned());
         opts.force = true;
-        let client = HubPairingClient::new(opts);
+        let client = HubPairingClient::new(opts)?;
         let creds = client.pair().await.context("Hub QR pairing")?;
         let base = creds.base_url.trim().trim_end_matches('/').to_string();
         return Ok((base, creds.token));

@@ -220,18 +220,18 @@ pub(super) struct HubClient {
 }
 
 impl HubClient {
-    pub(super) fn new(hub_url: String, token: String) -> Self {
+    pub(super) fn new(hub_url: String, token: String) -> Result<Self> {
         let hub_url = hub_url.trim_end_matches('/').to_string();
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(90))
             .build()
-            .expect("reqwest client");
-        Self {
+            .context("failed to build reqwest client")?;
+        Ok(Self {
             http,
             hub_url,
             token,
-        }
+        })
     }
 
     async fn getupdates(&self, buf: &mut String) -> Result<GetUpdatesOutcome> {
@@ -825,7 +825,10 @@ pub async fn run_bridge_with_shutdown(
     app: BridgeApp,
     shutdown: CancellationToken,
 ) -> BridgeStop {
-    let client = HubClient::new(hub_url, token);
+    let client = match HubClient::new(hub_url, token) {
+        Ok(c) => c,
+        Err(e) => return BridgeStop::FatalCliError(e.to_string()),
+    };
     let app = Arc::new(app);
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(None::<BridgeStop>);
     let dispatcher = Arc::new(SessionDispatcher::new(
@@ -1172,7 +1175,7 @@ timeout_secs: 5
     }
 
     fn fake_client() -> HubClient {
-        HubClient::new("http://127.0.0.1:1".into(), "test-token".into())
+        HubClient::new("http://127.0.0.1:1".into(), "test-token".into()).expect("test http client")
     }
 
     fn make_stop_tx() -> tokio::sync::watch::Sender<Option<BridgeStop>> {

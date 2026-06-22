@@ -57,14 +57,12 @@ pub struct HubPairingClient {
 }
 
 impl HubPairingClient {
-    pub fn new(opts: HubPairingOptions) -> Self {
-        Self {
-            http: Client::builder()
-                .timeout(STATUS_POLL_TIMEOUT)
-                .build()
-                .expect("http client"),
-            opts,
-        }
+    pub fn new(opts: HubPairingOptions) -> Result<Self> {
+        let http = Client::builder()
+            .timeout(STATUS_POLL_TIMEOUT)
+            .build()
+            .context("failed to build HTTP client")?;
+        Ok(Self { http, opts })
     }
 
     /// Load stored credentials or run the full QR pairing flow.
@@ -402,7 +400,7 @@ mod tests {
             force: false,
             bot_type: "3".to_string(),
         };
-        let client = HubPairingClient::new(opts);
+        let client = HubPairingClient::new(opts).expect("test http client");
 
         let creds = HubPairingCredentials {
             token: "save-load-token".to_string(),

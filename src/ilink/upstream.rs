@@ -1,7 +1,7 @@
 //! Upstream iLink client — connects to the real `ilinkai.weixin.qq.com`
 //! and fans received messages out to the Hub's internal message bus.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use reqwest::Client;
@@ -73,19 +73,19 @@ pub struct UpstreamClient {
 }
 
 impl UpstreamClient {
-    pub fn new(token: String, base_url: Option<String>) -> Self {
+    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
         let client = Client::builder()
             .timeout(Duration::from_secs(70))
             .build()
-            .expect("failed to build HTTP client");
-        Self {
+            .context("failed to build HTTP client")?;
+        Ok(Self {
             client,
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
             token: ArcSwap::new(Arc::new(token)),
             polls_ok: AtomicU64::new(0),
             polls_err: AtomicU64::new(0),
             relogin_attempts: AtomicU64::new(0),
-        }
+        })
     }
 
     /// Local format check only — does not contact iLink.
@@ -509,7 +509,7 @@ async fn renew_expired_session(
             })
         });
 
-    let login_client = LoginClient::new(renewal.ilink_base_url.clone());
+    let login_client = LoginClient::new(renewal.ilink_base_url.clone())?;
     let token = login_client.login_with_qr_ui(ui_tx).await?;
     let base = renewal
         .ilink_base_url
@@ -572,10 +572,10 @@ mod tests {
 
     #[test]
     fn headers_fail_with_invalid_token() {
-        let client = UpstreamClient::new("invalid\nkey".to_string(), None);
+        let client = UpstreamClient::new("invalid\nkey".to_string(), None).expect("test client");
         assert!(client.headers().is_err());
 
-        let client_ok = UpstreamClient::new("valid_key".to_string(), None);
+        let client_ok = UpstreamClient::new("valid_key".to_string(), None).expect("test client");
         assert!(client_ok.headers().is_ok());
     }
 }

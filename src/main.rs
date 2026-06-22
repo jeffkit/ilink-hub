@@ -173,7 +173,7 @@ async fn run_login(database_url: String, ilink_base_url: Option<String>) -> Resu
     };
     let store = Store::connect(&database_url).await?;
     let _ = store.set_master_key(std::sync::Arc::new(master_key));
-    let login_client = LoginClient::new(ilink_base_url.clone());
+    let login_client = LoginClient::new(ilink_base_url.clone())?;
     let token = login_client.login_with_qr().await?;
     let base = ilink_base_url.unwrap_or_else(|| "https://ilinkai.weixin.qq.com".to_string());
     store.save_credentials(&token, &base).await?;

@@ -1,7 +1,7 @@
 //! QR code login flow for the iLink Bot API.
 //! Handles get_bot_qrcode → polling get_qrcode_status → returns bot_token.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -30,14 +30,15 @@ pub struct LoginClient {
 }
 
 impl LoginClient {
-    pub fn new(base_url: Option<String>) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(Duration::from_secs(120))
-                .build()
-                .expect("http client"),
+    pub fn new(base_url: Option<String>) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("failed to build HTTP client")?;
+        Ok(Self {
+            client,
             base_url: base_url.unwrap_or_else(|| ILINK_BASE_URL.to_string()),
-        }
+        })
     }
 
     /// Full QR login flow — prints QR to terminal, polls until scanned.

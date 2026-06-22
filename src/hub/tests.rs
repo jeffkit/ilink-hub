@@ -134,7 +134,8 @@ async fn concurrent_register_and_route_does_not_deadlock() {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
-    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let upstream =
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = HubState::new(
@@ -246,7 +247,8 @@ async fn test_build_hub_ext_for_vctx_timeout_with_session_override() {
 // reference they need without forcing callers to hand the full HubState.
 
 async fn make_state() -> Arc<HubState> {
-    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let upstream =
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let store = Arc::new(
         Store::connect("sqlite::memory:")
             .await
@@ -362,11 +364,12 @@ fn sub_state_structs_carry_expected_fields() {
     }
 
     let (_tx, _rx) = tokio::sync::watch::channel(false);
-    let _upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let _upstream =
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let _queue: Arc<dyn MessageQueue> = Arc::new(InMemoryQueue::new());
 
     let ilink = IlinkConnState::new(
-        Arc::new(UpstreamClient::new("sk-test".to_string(), None)),
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client")),
         _rx,
     );
     assert_ilink_fields(&ilink);
