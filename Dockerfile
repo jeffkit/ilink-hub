@@ -11,6 +11,7 @@ RUN rm -rf src
 
 # Build actual code
 COPY src ./src
+COPY migrations ./migrations
 RUN touch src/main.rs && cargo build --release --locked --all-features
 
 FROM debian:bookworm-slim
