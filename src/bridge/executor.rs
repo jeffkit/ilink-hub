@@ -22,19 +22,25 @@ pub const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 /// SEC-003: `message` is user-controlled (forwarded WeChat message text). We
 /// refuse to inject any string that contains bytes which would be interpreted
 /// by a shell-style wrapper (`bash -c`, `sh -c`, `env` parsing) — NUL,
-/// newlines, or carriage returns. Callers that route `message` into argv or
-/// env vars should reject when this returns an error rather than silently
-/// passing through, to prevent a user message from breaking out of its
-/// intended slot.
+/// newlines, or carriage returns. Only validates a field when its placeholder
+/// actually appears in the template; callers that deliver the message via stdin
+/// (not argv/env) will not have `{{MESSAGE}}` in any arg template and must not
+/// be rejected just because the message contains newlines.
 pub(super) fn apply_placeholders(
     template: &str,
     message: &str,
     session_id: &str,
     session_name: &str,
 ) -> Result<String, PlaceholderError> {
-    validate_safe_value("message", message)?;
-    validate_safe_value("session_id", session_id)?;
-    validate_safe_value("session_name", session_name)?;
+    if template.contains("{{MESSAGE}}") {
+        validate_safe_value("message", message)?;
+    }
+    if template.contains("{{SESSION_ID}}") {
+        validate_safe_value("session_id", session_id)?;
+    }
+    if template.contains("{{SESSION_NAME}}") {
+        validate_safe_value("session_name", session_name)?;
+    }
     Ok(template
         .replace("{{MESSAGE}}", message)
         .replace("{{SESSION_ID}}", session_id)
@@ -422,6 +428,23 @@ mod tests {
     fn placeholders_reject_nul_in_message() {
         let err = apply_placeholders("{{MESSAGE}}", "evil\0payload", "sid", "name").unwrap_err();
         assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
+    }
+
+    /// Newline in message is OK when the template does not use {{MESSAGE}} (stdin: message mode).
+    /// This is the fix for the WeChat newline bug: profiles that deliver the message via stdin
+    /// rather than as a CLI arg must not be rejected at the arg-template stage.
+    #[test]
+    fn placeholders_allow_newline_in_message_when_placeholder_absent() {
+        let result = apply_placeholders(
+            "--session={{SESSION_ID}}",
+            "line1\nline2",
+            "sid-1",
+            "default",
+        );
+        assert!(
+            result.is_ok(),
+            "newline in message must be allowed when {{MESSAGE}} is not in template: {result:?}"
+        );
     }
 
     #[test]
