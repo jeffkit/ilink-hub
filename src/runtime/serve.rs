@@ -540,6 +540,14 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                         c.label.clone(),
                         Some(c.vtoken.clone()),
                     );
+                    // Restore persona fields — register_with_vtoken does not carry them.
+                    if c.persona_name.is_some() || c.persona_emoji.is_some() {
+                        registry.set_persona(
+                            &c.vtoken,
+                            c.persona_name.clone(),
+                            c.persona_emoji.clone(),
+                        );
+                    }
                 }
             }
             // Prefer the explicitly persisted default (HUB_DEFAULT_SENTINEL row) so that a

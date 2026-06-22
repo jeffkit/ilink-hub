@@ -517,8 +517,14 @@ pub async fn sendmessage(
         let (client_meta, registered_count) = {
             let reg = state.clients.registry.read().await;
             (
-                reg.get_by_vtoken(&vtoken)
-                    .map(|i| (i.name.clone(), i.label.clone())),
+                reg.get_by_vtoken(&vtoken).map(|i| {
+                    (
+                        i.name.clone(),
+                        i.label.clone(),
+                        i.persona_name.clone(),
+                        i.persona_emoji.clone(),
+                    )
+                }),
                 reg.online_clients().len(),
             )
         };
@@ -529,9 +535,11 @@ pub async fn sendmessage(
             registered_count,
             state.admin.outbound_origin_label.as_deref(),
         ) {
-            if let Some((ref name, ref label)) = client_meta {
-                crate::hub::append_outbound_origin_footer_to_first_text_item(
+            if let Some((ref name, ref label, ref persona_name, ref persona_emoji)) = client_meta {
+                crate::hub::apply_persona_and_footer_to_first_text_item(
                     msg,
+                    persona_name.as_deref(),
+                    persona_emoji.as_deref(),
                     name,
                     label.as_deref(),
                     active_session.as_deref(),
@@ -543,7 +551,7 @@ pub async fn sendmessage(
         // back to this backend + session. Content-based by necessity: real iLink never echoes
         // bot messages and strips `msg_id` from the quoted `ref_msg`, leaving only the text.
         let outbound_text = msg.text().map(str::to_string);
-        if let (Some((name, label)), Some(text)) = (client_meta, outbound_text) {
+        if let (Some((name, label, _, _)), Some(text)) = (client_meta, outbound_text) {
             let origin = crate::hub::quote_route::QuoteOrigin::Client {
                 vtoken: vtoken.clone(),
                 name,
@@ -758,6 +766,8 @@ pub async fn admin_clients(
                 "label": c.label,
                 "online": c.online,
                 "vtoken": redacted,
+                "persona_name": c.persona_name,
+                "persona_emoji": c.persona_emoji,
             })
         })
         .collect();
@@ -771,6 +781,8 @@ pub async fn admin_clients(
 pub struct AdminUpdateClientRequest {
     pub name: String,
     pub label: Option<String>,
+    pub persona_name: Option<String>,
+    pub persona_emoji: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -898,6 +910,8 @@ pub async fn admin_update_client(
         old_name,
         &req.name,
         req.label,
+        req.persona_name,
+        req.persona_emoji,
     )
     .await
     {

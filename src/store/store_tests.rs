@@ -7,17 +7,17 @@ static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 async fn test_schema_version_tracking() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    // All nine migrations must be applied after a fresh connect.
+    // All ten migrations must be applied after a fresh connect.
     let version = store
         .get_current_version()
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 9,
-        "expected all 9 migrations to be applied on a fresh DB"
+        version, 10,
+        "expected all 10 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=9 {
+    for v in 1..=10 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -49,7 +49,10 @@ async fn test_migration_idempotency() {
         .get_current_version()
         .await
         .expect("get_current_version");
-    assert_eq!(version, 9, "version must remain 9 after idempotent re-run");
+    assert_eq!(
+        version, 10,
+        "version must remain 10 after idempotent re-run"
+    );
 }
 
 /// Simulates a database that was bootstrapped at v2 (e.g. an older deployment
@@ -151,9 +154,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 9, "must reach v9 after incremental migration");
+    assert_eq!(version, 10, "must reach v10 after incremental migration");
 
-    for v in 1..=9 {
+    for v in 1..=10 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -247,7 +250,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 9, "current version must be 9, got {}", cur_ver);
+    assert_eq!(cur_ver, 10, "current version must be 9, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -601,13 +604,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        9,
-        "writer #1 must see all v1-v9 applied"
+        10,
+        "writer #1 must see all v1-v10 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        9,
-        "writer #2 must see all v1-v9 applied"
+        10,
+        "writer #2 must see all v1-v10 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -674,8 +677,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            9,
-            "connect #{i} must see all v1-v9 applied"
+            10,
+            "connect #{i} must see all v1-v10 applied"
         );
     }
 }
@@ -888,7 +891,7 @@ async fn adversarial_version_api_boundaries() {
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
     // get_current_version: 9 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 9);
+    assert_eq!(store.get_current_version().await.unwrap(), 10);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -1042,7 +1045,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 9 are applied. Re-running each must NOT fail
+    // After connect, all 10 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1053,9 +1056,10 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v7().await.expect("v7 re-run");
     store.migrate_to_v8().await.expect("v8 re-run");
     store.migrate_to_v9().await.expect("v9 re-run");
+    store.migrate_to_v10().await.expect("v10 re-run");
 
-    // Still at v9.
-    assert_eq!(store.get_current_version().await.unwrap(), 9);
+    // Still at v10.
+    assert_eq!(store.get_current_version().await.unwrap(), 10);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1227,15 +1231,15 @@ async fn m2_v4_alone_with_minimal_preconditions() {
 #[tokio::test]
 async fn m2_run_migrations_records_all_versions_in_order() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // All nine versions are present.
-    for v in 1..=9 {
+    // All ten versions are present.
+    for v in 1..=10 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be recorded after run_migrations"
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 9);
+    assert_eq!(store.get_current_version().await.unwrap(), 10);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1247,7 +1251,7 @@ async fn m2_run_migrations_idempotent_double_call() {
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
     // Version stays at 9 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 9);
+    assert_eq!(store.get_current_version().await.unwrap(), 10);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1917,8 +1921,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 9,
-        "database must still be at v9 after ensure_sqlite_file"
+        v, 10,
+        "database must still be at v10 after ensure_sqlite_file"
     );
 }
 
@@ -1969,7 +1973,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 9);
+    assert_eq!(v, 10);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -3408,4 +3412,119 @@ async fn test_get_all_session_entries_multi_session() {
         Some("question-B"),
         "session-b last user content"
     );
+}
+
+// ─── Quote-routing scope contract ─────────────────────────────────────────────
+//
+// The dispatch path normalises `msg.from_user_id` → "peer:<id>" / "group:<id>"
+// before looking up the QuoteRouteIndex and the DB.  The outbound registration
+// path in `routes.rs` stores the scope produced by `resolve_send_context` (which
+// returns `context_token_map.peer_user_id`, itself written as "peer:<id>" by
+// `find_or_create_vctx`).
+//
+// Before the fix, dispatch used the raw `from_user_id` ("o9cq80_...") while
+// registration used "peer:o9cq80_..." — the mismatch caused every quote-reply
+// to miss the index and fall through to the wrong `default_client`.
+
+/// `find_assistant_message_by_content` must return the correct row when
+/// the assistant message is stored under the "peer:<id>" scope (the format
+/// produced by `find_or_create_vctx` / `resolve_send_context`).
+/// Before the bug fix, `dispatch.rs` passed the raw `from_user_id` ("uid")
+/// instead of "peer:uid", so the LIKE query always returned nothing.
+#[tokio::test]
+async fn find_assistant_message_scope_uses_peer_prefix() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+
+    // Outbound registration path stores under "peer:<id>" scope.
+    let scope = "peer:o9cq80_testuser@im.wechat";
+    let vtoken = "a92250b1deadbeef";
+    let session = "at-20260622-152900941";
+    let text = "🤖 Claude\n───────\nhello world\n\n---\nat-20260622-152900941";
+
+    store
+        .save_message("vctx_abc", Some(vtoken), session, scope, "assistant", text)
+        .await
+        .unwrap();
+
+    // Correct call: prefix "peer:" matches stored scope.
+    let result = store
+        .find_assistant_message_by_content(scope, "🤖 Claude")
+        .await
+        .unwrap();
+    assert!(
+        result.is_some(),
+        "DB quote lookup must find the row when the scope includes 'peer:' prefix"
+    );
+    let (found_vt, found_session) = result.unwrap();
+    assert_eq!(found_vt, vtoken);
+    assert_eq!(found_session.as_deref(), Some(session));
+
+    // Wrong call (pre-fix behaviour): raw user_id without "peer:" must NOT match.
+    let raw_uid = "o9cq80_testuser@im.wechat";
+    let miss = store
+        .find_assistant_message_by_content(raw_uid, "🤖 Claude")
+        .await
+        .unwrap();
+    assert!(
+        miss.is_none(),
+        "DB quote lookup must NOT match when scope is missing the 'peer:' prefix (pre-fix regression guard)"
+    );
+}
+
+/// `find_vctx_for_scope` and `find_vtoken_for_session` cover the
+/// persona-footer slow path: when the footer only contains a session
+/// identifier (e.g. "at-20260622-..."), the dispatch code looks up the
+/// owning vtoken via `backend_sessions_v2`.
+#[tokio::test]
+async fn find_vtoken_for_session_resolves_persona_footer_fallback() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+
+    let scope = "peer:o9cq80_testuser@im.wechat";
+    let vtoken = "a92250b1deadbeef";
+    let session = "at-20260622-152900941";
+
+    // Simulate `find_or_create_vctx` storing the mapping.
+    store
+        .find_or_create_vctx(
+            "o9cq80_testuser@im.wechat",
+            None,
+            "AARzJWAFAAA_real_ctx",
+        )
+        .await
+        .unwrap();
+    // Obtain the actual vctx that was created.
+    let actual_vctx = store
+        .find_vctx_for_scope(scope)
+        .await
+        .unwrap()
+        .expect("vctx must exist after find_or_create_vctx");
+
+    // Simulate `set_backend_session` recording which bridge owns the session.
+    store
+        .set_backend_session(&actual_vctx, vtoken, session, "some-uuid")
+        .await
+        .unwrap();
+
+    // `find_vctx_for_scope` must return the vctx for the "peer:" scope.
+    let found_vctx = store
+        .find_vctx_for_scope(scope)
+        .await
+        .unwrap()
+        .expect("find_vctx_for_scope must return Some");
+    assert_eq!(found_vctx, actual_vctx);
+
+    // `find_vtoken_for_session` must return the owning vtoken.
+    let found_vt = store
+        .find_vtoken_for_session(&actual_vctx, session)
+        .await
+        .unwrap()
+        .expect("find_vtoken_for_session must return Some");
+    assert_eq!(found_vt, vtoken);
+
+    // Unknown session must return None (not panic or error).
+    let not_found = store
+        .find_vtoken_for_session(&actual_vctx, "at-99991231-999999")
+        .await
+        .unwrap();
+    assert!(not_found.is_none());
 }

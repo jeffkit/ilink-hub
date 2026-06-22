@@ -27,6 +27,10 @@ pub struct ClientInfo {
     /// Wall-clock registration time; survives display across restarts.
     pub registered_at: SystemTime,
     pub online: bool,
+    /// Optional persona display name prepended to every outbound reply (e.g. "Claude").
+    pub persona_name: Option<String>,
+    /// Optional emoji avatar accompanying `persona_name` (e.g. "🤖").
+    pub persona_emoji: Option<String>,
 }
 
 impl ClientInfo {
@@ -50,6 +54,8 @@ impl ClientInfo {
             label,
             registered_at: SystemTime::now(),
             online: false,
+            persona_name: None,
+            persona_emoji: None,
         }
     }
 }
@@ -188,6 +194,20 @@ impl ClientRegistry {
         self.by_name.get(name).and_then(|vt| self.by_vtoken.get(vt))
     }
 
+    /// Set persona fields on an already-registered client (identified by hashed vtoken).
+    /// Used by the startup loader and the admin update API.
+    pub fn set_persona(
+        &mut self,
+        vtoken: &str,
+        persona_name: Option<String>,
+        persona_emoji: Option<String>,
+    ) {
+        if let Some(info) = self.by_vtoken.get_mut(vtoken) {
+            info.persona_name = persona_name;
+            info.persona_emoji = persona_emoji;
+        }
+    }
+
     /// Mark a client as online. The `vtoken` argument must be the hashed
     /// form (callers receive the plaintext bearer credential over HTTP and
     /// must hash before calling).
@@ -253,7 +273,9 @@ impl ClientRegistry {
             self.by_name.insert(new_name.to_string(), vtoken.clone());
         }
 
-        info.label = label;
+        if let Some(l) = label {
+            info.label = Some(l);
+        }
         Ok(vtoken)
     }
 

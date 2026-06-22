@@ -254,6 +254,7 @@ impl Store {
         self.migrate_to_v7_tx(&mut tx).await?;
         self.migrate_to_v8_tx(&mut tx).await?;
         self.migrate_to_v9_tx(&mut tx).await?;
+        self.migrate_to_v10_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -811,6 +812,55 @@ impl Store {
         Ok(())
     }
 
+    pub(super) async fn migrate_to_v10_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 10).await? {
+            return Ok(());
+        }
+        // Guard: clients table may be absent in partial-schema test environments.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => {
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'")
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some()
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = 'clients' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+
+        if table_exists {
+            for ddl in V10_DDLS {
+                sqlx::query(ddl)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("DDL failed: {ddl}\n  Error: {e}"))?;
+            }
+            tracing::info!(version = 10, "migration applied: client persona columns");
+        } else {
+            tracing::debug!(
+                "v10 migration: clients table absent (partial schema), skipping persona columns"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v10(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v10_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -945,3 +995,5 @@ const V8_DDL: &str = include_str!("../../migrations/0008_vtoken_and_bot_token_ha
 
 const V9_MESSAGES_LOOKUP_IDX: &str =
     include_str!("../../migrations/0009_messages_lookup_index.sql");
+
+const V10_DDLS: &[&str] = &[include_str!("../../migrations/0010_client_persona.sql")];

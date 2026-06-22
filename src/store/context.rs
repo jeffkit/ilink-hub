@@ -172,6 +172,35 @@ impl Store {
     ///
     /// Combines `resolve_context_token_full` and `get_active_session_name` to
     /// eliminate the two serial queries on the hot outbound path. Returns `None`
+    /// Find the `vctx` for a conversation identified by its `peer_user_id` scope
+    /// (`"peer:<id>"` or `"group:<id>"`).  Used by the persona-footer quote fallback.
+    pub async fn find_vctx_for_scope(&self, scope: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT vctx FROM context_token_map WHERE peer_user_id = $1 LIMIT 1")
+            .bind(scope)
+            .fetch_optional(&self.rpool)
+            .await?;
+        Ok(row.map(|r| r.get("vctx")))
+    }
+
+    /// Return the `vtoken` of the backend that owns `session_name` inside `vctx`.
+    /// Looks up `backend_sessions_v2`; returns `None` when no matching row exists.
+    pub async fn find_vtoken_for_session(
+        &self,
+        vctx: &str,
+        session_name: &str,
+    ) -> Result<Option<String>> {
+        let row = sqlx::query(
+            "SELECT vtoken FROM backend_sessions_v2 \
+             WHERE vctx = $1 AND session_name = $2 \
+             ORDER BY rowid DESC LIMIT 1",
+        )
+        .bind(vctx)
+        .bind(session_name)
+        .fetch_optional(&self.rpool)
+        .await?;
+        Ok(row.map(|r| r.get("vtoken")))
+    }
+
     /// when the vctx is unknown (caller should 400).
     pub async fn resolve_send_context(
         &self,

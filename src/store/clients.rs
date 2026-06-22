@@ -39,7 +39,7 @@ impl Store {
             VALUES ($1, $2, $3)
             ON CONFLICT (name) DO UPDATE
               SET vtoken = EXCLUDED.vtoken,
-                  label = EXCLUDED.label,
+                  label = COALESCE(EXCLUDED.label, clients.label),
                   last_seen = CURRENT_TIMESTAMP
             "#,
         )
@@ -62,9 +62,11 @@ impl Store {
     }
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
-        let rows = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients ORDER BY name")
-            .fetch_all(&self.rpool)
-            .await?;
+        let rows = sqlx::query(
+            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji FROM clients ORDER BY name",
+        )
+        .fetch_all(&self.rpool)
+        .await?;
 
         Ok(rows
             .into_iter()
@@ -73,22 +75,43 @@ impl Store {
                 name: r.get("name"),
                 label: r.get("label"),
                 last_seen: r.get::<Option<String>, _>("last_seen"),
+                persona_name: r.get("persona_name"),
+                persona_emoji: r.get("persona_emoji"),
             })
             .collect())
     }
 
     pub async fn get_client_by_name(&self, name: &str) -> Result<Option<ClientRow>> {
-        let row = sqlx::query("SELECT vtoken, name, label, last_seen FROM clients WHERE name = $1")
-            .bind(name)
-            .fetch_optional(&self.rpool)
-            .await?;
+        let row = sqlx::query(
+            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji FROM clients WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.rpool)
+        .await?;
 
         Ok(row.map(|r| ClientRow {
             vtoken: r.get("vtoken"),
             name: r.get("name"),
             label: r.get("label"),
             last_seen: r.get::<Option<String>, _>("last_seen"),
+            persona_name: r.get("persona_name"),
+            persona_emoji: r.get("persona_emoji"),
         }))
+    }
+
+    pub async fn update_client_persona(
+        &self,
+        vtoken: &str,
+        persona_name: Option<&str>,
+        persona_emoji: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE clients SET persona_name = $2, persona_emoji = $3 WHERE vtoken = $1")
+            .bind(vtoken)
+            .bind(persona_name)
+            .bind(persona_emoji)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_client_by_name(&self, name: &str) -> Result<bool> {
@@ -105,7 +128,7 @@ impl Store {
         name: &str,
         label: Option<&str>,
     ) -> Result<()> {
-        sqlx::query("UPDATE clients SET name = $2, label = $3 WHERE vtoken = $1")
+        sqlx::query("UPDATE clients SET name = $2, label = COALESCE($3, label) WHERE vtoken = $1")
             .bind(vtoken)
             .bind(name)
             .bind(label)
@@ -172,4 +195,6 @@ pub struct ClientRow {
     pub name: String,
     pub label: Option<String>,
     pub last_seen: Option<String>,
+    pub persona_name: Option<String>,
+    pub persona_emoji: Option<String>,
 }

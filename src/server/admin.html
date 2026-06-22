@@ -59,57 +59,73 @@
     section { margin-bottom: 32px; }
     section h2 { font-size: 15px; font-weight: 600; margin-bottom: 14px; color: var(--text); }
 
-    /* Client cards */
-    #clients-grid { display: flex; flex-direction: column; gap: 10px; }
+    /* Clients table */
+    #clients-table-wrap { overflow-x: auto; }
 
-    .client-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 14px 16px;
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 10px 14px;
-      align-items: start;
+    #clients-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
     }
+
+    #clients-table th {
+      text-align: left;
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    #clients-table td {
+      padding: 10px 10px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+
+    #clients-table tr:last-child td { border-bottom: none; }
+
+    #clients-table tr.client-row:hover > td { background: rgba(255,255,255,0.02); }
 
     .status-dot {
-      width: 10px; height: 10px; border-radius: 50%; margin-top: 4px; flex-shrink: 0;
+      width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0;
     }
-    .status-dot.online  { background: var(--green); box-shadow: 0 0 6px var(--green); }
+    .status-dot.online  { background: var(--green); box-shadow: 0 0 5px var(--green); }
     .status-dot.offline { background: var(--muted); }
 
-    .client-meta .name { font-weight: 600; font-size: 15px; }
-    .client-meta .label { font-size: 12px; color: var(--muted); }
+    .client-name-col { display: flex; align-items: center; gap: 8px; }
+    .client-name-col .name { font-weight: 600; }
+    .client-name-col .label { font-size: 12px; color: var(--muted); }
 
     .client-actions {
       display: flex;
       gap: 6px;
-      flex-wrap: wrap;
-      flex-direction: row;
       align-items: center;
       justify-content: flex-end;
+      white-space: nowrap;
     }
 
-    .client-edit {
-      grid-column: 1 / -1;
-      display: none;
-      gap: 10px;
-      padding-top: 4px;
-      border-top: 1px solid var(--border);
-    }
-    .client-card.editing .client-edit { display: grid; }
-    .client-card.editing .client-view { display: none; }
+    /* Expandable credential rows */
+    .cred-row { display: none; }
+    .cred-row.visible { display: table-row; }
 
-    .client-edit .field { min-width: 0; }
-    .client-edit .form-row { align-items: flex-end; }
+    .cred-row td {
+      padding: 0 10px 10px 10px;
+      background: var(--bg);
+    }
+
+    .cred-inner {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
 
     .vtoken-row {
-      grid-column: 1 / -1;
       display: flex;
       align-items: center;
       gap: 8px;
-      background: var(--bg);
       border: 1px solid var(--border);
       border-radius: 6px;
       padding: 6px 10px;
@@ -125,6 +141,20 @@
       text-overflow: ellipsis;
       white-space: nowrap;
     }
+
+    /* Edit row */
+    .edit-row { display: none; }
+    .edit-row.visible { display: table-row; }
+
+    .edit-row td {
+      padding: 10px;
+      background: color-mix(in srgb, var(--surface) 80%, var(--bg));
+      border-bottom: 1px solid var(--border);
+    }
+
+    .client-edit { display: flex; flex-direction: column; gap: 10px; }
+    .client-edit .field { min-width: 0; }
+    .client-edit .form-row { align-items: flex-end; }
 
     /* Buttons */
     button, .btn {
@@ -374,7 +404,20 @@
   <!-- Client list -->
   <section>
     <h2>Connected Workspaces <span class="online-count" id="online-count"></span></h2>
-    <div id="clients-grid"><div class="empty">Loading…</div></div>
+    <div class="form-card" style="padding:0;overflow:hidden">
+      <div id="clients-table-wrap">
+        <table id="clients-table">
+          <thead>
+            <tr>
+              <th>Backend</th>
+              <th>Persona</th>
+              <th style="text-align:right">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="clients-tbody"><tr><td colspan="3" class="empty" style="text-align:center;padding:24px">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
   </section>
 
   <!-- Register new client -->
@@ -486,67 +529,99 @@ async function loadClients() {
     document.getElementById('status-bar').textContent = `${online}/${clients.length} online — refreshes every 10s`;
     renderClients(clients);
   } catch(e) {
-    document.getElementById('clients-grid').innerHTML = '<div class="empty">Failed to load clients.</div>';
+    document.getElementById('clients-tbody').innerHTML = '<tr><td colspan="3" class="empty" style="text-align:center;padding:24px">Failed to load clients.</td></tr>';
   }
 }
 
 function renderClients(clients) {
-  const grid = document.getElementById('clients-grid');
+  const tbody = document.getElementById('clients-tbody');
   if (!clients.length) {
-    grid.innerHTML = '<div class="empty">No clients registered yet — register one below.</div>';
+    tbody.innerHTML = '<tr><td colspan="3" class="empty" style="text-align:center;padding:24px">No clients registered yet — register one below.</td></tr>';
     return;
   }
-  grid.innerHTML = clients.map(c => {
+  tbody.innerHTML = clients.map(c => {
     const isEditing = editingClient && editingClient.oldName === c.name;
     const editName = isEditing ? editingClient.name : c.name;
     const editLabel = isEditing ? (editingClient.label ?? '') : (c.label || '');
+    const personaDisplay = (c.persona_emoji || c.persona_name)
+      ? esc((c.persona_emoji ? c.persona_emoji + ' ' : '') + (c.persona_name || ''))
+      : '<span style="color:var(--muted)">—</span>';
+
     return `
-    <div class="client-card${isEditing ? ' editing' : ''}" data-client-name="${esc(c.name)}">
-      <div class="status-dot ${c.online ? 'online' : 'offline'}"></div>
-      <div class="client-meta client-view">
-        <div class="name">${esc(c.name)}</div>
-        ${c.label ? `<div class="label">${esc(c.label)}</div>` : '<div class="label" style="color:var(--muted)">No label</div>'}
-      </div>
-      <div class="client-actions client-view">
-        <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'}">
-          ${c.online ? '🟢 online' : '⚫ offline'}
-        </span>
-        <button class="btn btn-ghost btn-sm" data-action="edit">Edit</button>
-        ${c.online ? '' : '<button class="btn btn-danger btn-sm" data-action="delete">Delete</button>'}
-      </div>
-      <div class="client-edit">
-        <div class="form-row">
-          <div class="field">
-            <label>Name</label>
-            <input type="text" data-field="name" value="${esc(editName)}" />
-          </div>
-          <div class="field">
-            <label>Label (optional)</label>
-            <input type="text" data-field="label" value="${esc(editLabel)}" placeholder="Mac Home — Claude" />
-          </div>
-          <div style="display:flex;gap:6px;align-self:flex-end">
-            <button class="btn btn-primary btn-sm" data-action="save">Save</button>
-            <button class="btn btn-ghost btn-sm" data-action="cancel">Cancel</button>
+    <tr class="client-row" data-client-name="${esc(c.name)}" data-persona-emoji="${esc(c.persona_emoji || '')}" data-persona-name="${esc(c.persona_name || '')}">
+      <td>
+        <div class="client-name-col">
+          <span class="status-dot ${c.online ? 'online' : 'offline'}"></span>
+          <div>
+            <div class="name">${esc(c.name)}</div>
+            ${c.label ? `<div class="label">${esc(c.label)}</div>` : ''}
           </div>
         </div>
-      </div>
-      <div class="vtoken-row">
-        <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_TOKEN</span>
-        <span class="vtoken-value">${esc(c.vtoken || '—')}</span>
-        ${c.vtoken ? `<button class="btn btn-ghost btn-sm" data-action="copy-vtoken" data-copy="${esc(c.vtoken)}">Copy</button>` : ''}
-      </div>
-      <div class="vtoken-row">
-        <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_BASE_URL</span>
-        <span class="vtoken-value">${esc(HUB_URL)}</span>
-        <button class="btn btn-ghost btn-sm" data-action="copy-hub-url">Copy</button>
-      </div>
-    </div>
+      </td>
+      <td style="color:var(--blue)">${personaDisplay}</td>
+      <td>
+        <div class="client-actions">
+          <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'}">
+            ${c.online ? '● online' : '● offline'}
+          </span>
+          <button class="btn btn-ghost btn-sm" data-action="toggle-creds" title="查看 Token / Base URL">Keys</button>
+          <button class="btn btn-ghost btn-sm" data-action="edit">Edit</button>
+          ${c.online ? '' : `<button class="btn btn-danger btn-sm" data-action="delete">Delete</button>`}
+        </div>
+      </td>
+    </tr>
+    <tr class="cred-row" data-for="${esc(c.name)}">
+      <td colspan="3">
+        <div class="cred-inner">
+          <div class="vtoken-row">
+            <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_TOKEN</span>
+            <span class="vtoken-value">${esc(c.vtoken || '—')}</span>
+            ${c.vtoken ? `<button class="btn btn-ghost btn-sm" data-action="copy-vtoken" data-copy="${esc(c.vtoken)}">Copy</button>` : ''}
+          </div>
+          <div class="vtoken-row">
+            <span style="color:var(--blue);font-size:11px;flex-shrink:0">WEIXIN_BASE_URL</span>
+            <span class="vtoken-value">${esc(HUB_URL)}</span>
+            <button class="btn btn-ghost btn-sm" data-action="copy-hub-url">Copy</button>
+          </div>
+        </div>
+      </td>
+    </tr>
+    <tr class="edit-row${isEditing ? ' visible' : ''}" data-for="${esc(c.name)}">
+      <td colspan="3">
+        <div class="client-edit">
+          <div class="form-row">
+            <div class="field">
+              <label>Name</label>
+              <input type="text" data-field="name" value="${esc(editName)}" />
+            </div>
+            <div class="field">
+              <label>Label (optional)</label>
+              <input type="text" data-field="label" value="${esc(editLabel)}" placeholder="Mac Home — Claude" />
+            </div>
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <div class="field" style="max-width:80px">
+              <label>头像 Emoji</label>
+              <input type="text" data-field="persona_emoji" value="${esc(isEditing ? (editingClient.persona_emoji ?? '') : (c.persona_emoji || ''))}" placeholder="🤖" />
+            </div>
+            <div class="field">
+              <label>显示名称（发消息时展示）</label>
+              <input type="text" data-field="persona_name" value="${esc(isEditing ? (editingClient.persona_name ?? '') : (c.persona_name || ''))}" placeholder="Claude" />
+            </div>
+            <div style="display:flex;gap:6px;align-self:flex-end">
+              <button class="btn btn-primary btn-sm" data-action="save">Save</button>
+              <button class="btn btn-ghost btn-sm" data-action="cancel">Cancel</button>
+            </div>
+          </div>
+        </div>
+      </td>
+    </tr>
   `;
   }).join('');
 }
 
-function startEditClient(name, label) {
-  editingClient = { oldName: name, name, label: label || '' };
+function startEditClient(name, label, personaEmoji, personaName) {
+  editingClient = { oldName: name, name, label: label || '', persona_emoji: personaEmoji || '', persona_name: personaName || '' };
   loadClients();
 }
 
@@ -555,21 +630,39 @@ function cancelEditClient() {
   loadClients();
 }
 
-async function saveEditClient(card) {
-  const oldName = card.dataset.clientName;
-  const name = card.querySelector('[data-field="name"]').value.trim();
-  const label = card.querySelector('[data-field="label"]').value.trim();
+async function saveEditRow(editRow) {
+  const oldName = editRow.dataset.for;
+  const name = editRow.querySelector('[data-field="name"]').value.trim();
+  const label = editRow.querySelector('[data-field="label"]').value.trim();
+  const personaEmoji = editRow.querySelector('[data-field="persona_emoji"]').value.trim();
+  const personaName = editRow.querySelector('[data-field="persona_name"]').value.trim();
 
   if (!name) {
     showToast('Name is required');
     return;
   }
 
+  // Only include label in the PATCH when the user actually changed it.
+  // editingClient.label holds the value as it was when the user clicked Edit
+  // (null is normalized to '' there). Sending null for label would overwrite
+  // any existing value, so omit the field entirely when unchanged.
+  const labelChanged = editingClient == null || editingClient.oldName !== oldName
+    ? true
+    : label !== (editingClient.label || '');
+  const body = {
+    name,
+    persona_emoji: personaEmoji || null,
+    persona_name: personaName || null,
+  };
+  if (labelChanged) {
+    body.label = label || null;
+  }
+
   try {
     const r = await fetch('/hub/clients/' + encodeURIComponent(oldName), {
       method: 'PATCH',
       headers: authHeaders(),
-      body: JSON.stringify({ name, label: label || null }),
+      body: JSON.stringify(body),
     });
     const data = await r.json();
     if (data.ret !== 0) {
@@ -660,21 +753,27 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-document.getElementById('clients-grid').addEventListener('click', (e) => {
+document.getElementById('clients-table').addEventListener('click', (e) => {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
-  const card = btn.closest('.client-card');
-  if (!card) return;
 
   const action = btn.dataset.action;
-  const name = card.dataset.clientName;
 
+  // Find the nearest table row to get the client name
+  const row = btn.closest('.client-row') || btn.closest('.edit-row') || btn.closest('.cred-row');
+  const name = row ? (row.dataset.clientName || row.dataset.for) : null;
+
+  if (action === 'toggle-creds') {
+    const credRow = document.querySelector(`.cred-row[data-for="${CSS.escape(name)}"]`);
+    if (credRow) credRow.classList.toggle('visible');
+    return;
+  }
   if (action === 'edit') {
-    const labelEl = card.querySelector('.client-meta .label');
-    const label = labelEl && !labelEl.textContent.startsWith('No label')
-      ? labelEl.textContent
-      : '';
-    startEditClient(name, label);
+    const clientRow = document.querySelector(`.client-row[data-client-name="${CSS.escape(name)}"]`);
+    const label = clientRow ? (clientRow.querySelector('.label')?.textContent || '') : '';
+    const personaEmoji = clientRow?.dataset.personaEmoji || '';
+    const personaName = clientRow?.dataset.personaName || '';
+    startEditClient(name, label, personaEmoji, personaName);
     return;
   }
   if (action === 'cancel') {
@@ -682,7 +781,8 @@ document.getElementById('clients-grid').addEventListener('click', (e) => {
     return;
   }
   if (action === 'save') {
-    saveEditClient(card);
+    const editRow = btn.closest('.edit-row');
+    saveEditRow(editRow);
     return;
   }
   if (action === 'delete') {

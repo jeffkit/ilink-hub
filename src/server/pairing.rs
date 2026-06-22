@@ -447,12 +447,14 @@ pub enum UpdateClientError {
     Store(anyhow::Error),
 }
 
-/// Update a registered client's name and label in memory and DB.
+/// Update a registered client's name, label, and persona in memory and DB.
 pub async fn update_client_in_hub(
     state: &HubState,
     old_name: &str,
     new_name: &str,
     label: Option<String>,
+    persona_name: Option<String>,
+    persona_emoji: Option<String>,
 ) -> Result<String, UpdateClientError> {
     let new_name = new_name.trim();
     if new_name.is_empty() {
@@ -462,17 +464,25 @@ pub async fn update_client_in_hub(
     let label_for_store = label.clone();
     let vtoken = {
         let mut registry = state.clients.registry.write().await;
-        registry
+        let vtoken = registry
             .update_client(old_name, new_name, label)
             .map_err(|e| match e {
                 crate::hub::registry::UpdateClientError::NotFound => UpdateClientError::NotFound,
                 crate::hub::registry::UpdateClientError::NameTaken => UpdateClientError::NameTaken,
-            })?
+            })?;
+        registry.set_persona(&vtoken, persona_name.clone(), persona_emoji.clone());
+        vtoken
     };
 
     state
         .store
         .update_client_by_vtoken(&vtoken, new_name, label_for_store.as_deref())
+        .await
+        .map_err(UpdateClientError::Store)?;
+
+    state
+        .store
+        .update_client_persona(&vtoken, persona_name.as_deref(), persona_emoji.as_deref())
         .await
         .map_err(UpdateClientError::Store)?;
 
