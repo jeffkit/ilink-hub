@@ -1395,7 +1395,7 @@ fn set_bridge_runtime_arc(runtime: &Arc<Mutex<BridgeRuntime>>, state: &str, erro
 }
 
 #[tauri::command]
-fn bridge_status(app: tauri::AppHandle) -> BridgeStatusPayload {
+async fn bridge_status(app: tauri::AppHandle) -> BridgeStatusPayload {
     let Some(ctrl) = app.try_state::<BridgeController>() else {
         return BridgeStatusPayload {
             configured: false,
@@ -1415,11 +1415,12 @@ fn bridge_status(app: tauri::AppHandle) -> BridgeStatusPayload {
             error: Some("读取 Bridge 状态失败".into()),
         });
     let has_task = ctrl.task.lock().ok().map(|g| g.is_some()).unwrap_or(false);
-    let manager = ctrl
-        .manager
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|h| h.status()));
+    // Clone the handle before releasing the Mutex so we can .await outside the lock.
+    let manager_handle = ctrl.manager.lock().ok().and_then(|g| g.as_ref().cloned());
+    let manager = match manager_handle {
+        Some(h) => Some(h.status().await),
+        None => None,
+    };
     let running = has_task && matches!(state.state.as_str(), "starting" | "running");
     if !running && state.state == "running" {
         state.state = "stopped".into();
