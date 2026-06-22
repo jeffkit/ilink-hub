@@ -168,7 +168,11 @@ impl Store {
                 .max_connections(1)
                 .after_connect(|conn, _meta| {
                     Box::pin(async move {
-                        sqlx::query("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
+                        // busy_timeout must be set first so that the subsequent
+                        // journal_mode=WAL switch (which requires an exclusive
+                        // file lock) will wait up to 5s instead of returning
+                        // SQLITE_BUSY immediately.
+                        sqlx::query("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL")
                             .execute(&mut *conn)
                             .await?;
                         Ok(())
@@ -183,7 +187,7 @@ impl Store {
                     .max_connections(4)
                     .after_connect(|conn, _meta| {
                         Box::pin(async move {
-                            sqlx::query("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000")
+                            sqlx::query("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL")
                                 .execute(&mut *conn)
                                 .await?;
                             Ok(())
