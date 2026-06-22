@@ -13,7 +13,7 @@ impl Store {
             .master_key
             .get()
             .ok_or_else(|| anyhow::anyhow!("Master key not configured on Store"))?;
-        let encrypted_token = crate::runtime::crypto::encrypt_token(token, key);
+        let encrypted_token = crate::runtime::crypto::encrypt_token(token, key)?;
 
         sqlx::query(
             r#"

@@ -454,9 +454,10 @@ async fn run_partial_forward_loop<S: ReplySender>(
         // Phase 2: build the request and send. We always read the
         // latest `pending` here — this is what makes phase 1's
         // overwrite semantics actually take effect on the wire.
-        let chunk = pending
-            .as_ref()
-            .expect("pending must be Some when entering phase 2");
+        let Some(chunk) = pending.as_ref() else {
+            tracing::warn!("partial forward loop: pending was None at phase 2 entry, skipping");
+            continue;
+        };
         let send_fut = sender.send_reply(&ctx, chunk, &from_user, &session_name);
         let send_result = tokio::select! {
             biased;
@@ -737,10 +738,7 @@ impl SessionDispatcher {
 
     async fn dispatch(&self, msg: WeixinMessage) {
         let key = session_dispatch_key(&msg);
-        let mut senders = self
-            .senders
-            .lock()
-            .expect("SessionDispatcher senders lock poisoned");
+        let mut senders = self.senders.lock().unwrap_or_else(|e| e.into_inner());
 
         // Check if a live worker already exists for this key.
         let needs_new = match senders.get(&key) {

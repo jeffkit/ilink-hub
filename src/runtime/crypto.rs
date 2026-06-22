@@ -9,20 +9,20 @@ pub type Key = LessSafeKey;
 
 /// Encrypts the token plaintext, prepends a 12-byte random nonce, and returns base64.
 /// Formats output as base64: nonce(12) || ct || tag(16)
-pub fn encrypt_token(plain: &str, key: &Key) -> String {
+pub fn encrypt_token(plain: &str, key: &Key) -> Result<String> {
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     let mut in_out = plain.as_bytes().to_vec();
     key.seal_in_place_append_tag(nonce, Aad::empty(), &mut in_out)
-        .expect("seal_in_place_append_tag failed");
+        .map_err(|_| anyhow::anyhow!("seal_in_place_append_tag failed"))?;
 
     let mut result = Vec::with_capacity(12 + in_out.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&in_out);
 
-    B64.encode(&result)
+    Ok(B64.encode(&result))
 }
 
 /// Decrypts the token from base64 blob using the master key.
@@ -105,7 +105,7 @@ mod tests {
         let key = LessSafeKey::new(unbound_key);
 
         let token = "my-secret-bot-token-12345";
-        let encrypted = encrypt_token(token, &key);
+        let encrypted = encrypt_token(token, &key).unwrap();
         assert_ne!(token, encrypted);
 
         let decrypted = decrypt_token(&encrypted, &key).unwrap();

@@ -665,7 +665,7 @@ impl Store {
                 let is_encrypted =
                     crate::runtime::crypto::decrypt_token(&token, master_key).is_ok();
                 if !is_encrypted {
-                    let encrypted = crate::runtime::crypto::encrypt_token(&token, master_key);
+                    let encrypted = crate::runtime::crypto::encrypt_token(&token, master_key)?;
                     sqlx::query("UPDATE bot_credentials SET token = $1 WHERE id = $2")
                         .bind(encrypted)
                         .bind(id)
