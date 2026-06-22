@@ -50,7 +50,13 @@ impl DatabaseKind {
     /// silently treated as SQLite.
     fn from_url(url: &str) -> Result<Self> {
         if url.starts_with("postgres:") || url.starts_with("postgresql:") {
-            Ok(DatabaseKind::Postgres)
+            #[cfg(feature = "postgres")]
+            return Ok(DatabaseKind::Postgres);
+            #[cfg(not(feature = "postgres"))]
+            anyhow::bail!(
+                "PostgreSQL support requires the `postgres` feature flag to be enabled at compile \
+                 time; rebuild with --features postgres"
+            );
         } else if url.starts_with("mysql:") || url.starts_with("mariadb:") {
             #[cfg(feature = "mysql")]
             return Ok(DatabaseKind::MySql);

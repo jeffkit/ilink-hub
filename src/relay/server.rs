@@ -65,9 +65,19 @@ pub struct RelayState {
     used_register_nonces: Arc<DashMap<(String, i64), Instant>>,
 }
 
+/// Monotonically increasing counter used to generate per-connection IDs.
+/// Ordering::Relaxed is sufficient — we only need uniqueness, not ordering
+/// across threads.
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone)]
 struct HubHandle {
     tx: tokio::sync::mpsc::Sender<RelayMessage>,
+    /// Unique identifier assigned when this connection was registered.
+    /// Used to detect the reconnect race: if a new connection has already
+    /// replaced this entry in `hubs`, the old connection's cleanup must
+    /// NOT evict the new registration.
+    conn_id: u64,
 }
 
 pub fn build_relay_router() -> Router {
@@ -151,6 +161,7 @@ async fn accept_registration(
 }
 
 async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (mut write, mut read) = socket.split();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<RelayMessage>(HUB_OUTBOUND_CAPACITY);
     let mut device_id: Option<String> = None;
@@ -204,7 +215,7 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
                             Ok(()) => {
                                 state.hubs.write().await.insert(
                                     id.clone(),
-                                    HubHandle { tx: out_tx.clone() },
+                                    HubHandle { tx: out_tx.clone(), conn_id },
                                 );
                                 device_id = Some(id.clone());
                                 info!(device_id = %id, "hub registered");
@@ -242,8 +253,15 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
     }
 
     if let Some(id) = device_id {
-        state.hubs.write().await.remove(&id);
-        info!(device_id = %id, "hub disconnected");
+        let mut hubs = state.hubs.write().await;
+        // Only evict the hub entry when it still belongs to *this* connection.
+        // If the same device_id reconnected while this connection was winding
+        // down, the new connection has already inserted a fresh entry with a
+        // different conn_id; removing it would cause an intermittent 503.
+        if hubs.get(&id).is_some_and(|h| h.conn_id == conn_id) {
+            hubs.remove(&id);
+        }
+        info!(device_id = %id, conn_id, "hub disconnected");
     }
 }
 
@@ -468,11 +486,13 @@ mod tests {
 
         let device_id = "test-device".to_string();
         let (ws_tx, mut ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
-        state
-            .hubs
-            .write()
-            .await
-            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+        state.hubs.write().await.insert(
+            device_id.clone(),
+            HubHandle {
+                tx: ws_tx,
+                conn_id: 0,
+            },
+        );
 
         let state_clone = state.clone();
         let handle = tokio::spawn(async move {
@@ -543,18 +563,24 @@ mod tests {
 
         // Simulate connection
         let (ws_tx, _ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
-        state
-            .hubs
-            .write()
-            .await
-            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+        state.hubs.write().await.insert(
+            device_id.clone(),
+            HubHandle {
+                tx: ws_tx,
+                conn_id: 1,
+            },
+        );
 
         // Verify key exists
         assert!(state.device_keys.read().await.contains_key(&device_id));
 
         // Simulate disconnection (calling the cleanup part of handle_hub_socket)
         if let Some(id) = Some(device_id.clone()) {
-            state.hubs.write().await.remove(&id);
+            let conn_id = 1u64;
+            let mut hubs = state.hubs.write().await;
+            if hubs.get(&id).is_some_and(|h| h.conn_id == conn_id) {
+                hubs.remove(&id);
+            }
         }
 
         // Verify key is NOT removed after disconnect
@@ -588,11 +614,13 @@ mod tests {
 
         // Simulate Hub connection
         let (ws_tx, _ws_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
-        state
-            .hubs
-            .write()
-            .await
-            .insert(device_id.clone(), HubHandle { tx: ws_tx });
+        state.hubs.write().await.insert(
+            device_id.clone(),
+            HubHandle {
+                tx: ws_tx,
+                conn_id: 1,
+            },
+        );
 
         // Verify key exists
         assert!(state.device_keys.read().await.contains_key(&device_id));
@@ -634,5 +662,64 @@ mod tests {
             }
         };
         assert!(accept_legit.is_ok());
+    }
+
+    /// Verifies that a stale connection's cleanup does NOT evict a newer
+    /// registration for the same device_id (reconnect race fix).
+    #[tokio::test]
+    async fn test_relay_stale_cleanup_does_not_evict_new_connection() {
+        let state = RelayState {
+            hubs: Arc::new(RwLock::new(HashMap::new())),
+            pending: Arc::new(DashMap::new()),
+            device_keys: Arc::new(RwLock::new(HashMap::new())),
+            ws_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            pair_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
+            used_register_nonces: Arc::new(DashMap::new()),
+        };
+
+        let device_id = "device_reconnect".to_string();
+
+        // Old connection registered with conn_id = 1.
+        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
+        state.hubs.write().await.insert(
+            device_id.clone(),
+            HubHandle {
+                tx: old_tx,
+                conn_id: 1,
+            },
+        );
+
+        // New connection registers and overwrites the entry with conn_id = 2.
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(HUB_OUTBOUND_CAPACITY);
+        state.hubs.write().await.insert(
+            device_id.clone(),
+            HubHandle {
+                tx: new_tx,
+                conn_id: 2,
+            },
+        );
+
+        // Old connection's cleanup fires with conn_id = 1; must NOT remove the
+        // new entry (conn_id = 2).
+        let stale_conn_id = 1u64;
+        {
+            let mut hubs = state.hubs.write().await;
+            if hubs
+                .get(&device_id)
+                .is_some_and(|h| h.conn_id == stale_conn_id)
+            {
+                hubs.remove(&device_id);
+            }
+        }
+
+        assert!(
+            state.hubs.read().await.contains_key(&device_id),
+            "new connection must remain registered after stale cleanup"
+        );
+        assert_eq!(
+            state.hubs.read().await.get(&device_id).map(|h| h.conn_id),
+            Some(2),
+            "conn_id of remaining entry must be the new connection's"
+        );
     }
 }

@@ -1435,14 +1435,29 @@ fn adversarial_database_kind_from_url() {
         DatabaseKind::from_url("sqlite:///var/data/x.db").unwrap(),
         DatabaseKind::Sqlite
     );
-    assert_eq!(
-        DatabaseKind::from_url("postgres://u:p@h:5432/db").unwrap(),
-        DatabaseKind::Postgres
-    );
-    assert_eq!(
-        DatabaseKind::from_url("postgresql://u:p@h:5432/db").unwrap(),
-        DatabaseKind::Postgres
-    );
+    // PostgreSQL support is gated behind the `postgres` feature flag.
+    #[cfg(feature = "postgres")]
+    {
+        assert_eq!(
+            DatabaseKind::from_url("postgres://u:p@h:5432/db").unwrap(),
+            DatabaseKind::Postgres
+        );
+        assert_eq!(
+            DatabaseKind::from_url("postgresql://u:p@h:5432/db").unwrap(),
+            DatabaseKind::Postgres
+        );
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        assert!(
+            DatabaseKind::from_url("postgres://u:p@h:5432/db").is_err(),
+            "postgres:// must return Err when `postgres` feature is disabled"
+        );
+        assert!(
+            DatabaseKind::from_url("postgresql://u:p@h:5432/db").is_err(),
+            "postgresql:// must return Err when `postgres` feature is disabled"
+        );
+    }
     // MySQL support is gated behind the `mysql` feature flag.
     #[cfg(feature = "mysql")]
     {
