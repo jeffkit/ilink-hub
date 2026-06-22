@@ -600,11 +600,11 @@ impl Store {
             let new_vtoken = crate::hub::hash_vtoken(&old_vtoken);
 
             if clients_exist {
-                let _ = sqlx::query("UPDATE clients SET vtoken = $1 WHERE vtoken = $2")
+                sqlx::query("UPDATE clients SET vtoken = $1 WHERE vtoken = $2")
                     .bind(&new_vtoken)
                     .bind(&old_vtoken)
                     .execute(&mut **tx)
-                    .await;
+                    .await?;
 
                 match sqlx::query(
                     "UPDATE routing_state SET active_vtoken = $1 WHERE active_vtoken = $2",
@@ -774,8 +774,7 @@ impl Store {
             DatabaseKind::Sqlite => {
                 sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'")
                     .fetch_optional(&mut **tx)
-                    .await
-                    .unwrap_or(None)
+                    .await?
                     .is_some()
             }
             DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
@@ -783,8 +782,7 @@ impl Store {
                  WHERE table_name = 'messages' LIMIT 1",
             )
             .fetch_optional(&mut **tx)
-            .await
-            .unwrap_or(None)
+            .await?
             .is_some(),
         };
 

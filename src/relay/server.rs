@@ -465,7 +465,7 @@ async fn shutdown_signal() {
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("clock")
+        .unwrap_or(Duration::ZERO)
         .as_secs() as i64
 }
 
