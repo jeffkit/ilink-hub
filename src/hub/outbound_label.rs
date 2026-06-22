@@ -1,4 +1,4 @@
-//! Human-readable origin footer on downstream `sendmessage` bodies (`— workspace · label`).
+//! Human-readable origin footer and persona header on downstream `sendmessage` bodies.
 
 use crate::ilink::types::WeixinMessage;
 
@@ -42,6 +42,84 @@ pub fn format_outbound_footer(
     {
         Some(s) => format!("{workspace} · {s}"),
         None => workspace,
+    }
+}
+
+/// Build the persona header prepended to every non-empty reply when a client has a persona configured.
+///
+/// Format: `"{emoji} 【name】\n"` (with emoji) or `"【name】\n"` (without).
+/// The name is wrapped in 【】 for a bold-like visual effect in WeChat (which does not support Markdown).
+/// Returns `None` when `persona_name` is absent or blank.
+pub fn build_persona_header(
+    persona_name: Option<&str>,
+    persona_emoji: Option<&str>,
+) -> Option<String> {
+    let name = persona_name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let display = match persona_emoji.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(e) => format!("{e} **{name}**"),
+        None => format!("**{name}**"),
+    };
+    Some(format!("{display}\n\n"))
+}
+
+/// Footer shown when persona is active: only the session name (skipping backend name/label
+/// since the persona header already identifies the sender).
+///
+/// Returns `None` when session is absent, blank, or "default".
+pub fn build_session_only_footer(session_name: Option<&str>) -> Option<String> {
+    let s = session_name?.trim();
+    if s.is_empty() || s == "default" {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Prepends a persona header and appends `\n\n— {footer}` to the first text item.
+///
+/// - When `persona_name` is set: prepends header, footer shows session only.
+/// - When `persona_name` is absent: prepends nothing, footer shows full origin (name · label · session).
+pub fn apply_persona_and_footer_to_first_text_item(
+    msg: &mut WeixinMessage,
+    persona_name: Option<&str>,
+    persona_emoji: Option<&str>,
+    client_name: &str,
+    label: Option<&str>,
+    session_name: Option<&str>,
+) {
+    let Some(items) = msg.item_list.as_mut() else {
+        return;
+    };
+    let items_mut = std::sync::Arc::make_mut(items);
+    let Some(first) = items_mut.first_mut() else {
+        return;
+    };
+    let Some(ti) = first.text_item.as_mut() else {
+        return;
+    };
+    let Some(t) = ti.text.as_ref() else {
+        return;
+    };
+
+    let has_persona = persona_name
+        .map(str::trim)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    if has_persona {
+        // Persona active: prepend header, append session-only footer (if non-default session).
+        let header = build_persona_header(persona_name, persona_emoji).unwrap_or_default();
+        let body = format!("{header}{t}");
+        ti.text = Some(match build_session_only_footer(session_name) {
+            Some(session) => format!("{body}\n\n---\n{session}"),
+            None => body,
+        });
+    } else {
+        // No persona: keep existing full-origin footer behaviour.
+        let line = format_outbound_footer(client_name, label, session_name);
+        ti.text = Some(format!("{t}\n\n---\n{line}"));
     }
 }
 
@@ -121,6 +199,96 @@ mod tests {
     #[test]
     fn format_line_same_label_skipped() {
         assert_eq!(format_outbound_origin_line("echo", Some("echo")), "echo");
+    }
+
+    // ─── build_persona_header ──────────────────────────────────────────
+
+    #[test]
+    fn persona_header_with_emoji_and_name() {
+        let h = build_persona_header(Some("Claude"), Some("🤖")).unwrap();
+        assert_eq!(h, "🤖 **Claude**\n\n");
+    }
+
+    #[test]
+    fn persona_header_name_only() {
+        let h = build_persona_header(Some("助手"), None).unwrap();
+        assert_eq!(h, "**助手**\n\n");
+    }
+
+    #[test]
+    fn persona_header_empty_emoji_treated_as_none() {
+        let h = build_persona_header(Some("Bot"), Some("  ")).unwrap();
+        assert_eq!(h, "**Bot**\n\n");
+    }
+
+    #[test]
+    fn persona_header_none_or_blank_name_returns_none() {
+        assert!(build_persona_header(None, Some("🤖")).is_none());
+        assert!(build_persona_header(Some(""), None).is_none());
+        assert!(build_persona_header(Some("  "), None).is_none());
+    }
+
+    // ─── apply_persona_and_footer_to_first_text_item ──────────────────
+
+    fn text_msg(body: &str) -> WeixinMessage {
+        WeixinMessage {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some(body.into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_with_persona_prepends_header_and_session_footer() {
+        let mut msg = text_msg("hello");
+        apply_persona_and_footer_to_first_text_item(
+            &mut msg,
+            Some("Claude"),
+            Some("🤖"),
+            "claude-backend",
+            None,
+            Some("feature-a"),
+        );
+        assert_eq!(
+            msg.text(),
+            Some("🤖 **Claude**\n\nhello\n\n---\nfeature-a")
+        );
+    }
+
+    #[test]
+    fn apply_with_persona_default_session_omits_footer() {
+        let mut msg = text_msg("hi");
+        apply_persona_and_footer_to_first_text_item(
+            &mut msg,
+            Some("Claude"),
+            Some("🤖"),
+            "claude-backend",
+            None,
+            Some("default"),
+        );
+        assert_eq!(msg.text(), Some("🤖 **Claude**\n\nhi"));
+    }
+
+    #[test]
+    fn apply_without_persona_uses_full_origin_footer() {
+        let mut msg = text_msg("body");
+        apply_persona_and_footer_to_first_text_item(
+            &mut msg,
+            None,
+            None,
+            "my-backend",
+            Some("my-label"),
+            Some("feat"),
+        );
+        assert_eq!(
+            msg.text(),
+            Some("body\n\n---\nmy-backend · my-label · feat")
+        );
     }
 
     #[test]

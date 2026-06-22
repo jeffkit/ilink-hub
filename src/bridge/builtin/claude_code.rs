@@ -109,6 +109,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let mut args: Vec<String> = vec![
         "--output-format".into(),
         "stream-json".into(),
+        "--verbose".into(),
         "--dangerously-skip-permissions".into(),
         // In -p (non-interactive) mode stdin is /dev/null, so AskUserQuestion would
         // block the process forever with no visible prompt to the user.
@@ -251,6 +252,7 @@ async fn stream_claude_multimodal(
         "stream-json".into(),
         "--output-format".into(),
         "stream-json".into(),
+        "--verbose".into(),
         "--dangerously-skip-permissions".into(),
         "--disallowed-tools".into(),
         "AskUserQuestion".into(),

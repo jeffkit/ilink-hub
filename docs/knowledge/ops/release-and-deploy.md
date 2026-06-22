@@ -67,10 +67,14 @@ git tag v0.3.0 && git push origin v0.3.0
 > **不再**依赖 `build-desktop`（Tauri）。Desktop 安装包为 best-effort（`continue-on-error`），
 > 其失败不会再跳过 Release 和 brew tap 更新 —— 这曾是 brew 长期停在旧版本的根因。
 
-## 远程 Hub 部署（tcloud_hk / systemd）
+## 远程 Hub 部署（tcloud_gz / systemd）
 
-远程 Hub（SSH 别名 `tcloud_hk`，地址 `43.138.149.34`，systemd 单元 `ilink-hub`）。
+远程 Hub（SSH 别名 `tcloud_gz`，地址 `43.138.149.34`，systemd 单元 `ilink-hub`）。
 本机直连其 `8765` 端口（**不再走 SSH 隧道转发**）。
+
+> ⚠️ **生产 hub 唯一实例**：生产 hub **只在 `tcloud_gz`（`43.138.149.34`）**。切勿在其他机器另起
+> hub 共用同一 `ILINK_TOKEN`——iLink 对单个 bot 只允许一个活跃会话，多实例会互抢，被抢者持续
+> 报 `-14 session timeout` 且收不到任何消息。
 
 ### ⚠️ 交叉编译避坑：优先在服务器上直接编译
 
@@ -86,10 +90,10 @@ git tag v0.3.0 && git push origin v0.3.0
 
 ```bash
 # 0. 确认服务器有 Rust（首次确认即可）
-ssh tcloud_hk "~/.cargo/bin/cargo --version"
+ssh tcloud_gz "~/.cargo/bin/cargo --version"
 
 # 1. 备份生产库（迁移不可逆，务必先备份）
-ssh tcloud_hk "python3 -c \"
+ssh tcloud_gz "python3 -c \"
 import sqlite3, shutil, datetime
 ts = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 shutil.copy('/var/lib/ilink-hub/ilink-hub.db', f'/var/lib/ilink-hub/ilink-hub.db.bak.{ts}')
@@ -98,15 +102,15 @@ print('backup ok:', ts)
 
 # 2. rsync 源码到服务器（migrations 必须一起同步，include_str! 引用的是编译时路径）
 cd /path/to/ilink-hub
-rsync -av src/ tcloud_hk:/home/ubuntu/ilink-hub-build/src/
-rsync -av migrations/ tcloud_hk:/home/ubuntu/ilink-hub-build/migrations/
-rsync -av Cargo.toml Cargo.lock tcloud_hk:/home/ubuntu/ilink-hub-build/
+rsync -av src/ tcloud_gz:/home/ubuntu/ilink-hub-build/src/
+rsync -av migrations/ tcloud_gz:/home/ubuntu/ilink-hub-build/migrations/
+rsync -av Cargo.toml Cargo.lock tcloud_gz:/home/ubuntu/ilink-hub-build/
 
 # 3. 在服务器上编译（约 1 分钟全量，增量数秒）
-ssh tcloud_hk "cd /home/ubuntu/ilink-hub-build && ~/.cargo/bin/cargo build --release --bin ilink-hub 2>&1 | tail -3"
+ssh tcloud_gz "cd /home/ubuntu/ilink-hub-build && ~/.cargo/bin/cargo build --release --bin ilink-hub 2>&1 | tail -3"
 
 # 4. 停服 → 替换二进制 → 启服（必须先 stop 再替换，否则报 "Text file busy"）
-ssh tcloud_hk "
+ssh tcloud_gz "
   sudo systemctl stop ilink-hub
   sudo cp /home/ubuntu/ilink-hub-build/target/release/ilink-hub /opt/ilink-hub/ilink-hub
   sudo systemctl start ilink-hub

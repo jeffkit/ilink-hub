@@ -285,24 +285,30 @@ async fn main() -> Result<()> {
                         info!("bridge received Ctrl-C; shutting down gracefully");
                         shutdown.cancel();
                         // Wait up to 3 s for error replies to be sent before aborting.
-                        let _ = tokio::time::timeout(
+                        // Only abort+await when the task did NOT finish within the timeout;
+                        // re-awaiting an already-completed JoinHandle causes a panic.
+                        let timed_out = tokio::time::timeout(
                             std::time::Duration::from_secs(3),
                             &mut handle,
-                        ).await;
-                        handle.abort();
-                        let _ = handle.await;
+                        ).await.is_err();
+                        if timed_out {
+                            handle.abort();
+                            let _ = handle.await;
+                        }
                         info!("exit");
                         return Ok(());
                     }
                     _ = &mut sigterm_fut => {
                         info!("bridge received SIGTERM; shutting down gracefully");
                         shutdown.cancel();
-                        let _ = tokio::time::timeout(
+                        let timed_out = tokio::time::timeout(
                             std::time::Duration::from_secs(3),
                             &mut handle,
-                        ).await;
-                        handle.abort();
-                        let _ = handle.await;
+                        ).await.is_err();
+                        if timed_out {
+                            handle.abort();
+                            let _ = handle.await;
+                        }
                         return Ok(());
                     }
                     result = &mut handle => {

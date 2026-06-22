@@ -1121,6 +1121,7 @@ async fn handle_one_message(
             .map_err(|e| HandleError::from(e.context("sendmessage reply")))?;
         }
         Err(e) => {
+            error!(error = %e, "CLI failed; sending error reply to user");
             if app.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
                 let req = SendMessageRequest::reply(ctx, err_text, &from_user);
