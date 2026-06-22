@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tracing::warn;
 
 use crate::bridge::config::{BridgeProfile, StdinMode};
@@ -182,7 +182,7 @@ pub(super) async fn run_cli(
     from_user: &str,
     context_token: &str,
     media_env: &[(String, String)],
-    partial_tx: mpsc::UnboundedSender<String>,
+    partial_tx: watch::Sender<Option<String>>,
 ) -> Result<(String, Option<String>)> {
     let args: Vec<String> = cfg
         .args
@@ -315,7 +315,7 @@ pub(super) async fn run_cli(
                     if streaming {
                         match serde_json::from_str::<String>(json_part) {
                             Ok(chunk) => {
-                                let _ = partial_tx.send(chunk);
+                                let _ = partial_tx.send(Some(chunk));
                             }
                             Err(e) => {
                                 warn!(error = %e, raw = %json_part, "failed to decode ILINK_PARTIAL chunk; skipping");
@@ -402,7 +402,7 @@ pub(super) async fn run_cli(
 mod tests {
     use super::*;
     use crate::bridge::config::BridgeApp;
-    use tokio::sync::mpsc;
+    use tokio::sync::watch;
 
     #[test]
     fn placeholders_message_session_id_and_name() {
@@ -483,7 +483,7 @@ mod tests {
         let large_msg = "A".repeat(128 * 1024);
 
         let start = std::time::Instant::now();
-        let (partial_tx, _partial_rx) = mpsc::unbounded_channel::<String>();
+        let (partial_tx, _partial_rx) = watch::channel::<Option<String>>(None);
         let res = run_cli(
             profile,
             "test_profile",

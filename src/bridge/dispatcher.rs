@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use futures_util::future::BoxFuture;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -383,7 +383,7 @@ impl ReplySender for HubClient {
 #[allow(clippy::too_many_arguments)]
 async fn run_partial_forward_loop<S: ReplySender>(
     sender: S,
-    mut partial_rx: mpsc::UnboundedReceiver<String>,
+    mut partial_rx: watch::Receiver<Option<String>>,
     ctx: String,
     from_user: String,
     session_name: String,
@@ -408,9 +408,14 @@ async fn run_partial_forward_loop<S: ReplySender>(
             let chunk = tokio::select! {
                 biased;
                 _ = shutdown.cancelled() => return,
-                chunk_opt = partial_rx.recv() => match chunk_opt {
-                    Some(c) => c,
-                    None => return,
+                result = partial_rx.changed() => match result {
+                    Ok(()) => match partial_rx.borrow_and_update().clone() {
+                        Some(c) => c,
+                        // Initial None slot — not a real chunk; keep waiting.
+                        None => continue,
+                    },
+                    // Sender dropped → CLI exited, no more chunks.
+                    Err(_) => return,
                 },
             };
             pending = Some(chunk);
@@ -428,24 +433,27 @@ async fn run_partial_forward_loop<S: ReplySender>(
                     biased;
                     _ = shutdown.cancelled() => return,
                     _ = tokio::time::sleep(backoff) => break,
-                    chunk_opt = partial_rx.recv() => match chunk_opt {
-                        Some(c) => {
-                            debug!(
-                                pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
-                                new_chunk_len = c.len(),
-                                "overwriting buffered partial chunk with newer content during backoff"
-                            );
-                            pending = Some(c);
-                            // `attempt` is intentionally preserved
-                            // across overwrites — the hub is still
-                            // throttling us, so resetting the counter
-                            // would let any CLI cadence flatten the
-                            // exponential schedule. `backoff` is
-                            // unchanged here as a consequence; we
-                            // recompute it only to surface the same
-                            // value through the local binding. F-M2-006.
+                    result = partial_rx.changed() => match result {
+                        Ok(()) => {
+                            if let Some(c) = partial_rx.borrow_and_update().clone() {
+                                debug!(
+                                    pending_len = pending.as_ref().map(|s| s.len()).unwrap_or(0),
+                                    new_chunk_len = c.len(),
+                                    "overwriting buffered partial chunk with newer content during backoff"
+                                );
+                                pending = Some(c);
+                                // `attempt` is intentionally preserved
+                                // across overwrites — the hub is still
+                                // throttling us, so resetting the counter
+                                // would let any CLI cadence flatten the
+                                // exponential schedule. `backoff` is
+                                // unchanged here as a consequence; we
+                                // recompute it only to surface the same
+                                // value through the local binding. F-M2-006.
+                            }
                         }
-                        None => return,
+                        // Sender dropped → CLI exited, no more chunks.
+                        Err(_) => return,
                     },
                 }
             }
@@ -1021,7 +1029,12 @@ async fn handle_one_message(
     tracing::Span::current().record("profile", profile_name);
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
-    let (partial_tx, partial_rx) = mpsc::unbounded_channel::<String>();
+    // watch::channel bounds the partial-chunk buffer to a single slot: only
+    // the latest ILINK_PARTIAL chunk matters for UI streaming, and stale
+    // intermediate state is dropped automatically. This eliminates the
+    // unbounded memory growth that mpsc::unbounded_channel caused when the
+    // Hub returned Throttled during a long exponential backoff (up to ~300s).
+    let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
 
     let fwd_client = client.clone();
     let fwd_ctx = ctx.clone();
@@ -1688,7 +1701,7 @@ timeout_secs: 5
     fn spawn_test_loop<S: ReplySender>(
         sender: S,
     ) -> (
-        mpsc::UnboundedSender<String>,
+        watch::Sender<Option<String>>,
         CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
@@ -1713,11 +1726,11 @@ timeout_secs: 5
         sender: S,
         max_total: Duration,
     ) -> (
-        mpsc::UnboundedSender<String>,
+        watch::Sender<Option<String>>,
         CancellationToken,
         tokio::task::JoinHandle<()>,
     ) {
-        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        let (tx, rx) = watch::channel::<Option<String>>(None);
         let shutdown = CancellationToken::new();
         let handle = tokio::spawn(run_partial_forward_loop(
             sender,
@@ -1768,12 +1781,12 @@ timeout_secs: 5
         let probe = scripted.clone();
 
         // Push 3 chunks while the hub is throttling.
-        tx.send("v1".into()).unwrap();
+        tx.send(Some("v1".into())).unwrap();
         // Give the loop time to attempt the first send.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send("v2".into()).unwrap();
+        tx.send(Some("v2".into())).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
-        tx.send("v3".into()).unwrap();
+        tx.send(Some("v3".into())).unwrap();
 
         // Wait until we have at least 4 sends (covers the throttled
         // retries + first success; the trailing v3 may or may not
@@ -1845,7 +1858,7 @@ timeout_secs: 5
         let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        tx.send("hello".into()).unwrap();
+        tx.send(Some("hello".into())).unwrap();
         for _ in 0..200 {
             if probe.sent_count() >= 2 {
                 break;
@@ -1906,13 +1919,13 @@ timeout_secs: 5
         let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        tx.send("v1".into()).unwrap();
+        tx.send(Some("v1".into())).unwrap();
         // Give the loop time to attempt several retries and enter
         // backoff sleep. Then send v2 — by the time v2 arrives the
         // loop is sleeping; the recv() inside the select! will
         // overwrite pending. Subsequent sends then carry v2.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tx.send("v2".into()).unwrap();
+        tx.send(Some("v2".into())).unwrap();
 
         for _ in 0..2000 {
             // We expect at least one send of v2 to land. Wait for that.
@@ -2003,7 +2016,7 @@ timeout_secs: 5
         // Send 3 chunks during the persistent throttle. Each arrives
         // during a backoff sleep and overwrites pending.
         for i in 0..3 {
-            tx.send(format!("chunk-{i}")).unwrap();
+            tx.send(Some(format!("chunk-{i}"))).unwrap();
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         // Wait for at least 4 retry attempts (test_backoff schedule
@@ -2094,11 +2107,11 @@ timeout_secs: 5
         let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        tx.send("first".into()).unwrap();
+        tx.send(Some("first".into())).unwrap();
         // Wait for the error to be consumed + a new chunk to clear
         // the buffer.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tx.send("second".into()).unwrap();
+        tx.send(Some("second".into())).unwrap();
         for _ in 0..200 {
             if probe.sent_count() >= 2 {
                 break;
@@ -2129,7 +2142,7 @@ timeout_secs: 5
         let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
         let probe = scripted.clone();
 
-        tx.send("stuck".into()).unwrap();
+        tx.send(Some("stuck".into())).unwrap();
         // Wait until the loop has issued at least one throttled send
         // and is currently sleeping in the backoff.
         for _ in 0..200 {
@@ -2166,7 +2179,11 @@ timeout_secs: 5
         let probe = scripted.clone();
 
         for i in 0..3 {
-            tx.send(format!("c{i}")).unwrap();
+            tx.send(Some(format!("c{i}"))).unwrap();
+            // With watch::channel only the latest slot is kept; space sends
+            // so each chunk is individually observable before the next one
+            // overwrites it, preserving the "each chunk → one send" invariant.
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         for _ in 0..200 {
             if probe.sent_count() >= 3 {
@@ -2347,13 +2364,13 @@ timeout_secs: 5
             spawn_test_loop_with_budget(scripted.clone(), Duration::from_millis(30));
         let probe = scripted.clone();
 
-        tx.send("chunk-0".to_string()).unwrap();
+        tx.send(Some("chunk-0".to_string())).unwrap();
         // Allow the budget to elapse and the loop to abandon chunk-0.
         tokio::time::sleep(Duration::from_millis(200)).await;
         let after_giveup = probe.sent_count();
 
         // A fresh chunk after give-up must trigger new attempts.
-        tx.send("chunk-1".to_string()).unwrap();
+        tx.send(Some("chunk-1".to_string())).unwrap();
         tokio::time::sleep(Duration::from_millis(120)).await;
         shutdown.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
