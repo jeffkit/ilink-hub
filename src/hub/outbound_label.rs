@@ -254,10 +254,7 @@ mod tests {
             None,
             Some("feature-a"),
         );
-        assert_eq!(
-            msg.text(),
-            Some("🤖 **Claude**\n\nhello\n\n---\nfeature-a")
-        );
+        assert_eq!(msg.text(), Some("🤖 **Claude**\n\nhello\n\n---\nfeature-a"));
     }
 
     #[test]

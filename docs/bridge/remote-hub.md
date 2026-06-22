@@ -79,7 +79,7 @@ mkdir -p ~/ilink-logs
 
 ### Bridge Manager launchd 服务（直连）
 
-创建 `~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist`。程序路径用 **Homebrew 安装路径** `/opt/homebrew/bin/ilink-hub-bridge`（见 [发布与部署规范](../knowledge/ops/release-and-deploy.md)，本地部署一律经 brew，不要裸拷 `~/.local/bin`）：
+创建 `~/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist`。程序路径用 **Homebrew 安装路径** `/opt/homebrew/bin/ilink-hub-bridge`（本地部署一律经 brew，不要裸拷 `~/.local/bin`）：
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>

@@ -3485,11 +3485,7 @@ async fn find_vtoken_for_session_resolves_persona_footer_fallback() {
 
     // Simulate `find_or_create_vctx` storing the mapping.
     store
-        .find_or_create_vctx(
-            "o9cq80_testuser@im.wechat",
-            None,
-            "AARzJWAFAAA_real_ctx",
-        )
+        .find_or_create_vctx("o9cq80_testuser@im.wechat", None, "AARzJWAFAAA_real_ctx")
         .await
         .unwrap();
     // Obtain the actual vctx that was created.

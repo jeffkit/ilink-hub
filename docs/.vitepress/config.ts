@@ -11,7 +11,7 @@ export default defineConfig({
   // Exclude internal design docs from VitePress processing.
   // These files contain angle-bracket fragments (<tag>, code snippets) that Vue's
   // HTML compiler misinterprets as component tags, causing build errors.
-  srcExclude: ['exec-plans/**', 'adr/**', 'proposals/**'],
+  srcExclude: ['exec-plans/**', 'adr/**', 'proposals/**', 'knowledge/**'],
 
   head: [
     ['link', { rel: 'icon', href: '/ilink-hub/favicon.svg' }],
