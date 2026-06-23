@@ -27,12 +27,6 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
     )?;
     registry.register(Box::new(ilink_status.clone()))?;
 
-    let ctx_map_size = IntGauge::new(
-        "ilink_hub_ctx_map_size",
-        "Number of virtual context token entries in memory cache",
-    )?;
-    registry.register(Box::new(ctx_map_size.clone()))?;
-
     let queue_size = IntGaugeVec::new(
         Opts::new(
             "ilink_hub_queue_size",
@@ -136,7 +130,6 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
         .set(online as i64);
 
     ilink_status.set(i64::from(state.ilink.ilink_status.load(Ordering::Relaxed)));
-    ctx_map_size.set(state.routing.ctx_map.len() as i64);
 
     for (vtoken, size) in &queue_sizes {
         let name = client_names_by_vtoken
@@ -197,13 +190,23 @@ mod tests {
     use crate::InMemoryQueue;
 
     async fn make_test_state() -> Arc<HubState> {
+        use crate::hub::AdminConfig;
+        use crate::ilink::upstream::UpstreamSink;
         let store = Store::connect("sqlite::memory:")
             .await
             .expect("in-memory store");
-        let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+        let upstream: Arc<dyn UpstreamSink> =
+            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"));
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        HubState::new(upstream, Arc::new(store), queue, shutdown_rx)
+        HubState::new(
+            upstream,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
     }
 
     /// Create a test state with a registered client so that `queue_size` gauge
@@ -212,7 +215,7 @@ mod tests {
         use crate::ilink::types::WeixinMessage;
 
         let state = make_test_state().await;
-        let (vtoken, _is_new) = {
+        let (_, vtoken, _) = {
             state
                 .clients
                 .registry
@@ -259,7 +262,6 @@ mod tests {
             "ilink_hub_dispatcher_lagged_total",
             "ilink_hub_relogin_attempts_total",
             "ilink_hub_ilink_status",
-            "ilink_hub_ctx_map_size",
             "ilink_hub_queue_size",
             "ilink_hub_persist_fire_and_forget_failures_total",
         ];
@@ -426,7 +428,6 @@ mod tests {
             "ilink_hub_dispatcher_lagged_total",
             "ilink_hub_relogin_attempts_total",
             "ilink_hub_ilink_status",
-            "ilink_hub_ctx_map_size",
             "ilink_hub_queue_size",
             "ilink_hub_persist_fire_and_forget_failures_total",
         ] {
@@ -470,7 +471,7 @@ mod tests {
             help_names, type_names,
             "every HELP must have a matching TYPE"
         );
-        assert_eq!(help_names.len(), 15, "expected exactly 15 metric families");
+        assert_eq!(help_names.len(), 14, "expected exactly 14 metric families");
     }
 
     #[tokio::test]
@@ -496,7 +497,7 @@ mod tests {
         let state = make_test_state().await;
         // Register a client with special characters and push a message so
         // queue_size gauge has a label value with special chars.
-        let (vtoken, _) = {
+        let (_, vtoken, _) = {
             state
                 .clients
                 .registry
@@ -599,7 +600,7 @@ mod tests {
     async fn test_one_client_many_queue_messages() {
         let state = make_test_state_with_client().await;
         // Push many messages for the same client.
-        let (vtoken, _) = {
+        let (_, vtoken, _) = {
             state
                 .clients
                 .registry

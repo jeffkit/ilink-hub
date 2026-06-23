@@ -255,8 +255,7 @@ impl UpstreamClient {
 
     pub async fn send_typing(&self, req: SendTypingRequest) -> Result<()> {
         let url = format!("{}/ilink/bot/sendtyping", self.base_url);
-        let resp = self
-            .client
+        self.client
             .post(&url)
             .headers(self.headers()?)
             .json(&req)
