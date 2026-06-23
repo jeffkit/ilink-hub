@@ -11,7 +11,7 @@ pub type Key = LessSafeKey;
 /// Formats output as base64: nonce(12) || ct || tag(16)
 pub fn encrypt_token(plain: &str, key: &Key) -> Result<String> {
     let mut nonce_bytes = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    rand::rng().fill_bytes(&mut nonce_bytes);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
 
     let mut in_out = plain.as_bytes().to_vec();

@@ -1,0 +1,21 @@
+milestone: M2
+title: "注册所有指标"
+files:
+  - src/metrics.rs
+  - src/lib.rs
+checks:
+  fmt: PASS
+  clippy: PASS
+  test: "242 passed, 0 failed"
+  build: PASS
+  desktop-frontend: PASS
+  desktop-tauri: PASS
+notes: |
+  新建 src/metrics.rs，用 IntCounterVec / IntGaugeVec 注册全部 15 个 Prometheus 指标。
+  gather_metrics 函数接受 &HubState 和 hub_name，创建 per-request Registry，
+  从 HubState 的 AtomicU64 字段及各子状态读取值并 set，最后用 TextEncoder 编码输出。
+  在 src/lib.rs 添加 pub mod metrics。
+requested_dimensions:
+  - correctness
+  - security
+  - simplicity

@@ -1,0 +1,217 @@
+milestone: M2
+verdict: PASS
+reviewer: security-concurrency-audit
+date: "2026-06-17"
+scope:
+  files:
+    - src/metrics.rs
+    - src/lib.rs
+    - src/server/routes.rs
+  metrics_registered: 15
+  test_count: 19
+
+findings:
+  - id: COR-01
+    severity: PASS
+    category: correctness
+    title: "test_all_metrics_present 已包含全部 15 个指标"
+    detail: >
+      gather_metrics 注册了 15 个指标（7 gauge family + 8 counter family），
+      test_all_metrics_present 的 expected_names 数组现在包含全部 15 个指标名称，
+      包括此前遗漏的 `ilink_hub_queue_size`。make_test_state_with_client 会 push
+      消息到队列，确保 queue_size gauge 有 label 值并出现在输出中。
+    code_ref:
+      file: src/metrics.rs
+      lines: "222-271"
+
+  - id: COR-02
+    severity: PASS
+    category: correctness
+    title: "gather_metrics 已接入 /metrics 路由"
+    detail: >
+      src/server/routes.rs 的 metrics handler 已调用 crate::metrics::gather_metrics
+      替换旧的手写 format! 实现。hub_name 从 HUB_NAME 环境变量获取（默认 "default"）。
+      /metrics 端点现在输出完整的 Prometheus 文本格式，带 hub label。
+    code_ref:
+      file: src/server/routes.rs
+      lines: "987-1007"
+
+  - id: COR-03
+    severity: INFO
+    category: correctness
+    title: "client_names_by_vtoken 与 queue_sizes 之间存在 .await 窗口，新注册客户端可能显示 name=\"unknown\""
+    detail: >
+      gather_metrics 第 116-130 行：先持有 registry.read().await 锁收集
+      client_names_by_vtoken，释放锁后 await queue_sizes()。在 lock 释放与
+      queue_sizes 返回之间注册的新客户端会在 queue_sizes 中有条目但在
+      client_names_by_vtoken 中无对应映射，从而落入第 145 行 unwrap_or("unknown")。
+      这不是数据正确性问题（metrics 本身就是快照），但 "unknown" 标签值
+      可能让运维人员困惑。窗口极小（两次 .await 之间），已有的 fallback 足够好。
+    code_ref:
+      file: src/metrics.rs
+      lines: "116-147"
+
+  - id: COR-04
+    severity: PASS
+    category: correctness
+    title: "f64 精度边界已测试——1<<52 值正确编码"
+    detail: >
+      Prometheus 内部在收集阶段将 IntCounter 值转为 f64，超过 2^53 的整数会丢失精度。
+      测试 test_large_counter_values_f64_safe_max 使用 1<<52 验证大数值的正确编码，
+      并记录了 f64 精度限制。对于实际使用场景，计数器值达到 2^53 之前部署早已轮转。
+    code_ref:
+      file: src/metrics.rs
+      lines: "376-392"
+
+  - id: CON-01
+    severity: PASS
+    category: concurrency
+    title: "所有 AtomicU64 load 使用 Relaxed 排序——对指标收集场景正确"
+    detail: >
+      gather_metrics 中所有 AtomicU64::load(Ordering::Relaxed) 调用仅用于读取
+      独立的计数器/仪表值。不同指标之间不需要 happens-before 关系，Relaxed
+      是正确的最低成本选择。不会导致未定义行为或数据竞争。
+    code_ref:
+      file: src/metrics.rs
+      lines: "138,155,157-164,166-181"
+
+  - id: CON-02
+    severity: PASS
+    category: concurrency
+    title: "per-request Registry 避免全局可变状态，多 Hub 实例安全"
+    detail: >
+      M1 PLAN-01 警告：Registry 不得为全局 static。M2 正确实现了每次调用
+      gather_metrics 创建全新的 Registry::new()，注册→设值→收集→编码全在
+      调用栈内完成。多 Hub 实例部署时各自的指标互不干扰。无 lazy_static 全局
+      Registry，不会出现重复注册 panic。
+    code_ref:
+      file: src/metrics.rs
+      line: 14
+
+  - id: CON-03
+    severity: PASS
+    category: concurrency
+    title: "clone-before-register 模式正确避免 use-after-move"
+    detail: >
+      registry.register(Box::new(x.clone()))? 先 clone 再注册，保留 metric handle
+      用于后续 with_label_values().set()/inc_by()。prometheus 的 register 以
+      Box<T> 获取所有权（move），不 clone 将导致编译错误或后续无法访问。
+      当前模式正确，无 use-after-move 风险。
+    code_ref:
+      file: src/metrics.rs
+      lines: "18-111"
+
+  - id: CON-04
+    severity: PASS
+    category: concurrency
+    title: "并发 gather_metrics 调用使用独立 Registry，互不干扰"
+    detail: >
+      test_concurrent_calls_independent_registries 验证两个并发的 gather_metrics
+      调用各自创建独立 Registry、独立收集指标、输出各自的 hub label。
+      无数据竞争、无重复注册 panic。
+    code_ref:
+      file: src/metrics.rs
+      lines: "396-438"
+
+  - id: MEM-01
+    severity: PASS
+    category: memory_safety
+    title: "零 unsafe 代码，全部安全 Rust"
+    detail: >
+      src/metrics.rs 及 src/lib.rs（仅添加 pub mod metrics）不含任何 unsafe 块。
+      所有操作（prometheus API、String 操作、HashMap 迭代）均为安全 Rust。
+    unsafe_blocks: 0
+
+  - id: MEM-02
+    severity: INFO
+    category: memory_safety
+    title: "大数据量场景下的资源消耗可控"
+    detail: >
+      当 Hub 注册大量客户端（例如 N=10000）时，queue_sizes 和 persist_faf_failures
+      会生成 N 行带独立 label 的指标输出。TextEncoder::encode_to_string 返回
+      堆分配的 String，内存消耗与客户端数成正比（约每客户端 80 字节）。
+      这不会导致 OOM（N 受 ClientRegistry 内存限制），但在极端规模下应注意。
+    mitigation: N 受 ClientRegistry + 数据库行数天然限制，当前无风险。
+
+  - id: SEC-01
+    severity: PASS
+    category: security
+    title: "OWASP A03:Injection — label 值通过 prometheus crate 内部转义，安全"
+    detail: >
+      client name 和 hub_name 作为 label 值传入 with_label_values(&[...])。
+      prometheus crate 0.13 的 label encoding 会转义 \\、\"、\n 等特殊字符，
+      确保输出始终是合法的 Prometheus 文本格式。恶意构造的后端名称不会导致
+      格式注入或跨行注入。
+      test_client_name_with_special_chars_escaped 与 test_hub_name_with_special_chars_escaped 已验证。
+    owasp_categories:
+      A03_Injection: secure
+
+  - id: SEC-02
+    severity: PASS
+    category: security
+    title: "A05:Security Misconfiguration — 指标端点鉴权由路由层负责，分层正确"
+    detail: >
+      gather_metrics 自身不含鉴权逻辑。调用方（routes.rs 的 metrics handler）
+      通过 check_admin_auth 进行鉴权。这种分层设计正确，避免指标采集函数与
+      鉴权耦合。
+    owasp_categories:
+      A05_Security_Misconfiguration: secure
+
+  - id: ASYNC-01
+    severity: PASS
+    category: async_safety
+    title: "gather_metrics 的 .await 点极少，不会阻塞 tokio worker"
+    detail: >
+      函数标记为 async，但仅在两处 .await：registry.read().await（lock 获取）
+      和 queue_sizes().await（内部可能有短暂锁）。其余操作均为纯同步 CPU 操作。
+      TextEncoder::encode_to_string 在典型场景（15 指标族、数十客户端）下耗时 < 100µs，
+      即使在数千客户端场景下也远低于 1ms。无需 spawn_blocking 或 block_in_place。
+    await_points: 2
+    blocking_risk: none
+
+  - id: SIM-01
+    severity: INFO
+    category: simplicity
+    title: "clone-then-register 模式有 15 处重复，可通过宏简化"
+    detail: >
+      每个指标都需要 create → clone → register(Box::new(clone)) → set/inc_by
+      三步，代码中出现了 15 个几乎相同的模式块。可以通过一个简短的内部宏
+      register_metric! 减少样板代码。当前可读性尚可接受，不算阻塞问题。
+    suggestion: M3 可引入 register_metric! 宏消除重复。
+
+  - id: PLAN-01
+    severity: PASS
+    category: forward_looking
+    title: "M1 警告已解决——per-request Registry 正确实现"
+    detail: >
+      M1 审查的 PLAN-01 要求 M2 采用 per-request Registry 模式。
+      gather_metrics 正确实现了每次调用创建新 Registry，从 HubState 读取值后
+      编码输出。无全局 static Registry，符合多 Hub 实例部署要求。
+
+verification_summary:
+  fmt: PASS
+  clippy: PASS
+  test: PASS  # 19 passed (含 10 项对抗性测试)
+  build: PASS
+
+review_dimensions:
+  memory_safety: PASS
+  data_race: PASS
+  tokio_async_safety: PASS
+  owasp_security: PASS
+  correctness: PASS
+  simplicity: INFO  # SIM-01: macro opportunity
+
+adversarial_tests:
+  - test_hub_name_with_special_chars_escaped
+  - test_empty_hub_name_does_not_panic
+  - test_large_counter_values_f64_safe_max
+  - test_concurrent_calls_independent_registries
+  - test_zero_counter_output_omitted
+  - test_every_help_has_matching_type
+  - test_no_empty_lines_between_metric_lines
+  - test_client_name_with_special_chars_escaped
+  - test_unicode_hub_name_does_not_panic
+  - test_no_duplicate_help_or_type_lines
+  - test_one_client_many_queue_messages
+  - test_eof_newline

@@ -157,6 +157,14 @@ pub struct Metrics {
     /// `*_created` in Prometheus text format so scrape tools can compute per-second rates
     /// correctly even after a process restart.
     pub process_start_unix_secs: f64,
+    /// Number of times the broadcast-channel receiver on the dispatcher lagged
+    /// (dropped messages due to a full buffer). Incremented inside the
+    /// `broadcast::error::RecvError::Lagged` arm.
+    pub dispatcher_lagged: AtomicU64,
+    /// Failed fire-and-forget persist operations on the unicast forward path.
+    pub persist_fire_and_forget_failures_forward: AtomicU64,
+    /// Failed fire-and-forget persist operations on the broadcast fan-out path.
+    pub persist_fire_and_forget_failures_broadcast: AtomicU64,
 }
 
 impl Metrics {
@@ -177,6 +185,9 @@ impl Metrics {
             sendmessage_upstream_latency_ms: LatencyHistogram::new(),
             dispatch_latency_ms: LatencyHistogram::new(),
             process_start_unix_secs,
+            dispatcher_lagged: AtomicU64::new(0),
+            persist_fire_and_forget_failures_forward: AtomicU64::new(0),
+            persist_fire_and_forget_failures_broadcast: AtomicU64::new(0),
         }
     }
 }

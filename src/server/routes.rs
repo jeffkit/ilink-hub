@@ -1194,6 +1194,8 @@ pub async fn metrics(
         return (StatusCode::UNAUTHORIZED, "Unauthorized".into());
     }
 
+    let _hub_name = std::env::var("HUB_NAME").unwrap_or_else(|_| "default".to_string());
+
     let (online, total, client_names_by_vtoken) = {
         let registry = state.clients.registry.read().await;
         let online = registry.online_clients().len() as u64;
