@@ -159,6 +159,42 @@ impl Store {
             .collect())
     }
 
+    /// Load messages for a specific (vtoken, session_name) pair, newest first.
+    ///
+    /// `limit` is clamped to `[1, 500]`. Returns rows ordered by id DESC (most recent first);
+    /// callers that want chronological order should reverse the result.
+    pub async fn list_messages_for_session(
+        &self,
+        vtoken: &str,
+        session_name: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageRow>> {
+        let clamped = limit.clamp(1, 500);
+        let rows = sqlx::query(
+            "SELECT id, vctx, vtoken, session_name, peer_user_id, role, content, created_at \
+             FROM messages WHERE vtoken = $1 AND session_name = $2 ORDER BY id DESC LIMIT $3",
+        )
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(clamped)
+        .fetch_all(&self.rpool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| MessageRow {
+                id: r.get("id"),
+                vctx: r.get("vctx"),
+                vtoken: r.get("vtoken"),
+                session_name: r.get("session_name"),
+                peer_user_id: r.get("peer_user_id"),
+                role: r.get("role"),
+                content: r.get("content"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
     /// For each vtoken in the list, return a summary of the most recent conversation turn:
     /// `(session_name, last_user_content, waiting_for_reply)`.
     ///

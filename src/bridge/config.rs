@@ -513,12 +513,13 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
 
     match pt.as_str() {
         "claude-code" => Ok(make_builtin(p, "claude-code", true)),
+        "codebuddy-code" => Ok(make_builtin(p, "codebuddy-code", true)),
         "codex" => Ok(make_builtin(p, "codex", false)),
         "cursor" => Ok(make_builtin(p, "cursor", true)),
         "agy" => Ok(make_builtin(p, "agy", true)),
         other => anyhow::bail!(
             "profile `{name}`: unknown `type: {other}`; \
-             supported built-in types: claude-code, codex, cursor, agy"
+             supported built-in types: claude-code, codebuddy-code, codex, cursor, agy"
         ),
     }
 }

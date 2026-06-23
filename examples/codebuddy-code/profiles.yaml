@@ -1,0 +1,73 @@
+# CodeBuddy Code Bridge Profile
+#
+# 功能：
+#   · 通过内置 `codebuddy-code` profile 类型调用本地 codebuddy CLI
+#   · 支持多轮对话（--resume <session_id>）及 session 失效自动降级
+#   · 支持 /new 前缀强制开启新会话
+#
+# ─── 前提条件 ────────────────────────────────────────────────────────────────
+#
+#   1. CodeBuddy Code CLI 已安装并在 PATH 中：
+#        codebuddy --version    # 或 cbc --version
+#
+#   2. 已登录：codebuddy login  或相关账号已配置
+#
+#   3. 确认当前可用模型（以实际 `codebuddy --help` 输出为准）：
+#        glm-5.1-ioa（推荐，最新 GLM）
+#        glm-5.0-turbo-ioa / glm-5.0-ioa / glm-4.7-ioa
+#        deepseek-v3-2-volc-ioa
+#        kimi-k2.6-ioa / kimi-k2.5-ioa
+#        claude-sonnet-4.6 / claude-opus-4.7
+#        gpt-5.5 / gpt-5.4 / gpt-5.3-codex
+#        hy3-preview-ioa（codebuddy 默认）
+#
+# ─── 快速开始 ─────────────────────────────────────────────────────────────────
+#
+#   ilink-hub-bridge --config profiles.yaml
+#
+# ─── 在微信里验证 ─────────────────────────────────────────────────────────────
+#
+#   普通消息（继续上一轮对话）：
+#     你: 帮我解释一下 src/bridge/builtin/codebuddy_code.rs 的实现
+#
+#   强制开启新会话：
+#     你: /new 帮我重新审视整个 bridge 设计
+#
+# ─── 终端模拟测试（不启动 bridge）─────────────────────────────────────────────
+#
+#   ILINK_MESSAGE="你好，简短介绍自己" ILINK_SESSION_ID="" \
+#     ILINK_CODEBUDDY_MODEL="glm-5.1-ioa" \
+#     ilink-hub-bridge profile codebuddy-code
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+profiles:
+  codebuddy:
+    type: codebuddy-code                        # 内置：自动管理 --resume / 降级
+    cwd: /Users/kongjie/projects/ilink-hub      # 工作目录，codebuddy 在此运行
+    timeout_secs: 600
+    max_reply_chars: 8000
+    env:
+      ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"      # ← 改模型从上方注释的列表中选
+      # 如需切换为 DeepSeek：
+      # ILINK_CODEBUDDY_MODEL: "deepseek-v3-2-volc-ioa"
+
+  codebuddy-new:                                # /new 前缀强制开新会话
+    type: codebuddy-code
+    cwd: /Users/kongjie/projects/ilink-hub
+    timeout_secs: 600
+    max_reply_chars: 8000
+    env:
+      ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"
+      ILINK_SESSION_ID: ""                      # 覆盖注入，强制新会话
+
+routing:
+  strategy: prefix
+  default_profile: codebuddy
+  prefix_rules:
+    - prefix: "/new "
+      profile: codebuddy-new
+
+skip_bot_messages: true
+require_text: true
+send_error_reply: true

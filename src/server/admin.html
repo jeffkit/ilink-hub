@@ -320,6 +320,97 @@
     }
     #logout-btn:hover { background: var(--border); color: var(--text); }
 
+    /* ─── Detail view (sessions + history) ─── */
+    #detail-view { display: none; }
+    #detail-view.visible { display: block; }
+
+    .detail-header {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 20px;
+    }
+    .detail-header .back-btn {
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); border-radius: 6px; padding: 5px 10px;
+      font-size: 12px; cursor: pointer; transition: all 0.15s;
+    }
+    .detail-header .back-btn:hover { background: var(--border); color: var(--text); }
+    .detail-header h2 { font-size: 15px; font-weight: 600; }
+    .detail-header .detail-badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 20px;
+      border: 1px solid var(--border); color: var(--muted);
+    }
+    .detail-header .detail-badge.online  { border-color: #166534; color: var(--green); background: #052e16; }
+    .detail-header .detail-badge.offline { background: transparent; }
+
+    /* Session cards */
+    .session-list { display: flex; flex-direction: column; gap: 8px; }
+
+    .session-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 14px 16px;
+      cursor: pointer; transition: border-color 0.15s, background 0.15s;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    .session-card:hover { border-color: var(--blue); }
+    .session-card.active { border-color: #1d4ed8; background: #0c1a3a; }
+
+    .session-card-left { flex: 1; min-width: 0; }
+    .session-card-name {
+      font-weight: 600; font-size: 13px; margin-bottom: 3px;
+      display: flex; align-items: center; gap: 6px;
+    }
+    .session-active-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--blue); flex-shrink: 0; display: inline-block;
+    }
+    .session-card-snippet {
+      font-size: 12px; color: var(--muted);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 520px;
+    }
+    .session-card-meta { font-size: 11px; color: var(--muted); white-space: nowrap; }
+    .waiting-badge {
+      font-size: 10px; padding: 1px 6px; border-radius: 10px;
+      background: #1f0808; border: 1px solid #7f1d1d; color: var(--red);
+    }
+
+    /* History panel */
+    #history-panel { display: none; }
+    #history-panel.visible { display: block; }
+
+    .history-header {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 14px;
+    }
+    .history-header h3 { font-size: 14px; font-weight: 600; }
+
+    .message-list {
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    .message-bubble {
+      max-width: 78%; padding: 10px 14px;
+      border-radius: 10px; font-size: 13px; line-height: 1.55;
+      word-break: break-word; white-space: pre-wrap;
+    }
+    .message-bubble.user {
+      align-self: flex-end;
+      background: #1d3a5c; border: 1px solid #1d4ed8; color: var(--text);
+      border-bottom-right-radius: 3px;
+    }
+    .message-bubble.assistant {
+      align-self: flex-start;
+      background: var(--surface); border: 1px solid var(--border); color: var(--text);
+      border-bottom-left-radius: 3px;
+    }
+    .message-meta {
+      font-size: 10px; color: var(--muted);
+      margin-top: 3px; padding: 0 2px;
+    }
+    .message-meta.user { text-align: right; }
+    .message-wrap { display: flex; flex-direction: column; }
+    .message-wrap.user { align-items: flex-end; }
+    .message-wrap.assistant { align-items: flex-start; }
+
+    .history-empty { color: var(--muted); font-size: 13px; padding: 20px 0; text-align: center; }
+
     /* iLink upstream status */
     #ilink-section .status-row {
       display: flex; align-items: center; gap: 12px; margin-bottom: 14px;
@@ -453,6 +544,35 @@
     </div>
   </section>
 
+  <!-- Sessions / History detail view (hidden by default) -->
+  <div id="detail-view">
+    <div class="detail-header">
+      <button class="back-btn" onclick="closeDetailView()">← Back</button>
+      <h2 id="detail-client-name"></h2>
+      <span id="detail-client-badge" class="detail-badge"></span>
+    </div>
+
+    <!-- Sessions list -->
+    <section id="sessions-section">
+      <h2>Sessions</h2>
+      <div id="sessions-list" class="session-list">
+        <div class="empty">Loading sessions…</div>
+      </div>
+    </section>
+
+    <!-- History panel (shown when a session is clicked) -->
+    <div id="history-panel">
+      <div class="form-card" style="padding:18px">
+        <div class="history-header">
+          <button class="btn btn-ghost btn-sm" onclick="closeHistory()">← Sessions</button>
+          <h3 id="history-session-name"></h3>
+          <span id="history-msg-count" style="font-size:11px;color:var(--muted);margin-left:auto"></span>
+        </div>
+        <div id="history-messages" class="message-list"></div>
+      </div>
+    </div>
+  </div>
+
   <!-- Quick commands -->
   <section>
     <h2>WeChat Commands</h2>
@@ -548,7 +668,7 @@ function renderClients(clients) {
       : '<span style="color:var(--muted)">—</span>';
 
     return `
-    <tr class="client-row" data-client-name="${esc(c.name)}" data-persona-emoji="${esc(c.persona_emoji || '')}" data-persona-name="${esc(c.persona_name || '')}">
+    <tr class="client-row" data-client-name="${esc(c.name)}" data-online="${c.online}" data-persona-emoji="${esc(c.persona_emoji || '')}" data-persona-name="${esc(c.persona_name || '')}">
       <td>
         <div class="client-name-col">
           <span class="status-dot ${c.online ? 'online' : 'offline'}"></span>
@@ -561,9 +681,7 @@ function renderClients(clients) {
       <td style="color:var(--blue)">${personaDisplay}</td>
       <td>
         <div class="client-actions">
-          <span style="font-size:11px;color:${c.online ? 'var(--green)' : 'var(--muted)'}">
-            ${c.online ? '● online' : '● offline'}
-          </span>
+          <button class="btn btn-ghost btn-sm" data-action="sessions">Sessions</button>
           <button class="btn btn-ghost btn-sm" data-action="toggle-creds" title="查看 Token / Base URL">Keys</button>
           <button class="btn btn-ghost btn-sm" data-action="edit">Edit</button>
           ${c.online ? '' : `<button class="btn btn-danger btn-sm" data-action="delete">Delete</button>`}
@@ -763,6 +881,12 @@ document.getElementById('clients-table').addEventListener('click', (e) => {
   const row = btn.closest('.client-row') || btn.closest('.edit-row') || btn.closest('.cred-row');
   const name = row ? (row.dataset.clientName || row.dataset.for) : null;
 
+  if (action === 'sessions') {
+    const clientRow = document.querySelector(`.client-row[data-client-name="${CSS.escape(name)}"]`);
+    const online = clientRow ? clientRow.dataset.online === 'true' : false;
+    openDetailView(name, online);
+    return;
+  }
   if (action === 'toggle-creds') {
     const credRow = document.querySelector(`.cred-row[data-for="${CSS.escape(name)}"]`);
     if (credRow) credRow.classList.toggle('visible');
@@ -797,6 +921,152 @@ document.getElementById('clients-table').addEventListener('click', (e) => {
     copyText(HUB_URL);
   }
 });
+
+// ─── Sessions / History detail view ──────────────────────────────────────────
+
+let detailClientName = '';
+let detailClientOnline = false;
+
+function openDetailView(name, online) {
+  detailClientName = name;
+  detailClientOnline = online;
+
+  document.getElementById('detail-client-name').textContent = name;
+  const badge = document.getElementById('detail-client-badge');
+  badge.textContent = online ? '● online' : '● offline';
+  badge.className = 'detail-badge ' + (online ? 'online' : 'offline');
+
+  // Show detail-view, hide main sections
+  document.querySelectorAll('main > section').forEach(s => s.style.display = 'none');
+  document.getElementById('detail-view').classList.add('visible');
+
+  // Reset history panel
+  closeHistory();
+
+  loadSessions(name);
+}
+
+function closeDetailView() {
+  document.getElementById('detail-view').classList.remove('visible');
+  document.querySelectorAll('main > section').forEach(s => s.style.display = '');
+  detailClientName = '';
+}
+
+async function loadSessions(clientName) {
+  const container = document.getElementById('sessions-list');
+  container.innerHTML = '<div class="empty">Loading…</div>';
+  try {
+    const r = await fetch(`/hub/clients/${encodeURIComponent(clientName)}/sessions`, {
+      headers: authHeaders(),
+    });
+    const data = await r.json();
+    if (data.ret !== 0) {
+      container.innerHTML = `<div class="empty">Failed: ${esc(data.errmsg || 'unknown error')}</div>`;
+      return;
+    }
+    renderSessions(clientName, data.sessions || []);
+  } catch (e) {
+    container.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderSessions(clientName, sessions) {
+  const container = document.getElementById('sessions-list');
+  if (!sessions.length) {
+    container.innerHTML = '<div class="empty">暂无 session 记录（backend 尚未发起过对话）</div>';
+    return;
+  }
+  container.innerHTML = sessions.map(s => {
+    const snippet = s.last_user_content
+      ? esc(s.last_user_content.slice(0, 80) + (s.last_user_content.length > 80 ? '…' : ''))
+      : '<span style="color:var(--muted);font-style:italic">（无用户消息）</span>';
+    const timeStr = s.user_msg_created_at
+      ? `<span title="${esc(s.user_msg_created_at)}">${formatRelTime(s.user_msg_created_at)}</span>`
+      : '';
+    const waitBadge = s.waiting_for_reply
+      ? `<span class="waiting-badge">等待回复</span>`
+      : '';
+    return `
+      <div class="session-card" data-session-name="${esc(s.name)}" onclick="openHistory(${JSON.stringify(clientName)}, ${JSON.stringify(s.name)})">
+        <div class="session-card-left">
+          <div class="session-card-name">
+            <span>${esc(s.name)}</span>
+            ${waitBadge}
+          </div>
+          <div class="session-card-snippet">${snippet}</div>
+        </div>
+        <div class="session-card-meta">${timeStr}</div>
+      </div>
+    `;
+  }).join('');
+}
+
+async function openHistory(clientName, sessionName) {
+  document.getElementById('sessions-section').style.display = 'none';
+  const panel = document.getElementById('history-panel');
+  panel.classList.add('visible');
+  document.getElementById('history-session-name').textContent = sessionName;
+  document.getElementById('history-messages').innerHTML = '<div class="history-empty">Loading…</div>';
+  document.getElementById('history-msg-count').textContent = '';
+
+  try {
+    const r = await fetch(
+      `/hub/clients/${encodeURIComponent(clientName)}/sessions/${encodeURIComponent(sessionName)}/history?limit=200`,
+      { headers: authHeaders() }
+    );
+    const data = await r.json();
+    if (data.ret !== 0) {
+      document.getElementById('history-messages').innerHTML =
+        `<div class="history-empty">Failed: ${esc(data.errmsg || 'unknown')}</div>`;
+      return;
+    }
+    const msgs = (data.messages || []).slice().reverse(); // newest-last for display
+    document.getElementById('history-msg-count').textContent =
+      msgs.length ? `${msgs.length} 条消息` : '';
+    renderHistory(msgs);
+  } catch (e) {
+    document.getElementById('history-messages').innerHTML =
+      `<div class="history-empty">Error: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderHistory(messages) {
+  const container = document.getElementById('history-messages');
+  if (!messages.length) {
+    container.innerHTML = '<div class="history-empty">暂无消息记录</div>';
+    return;
+  }
+  container.innerHTML = messages.map(m => {
+    const role = m.role === 'user' ? 'user' : 'assistant';
+    const label = role === 'user' ? '用户' : 'AI';
+    const timeStr = m.created_at ? formatRelTime(m.created_at) : '';
+    return `
+      <div class="message-wrap ${role}">
+        <div class="message-bubble ${role}">${esc(m.content || '')}</div>
+        <div class="message-meta ${role}">${label} · ${timeStr}</div>
+      </div>
+    `;
+  }).join('');
+  // Scroll to bottom
+  container.scrollTop = container.scrollHeight;
+}
+
+function closeHistory() {
+  document.getElementById('history-panel').classList.remove('visible');
+  document.getElementById('sessions-section').style.display = '';
+}
+
+function formatRelTime(isoStr) {
+  try {
+    const d = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
+    const diff = Date.now() - d.getTime();
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+    if (diff < 7 * 86400000) return Math.floor(diff / 86400000) + ' 天前';
+    return d.toLocaleDateString('zh-CN');
+  } catch { return isoStr || ''; }
+}
 
 // ─── iLink status + QR ───────────────────────────────────────────────────────
 

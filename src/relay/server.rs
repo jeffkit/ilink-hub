@@ -31,6 +31,10 @@ use super::ratelimit::RateLimiter;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Server sends a WebSocket Ping every 60 s to keep the connection alive.
+/// Hub relay clients disconnect after 120 s of inactivity; pinging at half
+/// that interval gives a 2× safety margin even under occasional packet loss.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 /// Max requests buffered toward a single connected Hub before we shed load.
 /// Each entry is an in-flight request awaiting a `REQUEST_TIMEOUT` response, so
 /// this bounds memory if a Hub's WebSocket write stalls; excess requests get a
@@ -169,11 +173,26 @@ async fn handle_hub_socket(state: RelayState, socket: WebSocket) {
     let register_deadline = tokio::time::sleep(REGISTER_TIMEOUT);
     tokio::pin!(register_deadline);
 
+    // Send a WebSocket Ping every KEEPALIVE_INTERVAL once the hub has registered.
+    // This prevents the hub client's idle-timeout from firing when there are no
+    // active pairing requests — without pings the client disconnects after 120 s
+    // and spends 5-38 s reconnecting, during which pairing URLs return 503.
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    // Skip the immediate first tick so we don't ping before the hub has had a
+    // chance to send the Register message (REGISTER_TIMEOUT window is 15 s, well
+    // within the 60 s interval).
+    keepalive.tick().await;
+
     loop {
         tokio::select! {
             _ = &mut register_deadline, if device_id.is_none() => {
                 warn!("hub registration timeout");
                 break;
+            }
+            _ = keepalive.tick(), if device_id.is_some() => {
+                if write.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
             }
             incoming = read.next() => {
                 let Some(msg) = incoming else { break };

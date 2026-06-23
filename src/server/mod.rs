@@ -10,7 +10,8 @@ use axum::{
     Router,
 };
 use routes::{
-    admin_ilink_qr_stream, admin_ilink_qr_stream_ticket, admin_ilink_relogin, admin_ilink_status,
+    admin_client_session_history, admin_client_sessions, admin_ilink_qr_stream,
+    admin_ilink_qr_stream_ticket, admin_ilink_relogin, admin_ilink_status,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -82,6 +83,11 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         .route(
             "/hub/clients/{name}",
             patch(admin_update_client).delete(admin_delete_client),
+        )
+        .route("/hub/clients/{name}/sessions", get(admin_client_sessions))
+        .route(
+            "/hub/clients/{name}/sessions/{session}/history",
+            get(admin_client_session_history),
         )
         .route("/hub/ui", get(admin_ui))
         .route("/hub/pair/{code}", get(pair_page))

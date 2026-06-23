@@ -8,15 +8,17 @@
 //!
 //! ## Supported built-in types
 //!
-//! | `type:` value  | CLI tool   | Session resume | Notes                                     |
-//! |----------------|------------|----------------|-------------------------------------------|
-//! | `claude-code`  | `claude`   | ✓ (`--resume`) | Anthropic Claude Code CLI                 |
-//! | `codex`        | `codex`    | ✗              | OpenAI Codex CLI (`@openai/codex`)        |
-//! | `cursor`       | `cursor`   | ✓ (optional)   | Cursor background agent CLI               |
-//! | `agy`          | `agy`      | ✓ (`--conversation`) | Google Antigravity CLI             |
+//! | `type:` value      | CLI tool      | Session resume | Notes                                     |
+//! |--------------------|---------------|----------------|-------------------------------------------|
+//! | `claude-code`      | `claude`      | ✓ (`--resume`) | Anthropic Claude Code CLI                 |
+//! | `codebuddy-code`   | `codebuddy`   | ✓ (`--resume`) | CodeBuddy Code CLI (stream-json compat)   |
+//! | `codex`            | `codex`       | ✗              | OpenAI Codex CLI (`@openai/codex`)        |
+//! | `cursor`           | `cursor`      | ✓ (optional)   | Cursor background agent CLI               |
+//! | `agy`              | `agy`         | ✓ (`--conversation`) | Google Antigravity CLI             |
 
 mod agy;
 mod claude_code;
+mod codebuddy_code;
 mod codex;
 mod common;
 mod cursor;
@@ -27,12 +29,13 @@ mod cursor;
 pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
     match profile_type {
         "claude-code" => claude_code::run().await,
+        "codebuddy-code" => codebuddy_code::run().await,
         "codex" => codex::run().await,
         "cursor" => cursor::run().await,
         "agy" => agy::run().await,
         other => anyhow::bail!(
             "unknown built-in profile type `{other}`; \
-             supported: claude-code, codex, cursor, agy"
+             supported: claude-code, codebuddy-code, codex, cursor, agy"
         ),
     }
 }

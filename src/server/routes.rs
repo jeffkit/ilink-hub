@@ -1066,6 +1066,116 @@ pub async fn admin_ilink_qr_stream(
     Ok(Sse::new(s).keep_alive(KeepAlive::default()))
 }
 
+// ─── Admin: client sessions list ─────────────────────────────────────────────
+
+pub async fn admin_client_sessions(
+    _admin: AdminGuard,
+    State(state): State<Arc<HubState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let vtoken = {
+        let registry = state.clients.registry.read().await;
+        registry.get_by_name(name.trim()).map(|c| c.vtoken.clone())
+    };
+    let Some(vtoken) = vtoken else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ret": 404, "errmsg": "Client not found"})),
+        );
+    };
+
+    match state
+        .store
+        .get_all_session_entries_per_vtoken(std::slice::from_ref(&vtoken))
+        .await
+    {
+        Ok(mut map) => {
+            let entries = map.remove(&vtoken).unwrap_or_default();
+            let sessions: Vec<_> = entries
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "name": e.session_name,
+                        "last_user_content": e.last_user_content,
+                        "waiting_for_reply": e.waiting_for_reply,
+                        "user_msg_created_at": e.user_msg_created_at,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ret": 0, "sessions": sessions})),
+            )
+        }
+        Err(e) => {
+            error!(error = %e, client = %name, "failed to list sessions");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ret": 500, "errmsg": "Failed to list sessions"})),
+            )
+        }
+    }
+}
+
+// ─── Admin: client session history ───────────────────────────────────────────
+
+#[derive(Debug, serde::Deserialize, Default)]
+pub struct AdminHistoryQuery {
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+pub async fn admin_client_session_history(
+    _admin: AdminGuard,
+    State(state): State<Arc<HubState>>,
+    axum::extract::Path((name, session_name)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<AdminHistoryQuery>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let vtoken = {
+        let registry = state.clients.registry.read().await;
+        registry.get_by_name(name.trim()).map(|c| c.vtoken.clone())
+    };
+    let Some(vtoken) = vtoken else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"ret": 404, "errmsg": "Client not found"})),
+        );
+    };
+
+    let limit = query.limit.unwrap_or(100);
+    match state
+        .store
+        .list_messages_for_session(&vtoken, &session_name, limit)
+        .await
+    {
+        Ok(rows) => {
+            let messages: Vec<_> = rows
+                .into_iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "role": m.role,
+                        "content": m.content,
+                        "created_at": m.created_at,
+                        "peer_user_id": m.peer_user_id,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"ret": 0, "messages": messages})),
+            )
+        }
+        Err(e) => {
+            error!(error = %e, client = %name, session = %session_name, "failed to fetch history");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"ret": 500, "errmsg": "Failed to fetch history"})),
+            )
+        }
+    }
+}
+
 // ─── Web Admin UI ─────────────────────────────────────────────────────────────
 
 static ADMIN_HTML: &str = include_str!("admin.html");
