@@ -1,0 +1,18 @@
+# Review Request for Milestone M1
+milestone: m1
+title: "M1: E-01 上游输入状态（typing status）错误传播修复"
+status: completed
+created_at: 2026-06-12T17:55:00+08:00
+changes:
+  - file: "src/ilink/upstream.rs"
+    description: "在 send_typing 方法中引入 error_for_status() 保证 HTTP 错误能够正确抛出为 Err"
+  - file: "src/server/routes.rs"
+    description: "更新 sendtyping 处理器以捕获 state.upstream.send_typing() 的错误，并返回带 ret: 500 及对应 errmsg 的 JSON"
+  - file: "tests/breaking_changes.rs"
+    description: "增加 sendtyping_error_propagation_test 集成测试用例，通过本地模拟服务测试 200 成功和 500 失败下的错误传播表现"
+verification:
+  fmt: "cargo fmt --check"
+  clippy: "cargo clippy -- -D warnings"
+  test: "cargo test"
+  build: "cargo build"
+  status: "Passed (All Green)"

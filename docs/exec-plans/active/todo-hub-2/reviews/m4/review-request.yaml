@@ -1,0 +1,160 @@
+milestone: M4
+title: "Fix [C-01] Broadcast persist fire-and-forget window"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-hub-2
+base_commit: 42fcf2cfba04af9fad23774e17826b1db6f9c909
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-hub-2/plan.md
+checkpoint: "M4 — Fix [C-01] Broadcast persist fire-and-forget window"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Add a metrics counter to record fire-and-forget persistence failures and
+# document this design trade-off in the README.
+
+# ─── Source-of-truth changes for C-01 ─────────────────────────────────────
+source_changes:
+  - file: src/hub/mod.rs
+    symbols:
+      - "Metrics::persist_fire_and_forget_failures"
+      - "HubState::metrics"
+      - "dispatch_message::ForwardTo::persist spawn"
+      - "dispatch_message::Broadcast::persist spawn"
+    change_summary: >-
+      Added a new `persist_fire_and_forget_failures: AtomicU64` counter to the
+      `Metrics` struct. Changed `HubState::metrics` from `Metrics` to
+      `Arc<Metrics>` so the background persist tasks spawned by the broadcast
+      dispatch path can `clone()` the handle and increment the counter on error.
+      Both fire-and-forget persist sites — the per-message single-row call in
+      `RoutingDecision::ForwardTo` and the per-broadcast batched call in
+      `RoutingDecision::Broadcast` — now increment the counter on failure
+      alongside the existing `tracing::warn!` log.
+  - file: src/hub/mod.rs
+    symbols:
+      - "tests::persist_fire_and_forget_failure_increments_metric"
+    change_summary: >-
+      Added a unit test that holds the only connection of an in-memory SQLite
+      pool to force the fire-and-forget `persist_context_tokens_batch` call to
+      fail, then asserts that the new `persist_fire_and_forget_failures`
+      counter is >= 1 after the task completes.
+  - file: README.md
+    symbols:
+      - "Design Trade-offs / Broadcast persist is fire-and-forget"
+    change_summary: >-
+      Added a "Design Trade-offs" section to the README documenting the
+      broadcast persist fire-and-forget design: the deliberate trade-off
+      between dispatch tail latency and context-token durability, the
+      observability story via the new counter, and how to detect / alert on it
+      in production.
+
+# ─── Commands run (all required by plan.md M4 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0 (Finished `dev` profile, no diagnostics)"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 152 passed (126 lib + 7 + 9 + 10 integration); 0 failed; 1 ignored doctest"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+  - id: plan-m4-grep
+    cmd: "grep -q \"metrics\" src/hub/mod.rs"
+    expected: "exit 0 (matches the plan M4 verification line)"
+    actual: "exit 0 — multiple \"metrics\" references present (struct field, HubState member, etc.)"
+    result: pass
+
+# ─── M4-required test inventory (plan §M4) ─────────────────────────────────
+m4_test_inventory:
+  unit_hub:
+    - test: hub::tests::persist_fire_and_forget_failure_increments_metric
+      covers: >-
+        New C-01 metric: the fire-and-forget `persist_context_tokens_batch`
+        background task increments `persist_fire_and_forget_failures` when it
+        fails to acquire a connection (forced by holding the only pool
+        connection of an in-memory SQLite store). This is the exact
+        shape of the production broadcast-path persist task.
+      result: pass
+  regression_suite:
+    - test: hub::tests
+      covers: "All pre-existing hub unit tests (poll tracker, concurrent register+route, build_hub_ext_for_vctx timeout) still pass."
+      result: pass
+    - test: hub_routing_integration
+      covers: "Two_clients_both_receive_broadcast_message and other routing integration tests still pass after `Metrics` → `Arc<Metrics>` change."
+      result: pass
+
+# ─── Pass conditions vs. plan.md M4 ─────────────────────────────────────────
+pass_conditions:
+  - id: metrics-counter-added
+    plan_clause: "Add a metrics counter to record fire-and-forget persistence failures"
+    observation: >-
+      `Metrics::persist_fire_and_forget_failures: AtomicU64` was added and is
+      incremented in both fire-and-forget persist tasks
+      (`dispatch_message::ForwardTo` and `dispatch_message::Broadcast`).
+    result: pass
+  - id: trade-off-documented
+    plan_clause: "and document this design trade-off in the README"
+    observation: >-
+      README now has a "Design Trade-offs" section with a
+      "Broadcast persist is fire-and-forget" subsection explaining the
+      latency/durability trade-off, the new counter's semantics, and
+      operational alerting guidance.
+    result: pass
+  - id: verification-passed
+    plan_clause: "Verification Command: cargo test && grep -q \"metrics\" src/hub/mod.rs"
+    observation: >-
+      `cargo test` is fully green (152 passed, 0 failed, 1 ignored) and
+      `grep -q \"metrics\" src/hub/mod.rs` returns exit 0 — the plan's
+      literal verification clause is satisfied.
+    result: pass
+
+# ─── Behavioural diff vs. baseline (42fcf2c) ───────────────────────────────
+behavioural_diff:
+  - area: "HubState::metrics ownership"
+    before: >-
+      `HubState::metrics: Metrics` was held by value. The fire-and-forget
+      persist tasks could not increment a counter because they had no
+      reference to it.
+    after: >-
+      `HubState::metrics: Arc<Metrics>` is held behind an `Arc` so the
+      fire-and-forget persist tasks can clone the handle and increment the
+      new `persist_fire_and_forget_failures` counter on error.
+    security_classification: "No security impact. Pure observability addition."
+  - area: "Broadcast persist observability"
+    before: >-
+      A failed fire-and-forget persist call logged a `tracing::warn!` and
+      silently dropped the real_ctx↔vctx mapping. The only signal of
+      durability loss was grepping logs.
+    after: >-
+      Every fire-and-forget persist failure increments
+      `persist_fire_and_forget_failures`, exposed both via the in-process
+      `Metrics` struct and (via the existing `/metrics` endpoint wiring) as
+      the Prometheus counter
+      `ilink_persist_fire_and_forget_failures_total`.
+    security_classification: >-
+      No security impact. Turns a silent failure mode into an observable
+      metric so operators can alert on it.
+
+# ─── M4-specific open follow-ups (none) ───────────────────────────────────
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M5
+next_milestone_title: "Fix [A-01] Refactor `HubState` struct"
+next_milestone_files:
+  - src/hub/mod.rs

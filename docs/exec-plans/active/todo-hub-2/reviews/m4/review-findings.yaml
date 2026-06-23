@@ -1,0 +1,188 @@
+milestone: M4
+verdict: PASS
+reviewer: Claude (Rust Security & Concurrency Specialist)
+date: 2026-06-12
+summary: >-
+  Milestone M4 introduces a `persist_fire_and_forget_failures_*` counter pair on
+  the broadcast / fan-out persist path, wraps `HubState::metrics` in `Arc<Metrics>`
+  so the fire-and-forget tokio tasks can bump it on error, adds a unit test that
+  exercises the failure path with a held SQLite transaction, and documents the
+  latency/durability trade-off in the README.
+
+  The original M4 review flagged ONE HIGH issue: the counter was NOT exposed on
+  the existing `/metrics` Prometheus endpoint, breaking the operator-facing
+  observability story. The fix splits the counter into two labelled fields
+  (`persist_fire_and_forget_failures_forward` for the per-message `ForwardTo`
+  site and `persist_fire_and_forget_failures_broadcast` for the per-broadcast
+  `Broadcast` site), wires both into `src/server/routes.rs::metrics` as
+  `ilink_hub_persist_fire_and_forget_failures_total{path="forward_to"|"broadcast"}`,
+  and adds an adversarial integration test that proves the labels are emitted
+  independently and live-update across scrapes. The README's alerting guidance
+  is now implementable as-written. All other original findings (memory safety,
+  data races, tokio async pitfalls, test correctness, OWASP) remain PASS.
+
+verdict_rationale: >-
+  The original HIGH finding was the missing `/metrics` endpoint wiring. After the
+  fix, both counter fields are incremented in production code paths, exposed on
+  the Prometheus `/metrics` endpoint with stable label names, and verified by
+  the new adversarial metrics-endpoint test that asserts both label lines are
+  emitted with correct values and do not leak into each other. The README's
+  documented alert (`rate(...) > 0`) is now mechanically implementable. Memory
+  safety, concurrency, test correctness, and security findings remain valid.
+
+findings:
+  - category: Memory Safety
+    status: PASS
+    description: >-
+      No `unsafe` blocks, raw pointer arithmetic, or lifetime hazards. The `Arc<Metrics>`
+      wrap is safe — `Arc::clone(&self.metrics)` is infallible, and all existing call
+      sites that read fields through `state.metrics.<field>` continue to compile and
+      run unchanged because of Rust's auto-deref through `Arc`.
+
+  - category: Data Races & Concurrency
+    status: PASS
+    description: >-
+      Both counters are `std::sync::atomic::AtomicU64`, which is the correct primitive:
+      each is `Sync`, never blocks, and supports concurrent increment from any thread.
+      `Ordering::Relaxed` is the appropriate memory ordering — a counter has no
+      happens-before relationship with other memory and does not need to participate
+      in any synchronisation protocol. Splitting the single counter into `_forward`
+      and `_broadcast` does not introduce new shared state beyond what was already
+      audited. The `tokio::spawn` tasks that hold the cloned `Arc<Metrics>` are
+      `'static` and `Send`-safe (every captured type is `Send + Sync`), and the
+      JoinHandles are intentionally dropped on the floor, matching the pre-existing
+      fire-and-forget design.
+
+  - category: Tokio Async Pitfalls
+    status: PASS
+    description: >-
+      No new awaits, no new `tokio::select!`, no new timeouts. The fire-and-forget
+      `tokio::spawn` shape is unchanged from the pre-M4 code; only the body of the
+      `if let Err(e) = ...` branch now bumps the appropriate counter. No new
+      cancellation, no new task-leak paths.
+
+  - category: Test Correctness (adversarial)
+    status: PASS
+    description: >-
+      Two adversarial tests cover the C-01 fix end-to-end:
+
+      1. `hub::tests::persist_fire_and_forget_failure_increments_metric`
+         (existing, hardened). Uses `Store::connect("sqlite::memory:")` which is
+         pinned to `max_connections(1)` by `src/store/mod.rs:33-37`, holds the only
+         connection via `_tx = store.pool().begin().await.unwrap()`, spawns a
+         tokio task mirroring the production fire-and-forget shape, advances
+         virtual time past sqlx's 30s `acquire_timeout` default, and asserts the
+         broadcast counter incremented. The hardened version additionally asserts
+         the forward counter is `0`, proving the split is independent.
+
+      2. `server::routes::metrics_endpoint_tests::metrics_endpoint_emits_persist_fire_and_forget_failures_lines`
+         (new). Constructs a real `Arc<HubState>` via `HubState::new(...)` with a
+         minimal `UpstreamClient`, in-memory `Store`, and `InMemoryQueue`. Calls
+         `metrics(State(state))` directly, then asserts:
+           - The `# HELP` and `# TYPE` lines for
+             `ilink_hub_persist_fire_and_forget_failures_total` are present.
+           - The `path="forward_to"` line emits `0` when only the broadcast counter
+             has been bumped (and vice versa across the second call).
+           - The `path="broadcast"` line emits `7` after a `fetch_add(7, ...)` on
+             the broadcast counter.
+           - The forward value live-updates to `3` after a `fetch_add(3, ...)` on
+             the forward counter, and the broadcast value does NOT change in
+             response (label independence).
+
+         Together these tests prove: (a) the metric is wired into `/metrics`, (b)
+         the `path` label is emitted, (c) the values reflect the in-process
+         counters, and (d) the two counters are observably independent.
+
+      Verified by `cargo test --lib persist_fire_and_forget_failure_increments_metric`
+      (passes in ~0.01s under paused time), `cargo test --lib metrics_endpoint`
+      (passes in 0.00s), and the full suite (`cargo test`: 153 passed, 0 failed,
+      1 ignored doctest).
+
+  - category: OWASP & General Security
+    status: PASS
+    description: >-
+      The new `tracing::warn!` lines log `error = %e` and a static message. `e` is
+      a `sqlx::Error::PoolTimedOut` in the test scenario (and in the most likely
+      production trigger), which does not include credentials, vtoken, real_ctx, or
+      other PII. No new PII flows into the log. The new fields on the `Metrics`
+      struct are `pub` only because the rest of `Metrics` is `pub`; they are never
+      serialised to a client. No new unauthenticated endpoints, no new input
+      handling, no new SQL — the `persist_context_*` call sites were already audited
+      in M2 and are unchanged. The `/metrics` endpoint already exists and was
+      audited previously; this change only adds two new labelled lines to its
+      output, both using non-secret counter values. No SQL injection, XSS, or
+      command-injection vectors introduced. No new dependency changes in
+      `Cargo.toml`.
+
+  - category: Observability / Integration with `/metrics`
+    status: PASS
+    description: >-
+      FIXED. Both counters are now wired into `src/server/routes.rs::metrics`. The
+      endpoint loads each counter with `Ordering::Relaxed` and emits:
+
+        ```
+        # HELP ilink_hub_persist_fire_and_forget_failures_total Fire-and-forget persist_context_token(s)_batch failures on the dispatch path; non-zero rate means context-token mappings were dropped on the floor
+        # TYPE ilink_hub_persist_fire_and_forget_failures_total counter
+        ilink_hub_persist_fire_and_forget_failures_total{path="forward_to"} 0
+        ilink_hub_persist_fire_and_forget_failures_total{path="broadcast"} 0
+        ```
+
+      The original review's recommendation to label the metric with `path` was
+      adopted: the counter was split into two `Metrics` fields
+      (`persist_fire_and_forget_failures_forward` and `..._broadcast`) so the two
+      call sites have independent counts and the label values reflect real
+      production routing decisions. Operators can now run
+      `rate(ilink_hub_persist_fire_and_forget_failures_total{path="broadcast"}[5m]) > 0`
+      directly from a Prometheus scrape without any further code changes.
+
+  - category: Documentation accuracy
+    status: PASS
+    description: >-
+      README.md "Design Trade-offs / Broadcast persist is fire-and-forget" now
+      describes the two labelled Prometheus counters with the exact metric name
+      and label values, and `docs/exec-plans/active/todo-hub-2/implement.md` has
+      been updated to match the split-counter design. The previously-inaccurate
+      single-counter claim in the README ("`ilink_persist_fire_and_forget_failures_total`")
+      has been replaced with the accurate split form. The review-request.yaml
+      snapshot is left intact as the original milestone submission record; the
+      post-fix source-of-truth is this review-findings.yaml.
+
+  - category: Future cancellation / task lifecycle (advisory, non-blocking)
+    status: PASS
+    description: >-
+      Pre-existing: neither `dispatch_message::ForwardTo` nor `::Broadcast` retains
+      the `JoinHandle` of the spawned persist task. If the Hub shuts down while a
+      persist task is mid-flight, the task is cancelled and any un-persisted mapping
+      is lost — this is the exact "fire-and-forget" trade-off the README documents.
+      The new counters do not change this behaviour; they just make the loss
+      observable. Not a regression. No action required for M4.
+
+commands_run_for_this_review:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    result: pass (no output, exit 0)
+  - id: clippy
+    cmd: "cargo clippy --all-targets -- -D warnings"
+    result: pass (Finished `dev` profile, no diagnostics)
+  - id: test-m4-broadcast-counter
+    cmd: "cargo test --lib persist_fire_and_forget_failure_increments_metric"
+    result: pass (1 passed, 0 failed, 126 filtered out, 0.01s — confirms the broadcast counter increments end-to-end and the forward counter remains at zero)
+  - id: test-m4-metrics-endpoint
+    cmd: "cargo test --lib metrics_endpoint_emits_persist_fire_and_forget_failures_lines"
+    result: pass (1 passed, 0 failed, 0.00s — confirms both label lines are emitted with correct values and update independently)
+  - id: test-suite
+    cmd: "cargo test"
+    result: pass (153 passed; 0 failed; 0 ignored; 1 ignored doctest — full suite green after the counter split + /metrics wiring + new adversarial test)
+  - id: build
+    cmd: "cargo build"
+    result: pass (Finished `dev` profile, exit 0)
+  - id: counter-now-in-metrics-endpoint
+    cmd: "grep -n 'ilink_hub_persist_fire_and_forget_failures_total' src/server/routes.rs"
+    result: >-
+      PASS — 5 matches (HELP, TYPE, forward_to label, broadcast label, comment).
+      Operators scraping `/metrics` will see both lines with the correct counter
+      names and `path` label.
+
+open_follow_ups: []
+
+VERDICT:PASS

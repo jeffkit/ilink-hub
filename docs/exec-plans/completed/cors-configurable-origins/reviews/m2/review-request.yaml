@@ -1,0 +1,28 @@
+milestone: M2
+description: "边界处理 — permissive fallback WARN 日志 + 非法 origin 格式启动报错"
+files:
+  - src/server/mod.rs
+checks:
+  - name: fmt
+    command: cargo fmt --check
+    result: pass
+  - name: clippy
+    command: cargo clippy -- -D warnings
+    result: pass
+  - name: test
+    command: cargo test
+    result: "254 passed, 0 failed"
+  - name: build
+    command: cargo build
+    result: pass
+  - name: desktop-frontend
+    command: cd desktop/ilink-hub-desktop && npm run build
+    result: pass
+  - name: desktop-tauri
+    command: cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+    result: pass
+changes:
+  - "parse_origins: 拒绝不含 :// 的 origin（如 bad-origin、*、null）"
+  - "build_cors_layer: fallback 分支添加 tracing::warn! 日志"
+  - "测试更新: origins_rejects_wildcard/null 改为 should_panic"
+  - "新增测试: origins_rejects_no_scheme, origins_rejects_mixed_with_bad_origin"

@@ -1,0 +1,100 @@
+milestone: M2
+title: "Fix [TO-02] DB queries timeout in `build_hub_ext_for_vctx`"
+status: passed
+date: 2026-06-12
+worktree: /Users/kongjie/projects/ilink-hub/.worktrees/todo-hub-2
+base_commit: 5b5b1814f711748fcaa8b06f01b9dda84198f19c
+toolchain:
+  rustc: "1.95.0 (59807616e 2026-04-14)"
+  cargo: "1.95.0 (f2d3ce0bd 2026-03-21)"
+
+# ─── Plan reference ─────────────────────────────────────────────────────────
+plan: docs/exec-plans/active/todo-hub-2/plan.md
+checkpoint: "M2 — Fix [TO-02] DB queries timeout in `build_hub_ext_for_vctx`"
+
+# ─── Scope of this checkpoint ──────────────────────────────────────────────
+# Wrap DB queries (`get_active_session_name` and `get_backend_session`) inside `build_hub_ext_for_vctx`
+# with `tokio::time::timeout(Duration::from_secs(5), ...)` and handle timeouts gracefully.
+
+# ─── Source-of-truth changes for TO-02 ─────────────────────────────────────
+source_changes:
+  - file: src/hub/mod.rs
+    symbols:
+      - "build_hub_ext_for_vctx"
+    change_summary: >-
+      Wrapped DB queries `get_active_session_name` and `get_backend_session` inside `build_hub_ext_for_vctx`
+      with `tokio::time::timeout(Duration::from_secs(5), ...)` and handled timeouts gracefully.
+      When a timeout or query error occurs, the function logs a warning and falls back to default values
+      ("default" for session name and None for session ID).
+  - file: src/store/mod.rs
+    symbols:
+      - "Store::pool"
+    change_summary: >-
+      Added a `#[cfg(test)] pub fn pool(&self) -> &sqlx::AnyPool` accessor to allow unit tests to
+      temporarily lock the SQLite connection pool.
+
+# ─── Commands run (all required by plan.md M2 + task prompt) ───────────────
+commands:
+  - id: fmt
+    cmd: "cargo fmt --check"
+    expected: "no output, exit 0"
+    actual: "no output, exit 0"
+    result: pass
+  - id: clippy
+    cmd: "cargo clippy -- -D warnings"
+    expected: "no warnings, exit 0"
+    actual: "no warnings, exit 0"
+    result: pass
+  - id: test
+    cmd: "cargo test"
+    expected: "all tests pass, 0 failures"
+    actual: "all tests pass, 123 passed; 0 failed; 0 ignored"
+    result: pass
+  - id: build
+    cmd: "cargo build"
+    expected: "Finished `dev` profile, exit 0"
+    actual: "Finished `dev` profile, exit 0"
+    result: pass
+
+# ─── M2-required test inventory (plan §M2) ─────────────────────────────────
+m2_test_inventory:
+  unit_hub:
+    - test: hub::tests::test_build_hub_ext_for_vctx_timeout
+      covers: "Graceful timeout handling when get_active_session_name queries block/timeout"
+      result: pass
+    - test: hub::tests::test_build_hub_ext_for_vctx_timeout_with_session_override
+      covers: "Graceful timeout handling when get_backend_session queries block/timeout under session override"
+      result: pass
+
+# ─── Pass conditions vs. plan.md M2 ─────────────────────────────────────────
+pass_conditions:
+  - id: wrap-db-queries-timeout
+    plan_clause: "Wrap DB queries (get_active_session_name and get_backend_session) inside build_hub_ext_for_vctx with tokio::time::timeout(Duration::from_secs(5), ...)"
+    observation: "Both queries are wrapped with `tokio::time::timeout(std::time::Duration::from_secs(5), ...).await`."
+    result: pass
+  - id: graceful-timeout-handling
+    plan_clause: "and handle timeouts gracefully"
+    observation: "When a timeout (or DB error) occurs, the warning is logged via `tracing::warn` and it falls back safely to default values ('default' for session_name, None for session_id)."
+    result: pass
+  - id: verification-passed
+    plan_clause: "Verification Command: cargo test --lib hub::tests"
+    observation: "Added unit tests verifying the timeout behavior, running cleanly in both timeout cases."
+    result: pass
+
+# ─── Behavioural diff vs. baseline (5b5b181) ───────────────────────────────
+behavioural_diff:
+  - area: "build_hub_ext_for_vctx database queries"
+    before: >-
+      `get_active_session_name` and `get_backend_session` queries could block indefinitely if database connection or lock was held, potentially causing inbound message routing to timeout.
+    after: >-
+      Queries are now guarded with a 5-second timeout, falling back gracefully to standard defaults.
+    security_classification: "No security impact. Improves reliability and avoids service stagnation."
+
+# ─── M2-specific open follow-ups (none) ───────────────────────────────────
+open_follow_ups: []
+
+# ─── Next milestone ────────────────────────────────────────────────────────
+next_milestone: M3
+next_milestone_title: "Fix [S-01] vtoken exposure in debug logs"
+next_milestone_files:
+  - src/hub/router.rs
