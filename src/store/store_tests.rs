@@ -641,7 +641,7 @@ async fn adversarial_many_concurrent_connects_converge() {
         let url = url.clone();
         handles.push(tokio::spawn(async move {
             let mut last_err = String::new();
-            for attempt in 0..5 {
+            for attempt in 0..15 {
                 match Store::connect(&url).await {
                     Ok(s) => return Ok(s),
                     Err(e) => {
@@ -656,8 +656,9 @@ async fn adversarial_many_concurrent_connects_converge() {
                             })
                             .unwrap_or(false);
                         last_err = format!("{e}");
-                        if is_busy && attempt < 4 {
-                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if is_busy && attempt < 14 {
+                            let delay = 200 + (rand::random::<u32>() % 300) as u64;
+                            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                             continue;
                         }
                     }

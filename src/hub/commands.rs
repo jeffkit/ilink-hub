@@ -47,313 +47,46 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
     debug!(?cmd, from_user_id, context_token = %real_ctx, "handling hub command");
 
     let reply_text = match cmd {
-        HubCommand::List => {
-            let registry = state.clients.registry.read().await;
-            let clients = registry.all_clients();
-            if clients.is_empty() {
-                "尚未注册任何后端客户端。".to_string()
-            } else {
-                let active_vtoken = {
-                    let router = state.routing.router.lock().await;
-                    router.get_route(&from_user_id).map(str::to_string)
-                };
-                let active_name = active_vtoken.as_deref().and_then(|vt| {
-                    clients
-                        .iter()
-                        .find(|c| c.vtoken == vt)
-                        .map(|c| c.name.as_str())
-                });
-                let mut lines = vec!["**已注册的后端：**".to_string()];
-                for c in clients {
-                    let status = if c.online { "🟢" } else { "🔴" };
-                    let label = c.label.as_deref().unwrap_or(&c.name);
-                    let selected = if active_name == Some(c.name.as_str()) {
-                        " ✅"
-                    } else {
-                        ""
-                    };
-                    lines.push(format!("{} `{}`{} — {}", status, c.name, selected, label));
-                }
-                match active_name {
-                    Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
-                    None => lines.push("\n当前未选中（广播模式）".to_string()),
-                }
-                lines.push("用 `/use <名称>`（或 `/u <名称>`）切换后端，或发送 `@<名称> <消息>` 直接发起临时会话。".to_string());
-                lines.join("\n")
-            }
-        }
-        HubCommand::UseClient(ref name) => {
-            let registry = state.clients.registry.read().await;
-            if let Some(client) = registry.get_by_name(name) {
-                let vtoken = client.vtoken.clone();
-                drop(registry);
-
-                if let Err(e) = state.store.set_route(&from_user_id, &vtoken).await {
-                    warn!(error = %e, "failed to persist route to DB");
-                    format!("⚠️ 切换到 `{}` 失败（数据库写入错误），请重试", name)
-                } else {
-                    let mut router = state.routing.router.lock().await;
-                    router.set_route(&from_user_id, vtoken.clone());
-                    format!("✅ 已切换到 `{}`", name)
-                }
-            } else {
-                format!(
-                    "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。",
-                    name
-                )
-            }
-        }
+        HubCommand::List => handle_cmd_list(&state, &from_user_id).await,
+        HubCommand::UseClient(ref name) => handle_cmd_use(&state, &from_user_id, name).await,
         HubCommand::Broadcast(ref text) => {
-            let online = {
-                let registry = state.clients.registry.read().await;
-                registry
-                    .online_clients()
-                    .iter()
-                    .map(|c| c.vtoken.clone())
-                    .collect::<Vec<_>>()
-            };
-            for vtoken in &online {
-                // Unscoped vctx (see broadcast note in dispatch_message): keeps each backend's
-                // session namespace consistent between directed and broadcast routing.
-                let vctx = super::dispatch::resolve_vctx_for_message(
-                    &state,
-                    &real_ctx,
-                    &from_user_id,
-                    msg.group_id.as_deref(),
-                    None,
-                )
-                .await;
-                let mut m = msg.clone();
-                let hub_ext =
-                    super::dispatch::build_hub_ext_for_vctx(&state.store, &vctx, vtoken, None)
-                        .await;
-                m.context_token = Some(vctx.clone());
-                m.ilink_hub_ext = hub_ext;
-                // Replace text content in item_list
-                if let Some(items) = &mut m.item_list {
-                    let items_mut = std::sync::Arc::make_mut(items);
-                    if let Some(first) = items_mut.first_mut() {
-                        if let Some(ti) = &mut first.text_item {
-                            ti.text = Some(text.clone());
-                        }
-                    }
-                }
-                match state.clients.queue.push(vtoken, m).await {
-                    Ok(false) => {
-                        state
-                            .metrics
-                            .messages_dispatched
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(true) => {
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push hub broadcast message");
-                        state
-                            .metrics
-                            .messages_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-            format!("📡 Broadcast to {} client(s)", online.len())
+            handle_cmd_broadcast(&state, &from_user_id, &real_ctx, &msg, text).await
         }
-        HubCommand::Status => {
-            let (online, total, online_clients) = {
-                let registry = state.clients.registry.read().await;
-                let all = registry.all_clients();
-                let online = registry.online_clients().len();
-                let total = all.len();
-                // Only online clients are shown in the overview.
-                let online_clients: Vec<(String, String)> = all
-                    .iter()
-                    .filter(|c| c.online)
-                    .map(|c| (c.name.clone(), c.vtoken.clone()))
-                    .collect();
-                (online, total, online_clients)
-            };
-            let vtokens: Vec<String> = online_clients.iter().map(|(_, vt)| vt.clone()).collect();
-            let all_sessions_map = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                state.store.get_all_session_entries_per_vtoken(&vtokens),
+        HubCommand::Status => handle_cmd_status(&state).await,
+        HubCommand::Help => handle_cmd_help(),
+        HubCommand::SessionList => {
+            handle_cmd_session_list(&state, &from_user_id, &real_ctx, msg.group_id.as_deref()).await
+        }
+        HubCommand::SessionNew(ref session_name, ref initial_uuid) => {
+            handle_cmd_session_new(
+                &state,
+                &from_user_id,
+                &real_ctx,
+                msg.group_id.as_deref(),
+                session_name,
+                initial_uuid,
             )
             .await
-            .unwrap_or_else(|_| {
-                warn!("get_all_session_entries_per_vtoken timed out in /status");
-                Ok(std::collections::HashMap::new())
-            })
-            .unwrap_or_default();
-            // Build per-client session list: (client_name, Vec<SessionStatusEntry>)
-            let client_sessions: Vec<(String, Vec<crate::store::SessionStatusEntry>)> =
-                online_clients
-                    .into_iter()
-                    .map(|(name, vtoken)| {
-                        let sessions = all_sessions_map.get(&vtoken).cloned().unwrap_or_default();
-                        (name, sessions)
-                    })
-                    .collect();
-            messages::hub_status(online, total, &client_sessions)
         }
-        HubCommand::Help => build_help_text(),
-
-        HubCommand::SessionList => {
-            let (vctx, vtoken) =
-                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
-                    .await;
-            match vtoken {
-                None => messages::NO_BACKEND.to_string(),
-                Some(vtoken) => {
-                    // Resolve the backend display name for the reply header.
-                    let backend_name = {
-                        let registry = state.clients.registry.read().await;
-                        registry
-                            .all_clients()
-                            .into_iter()
-                            .find(|c| c.vtoken == vtoken)
-                            .map(|c| c.name.clone())
-                            // Fall back to a redacted token, never the raw bearer
-                            // credential — this string is sent to the WeChat user.
-                            .unwrap_or_else(|| crate::redact_token(&vtoken))
-                    };
-                    let active = state
-                        .store
-                        .get_active_session_name(&vctx, &vtoken)
-                        .await
-                        .unwrap_or_else(|_| "default".to_string());
-                    match state.store.list_backend_sessions(&vctx, &vtoken).await {
-                        Ok(sessions) if sessions.is_empty() => {
-                            format!(
-                                "当前后端 `{backend_name}` {}",
-                                messages::SESSION_LIST_NO_SESSIONS
-                            )
-                        }
-                        Ok(sessions) => {
-                            let mut lines =
-                                vec![format!("**后端 `{backend_name}` 的 sessions：**")];
-                            for s in &sessions {
-                                let marker = if s.session_name == active { " ✅" } else { "" };
-                                let uuid_hint = if s.backend_session_id.is_empty() {
-                                    messages::SESSION_SLOT_NO_UUID.to_string()
-                                } else {
-                                    format!(
-                                        "`{}`",
-                                        s.backend_session_id.chars().take(12).collect::<String>()
-                                    )
-                                };
-                                lines.push(format!(
-                                    "• `{}`{} — {}",
-                                    s.session_name, marker, uuid_hint
-                                ));
-                            }
-                            lines.push(format!("\n当前活跃：`{}`", active));
-                            lines.push(messages::SESSION_LIST_SWITCH_HINT.to_string());
-                            lines.join("\n")
-                        }
-                        Err(e) => messages::session_list_failed(&e),
-                    }
-                }
-            }
-        }
-
-        HubCommand::SessionNew(ref session_name, ref initial_uuid) => {
-            let (vctx, vtoken) =
-                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
-                    .await;
-            match vtoken {
-                None => messages::NO_BACKEND.to_string(),
-                Some(vtoken) => {
-                    match state
-                        .store
-                        .set_backend_session(&vctx, &vtoken, session_name, initial_uuid)
-                        .await
-                    {
-                        Ok(()) => {
-                            let switch_result = state
-                                .store
-                                .set_active_session_name(&vctx, &vtoken, session_name)
-                                .await;
-                            match switch_result {
-                                Ok(()) => messages::session_new_ok(session_name),
-                                Err(e) => {
-                                    messages::session_new_created_switch_failed(session_name, &e)
-                                }
-                            }
-                        }
-                        Err(e) => messages::session_new_failed(&e),
-                    }
-                }
-            }
-        }
-
         HubCommand::SessionUse(ref session_name) => {
-            let (vctx, vtoken) =
-                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
-                    .await;
-            match vtoken {
-                None => messages::NO_BACKEND.to_string(),
-                Some(vtoken) => {
-                    // Ensure the session exists (auto-create slot with empty UUID if not)
-                    let ensure_result: Result<(), String> = match state
-                        .store
-                        .get_backend_session(&vctx, &vtoken, session_name)
-                        .await
-                    {
-                        Ok(None) => state
-                            .store
-                            .set_backend_session(&vctx, &vtoken, session_name, "")
-                            .await
-                            .map_err(|e| messages::session_use_slot_create_failed(&e)),
-                        Err(e) => Err(messages::session_use_query_failed(&e)),
-                        Ok(Some(_)) => Ok(()),
-                    };
-                    match ensure_result {
-                        Err(msg) => msg,
-                        Ok(()) => {
-                            match state
-                                .store
-                                .set_active_session_name(&vctx, &vtoken, session_name)
-                                .await
-                            {
-                                Ok(()) => messages::session_use_ok(session_name),
-                                Err(e) => messages::session_use_failed(&e),
-                            }
-                        }
-                    }
-                }
-            }
+            handle_cmd_session_use(
+                &state,
+                &from_user_id,
+                &real_ctx,
+                msg.group_id.as_deref(),
+                session_name,
+            )
+            .await
         }
-
         HubCommand::SessionDelete(ref session_name) => {
-            let (vctx, vtoken) =
-                resolve_vctx_and_vtoken(&state, &real_ctx, &from_user_id, msg.group_id.as_deref())
-                    .await;
-            match vtoken {
-                None => messages::NO_BACKEND.to_string(),
-                Some(vtoken) => {
-                    let active = state
-                        .store
-                        .get_active_session_name(&vctx, &vtoken)
-                        .await
-                        .unwrap_or_else(|_| "default".to_string());
-                    if *session_name == active {
-                        messages::session_delete_active_error(session_name)
-                    } else {
-                        match state
-                            .store
-                            .delete_backend_session(&vctx, &vtoken, session_name)
-                            .await
-                        {
-                            Ok(true) => messages::session_delete_ok(session_name),
-                            Ok(false) => messages::session_delete_not_found(session_name),
-                            Err(e) => messages::session_delete_failed(&e),
-                        }
-                    }
-                }
-            }
+            handle_cmd_session_delete(
+                &state,
+                &from_user_id,
+                &real_ctx,
+                msg.group_id.as_deref(),
+                session_name,
+            )
+            .await
         }
     };
 
@@ -395,6 +128,326 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
         }
         Ok(_) => {
             debug!(?cmd, "hub command reply sent successfully");
+        }
+    }
+}
+
+pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> String {
+    let registry = state.clients.registry.read().await;
+    let clients = registry.all_clients();
+    if clients.is_empty() {
+        "尚未注册任何后端客户端。".to_string()
+    } else {
+        let active_vtoken = {
+            let router = state.routing.router.lock().await;
+            router.get_route(from_user_id).map(str::to_string)
+        };
+        let active_name = active_vtoken.as_deref().and_then(|vt| {
+            clients
+                .iter()
+                .find(|c| c.vtoken == vt)
+                .map(|c| c.name.as_str())
+        });
+        let mut lines = vec!["**已注册的后端：**".to_string()];
+        for c in clients {
+            let status = if c.online { "🟢" } else { "🔴" };
+            let label = c.label.as_deref().unwrap_or(&c.name);
+            let selected = if active_name == Some(c.name.as_str()) {
+                " ✅"
+            } else {
+                ""
+            };
+            lines.push(format!("{} `{}`{} — {}", status, c.name, selected, label));
+        }
+        match active_name {
+            Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
+            None => lines.push("\n当前未选中（广播模式）".to_string()),
+        }
+        lines.push("用 `/use <名称>`（或 `/u <名称>`）切换后端，或发送 `@<名称> <消息>` 直接发起临时会话。".to_string());
+        lines.join("\n")
+    }
+}
+
+pub(super) async fn handle_cmd_use(state: &HubState, from_user_id: &str, name: &str) -> String {
+    let registry = state.clients.registry.read().await;
+    if let Some(client) = registry.get_by_name(name) {
+        let vtoken = client.vtoken.clone();
+        drop(registry);
+
+        if let Err(e) = state.store.set_route(from_user_id, &vtoken).await {
+            warn!(error = %e, "failed to persist route to DB");
+            format!("⚠️ 切换到 `{}` 失败（数据库写入错误），请重试", name)
+        } else {
+            let mut router = state.routing.router.lock().await;
+            router.set_route(from_user_id, vtoken.clone());
+            format!("✅ 已切换到 `{}`", name)
+        }
+    } else {
+        format!(
+            "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。",
+            name
+        )
+    }
+}
+
+pub(super) async fn handle_cmd_broadcast(
+    state: &HubState,
+    from_user_id: &str,
+    real_ctx: &str,
+    msg: &WeixinMessage,
+    text: &str,
+) -> String {
+    let online = {
+        let registry = state.clients.registry.read().await;
+        registry
+            .online_clients()
+            .iter()
+            .map(|c| c.vtoken.clone())
+            .collect::<Vec<_>>()
+    };
+    for vtoken in &online {
+        let vctx = super::dispatch::resolve_vctx_for_message(
+            state,
+            real_ctx,
+            from_user_id,
+            msg.group_id.as_deref(),
+            None,
+        )
+        .await;
+        let mut m = msg.clone();
+        let hub_ext =
+            super::dispatch::build_hub_ext_for_vctx(&state.store, &vctx, vtoken, None).await;
+        m.context_token = Some(vctx.clone());
+        m.ilink_hub_ext = hub_ext;
+        if let Some(items) = &mut m.item_list {
+            let items_mut = std::sync::Arc::make_mut(items);
+            if let Some(first) = items_mut.first_mut() {
+                if let Some(ti) = &mut first.text_item {
+                    ti.text = Some(text.to_string());
+                }
+            }
+        }
+        match state.clients.queue.push(vtoken, m).await {
+            Ok(false) => {
+                state
+                    .metrics
+                    .messages_dispatched
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(true) => {
+                state
+                    .metrics
+                    .messages_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push hub broadcast message");
+                state
+                    .metrics
+                    .messages_dropped
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    format!("📡 Broadcast to {} client(s)", online.len())
+}
+
+pub(super) async fn handle_cmd_status(state: &HubState) -> String {
+    let (online, total, online_clients) = {
+        let registry = state.clients.registry.read().await;
+        let all = registry.all_clients();
+        let online = registry.online_clients().len();
+        let total = all.len();
+        let online_clients: Vec<(String, String)> = all
+            .iter()
+            .filter(|c| c.online)
+            .map(|c| (c.name.clone(), c.vtoken.clone()))
+            .collect();
+        (online, total, online_clients)
+    };
+    let vtokens: Vec<String> = online_clients.iter().map(|(_, vt)| vt.clone()).collect();
+    let all_sessions_map = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        state.store.get_all_session_entries_per_vtoken(&vtokens),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        warn!("get_all_session_entries_per_vtoken timed out in /status");
+        Ok(std::collections::HashMap::new())
+    })
+    .unwrap_or_default();
+    let client_sessions: Vec<(String, Vec<crate::store::SessionStatusEntry>)> = online_clients
+        .into_iter()
+        .map(|(name, vtoken)| {
+            let sessions = all_sessions_map.get(&vtoken).cloned().unwrap_or_default();
+            (name, sessions)
+        })
+        .collect();
+    messages::hub_status(online, total, &client_sessions)
+}
+
+pub(super) fn handle_cmd_help() -> String {
+    build_help_text()
+}
+
+pub(super) async fn handle_cmd_session_list(
+    state: &HubState,
+    from_user_id: &str,
+    real_ctx: &str,
+    group_id: Option<&str>,
+) -> String {
+    let (vctx, vtoken) = resolve_vctx_and_vtoken(state, real_ctx, from_user_id, group_id).await;
+    match vtoken {
+        None => messages::NO_BACKEND.to_string(),
+        Some(vtoken) => {
+            let backend_name = {
+                let registry = state.clients.registry.read().await;
+                registry
+                    .all_clients()
+                    .into_iter()
+                    .find(|c| c.vtoken == vtoken)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| crate::redact_token(&vtoken))
+            };
+            let active = state
+                .store
+                .get_active_session_name(&vctx, &vtoken)
+                .await
+                .unwrap_or_else(|_| "default".to_string());
+            match state.store.list_backend_sessions(&vctx, &vtoken).await {
+                Ok(sessions) if sessions.is_empty() => {
+                    format!(
+                        "当前后端 `{backend_name}` {}",
+                        messages::SESSION_LIST_NO_SESSIONS
+                    )
+                }
+                Ok(sessions) => {
+                    let mut lines = vec![format!("**后端 `{backend_name}` 的 sessions：**")];
+                    for s in &sessions {
+                        let marker = if s.session_name == active { " ✅" } else { "" };
+                        let uuid_hint = if s.backend_session_id.is_empty() {
+                            messages::SESSION_SLOT_NO_UUID.to_string()
+                        } else {
+                            format!(
+                                "`{}`",
+                                s.backend_session_id.chars().take(12).collect::<String>()
+                            )
+                        };
+                        lines.push(format!("• `{}`{} — {}", s.session_name, marker, uuid_hint));
+                    }
+                    lines.push(format!("\n当前活跃：`{}`", active));
+                    lines.push(messages::SESSION_LIST_SWITCH_HINT.to_string());
+                    lines.join("\n")
+                }
+                Err(e) => messages::session_list_failed(&e),
+            }
+        }
+    }
+}
+
+pub(super) async fn handle_cmd_session_new(
+    state: &HubState,
+    from_user_id: &str,
+    real_ctx: &str,
+    group_id: Option<&str>,
+    session_name: &str,
+    initial_uuid: &str,
+) -> String {
+    let (vctx, vtoken) = resolve_vctx_and_vtoken(state, real_ctx, from_user_id, group_id).await;
+    match vtoken {
+        None => messages::NO_BACKEND.to_string(),
+        Some(vtoken) => {
+            match state
+                .store
+                .set_backend_session(&vctx, &vtoken, session_name, initial_uuid)
+                .await
+            {
+                Ok(()) => {
+                    let switch_result = state
+                        .store
+                        .set_active_session_name(&vctx, &vtoken, session_name)
+                        .await;
+                    match switch_result {
+                        Ok(()) => messages::session_new_ok(session_name),
+                        Err(e) => messages::session_new_created_switch_failed(session_name, &e),
+                    }
+                }
+                Err(e) => messages::session_new_failed(&e),
+            }
+        }
+    }
+}
+
+pub(super) async fn handle_cmd_session_use(
+    state: &HubState,
+    from_user_id: &str,
+    real_ctx: &str,
+    group_id: Option<&str>,
+    session_name: &str,
+) -> String {
+    let (vctx, vtoken) = resolve_vctx_and_vtoken(state, real_ctx, from_user_id, group_id).await;
+    match vtoken {
+        None => messages::NO_BACKEND.to_string(),
+        Some(vtoken) => {
+            let ensure_result: Result<(), String> = match state
+                .store
+                .get_backend_session(&vctx, &vtoken, session_name)
+                .await
+            {
+                Ok(None) => state
+                    .store
+                    .set_backend_session(&vctx, &vtoken, session_name, "")
+                    .await
+                    .map_err(|e| messages::session_use_slot_create_failed(&e)),
+                Err(e) => Err(messages::session_use_query_failed(&e)),
+                Ok(Some(_)) => Ok(()),
+            };
+            match ensure_result {
+                Err(msg) => msg,
+                Ok(()) => {
+                    match state
+                        .store
+                        .set_active_session_name(&vctx, &vtoken, session_name)
+                        .await
+                    {
+                        Ok(()) => messages::session_use_ok(session_name),
+                        Err(e) => messages::session_use_failed(&e),
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(super) async fn handle_cmd_session_delete(
+    state: &HubState,
+    from_user_id: &str,
+    real_ctx: &str,
+    group_id: Option<&str>,
+    session_name: &str,
+) -> String {
+    let (vctx, vtoken) = resolve_vctx_and_vtoken(state, real_ctx, from_user_id, group_id).await;
+    match vtoken {
+        None => messages::NO_BACKEND.to_string(),
+        Some(vtoken) => {
+            let active = state
+                .store
+                .get_active_session_name(&vctx, &vtoken)
+                .await
+                .unwrap_or_else(|_| "default".to_string());
+            if session_name == active {
+                messages::session_delete_active_error(session_name)
+            } else {
+                match state
+                    .store
+                    .delete_backend_session(&vctx, &vtoken, session_name)
+                    .await
+                {
+                    Ok(true) => messages::session_delete_ok(session_name),
+                    Ok(false) => messages::session_delete_not_found(session_name),
+                    Err(e) => messages::session_delete_failed(&e),
+                }
+            }
         }
     }
 }

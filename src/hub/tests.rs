@@ -519,3 +519,181 @@ fn latency_guard_records_submillisecond_elapsed() {
     // test pins the millisecond-output side.
     let _ = h.sum_us.load(Ordering::Relaxed);
 }
+
+#[tokio::test]
+async fn test_extracted_hub_commands() {
+    use super::commands::*;
+
+    let store = Store::connect("sqlite::memory:")
+        .await
+        .expect("in-memory store");
+    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let queue = Arc::new(InMemoryQueue::new());
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
+    ));
+
+    let from_user = "user-123";
+
+    // 1. Test handle_cmd_list on empty registry
+    let list_res = handle_cmd_list(&state, from_user).await;
+    assert!(list_res.contains("尚未注册任何后端客户端"));
+
+    // 2. Test handle_cmd_use on non-existent client
+    let use_res = handle_cmd_use(&state, from_user, "non-existent").await;
+    assert!(use_res.contains("未找到名为 `non-existent` 的后端"));
+
+    // 3. Register client-a and client-b
+    let (vt_a, _) =
+        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
+    let (vt_b, _) =
+        crate::server::pairing::register_client_in_hub(&state, "client-b".to_string(), None).await;
+
+    // Initially online is false
+    let list_res2 = handle_cmd_list(&state, from_user).await;
+    assert!(list_res2.contains("🔴 `client-a`"));
+    assert!(list_res2.contains("🔴 `client-b`"));
+
+    // Mark online
+    state.clients.registry.write().await.mark_online(&vt_a);
+    state.clients.registry.write().await.mark_online(&vt_b);
+
+    let list_res3 = handle_cmd_list(&state, from_user).await;
+    assert!(list_res3.contains("🟢 `client-a`"));
+    assert!(list_res3.contains("🟢 `client-b`"));
+
+    // Test handle_cmd_use successfully
+    let use_res2 = handle_cmd_use(&state, from_user, "client-a").await;
+    assert!(use_res2.contains("已切换到 `client-a`"));
+
+    // Check routing state matches
+    {
+        let router = state.routing.router.lock().await;
+        assert_eq!(router.get_route(from_user), Some(vt_a.as_str()));
+    }
+
+    // Check list now shows client-a selected
+    let list_res4 = handle_cmd_list(&state, from_user).await;
+    assert!(list_res4.contains("`client-a` ✅"));
+
+    // 4. Test handle_cmd_session_new
+    let real_ctx = "ctx-789";
+    let session_res =
+        handle_cmd_session_new(&state, from_user, real_ctx, None, "session-1", "uuid-1234").await;
+    assert!(session_res.contains("session `session-1`"));
+
+    // Check persistence of the session in store using resolved vctx
+    let vctx =
+        super::dispatch::resolve_vctx_for_message(&state, real_ctx, from_user, None, None).await;
+    let active_session = state
+        .store
+        .get_active_session_name(&vctx, &vt_a)
+        .await
+        .unwrap();
+    assert_eq!(active_session, "session-1");
+
+    // Test session list/switch/delete command helper functions
+    let list_sessions = handle_cmd_session_list(&state, from_user, real_ctx, None).await;
+    assert!(list_sessions.contains("session-1") && list_sessions.contains("✅"));
+
+    // Session new with empty session name/uuid (adversarial case)
+    let session_res_empty = handle_cmd_session_new(&state, from_user, real_ctx, None, "", "").await;
+    assert!(session_res_empty.contains("session ``"));
+
+    // Use command on session
+    let use_session_res =
+        handle_cmd_session_use(&state, from_user, real_ctx, None, "session-2").await;
+    assert!(use_session_res.contains("session `session-2`"));
+
+    // Delete session
+    let delete_session_res =
+        handle_cmd_session_delete(&state, from_user, real_ctx, None, "session-1").await;
+    assert!(delete_session_res.contains("session `session-1`"));
+
+    // Trying to delete active session-2 should fail
+    let delete_active_res =
+        handle_cmd_session_delete(&state, from_user, real_ctx, None, "session-2").await;
+    assert!(delete_active_res.contains("无法删除当前活跃的 session"));
+}
+
+#[tokio::test]
+async fn test_adversarial_hub_commands() {
+    use super::commands::*;
+
+    let store = Store::connect("sqlite::memory:")
+        .await
+        .expect("in-memory store");
+    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let queue = Arc::new(InMemoryQueue::new());
+    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = Arc::new(HubState::new(
+        upstream,
+        Arc::new(store),
+        queue,
+        shutdown_rx,
+        "test-relay-secret".to_string(),
+        AdminConfig::from_env(),
+    ));
+
+    let from_user = "user-adversarial";
+    let real_ctx = "ctx-adversarial";
+
+    // 1. Session commands when no backend is selected/routed
+    // This should return NO_BACKEND
+    let list_res = handle_cmd_session_list(&state, from_user, real_ctx, None).await;
+    assert!(list_res.contains("当前未路由到任何后端"));
+
+    let new_res = handle_cmd_session_new(&state, from_user, real_ctx, None, "test", "").await;
+    assert!(new_res.contains("当前未路由到任何后端"));
+
+    let use_res = handle_cmd_session_use(&state, from_user, real_ctx, None, "test").await;
+    assert!(use_res.contains("当前未路由到任何后端"));
+
+    let del_res = handle_cmd_session_delete(&state, from_user, real_ctx, None, "test").await;
+    assert!(del_res.contains("当前未路由到任何后端"));
+
+    // Register a client and select it
+    let (vt_a, _) =
+        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
+    state.clients.registry.write().await.mark_online(&vt_a);
+    let _ = handle_cmd_use(&state, from_user, "client-a").await;
+
+    // 2. Extremely long session name
+    let long_name = "a".repeat(1000);
+    let new_long = handle_cmd_session_new(&state, from_user, real_ctx, None, &long_name, "").await;
+    assert!(new_long.contains("session `aaaaaaaa")); // Check it succeeded or handled it safely
+
+    // 3. Special characters (SQL injection, paths, quotes) in session name
+    let injection_name = "' OR '1'='1";
+    let new_inject =
+        handle_cmd_session_new(&state, from_user, real_ctx, None, injection_name, "").await;
+    assert!(new_inject.contains("session `' OR '1'='1`"));
+
+    let path_name = "../../../etc/passwd";
+    let new_path = handle_cmd_session_new(&state, from_user, real_ctx, None, path_name, "").await;
+    assert!(new_path.contains("session `../../../etc/passwd`"));
+
+    let unicode_name = "会话🚀🌟";
+    let new_unicode =
+        handle_cmd_session_new(&state, from_user, real_ctx, None, unicode_name, "").await;
+    assert!(new_unicode.contains("session `会话🚀🌟`"));
+
+    // 4. Try using a nonexistent session
+    let use_nonexistent =
+        handle_cmd_session_use(&state, from_user, real_ctx, None, "nonexistent-session").await;
+    // According to commands.rs, handle_cmd_session_use creates a new slot with empty uuid if it does not exist:
+    // "Ok(None) => state.store.set_backend_session(&vctx, &vtoken, session_name, "")..."
+    // So it should succeed and return session_use_ok!
+    assert!(use_nonexistent.contains("已切换到 session `nonexistent-session`"));
+
+    // 5. Deleting a nonexistent session
+    let delete_nonexistent =
+        handle_cmd_session_delete(&state, from_user, real_ctx, None, "not-real").await;
+    assert!(delete_nonexistent.contains("未找到 session `not-real`"));
+}
