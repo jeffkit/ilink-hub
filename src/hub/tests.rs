@@ -527,7 +527,8 @@ async fn test_extracted_hub_commands() {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
-    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let upstream =
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(HubState::new(
@@ -550,10 +551,12 @@ async fn test_extracted_hub_commands() {
     assert!(use_res.contains("未找到名为 `non-existent` 的后端"));
 
     // 3. Register client-a and client-b
-    let (vt_a, _) =
+    let out_a =
         crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
-    let (vt_b, _) =
+    let vt_a = out_a.hashed;
+    let out_b =
         crate::server::pairing::register_client_in_hub(&state, "client-b".to_string(), None).await;
+    let vt_b = out_b.hashed;
 
     // Initially online is false
     let list_res2 = handle_cmd_list(&state, from_user).await;
@@ -629,7 +632,8 @@ async fn test_adversarial_hub_commands() {
     let store = Store::connect("sqlite::memory:")
         .await
         .expect("in-memory store");
-    let upstream = Arc::new(UpstreamClient::new("sk-test".to_string(), None));
+    let upstream =
+        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let queue = Arc::new(InMemoryQueue::new());
     let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let state = Arc::new(HubState::new(
@@ -659,8 +663,9 @@ async fn test_adversarial_hub_commands() {
     assert!(del_res.contains("当前未路由到任何后端"));
 
     // Register a client and select it
-    let (vt_a, _) =
+    let out_a =
         crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
+    let vt_a = out_a.hashed;
     state.clients.registry.write().await.mark_online(&vt_a);
     let _ = handle_cmd_use(&state, from_user, "client-a").await;
 
