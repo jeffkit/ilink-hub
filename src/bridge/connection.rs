@@ -135,9 +135,12 @@ pub async fn validate_hub_token(hub_url: &str, token: &str) -> Result<()> {
 async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!("{}/hub/register", hub_url.trim().trim_end_matches('/'));
-    let mut req = client
-        .post(&url)
-        .json(&serde_json::json!({ "name": name, "label": label }));
+    let mut req = client.post(&url).json(&serde_json::json!({
+        "name": name,
+        "label": label,
+        "persona_name": name,
+        "persona_emoji": "🤖",
+    }));
     if let Ok(admin) = std::env::var("ILINK_ADMIN_TOKEN") {
         let admin = admin.trim();
         if !admin.is_empty() {

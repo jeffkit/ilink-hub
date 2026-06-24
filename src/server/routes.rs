@@ -93,6 +93,13 @@ impl FromRequestParts<Arc<HubState>> for AdminGuard {
 pub struct RegisterRequest {
     pub name: String,
     pub label: Option<String>,
+    /// Optional display name shown in `/list` and prepended to replies.
+    /// Defaults to the client name when omitted on the bridge side.
+    #[serde(default)]
+    pub persona_name: Option<String>,
+    /// Optional emoji avatar shown alongside `persona_name` in `/list` and replies.
+    #[serde(default)]
+    pub persona_emoji: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +176,29 @@ pub async fn register(
                 )),
             }),
         );
+    }
+
+    // Apply persona fields (if provided) immediately after a successful fresh registration.
+    if req.persona_name.is_some() || req.persona_emoji.is_some() {
+        {
+            let mut registry = state.clients.registry.write().await;
+            registry.set_persona(
+                &outcome.hashed,
+                req.persona_name.clone(),
+                req.persona_emoji.clone(),
+            );
+        }
+        if let Err(e) = state
+            .store
+            .update_client_persona(
+                &outcome.hashed,
+                req.persona_name.as_deref(),
+                req.persona_emoji.as_deref(),
+            )
+            .await
+        {
+            warn!(error = %e, name = %req.name, "failed to persist persona on registration");
+        }
     }
 
     (
