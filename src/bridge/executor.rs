@@ -211,6 +211,8 @@ pub(super) async fn run_cli(
                 .with_context(|| format!("unsafe placeholder value in cwd template `{dir}`"))?,
         );
         cmd.current_dir(&dir);
+    } else if let Some(home) = dirs::home_dir() {
+        cmd.current_dir(&home);
     }
 
     cmd.env(

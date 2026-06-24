@@ -1130,7 +1130,11 @@ async fn handle_one_message(
             error!(error = %e, "CLI failed; sending error reply to user");
             if app.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
-                let req = SendMessageRequest::reply(ctx, err_text, &from_user);
+                let mut req = SendMessageRequest::reply(ctx, err_text, &from_user);
+                if let Some(ref mut msg) = req.msg {
+                    let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                    hub_ext.session_name = Some(session_name_for_cli.clone());
+                }
                 if let Err(send_e) = send_final_with_retry(
                     client,
                     req,
