@@ -426,7 +426,8 @@ async fn sendtyping_upstream_network_error_propagates() {
     drop(listener);
 
     let base_url = format!("http://{}", addr);
-    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url));
+    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url))
+        .expect("test upstream client");
 
     let req = ilink_hub::ilink::SendTypingRequest {
         status: Some(1),
@@ -466,7 +467,8 @@ async fn sendtyping_upstream_http_500_propagates() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url));
+    let upstream = UpstreamClient::new("sk-test:key".to_string(), Some(base_url))
+        .expect("test upstream client");
     let req = ilink_hub::ilink::SendTypingRequest {
         status: Some(1),
         ..Default::default()

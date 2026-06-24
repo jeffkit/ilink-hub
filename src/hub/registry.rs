@@ -194,6 +194,28 @@ impl ClientRegistry {
         self.by_name.get(name).and_then(|vt| self.by_vtoken.get(vt))
     }
 
+    /// Resolve a client by its registered name **or** a numeric alias.
+    ///
+    /// `@1`, `@2`, … and `/use 1`, `/use 2`, … map to the n-th client in the
+    /// `/list` output. The ordering is `name` ascending (dictionary order) so
+    /// the index is stable and predictable across calls — `all_clients()`
+    /// returns a HashMap iteration order which must NOT be used directly.
+    ///
+    /// Resolution order: exact name first (so a client genuinely named `"1"`
+    /// still wins), then the 1-based numeric index into the sorted list.
+    pub fn get_by_alias(&self, name: &str) -> Option<&ClientInfo> {
+        if let Some(c) = self.get_by_name(name) {
+            return Some(c);
+        }
+        let n: usize = name.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        let mut sorted: Vec<&ClientInfo> = self.all_clients();
+        sorted.sort_by(|a, b| a.name.cmp(&b.name));
+        sorted.get(n - 1).copied()
+    }
+
     /// Set persona fields on an already-registered client (identified by hashed vtoken).
     /// Used by the startup loader and the admin update API.
     pub fn set_persona(
@@ -382,6 +404,59 @@ mod tests {
         assert_eq!(c.label.as_deref(), Some("echo test"));
         // already-hashed lookup should also work
         assert!(reg.get_by_vtoken(&c.vtoken).is_some());
+    }
+
+    #[test]
+    fn get_by_alias_matches_exact_name_first() {
+        let mut reg = ClientRegistry::new();
+        // Register in non-sorted insertion order to prove the numeric path
+        // does not depend on insertion order.
+        reg.register("charlie".into(), None);
+        reg.register("alpha".into(), None);
+        reg.register("bravo".into(), None);
+        // Exact name wins even if a numeric alias could also resolve.
+        assert_eq!(reg.get_by_alias("alpha").unwrap().name, "alpha");
+        assert_eq!(reg.get_by_alias("bravo").unwrap().name, "bravo");
+    }
+
+    #[test]
+    fn get_by_alias_numeric_uses_sorted_index() {
+        let mut reg = ClientRegistry::new();
+        reg.register("charlie".into(), None);
+        reg.register("alpha".into(), None);
+        reg.register("bravo".into(), None);
+        // Sorted: alpha(1), bravo(2), charlie(3)
+        assert_eq!(reg.get_by_alias("1").unwrap().name, "alpha");
+        assert_eq!(reg.get_by_alias("2").unwrap().name, "bravo");
+        assert_eq!(reg.get_by_alias("3").unwrap().name, "charlie");
+    }
+
+    #[test]
+    fn get_by_alias_rejects_zero_and_overflow() {
+        let mut reg = ClientRegistry::new();
+        reg.register("alpha".into(), None);
+        assert!(reg.get_by_alias("0").is_none(), "0 is not a valid alias");
+        assert!(
+            reg.get_by_alias("2").is_none(),
+            "out-of-range index must return None"
+        );
+    }
+
+    #[test]
+    fn get_by_alias_unknown_name_returns_none() {
+        let mut reg = ClientRegistry::new();
+        reg.register("alpha".into(), None);
+        assert!(reg.get_by_alias("nope").is_none());
+        assert!(
+            reg.get_by_alias("999").is_none(),
+            "non-existent numeric alias must return None"
+        );
+    }
+
+    #[test]
+    fn get_by_alias_numeric_works_on_empty_registry() {
+        let reg = ClientRegistry::new();
+        assert!(reg.get_by_alias("1").is_none());
     }
 
     #[test]

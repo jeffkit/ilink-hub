@@ -88,7 +88,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let vtoken = {
                 let registry = state.clients.registry.read().await;
                 registry
-                    .get_by_name(&backend_name)
+                    .get_by_alias(&backend_name)
                     .map(|c| c.vtoken.clone())
             };
             if let Some(vtoken) = vtoken {

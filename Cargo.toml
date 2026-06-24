@@ -104,6 +104,7 @@ percent-encoding = "2.3.2"
 tokio-test = "0.4"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+temp-env = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

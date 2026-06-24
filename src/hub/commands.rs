@@ -134,7 +134,9 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
 
 pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> String {
     let registry = state.clients.registry.read().await;
-    let clients = registry.all_clients();
+    let mut clients = registry.all_clients();
+    // Sort by name so the 1-based index shown here matches `get_by_alias`.
+    clients.sort_by(|a, b| a.name.cmp(&b.name));
     if clients.is_empty() {
         "尚未注册任何后端客户端。".to_string()
     } else {
@@ -149,7 +151,7 @@ pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> Str
                 .map(|c| c.name.as_str())
         });
         let mut lines = vec!["**已注册的后端：**".to_string()];
-        for c in clients {
+        for (i, c) in clients.iter().enumerate() {
             let status = if c.online { "🟢" } else { "🔴" };
             let label = c.label.as_deref().unwrap_or(&c.name);
             let selected = if active_name == Some(c.name.as_str()) {
@@ -157,34 +159,48 @@ pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> Str
             } else {
                 ""
             };
-            lines.push(format!("{} `{}`{} — {}", status, c.name, selected, label));
+            lines.push(format!(
+                "{} {}. `{}`{} — {}",
+                status,
+                i + 1,
+                c.name,
+                selected,
+                label
+            ));
         }
         match active_name {
             Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
             None => lines.push("\n当前未选中（广播模式）".to_string()),
         }
-        lines.push("用 `/use <名称>`（或 `/u <名称>`）切换后端，或发送 `@<名称> <消息>` 直接发起临时会话。".to_string());
+        lines.push(
+            "用 `/use <名称或序号>`（或 `/u <名称或序号>`）切换后端，或发送 `@<名称或序号> <消息>` 直接发起临时会话。"
+                .to_string(),
+        );
         lines.join("\n")
     }
 }
 
 pub(super) async fn handle_cmd_use(state: &HubState, from_user_id: &str, name: &str) -> String {
     let registry = state.clients.registry.read().await;
-    if let Some(client) = registry.get_by_name(name) {
+    if let Some(client) = registry.get_by_alias(name) {
         let vtoken = client.vtoken.clone();
+        let resolved_name = client.name.clone();
         drop(registry);
 
         if let Err(e) = state.store.set_route(from_user_id, &vtoken).await {
             warn!(error = %e, "failed to persist route to DB");
-            format!("⚠️ 切换到 `{}` 失败（数据库写入错误），请重试", name)
+            format!(
+                "⚠️ 切换到 `{}` 失败（数据库写入错误），请重试",
+                resolved_name
+            )
         } else {
             let mut router = state.routing.router.lock().await;
             router.set_route(from_user_id, vtoken.clone());
-            format!("✅ 已切换到 `{}`", name)
+            format!("✅ 已切换到 `{}`", resolved_name)
         }
     } else {
         format!(
-            "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端。",
+            "❌ 未找到名为 `{}` 的后端。用 `/list`（或 `/ls`）查看可用后端（支持用序号，如 `/use 1`）。",
             name
         )
     }
@@ -459,14 +475,14 @@ fn build_help_text() -> String {
      可用指令（括号内为缩写）：\n\
      /status（/s）— 查看当前 Hub 状态\n\
      /list（/ls）— 列出所有已注册的 AI 后端\n\
-     /use <名称>（/u <名称>）— 切换到指定的 AI 后端\n\
+     /use <名称或序号>（/u <名称或序号>）— 切换到指定的 AI 后端\n\
      /help（/h）— 显示此帮助\n\n\
      Session 管理（同一后端下的多会话）：\n\
      /session list（/sl）— 列出当前对话的所有 sessions\n\
      /session new <名称> [UUID]（/sn <名称>）— 创建新 session（可选初始 UUID）\n\
      /session use <名称>（/su <名称>）— 切换到指定 session\n\
      /session delete <名称>（/sd <名称>）— 删除指定 session\n\n\
-     快捷 @ 后端：发送 `@<名称> <消息>` 可临时在该后端上**新建一个会话**并发送此消息，不会改变你当前 /use 的后端和活跃 session（与引用回复类似的临时操作）。名称与 /use 使用的名称一致（可用 /list 查看）；名称取第一个空格之前的部分，其余为消息内容。需要继续这个临时会话时，引用它的回复即可。\n\n\
+     快捷 @ 后端：发送 `@<名称或序号> <消息>` 可临时在该后端上**新建一个会话**并发送此消息，不会改变你当前 /use 的后端和活跃 session（与引用回复类似的临时操作）。名称与 /use 使用的名称一致（可用 /list 查看，序号即 /list 中的编号）；名称取第一个空格之前的部分，其余为消息内容。需要继续这个临时会话时，引用它的回复即可。\n\n\
      引用回复：引用某条机器人消息后发送的内容，会优先路由到发出该条消息的后端（或 Hub 指令结果），不必依赖当前 /use。\n\
      多后端时，各后端回复末尾可能带有「— 工作区名」展示行（仅**同时在线**的后端多于一个时默认追加；历史注册但离线的客户端不计入）。可用环境变量 ILINKHUB_OUTBOUND_ORIGIN_LABEL 强制关/开。\n\n\
      关于 iLink Hub：\n\

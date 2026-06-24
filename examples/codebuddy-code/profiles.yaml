@@ -47,6 +47,7 @@ profiles:
     cwd: /Users/kongjie/projects/ilink-hub      # 工作目录，codebuddy 在此运行
     timeout_secs: 600
     max_reply_chars: 8000
+    streaming: false
     env:
       ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"      # ← 改模型从上方注释的列表中选
       # 如需切换为 DeepSeek：
@@ -57,6 +58,7 @@ profiles:
     cwd: /Users/kongjie/projects/ilink-hub
     timeout_secs: 600
     max_reply_chars: 8000
+    streaming: false
     env:
       ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"
       ILINK_SESSION_ID: ""                      # 覆盖注入，强制新会话

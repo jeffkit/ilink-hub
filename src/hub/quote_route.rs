@@ -870,6 +870,131 @@ mod tests {
         assert!(parse_footer_from_quoted_text("plain message without footer").is_none());
     }
 
+    // ─── Bug repro: @mention session quote-routing ──────────────────────────
+    //
+    // Scenario reproduced from production incident (2026-06-24):
+    //
+    //  1. User sends `@ilink-claude <msg>` → Hub creates at-session "at-20260624-092041904"
+    //     and dispatches to vtoken "vt-claude".
+    //  2. Bridge replies via sendmessage. The reply is indexed in quote_index with
+    //     session_name = Some("at-20260624-092041904") and vtoken = "vt-claude".
+    //  3. User quote-replies to that message. The inbound routing must resolve back
+    //     to ("vt-claude", "at-20260624-092041904"), NOT fall through to the current
+    //     /use route (e.g. "vt-home" pointing at the old "session-20260623-181249").
+    //
+    // This test pins that the quote_index correctly stores and retrieves the
+    // at-session name from the outbound reply footer.
+
+    #[test]
+    fn at_mention_reply_quote_routes_back_to_at_session() {
+        let mut idx = QuoteRouteIndex::default();
+        let at_session = "at-20260624-092041904";
+        // Simulate the outbound reply footer that the Hub appends when sending
+        // the @mention response back to the user.
+        let reply_text = format!(
+            "只有 codebuddy 那个文件里提到 GLM...\n\n---\nilink-claude · KONGJIE-MC3 · {at_session}"
+        );
+        let vtoken_claude = "vt-2f43aec8";
+
+        // Register as if sendmessage handler indexed it.
+        idx.register_outbound_content(
+            "peer:user@wx",
+            &reply_text,
+            QuoteOrigin::Client {
+                vtoken: vtoken_claude.to_string(),
+                name: "ilink-claude".to_string(),
+                label: Some("KONGJIE-MC3".to_string()),
+                session_name: Some(at_session.to_string()),
+            },
+        );
+
+        // User quote-replies to that message.
+        let inbound = quote_reply("followup question", &reply_text, Some(1750000000000));
+        let origin = idx
+            .resolve_user_quote("peer:user@wx", &inbound)
+            .expect("quote_index must resolve the at-mention reply");
+
+        match origin {
+            QuoteOrigin::Client {
+                vtoken,
+                session_name,
+                ..
+            } => {
+                assert_eq!(
+                    vtoken, vtoken_claude,
+                    "must route back to ilink-claude, not the home/default backend"
+                );
+                assert_eq!(
+                    session_name.as_deref(),
+                    Some(at_session),
+                    "must resume the at-session, not fall back to the old active session"
+                );
+            }
+            QuoteOrigin::Hub { .. } => panic!("expected Client origin, got Hub"),
+        }
+    }
+
+    /// When there are TWO registered sessions for the same vtoken (the old
+    /// active session-1249 AND the new at-1904), a quote-reply that quotes the
+    /// at-1904 message must NOT be confused with the session-1249 entry.
+    #[test]
+    fn at_mention_reply_not_confused_with_older_active_session() {
+        let mut idx = QuoteRouteIndex::default();
+        let scope = "peer:user@wx";
+        let vtoken = "vt-2f43aec8";
+
+        // First, there's an existing session-1249 entry from a previous conversation.
+        let old_reply = "目前这次对话里完成的事情...\n\n---\nilink-claude · KONGJIE-MC3 · session-20260623-181249";
+        idx.register_outbound_content(
+            scope,
+            old_reply,
+            QuoteOrigin::Client {
+                vtoken: vtoken.to_string(),
+                name: "ilink-claude".to_string(),
+                label: Some("KONGJIE-MC3".to_string()),
+                session_name: Some("session-20260623-181249".to_string()),
+            },
+        );
+
+        // Then the @mention reply is indexed (newer, different text).
+        let at_reply =
+            "只有 codebuddy 那个文件里提到 GLM\n\n---\nilink-claude · KONGJIE-MC3 · at-20260624-092041904";
+        idx.register_outbound_content(
+            scope,
+            at_reply,
+            QuoteOrigin::Client {
+                vtoken: vtoken.to_string(),
+                name: "ilink-claude".to_string(),
+                label: Some("KONGJIE-MC3".to_string()),
+                session_name: Some("at-20260624-092041904".to_string()),
+            },
+        );
+
+        // Quote-replying the at-mention reply → must get at-session.
+        let q_at = quote_reply("follow up on glm", at_reply, Some(1750000100000));
+        let origin_at = idx
+            .resolve_user_quote(scope, &q_at)
+            .expect("must resolve at-session reply");
+        match origin_at {
+            QuoteOrigin::Client { session_name, .. } => {
+                assert_eq!(session_name.as_deref(), Some("at-20260624-092041904"));
+            }
+            _ => panic!("expected Client"),
+        }
+
+        // Quote-replying the old session-1249 reply → must get session-1249.
+        let q_old = quote_reply("continue old session", old_reply, Some(1749900000000));
+        let origin_old = idx
+            .resolve_user_quote(scope, &q_old)
+            .expect("must resolve old session reply");
+        match origin_old {
+            QuoteOrigin::Client { session_name, .. } => {
+                assert_eq!(session_name.as_deref(), Some("session-20260623-181249"));
+            }
+            _ => panic!("expected Client"),
+        }
+    }
+
     // ─── M3 — quote_index startup warmup ───────────────────────────────────
 
     /// Equivalence with N manual `register_outbound_content` calls. Each warm
