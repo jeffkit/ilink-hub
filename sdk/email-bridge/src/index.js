@@ -23,7 +23,10 @@ const path = require('path');
 const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
 const { ProfileDispatcher, convertMarkdownToHtml } = require('./dispatcher');
 const { PendingStore } = require('./pending-store');
+const { AclConfig } = require('./acl-config');
 const { SenderAcl } = require('./sender-acl');
+const { DeniedLog } = require('./denied-log');
+const { AdminHandler } = require('./admin-handler');
 
 // Re-export createProfile from ilink-bridge-profile (or a minimal fallback)
 let _createProfile;
@@ -107,16 +110,21 @@ function isSelfSent(msgSummary, ownAddresses) {
  *
  * @param {object}  [options]
  * @param {string}  [options.profilesConfig]   Path to email-profiles.yaml
+ * @param {string}  [options.aclConfig]        Path to email-acl.yaml (optional)
  * @param {number}  [options.pollIntervalMs]   Poll interval in ms (default 300_000)
  * @param {boolean} [options.dryRun]           Skip actual replies (default false)
- * @param {number}  [options.limit]            Max unread per poll cycle (default 20)
+ * @param {number}  [options.limit]            Max messages per poll cycle (default 20)
  * @param {boolean} [options.filterSelfSent]   Skip emails sent by our own address (default true)
  * @param {string}  [options.pendingStoreFile] Custom path for pending state JSON file
  * @returns {{ stop: () => void }}
  */
 function createEmailBridge(options = {}) {
   const {
-    profilesConfig = require('path').join(process.cwd(), 'email-profiles.yaml'),
+    profilesConfig = path.join(process.cwd(), 'email-profiles.yaml'),
+    aclConfig: aclConfigFile = (() => {
+      const candidate = path.join(process.cwd(), 'email-acl.yaml');
+      return fs.existsSync(candidate) ? candidate : null;
+    })(),
     pollIntervalMs = 300_000,
     dryRun = process.env.DRY_RUN === '1',
     limit = 20,
@@ -147,10 +155,22 @@ function createEmailBridge(options = {}) {
     } catch { /* ignore */ }
   }
 
-  const mail = new AgentlyMailClient();
+  const mail       = new AgentlyMailClient();
   const dispatcher = new ProfileDispatcher(profilesConfig);
-  const pending = new PendingStore(pendingStoreFile);
-  const acl = new SenderAcl(dispatcher.config);
+  const pending    = new PendingStore(pendingStoreFile);
+  const aclCfg     = new AclConfig({
+    aclConfigFile,
+    dynamicFile: pendingStoreFile
+      ? path.join(path.dirname(pendingStoreFile), 'acl-dynamic.json')
+      : undefined,
+  });
+  const acl        = new SenderAcl(aclCfg);
+  const deniedLog  = new DeniedLog(
+    pendingStoreFile
+      ? path.join(path.dirname(pendingStoreFile), 'denied-log.json')
+      : undefined,
+  );
+  const admin      = new AdminHandler(aclCfg, deniedLog, mail, { dryRun });
 
   const profileNames = dispatcher.profileNames();
   process.stderr.write(
@@ -163,11 +183,14 @@ function createEmailBridge(options = {}) {
     const me = mail.me();
     const email = me?.aliases?.[0]?.email || 'unknown';
     ownAddresses = getOwnAddresses(mail);
+    const adminList = aclCfg.adminSenders;
     process.stderr.write(
       `[email-bridge] Monitoring ${email} every ${pollIntervalMs / 1000}s\n` +
       `[email-bridge] Subject prefix routing: [profile-name], default=${dispatcher.config.default}\n` +
       (filterSelfSent ? `[email-bridge] Self-sent filter: ON (${[...ownAddresses].join(', ')})\n` : '') +
-      (acl.isOpenAccess() ? '' : `[email-bridge] Sender ACL: ON (deny_action=${acl.denyAction})\n`),
+      (acl.isOpenAccess() ? '' : `[email-bridge] Sender ACL: ON (deny_action=${acl.denyAction})\n`) +
+      (adminList.length > 0 ? `[email-bridge] Admin senders: ${adminList.join(', ')}\n` : '') +
+      (aclConfigFile ? `[email-bridge] ACL config: ${aclConfigFile}\n` : '[email-bridge] ACL config: (none — open access)\n'),
     );
   } catch (err) {
     process.stderr.write(
@@ -178,8 +201,7 @@ function createEmailBridge(options = {}) {
   }
 
   /**
-   * Handle a sender that failed ACL checks.
-   * Marks the message as "replied" in pending store so retry sweep ignores it.
+   * Handle a sender that failed ACL checks: log it and optionally notify.
    */
   async function handleDenied(client, msg, reason) {
     const { message_id, subject, from } = msg;
@@ -187,7 +209,9 @@ function createEmailBridge(options = {}) {
       `[email-bridge] ACL denied: "${subject}" from ${from?.email} — ${reason}\n`,
     );
 
-    // Always mark as done in pending store to prevent retry sweep re-processing
+    deniedLog.record(msg, reason);
+
+    // Mark as done in pending store to prevent retry sweep re-processing
     pending.add(msg);
     pending.markReplied(message_id);
 
@@ -291,8 +315,21 @@ function createEmailBridge(options = {}) {
       return;
     }
 
-    // Global ACL check
-    if (acl.checkGlobal(senderEmail) === 'deny') {
+    // Admin path: read message, check for commands, bypass normal ACL + dispatch
+    if (acl.isAdmin(senderEmail)) {
+      process.stderr.write(`[email-bridge] Admin message from ${senderEmail}: "${subject}"\n`);
+      let fullMsg;
+      try { fullMsg = client.read(message_id); } catch { fullMsg = null; }
+      const body = fullMsg ? _plainBody(fullMsg) : '';
+      if (admin.hasCommands(body)) {
+        await admin.executeCommands(message_id, body, senderEmail);
+        return;
+      }
+      // Admin with no commands → fall through to normal dispatch
+    }
+
+    // Global ACL check (non-admin senders)
+    if (!acl.isAdmin(senderEmail) && acl.checkGlobal(senderEmail) === 'deny') {
       await handleDenied(client, msg, 'global ACL');
       return;
     }
@@ -327,9 +364,13 @@ function createEmailBridge(options = {}) {
     retryTimer = setInterval(runRetrySweep, pollIntervalMs);
   }, Math.floor(pollIntervalMs / 2));
 
+  // Start inspection report scheduler
+  admin.startReportScheduler();
+
   // Graceful shutdown
   const stop = () => {
     poller.stop();
+    admin.stopReportScheduler();
     if (retryTimer) clearInterval(retryTimer);
   };
   process.on('SIGINT', () => {
@@ -342,11 +383,21 @@ function createEmailBridge(options = {}) {
   return { stop };
 }
 
+/** Extract plain text from a full message (strips HTML + quoted content). */
+function _plainBody(fullMsg) {
+  const { cleanBody } = require('./dispatcher');
+  try { return cleanBody(fullMsg, { stripQuotes: true }); } catch { return ''; }
+}
+
 module.exports = {
   AgentlyMailClient,
   AgentlyMailError,
   ProfileDispatcher,
   PendingStore,
+  AclConfig,
+  SenderAcl,
+  DeniedLog,
+  AdminHandler,
   createEmailBridge,
   createProfile,
   convertMarkdownToHtml,

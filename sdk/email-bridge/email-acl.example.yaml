@@ -1,0 +1,73 @@
+# email-acl.yaml — Agently Mail 访问控制配置
+#
+# 本文件专属于 agently mail 渠道的访问控制，
+# 与 email-profiles.yaml（profile 路由规范）严格分离。
+#
+# 使用方法：
+#   将本文件复制为 email-acl.yaml 并按需修改。
+#   bridge 启动时自动检测同目录下的 email-acl.yaml。
+#
+# 动态名单（运行时由管理员指令写入）存放在：
+#   ~/.ilink-email-bridge/acl-dynamic.json
+# 动态名单优先级高于本文件中的静态配置。
+
+# ── 管理员邮箱 ──────────────────────────────────────────────────────────────
+# 这些地址的邮件可以执行管理指令（/allow /deny /reset /status）
+# 并会收到巡检报告。
+# 支持精确地址和域名匹配（同 allowed_senders 语法）。
+#
+admin_senders:
+  - me@gmail.com
+  # - admin@mycompany.com
+  # - "@mycompany.com"    # 整个域名都是管理员
+
+# ── 全局白名单 ──────────────────────────────────────────────────────────────
+# 只处理来自这些地址/域名的邮件。
+# 不配置或留空 = 不限制（接受所有来信，open access 模式）。
+#
+# 匹配语法：
+#   user@example.com      精确匹配（大小写不敏感）
+#   @example.com          该域名下所有邮箱
+#   @*.example.com        所有子域名
+#
+# allowed_senders:
+#   - me@gmail.com
+#   - "@mycompany.com"
+#   - "@*.trusted-partner.org"
+
+# ── 全局黑名单 ──────────────────────────────────────────────────────────────
+# 明确拒绝这些地址，优先级高于白名单。
+#
+# denied_senders:
+#   - spam@example.com
+#   - "@blocked-domain.com"
+
+# ── 拒绝行为 ────────────────────────────────────────────────────────────────
+# silent  — 静默丢弃，不回复（默认，避免泄露 Agent 存在）
+# notify  — 发送一封礼貌的拒绝通知邮件
+#
+deny_action: silent
+
+# 自定义拒绝通知正文（仅 deny_action: notify 时生效）
+# deny_message: "感谢来信，您无权使用此服务，请联系管理员。"
+
+# ── Per-Profile 访问控制 ─────────────────────────────────────────────────────
+# 对特定 profile 设置独立白名单，不影响 email-profiles.yaml 的 profile 定义。
+# 留空或不配置某个 profile = 继承全局 ACL 规则。
+#
+# profile_acl:
+#   echo:
+#     allowed_senders:
+#       - me@gmail.com      # echo profile 仅供调试，只有自己能用
+#   cursor:
+#     allowed_senders:
+#       - "@mycompany.com"  # cursor profile 仅限公司内部
+
+# ── 巡检报告 ────────────────────────────────────────────────────────────────
+# 定期向 admin_senders 发送被拒绝邮件的汇总报告。
+# 管理员回复报告邮件即可执行 /allow /deny 等指令。
+#
+report:
+  enabled: true
+  interval_hours: 24      # 每 24 小时检查一次
+  min_denied_count: 1     # 至少有 1 封被拒绝邮件才发送报告（避免空报告）
