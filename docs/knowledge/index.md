@@ -9,12 +9,14 @@
 * [质量门](project/quality-gates.md) — 每次代码变更必须通过的 CI 检查
 * [代码规范与约定](project/conventions.md) — Rust 规范、并发开发约定
 
-## Bridge
+## Bridge & 通道
 
 * [Bridge 概览](bridges/overview.md) — Bridge 是什么、有哪些内置实现
 * [P0 协议与 Profile](bridges/profile-protocol.md) — 进程契约：环境变量输入、stdout 输出、流式格式
 * [Cursor Bridge](bridges/cursor.md) — Cursor IDE bridge 实现细节
 * [Claude Code Bridge](bridges/claude-code.md) — Claude Code CLI bridge 实现细节
+* [Email Bridge](bridges/email-bridge.md) — Agently Mail 邮件通道（快速启动、防循环、线程会话、内置 Profiles）
+* [Universal Agent Gateway 架构方案](../../sdk/email-bridge/docs/ARCHITECTURE.md) — 多通道统一架构与演化路径
 
 ## API & 命令
 

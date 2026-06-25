@@ -17,6 +17,14 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 | `cursor` | `src/bridge/builtin/cursor.rs` | [Cursor Bridge](cursor.md) |
 | `claude-code` | `src/bridge/builtin/claude_code.rs` | [Claude Code Bridge](claude-code.md) |
 
+## Email 通道（ilink-email-bridge）
+
+除了微信通道，项目还提供了基于邮件的独立通道适配器：
+
+- **位置**：`sdk/email-bridge/`
+- **文档**：[Email Bridge](email-bridge.md)
+- **架构关系**：与 Hub 并列的同级通道，共用 P0 Profile 执行层，详见 [Universal Agent Gateway 方案](../../sdk/email-bridge/docs/ARCHITECTURE.md)
+
 ## Bridge 的工作方式
 
 1. AI 工具向 Hub 注册（WebSocket 连接 + 认证）
