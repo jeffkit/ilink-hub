@@ -16,8 +16,12 @@
  * });
  */
 
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+
 const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
-const { ProfileDispatcher } = require('./dispatcher');
+const { ProfileDispatcher, convertMarkdownToHtml } = require('./dispatcher');
 const { PendingStore } = require('./pending-store');
 
 // Re-export createProfile from ilink-bridge-profile (or a minimal fallback)
@@ -119,6 +123,29 @@ function createEmailBridge(options = {}) {
     pendingStoreFile,
   } = options;
 
+  // Cursor file lives alongside the pending store for persistence across restarts
+  const storeDir = pendingStoreFile
+    ? path.dirname(pendingStoreFile)
+    : path.join(os.homedir(), '.ilink-email-bridge');
+  const cursorFile = path.join(storeDir, 'poll-cursor.json');
+
+  function loadCursor() {
+    try {
+      if (fs.existsSync(cursorFile)) {
+        const { afterTimestamp } = JSON.parse(fs.readFileSync(cursorFile, 'utf8'));
+        if (afterTimestamp) return afterTimestamp;
+      }
+    } catch { /* ignore */ }
+    return null;
+  }
+
+  function saveCursor(ts) {
+    try {
+      fs.mkdirSync(storeDir, { recursive: true });
+      fs.writeFileSync(cursorFile, JSON.stringify({ afterTimestamp: ts }, null, 2), 'utf8');
+    } catch { /* ignore */ }
+  }
+
   const mail = new AgentlyMailClient();
   const dispatcher = new ProfileDispatcher(profilesConfig);
   const pending = new PendingStore(pendingStoreFile);
@@ -181,9 +208,11 @@ function createEmailBridge(options = {}) {
 
     if (!dryRun) {
       try {
-        client.reply(message_id, response);
+        // 将 Markdown 响应转换为 HTML 格式
+        const htmlResponse = convertMarkdownToHtml(response);
+        client.reply(message_id, htmlResponse, { bodyFormat: 'html' });
         pending.markReplied(message_id);
-        process.stderr.write(`[email-bridge]${tag} Replied: ${message_id}\n`);
+        process.stderr.write(`[email-bridge]${tag} Replied (HTML): ${message_id}\n`);
       } catch (err) {
         process.stderr.write(`[email-bridge]${tag} Reply failed for ${message_id}: ${err.message}\n`);
         pending.markFailed(message_id, `reply failed: ${err.message}`);
@@ -196,6 +225,11 @@ function createEmailBridge(options = {}) {
     return true;
   }
 
+  const savedCursor = loadCursor();
+  if (savedCursor) {
+    process.stderr.write(`[email-bridge] Resuming from cursor: ${savedCursor}\n`);
+  }
+
   const poller = mail.poll(pollIntervalMs, async (msg, client) => {
     const { message_id, subject, from } = msg;
 
@@ -204,8 +238,6 @@ function createEmailBridge(options = {}) {
       process.stderr.write(
         `[email-bridge] Skipping self-sent: "${subject}" (${message_id})\n`,
       );
-      // Mark as read so it doesn't reappear in every poll cycle
-      try { client.read(message_id); } catch { /* ignore */ }
       return;
     }
 
@@ -214,10 +246,11 @@ function createEmailBridge(options = {}) {
 
     await dispatchAndReply(message_id, subject, from?.email || '?', client, false);
 
-  }, { limit });
+  }, { limit, afterTimestamp: savedCursor || undefined, saveCursor });
 
-  // Retry sweep: runs on every poll interval even when inbox is empty
-  // Uses a separate timer so retries happen regardless of new mail arriving
+  // Retry sweep: runs on every poll interval even when inbox is empty.
+  // Delayed by half an interval so it doesn't fire simultaneously with the
+  // main poll, spreading API calls evenly and reducing burst rate.
   let retryTimer = null;
   const runRetrySweep = async () => {
     const retryQueue = pending.getPending();
@@ -232,8 +265,11 @@ function createEmailBridge(options = {}) {
     }
     pending.cleanup();
   };
-  // First retry sweep runs after initial poll interval
-  retryTimer = setInterval(runRetrySweep, pollIntervalMs);
+  // Start retry sweep after half-interval offset to avoid simultaneous poll+retry bursts
+  setTimeout(() => {
+    runRetrySweep();
+    retryTimer = setInterval(runRetrySweep, pollIntervalMs);
+  }, Math.floor(pollIntervalMs / 2));
 
   // Graceful shutdown
   const stop = () => {
@@ -257,4 +293,5 @@ module.exports = {
   PendingStore,
   createEmailBridge,
   createProfile,
+  convertMarkdownToHtml,
 };
