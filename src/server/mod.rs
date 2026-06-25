@@ -2,6 +2,7 @@ pub mod pairing;
 pub mod routes;
 pub mod sse_ticket;
 
+use axum::http::HeaderValue;
 use axum::{
     extract::{DefaultBodyLimit, Request},
     middleware::{self, Next},
@@ -18,6 +19,47 @@ use std::sync::Arc;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+
+/// Parse a comma-separated list of allowed origins from a string.
+///
+/// Each entry must include a scheme (`https://` or `http://`).
+/// Panics with a descriptive message if any entry is missing a scheme,
+/// so misconfiguration surfaces immediately at startup rather than silently
+/// allowing unintended origins.
+pub fn parse_origins(s: &str) -> Vec<HeaderValue> {
+    s.split(',')
+        .map(|o| o.trim())
+        .filter(|o| !o.is_empty())
+        .map(|o| {
+            assert!(
+                o.starts_with("http://") || o.starts_with("https://"),
+                "CORS origin {o:?} is invalid: must start with http:// or https:// (without scheme)"
+            );
+            HeaderValue::from_str(o)
+                .unwrap_or_else(|_| panic!("CORS origin {o:?} is not a valid header value"))
+        })
+        .collect()
+}
+
+/// Build a `CorsLayer` from the `ILINK_CORS_ORIGINS` environment variable.
+///
+/// - If the variable is unset or empty, returns a permissive layer (`*`).
+/// - If set, returns a restrictive layer that only allows the listed origins.
+pub fn build_cors_layer() -> CorsLayer {
+    match std::env::var("ILINK_CORS_ORIGINS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
+        None => CorsLayer::permissive(),
+        Some(origins_str) => {
+            let origins = parse_origins(&origins_str);
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+        }
+    }
+}
 
 use crate::hub::HubState;
 use pairing::*;
