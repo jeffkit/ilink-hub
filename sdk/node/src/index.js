@@ -169,4 +169,13 @@ function createProfile(handler) {
     });
 }
 
-module.exports = { createProfile, loadHistory, appendHistory, sessionFilePath };
+const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
+
+module.exports = {
+  createProfile,
+  loadHistory,
+  appendHistory,
+  sessionFilePath,
+  AgentlyMailClient,
+  AgentlyMailError,
+};
