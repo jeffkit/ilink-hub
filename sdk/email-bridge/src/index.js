@@ -151,6 +151,8 @@ function createEmailBridge(options = {}) {
       process.stderr.write(
         `[email-bridge] Skipping self-sent: "${subject}" (${message_id})\n`,
       );
+      // Mark as read so it doesn't reappear in every poll cycle
+      try { client.read(message_id); } catch { /* ignore */ }
       return;
     }
 

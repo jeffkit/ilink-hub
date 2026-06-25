@@ -16,7 +16,7 @@ const { createProfile } = require('../src/index');
 const { streamJsonCli, withResumeFallback } = require('./_stream_json');
 
 createProfile(async ({ message, sessionId, sendPartial }) => {
-  const model = process.env.CLAUDE_MODEL || '';
+  const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5';
 
   const invoke = async (sid) => {
     const args = ['--print', '--dangerously-skip-permissions'];
