@@ -187,6 +187,47 @@ createEmailBridge({
 
 ---
 
+## HTML 邮件格式支持
+
+Agent 回复**自动使用 HTML 格式**，将 AI 输出的 Markdown 转换为格式化的 HTML 邮件，提供更好的阅读体验。
+
+### 支持的 Markdown 特性
+
+- ✅ **标题**：`#`、`##`、`###` 等
+- ✅ **加粗/斜体**：`**加粗**`、`*斜体*`
+- ✅ **代码**：行内 `` `code` ``、代码块 ` ```language `
+- ✅ **列表**：有序列表、无序列表、嵌套列表
+- ✅ **引用**：`> quote`
+- ✅ **链接**：`[text](url)`
+- ✅ **表格**：Markdown 表格（GFM）
+- ✅ **分隔线**：`---` 或 `***`
+
+### 样式设计
+
+使用 GitHub 风格样式，包含：
+- 清晰的标题层级（带下划线）
+- 代码块背景高亮
+- 表格斑马条纹
+- 适中的行距和间距
+- 响应式设计（最大宽度 800px）
+
+### 程序化使用
+
+```js
+const { convertMarkdownToHtml } = require('ilink-email-bridge');
+
+const markdown = `
+## 你好
+
+这是 **加粗** 文字，还有 \`代码\`。
+`;
+
+const html = convertMarkdownToHtml(markdown);
+// → 完整的 HTML 文档，包含样式
+```
+
+---
+
 ## 程序化使用
 
 ```js
@@ -205,12 +246,16 @@ createEmailBridge({
 // 高级：手动控制
 const mail = new AgentlyMailClient();
 const dispatcher = new ProfileDispatcher('./email-profiles.yaml');
+const { convertMarkdownToHtml } = require('ilink-email-bridge');
 
 const poller = mail.poll(60_000, async (msg, client) => {
   const full = client.read(msg.message_id);
   const { response, profileName } = dispatcher.dispatch(full);
   console.log(`[${profileName}] → ${response.length} chars`);
-  client.reply(msg.message_id, response);
+  
+  // 将 Markdown 响应转换为 HTML 邮件
+  const htmlResponse = convertMarkdownToHtml(response);
+  client.reply(msg.message_id, htmlResponse, { bodyFormat: 'html' });
 }, { limit: 10 });
 
 // 优雅关闭

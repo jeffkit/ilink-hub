@@ -58,3 +58,9 @@ export interface BridgeController {
  * Polls the mailbox, routes each unread email to a Profile, and replies.
  */
 export function createEmailBridge(options?: EmailBridgeOptions): BridgeController;
+
+/**
+ * Convert Markdown text to styled HTML suitable for email.
+ * The output includes basic GitHub-style formatting.
+ */
+export function convertMarkdownToHtml(markdown: string): string;

@@ -23,6 +23,7 @@ const path = require('path');
 const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
 const { ProfileDispatcher, convertMarkdownToHtml } = require('./dispatcher');
 const { PendingStore } = require('./pending-store');
+const { SenderAcl } = require('./sender-acl');
 
 // Re-export createProfile from ilink-bridge-profile (or a minimal fallback)
 let _createProfile;
@@ -149,6 +150,7 @@ function createEmailBridge(options = {}) {
   const mail = new AgentlyMailClient();
   const dispatcher = new ProfileDispatcher(profilesConfig);
   const pending = new PendingStore(pendingStoreFile);
+  const acl = new SenderAcl(dispatcher.config);
 
   const profileNames = dispatcher.profileNames();
   process.stderr.write(
@@ -164,7 +166,8 @@ function createEmailBridge(options = {}) {
     process.stderr.write(
       `[email-bridge] Monitoring ${email} every ${pollIntervalMs / 1000}s\n` +
       `[email-bridge] Subject prefix routing: [profile-name], default=${dispatcher.config.default}\n` +
-      (filterSelfSent ? `[email-bridge] Self-sent filter: ON (${[...ownAddresses].join(', ')})\n` : ''),
+      (filterSelfSent ? `[email-bridge] Self-sent filter: ON (${[...ownAddresses].join(', ')})\n` : '') +
+      (acl.isOpenAccess() ? '' : `[email-bridge] Sender ACL: ON (deny_action=${acl.denyAction})\n`),
     );
   } catch (err) {
     process.stderr.write(
@@ -172,6 +175,32 @@ function createEmailBridge(options = {}) {
       `  Run: agently-cli auth login\n`,
     );
     process.exit(3);
+  }
+
+  /**
+   * Handle a sender that failed ACL checks.
+   * Marks the message as "replied" in pending store so retry sweep ignores it.
+   */
+  async function handleDenied(client, msg, reason) {
+    const { message_id, subject, from } = msg;
+    process.stderr.write(
+      `[email-bridge] ACL denied: "${subject}" from ${from?.email} — ${reason}\n`,
+    );
+
+    // Always mark as done in pending store to prevent retry sweep re-processing
+    pending.add(msg);
+    pending.markReplied(message_id);
+
+    if (acl.denyAction === 'notify' && !dryRun) {
+      const body = acl.denyMessage ||
+        '感谢您的来信。您的邮件无法被自动处理，请联系管理员。\n\nThank you for your message. Your email could not be processed automatically. Please contact the administrator.';
+      try {
+        client.reply(message_id, body, { bodyFormat: 'plain' });
+        process.stderr.write(`[email-bridge] ACL deny notification sent: ${message_id}\n`);
+      } catch (err) {
+        process.stderr.write(`[email-bridge] ACL notify reply failed: ${err.message}\n`);
+      }
+    }
   }
 
   /**
@@ -193,6 +222,27 @@ function createEmailBridge(options = {}) {
       return false;
     }
 
+    // Resolve profile first so we can run per-profile ACL check
+    let resolvedProfile;
+    try {
+      resolvedProfile = dispatcher.resolveProfile(fullMsg.subject || '');
+    } catch (err) {
+      process.stderr.write(`[email-bridge]${tag} Profile resolution failed: ${err.message}\n`);
+      pending.markFailed(message_id, `profile resolve failed: ${err.message}`);
+      return false;
+    }
+
+    // Per-profile ACL check (global ACL already passed in poll handler)
+    if (acl.checkProfile(resolvedProfile.profileName, fromEmail) === 'deny') {
+      process.stderr.write(
+        `[email-bridge]${tag} ACL denied profile "${resolvedProfile.profileName}" for ${fromEmail}\n`,
+      );
+      // Build a minimal msg-like object for handleDenied (retry path may not have full msg)
+      const msgSummary = { message_id, subject, from: { email: fromEmail } };
+      await handleDenied(client, msgSummary, `profile "${resolvedProfile.profileName}" not allowed`);
+      return true; // treated as "handled", not a retriable failure
+    }
+
     let response, profileName;
     try {
       ({ response, profileName } = dispatcher.dispatch(fullMsg, dryRun));
@@ -208,7 +258,6 @@ function createEmailBridge(options = {}) {
 
     if (!dryRun) {
       try {
-        // 将 Markdown 响应转换为 HTML 格式
         const htmlResponse = convertMarkdownToHtml(response);
         client.reply(message_id, htmlResponse, { bodyFormat: 'html' });
         pending.markReplied(message_id);
@@ -232,6 +281,7 @@ function createEmailBridge(options = {}) {
 
   const poller = mail.poll(pollIntervalMs, async (msg, client) => {
     const { message_id, subject, from } = msg;
+    const senderEmail = from?.email || '';
 
     // Skip emails we sent ourselves (prevents reply loops)
     if (filterSelfSent && isSelfSent(msg, ownAddresses)) {
@@ -241,10 +291,16 @@ function createEmailBridge(options = {}) {
       return;
     }
 
+    // Global ACL check
+    if (acl.checkGlobal(senderEmail) === 'deny') {
+      await handleDenied(client, msg, 'global ACL');
+      return;
+    }
+
     // Register in pending store BEFORE reading (read() marks as read on server side)
     pending.add(msg);
 
-    await dispatchAndReply(message_id, subject, from?.email || '?', client, false);
+    await dispatchAndReply(message_id, subject, senderEmail, client, false);
 
   }, { limit, afterTimestamp: savedCursor || undefined, saveCursor });
 

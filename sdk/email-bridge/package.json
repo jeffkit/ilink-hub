@@ -31,5 +31,8 @@
     "bin/",
     "profiles/",
     "email-profiles.example.yaml"
-  ]
+  ],
+  "dependencies": {
+    "marked": "^18.0.5"
+  }
 }

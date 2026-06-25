@@ -16,6 +16,7 @@
 const { spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const { marked } = require('marked');
 
 // ---------------------------------------------------------------------------
 // Session history helpers — optional dependency on ilink-bridge-profile
@@ -226,6 +227,125 @@ function removeQuotedContent(text) {
 function truncate(text, maxLength) {
   if (!maxLength || text.length <= maxLength) return text;
   return text.slice(0, maxLength) + `\n\n[... 内容已截断，原始长度 ${text.length} 字符]`;
+}
+
+/**
+ * Convert Markdown text to HTML using marked.
+ * Adds basic email styling for better readability.
+ *
+ * @param {string} markdown
+ * @returns {string} HTML string with basic styling
+ */
+function convertMarkdownToHtml(markdown) {
+  const htmlBody = marked.parse(markdown, {
+    breaks: true,  // 支持换行符转换为 <br>
+    gfm: true      // 启用 GitHub Flavored Markdown
+  });
+
+  // 添加基础邮件样式
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    line-height: 1.6;
+    color: #24292e;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 20px;
+  }
+  h1, h2, h3, h4, h5, h6 {
+    margin-top: 24px;
+    margin-bottom: 16px;
+    font-weight: 600;
+    line-height: 1.25;
+  }
+  h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+  h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+  h3 { font-size: 1.25em; }
+  code {
+    padding: 0.2em 0.4em;
+    margin: 0;
+    font-size: 85%;
+    background-color: rgba(27,31,35,0.05);
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  pre {
+    padding: 16px;
+    overflow: auto;
+    font-size: 85%;
+    line-height: 1.45;
+    background-color: #f6f8fa;
+    border-radius: 3px;
+  }
+  pre code {
+    background-color: transparent;
+    padding: 0;
+  }
+  blockquote {
+    padding: 0 1em;
+    color: #6a737d;
+    border-left: 0.25em solid #dfe2e5;
+    margin: 0 0 16px 0;
+  }
+  ul, ol {
+    padding-left: 2em;
+    margin: 0 0 16px 0;
+  }
+  li {
+    margin-top: 0.25em;
+  }
+  p {
+    margin: 0 0 16px 0;
+  }
+  a {
+    color: #0366d6;
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+  table {
+    border-spacing: 0;
+    border-collapse: collapse;
+    margin: 0 0 16px 0;
+  }
+  table th, table td {
+    padding: 6px 13px;
+    border: 1px solid #dfe2e5;
+  }
+  table th {
+    font-weight: 600;
+    background-color: #f6f8fa;
+  }
+  table tr {
+    background-color: #fff;
+    border-top: 1px solid #c6cbd1;
+  }
+  table tr:nth-child(2n) {
+    background-color: #f6f8fa;
+  }
+  hr {
+    height: 0.25em;
+    padding: 0;
+    margin: 24px 0;
+    background-color: #e1e4e8;
+    border: 0;
+  }
+  strong {
+    font-weight: 600;
+  }
+</style>
+</head>
+<body>
+${htmlBody}
+</body>
+</html>
+`.trim();
 }
 
 /**
@@ -464,4 +584,4 @@ class ProfileDispatcher {
   }
 }
 
-module.exports = { ProfileDispatcher, loadProfilesConfig, cleanBody, stripHtml, removeQuotedContent };
+module.exports = { ProfileDispatcher, loadProfilesConfig, cleanBody, stripHtml, removeQuotedContent, convertMarkdownToHtml };

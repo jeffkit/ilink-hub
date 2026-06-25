@@ -5,6 +5,37 @@
 #
 # 内置 Profile 路径相对于本配置文件所在目录（无需 npm install）
 
+# ── 发件人访问控制（可选） ──────────────────────────────────────────────────────
+#
+# allowed_senders: 全局白名单，只处理来自这些地址/域名的邮件
+#   不配置或留空 = 不限制（接受所有来信）
+#   支持：精确地址 "user@example.com"
+#         域名    "@example.com"（该域所有邮箱）
+#         子域通配 "@*.example.com"（所有子域名）
+#
+# allowed_senders:
+#   - me@gmail.com
+#   - "@mycompany.com"
+#   - "@*.trusted-partner.org"
+
+# denied_senders: 全局黑名单，优先级高于白名单
+#
+# denied_senders:
+#   - spam@example.com
+#   - "@blocked-domain.com"
+
+# deny_action: 被拒绝时的行为
+#   silent  — 静默丢弃，不回复（默认，避免泄露 Agent 存在）
+#   notify  — 发送一封礼貌的拒绝通知邮件
+#
+# deny_action: silent
+
+# deny_message: 自定义拒绝通知邮件正文（仅 deny_action: notify 时生效）
+#
+# deny_message: "感谢来信，您无权使用此服务，请联系管理员。"
+
+# ───────────────────────────────────────────────────────────────────────────────
+
 default: claude-code
 
 profiles:
@@ -61,3 +92,6 @@ profiles:
       - ./profiles/echo.js          # 原样回显，调试路由用
     description: Echo（调试）
     trigger: echo
+    # per-profile 白名单示例：只有自己能用 echo（调试专用）
+    # allowed_senders:
+    #   - me@gmail.com

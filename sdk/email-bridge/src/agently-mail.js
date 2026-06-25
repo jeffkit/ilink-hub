@@ -326,33 +326,54 @@ class AgentlyMailClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Poll for unread messages at a fixed interval.
+   * Poll for new inbox messages at a fixed interval using a time-cursor strategy.
    *
-   * The handler is called once per unread message.  If the handler throws,
-   * the error is logged to stderr and polling continues.  Call `stop()` on
-   * the returned controller to stop polling.
+   * Unlike the previous unread-flag approach, this method uses `--after <timestamp>`
+   * so that messages are never missed due to external read operations (e.g. manual
+   * `agently-cli message +read`, reading in another client, or a crash mid-processing).
    *
-   * Only the message summary (from +list) is passed to the handler, not the
-   * full body — fetch it with `client.read(msg.message_id)` if needed.
-   * This keeps poll cost at one CLI call per interval when the inbox is empty.
+   * The cursor (`afterTimestamp`) advances only after all messages in a batch have
+   * been handed to the handler. It is persisted via `options.saveCursor` so restarts
+   * resume from where they left off.
+   *
+   * De-duplication: a Set of seen message_ids prevents the same message from being
+   * dispatched twice within one process lifetime (the server may return messages whose
+   * created_at equals the cursor boundary).
+   *
+   * The handler is called once per message.  If the handler throws, the error is
+   * logged to stderr and polling continues.  Call `stop()` on the returned controller
+   * to stop polling.
    *
    * @param {number} intervalMs
    * @param {(msg: object, client: AgentlyMailClient) => Promise<void>} handler
    * @param {object} [options]
-   * @param {number} [options.limit=20]   Max unread per poll cycle
+   * @param {number} [options.limit=20]          Max messages per poll cycle
+   * @param {string} [options.afterTimestamp]    Initial cursor (ISO 8601); defaults to now
+   * @param {(ts: string) => void} [options.saveCursor]  Called after each batch to persist cursor
    * @returns {{ stop: () => void }}
    */
   poll(intervalMs, handler, options = {}) {
     const limit = options.limit ?? 20;
+    // Start from now if no saved cursor: don't reprocess the entire inbox on first run
+    let afterTimestamp = options.afterTimestamp || new Date().toISOString();
+    const saveCursor = options.saveCursor || null;
+    const seenIds = new Set();
     let stopped = false;
     let timer = null;
 
     const tick = async () => {
       if (stopped) return;
       try {
-        const unread = this.listUnread(limit);
-        for (const msg of unread) {
+        const { messages } = this.list({ after: afterTimestamp, limit, dir: 'inbox' });
+        // Sort ascending by created_at so we process oldest-first and advance cursor correctly
+        messages.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+        let latestTimestamp = afterTimestamp;
+        for (const msg of messages) {
           if (stopped) break;
+          if (seenIds.has(msg.message_id)) continue;
+          seenIds.add(msg.message_id);
+
           try {
             await handler(msg, this);
           } catch (err) {
@@ -360,6 +381,18 @@ class AgentlyMailClient {
               `[agently-mail] handler error for ${msg.message_id}: ${err?.message || err}\n`,
             );
           }
+
+          // Advance cursor past this message
+          if (msg.created_at && msg.created_at > latestTimestamp) {
+            latestTimestamp = msg.created_at;
+          }
+        }
+
+        // Move cursor forward so next poll only fetches newer messages.
+        // We add 1ms to avoid re-fetching the last message on the boundary.
+        if (messages.length > 0 && latestTimestamp >= afterTimestamp) {
+          afterTimestamp = new Date(new Date(latestTimestamp).getTime() + 1).toISOString();
+          if (saveCursor) saveCursor(afterTimestamp);
         }
       } catch (err) {
         process.stderr.write(
