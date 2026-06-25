@@ -29,6 +29,7 @@
   "files": [
     "src/",
     "bin/",
+    "profiles/",
     "email-profiles.example.yaml"
   ]
 }

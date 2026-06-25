@@ -125,6 +125,26 @@ Output (stdout):
 
 ---
 
+## 内置 Profiles
+
+包内置了所有主流 Coding Agent CLI 的 Node.js Profile，无需额外安装：
+
+| Profile 文件 | 调用的 CLI | 主题前缀 | 所需 CLI |
+|-------------|-----------|---------|---------|
+| `profiles/claude-code.js` | `claude` | `[claude]` | Claude Code |
+| `profiles/cursor.js` | `agent` | `[cursor]` | Cursor Agent |
+| `profiles/codebuddy.js` | `codebuddy` | `[codebuddy]` | CodeBuddy Code |
+| `profiles/codex.js` | `codex` | `[codex]` | OpenAI Codex |
+| `profiles/agy.js` | `agy` | `[agy]` | Antigravity (DeepMind) |
+| `profiles/echo.js` | （内置） | `[echo]` | 无（调试用） |
+
+所有 Profiles 都实现了：
+- **session 续传**：`--resume <uuid>` 恢复上次对话
+- **session 降级**：session 失效时自动重试新会话
+- **P0 兼容**：`ILINK_PARTIAL` 流式输出 + `ILINK_SESSION` 更新
+
+---
+
 ## 邮件线程与会话
 
 每个「邮件线程 × Profile」对应一个独立的 AI 会话（Session）。

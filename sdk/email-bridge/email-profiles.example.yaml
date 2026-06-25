@@ -1,31 +1,63 @@
-# Email Bridge Profile 配置
-# 使用邮件主题前缀 [profile-name] 来指定用哪个 Profile 处理
-# 例如: Subject: [cursor] 帮我看看这段代码
+# email-profiles.yaml 示例配置
 #
-# default: 没有匹配到任何前缀时使用的 Profile 名称
-default: claude
+# 使用邮件主题前缀 [profile-name] 指定处理 Profile：
+#   Subject: [cursor] 帮我看这段代码
+#
+# 内置 Profile 路径相对于本配置文件所在目录（无需 npm install）
+
+default: claude-code
 
 profiles:
-  # Claude Code — 默认 AI 助手
-  claude:
+  # ──────────────────────────────────────
+  # 内置 Coding Agent CLI Profiles
+  # ──────────────────────────────────────
+
+  claude-code:
     command: node
     args:
-      - ../../examples/claude-code-nodejs/handler.js
+      - ./profiles/claude-code.js   # Claude Code CLI (claude)
     description: Claude Code AI 助手（默认）
     trigger: claude
+    # 可选 env: CLAUDE_MODEL=claude-opus-4-5
 
-  # Cursor AI
   cursor:
-    command: python3
+    command: node
     args:
-      - ../../examples/cursor-python/handler.py
+      - ./profiles/cursor.js        # Cursor Agent CLI (agent)
     description: Cursor AI 编程助手
     trigger: cursor
+    # 可选 env: CURSOR_MODEL=claude-opus-4-5
 
-  # 内置 echo 测试（不依赖外部 AI）
+  codebuddy:
+    command: node
+    args:
+      - ./profiles/codebuddy.js     # CodeBuddy Code CLI (codebuddy)
+    description: CodeBuddy Code AI（腾讯云内部）
+    trigger: codebuddy
+    # 可选 env: ILINK_CODEBUDDY_MODEL=claude-sonnet-4.6
+
+  codex:
+    command: node
+    args:
+      - ./profiles/codex.js         # OpenAI Codex CLI (codex)
+    description: OpenAI Codex
+    trigger: codex
+
+  agy:
+    command: node
+    args:
+      - ./profiles/agy.js           # Antigravity (Google DeepMind) CLI (agy)
+    description: Google DeepMind Agy
+    trigger: agy
+    # 可选 env: AGY_MODEL=gemini-2.0-flash
+
+  # ──────────────────────────────────────
+  # 调试 / 自定义 Profile
+  # ──────────────────────────────────────
+
   echo:
     command: node
     args:
-      - ../../examples/email-bridge/echo-profile.js
-    description: 原样回显（调试用）
+      - ./profiles/echo.js          # 原样回显，调试路由用
+    description: Echo（调试）
     trigger: echo

@@ -19,6 +19,40 @@
 const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
 const { ProfileDispatcher } = require('./dispatcher');
 
+// Re-export createProfile from ilink-bridge-profile (or a minimal fallback)
+let _createProfile;
+try {
+  ({ createProfile: _createProfile } = require('ilink-bridge-profile'));
+} catch {
+  // Minimal standalone fallback when ilink-bridge-profile is not installed
+  _createProfile = function createProfile(handler) {
+    const ctx = {
+      message: process.env.ILINK_MESSAGE || '',
+      sessionId: process.env.ILINK_SESSION_ID || '',
+      sessionName: process.env.ILINK_SESSION_NAME || 'email',
+      fromUser: process.env.ILINK_FROM_USER || '',
+      contextToken: process.env.ILINK_CONTEXT_TOKEN || '',
+      sendPartial(text) {
+        process.stdout.write(`ILINK_PARTIAL:${JSON.stringify(text)}\n`);
+      },
+    };
+    Promise.resolve()
+      .then(() => handler(ctx))
+      .then((result) => {
+        const response = typeof result === 'string' ? result : (result?.response || '');
+        const newSid = typeof result === 'object' ? result?.sessionId : undefined;
+        if (newSid) process.stdout.write(`ILINK_SESSION:${newSid}\n`);
+        process.stdout.write(response);
+        process.exit(0);
+      })
+      .catch((err) => {
+        process.stderr.write(`[ilink-email-bridge/profile] error: ${err?.stack || err}\n`);
+        process.exit(1);
+      });
+  };
+}
+const createProfile = _createProfile;
+
 // ---------------------------------------------------------------------------
 // Self-email filter helpers
 // ---------------------------------------------------------------------------
@@ -150,4 +184,10 @@ function createEmailBridge(options = {}) {
   return poller;
 }
 
-module.exports = { AgentlyMailClient, AgentlyMailError, ProfileDispatcher, createEmailBridge };
+module.exports = {
+  AgentlyMailClient,
+  AgentlyMailError,
+  ProfileDispatcher,
+  createEmailBridge,
+  createProfile,
+};
