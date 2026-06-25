@@ -73,7 +73,7 @@ function _parseSimpleYaml(text) {
     if (m0) { result.default = _stripInlineComment(m0[1]); continue; }
     if (line.match(/^profiles:/)) continue;
 
-    const m1 = line.match(/^  (\w+):/);
+    const m1 = line.match(/^  ([\w-]+):/);
     if (m1) {
       current = m1[1];
       result.profiles[current] = { command: '', args: [], trigger: '' };
