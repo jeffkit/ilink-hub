@@ -51,6 +51,16 @@ function loadProfilesConfig(filePath) {
   }
 }
 
+/**
+ * Strip an inline YAML comment from a scalar value string.
+ * e.g. './profiles/echo.js   # debug' → './profiles/echo.js'
+ * Note: does not handle strings that legitimately contain " #".
+ */
+function _stripInlineComment(value) {
+  // Remove anything from " #" (space + hash) onwards
+  return value.replace(/\s+#.*$/, '').trim();
+}
+
 function _parseSimpleYaml(text) {
   const result = { default: '', profiles: {} };
   let current = null;
@@ -60,7 +70,7 @@ function _parseSimpleYaml(text) {
     if (line.trim().startsWith('#') || !line.trim()) continue;
 
     const m0 = line.match(/^default:\s*(.+)/);
-    if (m0) { result.default = m0[1].trim(); continue; }
+    if (m0) { result.default = _stripInlineComment(m0[1]); continue; }
     if (line.match(/^profiles:/)) continue;
 
     const m1 = line.match(/^  (\w+):/);
@@ -72,14 +82,19 @@ function _parseSimpleYaml(text) {
     }
 
     if (current) {
-      const mc = line.match(/^    command:\s*(.+)/); if (mc) { result.profiles[current].command = mc[1].trim(); continue; }
-      const mt = line.match(/^    trigger:\s*(.+)/); if (mt) { result.profiles[current].trigger = mt[1].trim(); continue; }
-      const md = line.match(/^    description:\s*(.+)/); if (md) { result.profiles[current].description = md[1].trim(); continue; }
+      const mc = line.match(/^    command:\s*(.+)/);
+      if (mc) { result.profiles[current].command = _stripInlineComment(mc[1]); continue; }
+      const mt = line.match(/^    trigger:\s*(.+)/);
+      if (mt) { result.profiles[current].trigger = _stripInlineComment(mt[1]); continue; }
+      const md = line.match(/^    description:\s*(.+)/);
+      if (md) { result.profiles[current].description = _stripInlineComment(md[1]); continue; }
       if (line.match(/^    args:/)) { inArgs = true; continue; }
       if (inArgs) {
         const ma = line.match(/^      - (.+)/);
-        if (ma) { result.profiles[current].args.push(ma[1].trim()); continue; }
-        else { inArgs = false; }
+        if (ma) {
+          result.profiles[current].args.push(_stripInlineComment(ma[1]));
+          continue;
+        } else { inArgs = false; }
       }
     }
   }
@@ -116,6 +131,17 @@ function stripHtml(html) {
     .replace(/[ \t]{2,}/g, ' ')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Remove Agently Mail's automatic footer injected into every sent message.
+ * Pattern: "此邮件由{email}通过Agently Mail自动发送。举报退订"
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function removeAgentlyFooter(text) {
+  return text.replace(/\s*此邮件由[\S]+通过Agently Mail自动发送。举报退订\s*/g, '').trim();
 }
 
 /**
@@ -221,6 +247,9 @@ function cleanBody(fullMsg, opts = {}) {
   if (stripQuotes) {
     text = removeQuotedContent(text);
   }
+
+  // Remove Agently Mail's auto-injected footer before sending to Profile
+  text = removeAgentlyFooter(text);
 
   return truncate(text.trim(), maxLength);
 }
