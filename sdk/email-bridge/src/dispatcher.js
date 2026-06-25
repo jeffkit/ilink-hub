@@ -336,6 +336,8 @@ class ProfileDispatcher {
     });
 
     const message = [
+      '你是一个智能邮件 AI 助手。请直接回复以下邮件，像正常邮件往来一样给出回复正文。不要描述或分析邮件本身，直接切入内容回复。',
+      '',
       `发件人: ${senderName} <${senderEmail}>`,
       `主题: ${cleanSubject}`,
       '',
