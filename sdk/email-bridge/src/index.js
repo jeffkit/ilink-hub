@@ -227,75 +227,91 @@ function createEmailBridge(options = {}) {
     }
   }
 
+  // In-memory guard: tracks message IDs currently being dispatched.
+  // Prevents retry sweep from launching a second dispatch while the poll
+  // handler's dispatchAndReply is still running (e.g. waiting for Claude).
+  const processingSet = new Set();
+
   /**
    * Core dispatch-and-reply logic, shared between new mail handler and retry handler.
    * Returns true on success, false on failure.
    */
   async function dispatchAndReply(message_id, subject, fromEmail, client, isRetry = false) {
-    const tag = isRetry ? '[RETRY]' : '';
-    process.stderr.write(
-      `[email-bridge]${tag} Processing: "${subject}" from ${fromEmail} (${message_id})\n`,
-    );
-
-    let fullMsg;
-    try {
-      fullMsg = client.read(message_id);
-    } catch (err) {
-      process.stderr.write(`[email-bridge]${tag} Failed to read ${message_id}: ${err.message}\n`);
-      pending.markFailed(message_id, `read failed: ${err.message}`);
-      return false;
-    }
-
-    // Resolve profile first so we can run per-profile ACL check
-    let resolvedProfile;
-    try {
-      resolvedProfile = dispatcher.resolveProfile(fullMsg.subject || '');
-    } catch (err) {
-      process.stderr.write(`[email-bridge]${tag} Profile resolution failed: ${err.message}\n`);
-      pending.markFailed(message_id, `profile resolve failed: ${err.message}`);
-      return false;
-    }
-
-    // Per-profile ACL check (global ACL already passed in poll handler)
-    if (acl.checkProfile(resolvedProfile.profileName, fromEmail) === 'deny') {
+    if (processingSet.has(message_id)) {
       process.stderr.write(
-        `[email-bridge]${tag} ACL denied profile "${resolvedProfile.profileName}" for ${fromEmail}\n`,
+        `[email-bridge] Skipping duplicate dispatch for ${message_id} (already in progress)\n`,
       );
-      // Build a minimal msg-like object for handleDenied (retry path may not have full msg)
-      const msgSummary = { message_id, subject, from: { email: fromEmail } };
-      await handleDenied(client, msgSummary, `profile "${resolvedProfile.profileName}" not allowed`);
-      return true; // treated as "handled", not a retriable failure
+      return true;
     }
-
-    let response, profileName;
+    processingSet.add(message_id);
     try {
-      ({ response, profileName } = dispatcher.dispatch(fullMsg, dryRun));
-    } catch (err) {
-      process.stderr.write(`[email-bridge]${tag} Dispatch failed for ${message_id}: ${err.message}\n`);
-      pending.markFailed(message_id, `dispatch failed: ${err.message}`);
-      return false;
-    }
+      const tag = isRetry ? '[RETRY]' : '';
+      process.stderr.write(
+        `[email-bridge]${tag} Processing: "${subject}" from ${fromEmail} (${message_id})\n`,
+      );
 
-    process.stderr.write(
-      `[email-bridge]${tag} Profile: ${profileName} → ${response.length} chars\n`,
-    );
-
-    if (!dryRun) {
+      let fullMsg;
       try {
-        const htmlResponse = convertMarkdownToHtml(response);
-        client.reply(message_id, htmlResponse, { bodyFormat: 'html' });
-        pending.markReplied(message_id);
-        process.stderr.write(`[email-bridge]${tag} Replied (HTML): ${message_id}\n`);
+        fullMsg = client.read(message_id);
       } catch (err) {
-        process.stderr.write(`[email-bridge]${tag} Reply failed for ${message_id}: ${err.message}\n`);
-        pending.markFailed(message_id, `reply failed: ${err.message}`);
+        process.stderr.write(`[email-bridge]${tag} Failed to read ${message_id}: ${err.message}\n`);
+        pending.markFailed(message_id, `read failed: ${err.message}`);
         return false;
       }
-    } else {
-      pending.markReplied(message_id);
-      process.stderr.write(`[email-bridge][DRY_RUN] Would reply: ${response.slice(0, 120)}\n`);
+
+      // Resolve profile first so we can run per-profile ACL check
+      let resolvedProfile;
+      try {
+        resolvedProfile = dispatcher.resolveProfile(fullMsg.subject || '');
+      } catch (err) {
+        process.stderr.write(`[email-bridge]${tag} Profile resolution failed: ${err.message}\n`);
+        pending.markFailed(message_id, `profile resolve failed: ${err.message}`);
+        return false;
+      }
+
+      // Per-profile ACL check (global ACL already passed in poll handler)
+      if (acl.checkProfile(resolvedProfile.profileName, fromEmail) === 'deny') {
+        process.stderr.write(
+          `[email-bridge]${tag} ACL denied profile "${resolvedProfile.profileName}" for ${fromEmail}\n`,
+        );
+        // Build a minimal msg-like object for handleDenied (retry path may not have full msg)
+        const msgSummary = { message_id, subject, from: { email: fromEmail } };
+        await handleDenied(client, msgSummary, `profile "${resolvedProfile.profileName}" not allowed`);
+        return true; // treated as "handled", not a retriable failure
+      }
+
+      let response, profileName;
+      try {
+        ({ response, profileName } = dispatcher.dispatch(fullMsg, dryRun));
+      } catch (err) {
+        process.stderr.write(`[email-bridge]${tag} Dispatch failed for ${message_id}: ${err.message}\n`);
+        pending.markFailed(message_id, `dispatch failed: ${err.message}`);
+        return false;
+      }
+
+      process.stderr.write(
+        `[email-bridge]${tag} Profile: ${profileName} → ${response.length} chars\n`,
+      );
+
+      if (!dryRun) {
+        try {
+          const htmlResponse = convertMarkdownToHtml(response);
+          client.reply(message_id, htmlResponse, { bodyFormat: 'html' });
+          pending.markReplied(message_id);
+          process.stderr.write(`[email-bridge]${tag} Replied (HTML): ${message_id}\n`);
+        } catch (err) {
+          process.stderr.write(`[email-bridge]${tag} Reply failed for ${message_id}: ${err.message}\n`);
+          pending.markFailed(message_id, `reply failed: ${err.message}`);
+          return false;
+        }
+      } else {
+        pending.markReplied(message_id);
+        process.stderr.write(`[email-bridge][DRY_RUN] Would reply: ${response.slice(0, 120)}\n`);
+      }
+      return true;
+    } finally {
+      processingSet.delete(message_id);
     }
-    return true;
   }
 
   const savedCursor = loadCursor();

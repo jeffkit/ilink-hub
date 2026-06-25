@@ -137,6 +137,11 @@ class PendingStore {
   /**
    * 返回所有「应该重试」的邮件摘要（未回复 + 未超过重试上限 + 超过冷却期）。
    *
+   * 冷却规则：
+   *  - 刚 add() 的消息（无 last_failed_at）必须等满 RETRY_COOLDOWN_MS 才进入重试队列，
+   *    防止 poll handler 正在处理时 retry sweep 并发重复 dispatch。
+   *  - 失败后重试同样需要等 RETRY_COOLDOWN_MS。
+   *
    * @returns {object[]}
    */
   getPending() {
@@ -145,7 +150,11 @@ class PendingStore {
     return Object.values(this._data).filter((entry) => {
       if (entry.replied) return false;
       if ((entry.retries || 0) >= MAX_RETRIES) return false;
-      // 冷却期：上次失败后至少等 RETRY_COOLDOWN_MS
+      // 新消息初始冷却：距 add() 时间不足 RETRY_COOLDOWN_MS，跳过
+      // 这样 poll handler 的 dispatchAndReply 有足够时间完成并调用 markReplied
+      const addedAt = entry.added_at ? new Date(entry.added_at).getTime() : 0;
+      if (now - addedAt < RETRY_COOLDOWN_MS) return false;
+      // 失败冷却：上次失败后至少等 RETRY_COOLDOWN_MS
       if (entry.last_failed_at) {
         const lastFailed = new Date(entry.last_failed_at).getTime();
         if (now - lastFailed < RETRY_COOLDOWN_MS) return false;
