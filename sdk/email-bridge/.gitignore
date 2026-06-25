@@ -33,3 +33,6 @@ lerna-debug.log*
 .env
 .env.local
 .env.*.local
+
+# Personal ACL config (use email-acl.example.yaml as template)
+email-acl.yaml
