@@ -18,6 +18,7 @@
 
 const { AgentlyMailClient, AgentlyMailError } = require('./agently-mail');
 const { ProfileDispatcher } = require('./dispatcher');
+const { PendingStore } = require('./pending-store');
 
 // Re-export createProfile from ilink-bridge-profile (or a minimal fallback)
 let _createProfile;
@@ -105,6 +106,7 @@ function isSelfSent(msgSummary, ownAddresses) {
  * @param {boolean} [options.dryRun]           Skip actual replies (default false)
  * @param {number}  [options.limit]            Max unread per poll cycle (default 20)
  * @param {boolean} [options.filterSelfSent]   Skip emails sent by our own address (default true)
+ * @param {string}  [options.pendingStoreFile] Custom path for pending state JSON file
  * @returns {{ stop: () => void }}
  */
 function createEmailBridge(options = {}) {
@@ -114,10 +116,12 @@ function createEmailBridge(options = {}) {
     dryRun = process.env.DRY_RUN === '1',
     limit = 20,
     filterSelfSent = true,
+    pendingStoreFile,
   } = options;
 
   const mail = new AgentlyMailClient();
   const dispatcher = new ProfileDispatcher(profilesConfig);
+  const pending = new PendingStore(pendingStoreFile);
 
   const profileNames = dispatcher.profileNames();
   process.stderr.write(
@@ -143,6 +147,55 @@ function createEmailBridge(options = {}) {
     process.exit(3);
   }
 
+  /**
+   * Core dispatch-and-reply logic, shared between new mail handler and retry handler.
+   * Returns true on success, false on failure.
+   */
+  async function dispatchAndReply(message_id, subject, fromEmail, client, isRetry = false) {
+    const tag = isRetry ? '[RETRY]' : '';
+    process.stderr.write(
+      `[email-bridge]${tag} Processing: "${subject}" from ${fromEmail} (${message_id})\n`,
+    );
+
+    let fullMsg;
+    try {
+      fullMsg = client.read(message_id);
+    } catch (err) {
+      process.stderr.write(`[email-bridge]${tag} Failed to read ${message_id}: ${err.message}\n`);
+      pending.markFailed(message_id, `read failed: ${err.message}`);
+      return false;
+    }
+
+    let response, profileName;
+    try {
+      ({ response, profileName } = dispatcher.dispatch(fullMsg, dryRun));
+    } catch (err) {
+      process.stderr.write(`[email-bridge]${tag} Dispatch failed for ${message_id}: ${err.message}\n`);
+      pending.markFailed(message_id, `dispatch failed: ${err.message}`);
+      return false;
+    }
+
+    process.stderr.write(
+      `[email-bridge]${tag} Profile: ${profileName} → ${response.length} chars\n`,
+    );
+
+    if (!dryRun) {
+      try {
+        client.reply(message_id, response);
+        pending.markReplied(message_id);
+        process.stderr.write(`[email-bridge]${tag} Replied: ${message_id}\n`);
+      } catch (err) {
+        process.stderr.write(`[email-bridge]${tag} Reply failed for ${message_id}: ${err.message}\n`);
+        pending.markFailed(message_id, `reply failed: ${err.message}`);
+        return false;
+      }
+    } else {
+      pending.markReplied(message_id);
+      process.stderr.write(`[email-bridge][DRY_RUN] Would reply: ${response.slice(0, 120)}\n`);
+    }
+    return true;
+  }
+
   const poller = mail.poll(pollIntervalMs, async (msg, client) => {
     const { message_id, subject, from } = msg;
 
@@ -156,40 +209,52 @@ function createEmailBridge(options = {}) {
       return;
     }
 
-    process.stderr.write(
-      `[email-bridge] Processing: "${subject}" from ${from?.email || '?'} (${message_id})\n`,
-    );
+    // Register in pending store BEFORE reading (read() marks as read on server side)
+    pending.add(msg);
 
-    const fullMsg = client.read(message_id);
-    const { response, profileName } = dispatcher.dispatch(fullMsg, dryRun);
+    await dispatchAndReply(message_id, subject, from?.email || '?', client, false);
 
-    process.stderr.write(
-      `[email-bridge] Profile: ${profileName} → ${response.length} chars\n`,
-    );
-
-    if (!dryRun) {
-      client.reply(message_id, response);
-      process.stderr.write(`[email-bridge] Replied: ${message_id}\n`);
-    } else {
-      process.stderr.write(`[email-bridge][DRY_RUN] Would reply: ${response.slice(0, 120)}\n`);
-    }
   }, { limit });
 
+  // Retry sweep: runs on every poll interval even when inbox is empty
+  // Uses a separate timer so retries happen regardless of new mail arriving
+  let retryTimer = null;
+  const runRetrySweep = async () => {
+    const retryQueue = pending.getPending();
+    if (retryQueue.length === 0) {
+      pending.cleanup();
+      return;
+    }
+    process.stderr.write(`[email-bridge] Retry sweep: ${retryQueue.length} pending message(s)\n`);
+    const client = mail;
+    for (const entry of retryQueue) {
+      await dispatchAndReply(entry.message_id, entry.subject, entry.from_email, client, true);
+    }
+    pending.cleanup();
+  };
+  // First retry sweep runs after initial poll interval
+  retryTimer = setInterval(runRetrySweep, pollIntervalMs);
+
   // Graceful shutdown
+  const stop = () => {
+    poller.stop();
+    if (retryTimer) clearInterval(retryTimer);
+  };
   process.on('SIGINT', () => {
     process.stderr.write('\n[email-bridge] Stopping...\n');
-    poller.stop();
+    stop();
     process.exit(0);
   });
-  process.on('SIGTERM', () => { poller.stop(); process.exit(0); });
+  process.on('SIGTERM', () => { stop(); process.exit(0); });
 
-  return poller;
+  return { stop };
 }
 
 module.exports = {
   AgentlyMailClient,
   AgentlyMailError,
   ProfileDispatcher,
+  PendingStore,
   createEmailBridge,
   createProfile,
 };
