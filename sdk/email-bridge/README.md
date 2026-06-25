@@ -125,6 +125,26 @@ Output (stdout):
 
 ---
 
+## 邮件线程与会话
+
+每个「邮件线程 × Profile」对应一个独立的 AI 会话（Session）。
+
+```
+原始邮件 A (rfc_message_id: <msgA>)
+  └── 你回复 → 已过滤（自发）
+       └── 用户再次回复 B (in_reply_to: <msgA>, references: [<msgA>])
+            └── 共享同一 session_id: email_claude_msgA_xxx
+```
+
+**Session key 计算规则**（按优先级）：
+1. `references[0]`（RFC 2822 规范的线程根 Message-ID）
+2. `in_reply_to`（直接父级，适用于只有一级回复的情况）
+3. `rfc_message_id`（全新线程，从这封邮件开始）
+
+效果：**同一条邮件链的所有消息共享一个 AI 会话**，Profile 能记住整个对话上下文，无需用户重复说明背景。
+
+---
+
 ## 防循环设计
 
 默认开启 **自发邮件过滤**：跳过所有 `from.email` 与自己邮箱地址一致的邮件，防止 Agent 对自己的回复再次处理，形成无限循环。

@@ -350,10 +350,31 @@ class ProfileDispatcher {
     return { response, profileName };
   }
 
-  /** @private */
+  /**
+   * Compute a stable session ID for a (thread × profile) pair.
+   *
+   * Thread grouping strategy:
+   *  - If the message has a References header, use the FIRST entry (the thread root)
+   *  - If only In-Reply-To is set, use that (direct parent = thread root for 1-level threads)
+   *  - Otherwise use the message's own RFC Message-ID (start of a new thread)
+   *
+   * All replies in the same email chain therefore share one session, so the
+   * AI Profile maintains conversation context across the full thread.
+   *
+   * @private
+   */
   _sessionId(fullMsg, profileName) {
-    const raw = fullMsg.rfc_message_id || fullMsg.message_id || 'unknown';
-    return `email_${profileName}_${raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 60)}`;
+    // references[0] is the oldest (root) message in the thread per RFC 2822
+    const threadRoot =
+      (Array.isArray(fullMsg.references) && fullMsg.references.length > 0
+        ? fullMsg.references[0]
+        : null) ||
+      fullMsg.in_reply_to ||
+      fullMsg.rfc_message_id ||
+      fullMsg.message_id ||
+      'unknown';
+
+    return `email_${profileName}_${threadRoot.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 80)}`;
   }
 
   /** @private */
