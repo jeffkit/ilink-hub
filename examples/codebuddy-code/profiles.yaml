@@ -35,7 +35,7 @@
 #
 # ─── 终端模拟测试（不启动 bridge）─────────────────────────────────────────────
 #
-#   ILINK_MESSAGE="你好，简短介绍自己" ILINK_SESSION_ID="" \
+#   AGENT_MESSAGE="你好，简短介绍自己" AGENT_SESSION_ID="" \
 #     ILINK_CODEBUDDY_MODEL="glm-5.1-ioa" \
 #     ilink-hub-bridge profile codebuddy-code
 #
@@ -61,7 +61,7 @@ profiles:
     streaming: false
     env:
       ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"
-      ILINK_SESSION_ID: ""                      # 覆盖注入，强制新会话
+      AGENT_SESSION_ID: ""                      # 覆盖注入，强制新会话
 
 routing:
   strategy: prefix

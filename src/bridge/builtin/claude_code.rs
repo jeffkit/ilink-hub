@@ -78,7 +78,7 @@ async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Resu
 /// preceding `assistant` event); we emit it as an extra AGENT_PARTIAL in that case.
 ///
 /// When the inbound message carries an image or file (URLs set by the bridge in
-/// `ILINK_IMAGE_URL` / `ILINK_FILE_URL`), switches to the bidirectional `stream-json`
+/// `AGENT_IMAGE_URL` / `AGENT_FILE_URL`), switches to the bidirectional `stream-json`
 /// input/output mode and writes a single `SDKUserMessage` to stdin whose `content` is
 /// an array of `[text, image/document]` blocks. This is the same protocol the Claude
 /// Code TS SDK uses internally.
@@ -89,10 +89,10 @@ async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Resu
 ///   Other file types are NOT supported through this path (no `video` block, no generic
 ///   file block). Non-matching files surface a clear error before the CLI is spawned.
 async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>> {
-    let image_url = std::env::var("ILINK_IMAGE_URL")
+    let image_url = std::env::var("AGENT_IMAGE_URL")
         .ok()
         .filter(|s| !s.is_empty());
-    let file_url = std::env::var("ILINK_FILE_URL")
+    let file_url = std::env::var("AGENT_FILE_URL")
         .ok()
         .filter(|s| !s.is_empty());
 
@@ -866,7 +866,7 @@ mod tests {
 
     /// Mixed image + document in a single SDKUserMessage: both blocks must be present
     /// in order, each with the correct `type`. This is the combined path the bridge
-    /// takes when both ILINK_IMAGE_URL and ILINK_FILE_URL are set.
+    /// takes when both AGENT_IMAGE_URL and AGENT_FILE_URL are set.
     #[test]
     fn sdk_user_message_with_image_and_document() {
         let user_message = json!({

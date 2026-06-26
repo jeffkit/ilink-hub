@@ -148,31 +148,31 @@ pub(super) fn extract_media_env(msg: &WeixinMessage) -> Vec<(String, String)> {
     for item in items.iter() {
         match item.item_type {
             Some(msg_type::IMAGE) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "image".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "image".into()));
                 if let Some(url) = item.image_item.as_ref().and_then(|i| i.cdn_url.as_deref()) {
                     if !url.is_empty() {
-                        env.push(("ILINK_IMAGE_URL".into(), url.to_string()));
+                        env.push(("AGENT_IMAGE_URL".into(), url.to_string()));
                     }
                 }
                 break;
             }
             Some(msg_type::FILE) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "file".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "file".into()));
                 if let Some(fi) = item.file_item.as_ref() {
                     if let Some(url) = fi.cdn_url.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("ILINK_FILE_URL".into(), url.to_string()));
+                        env.push(("AGENT_FILE_URL".into(), url.to_string()));
                     }
                     if let Some(name) = fi.file_name.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("ILINK_FILE_NAME".into(), name.to_string()));
+                        env.push(("AGENT_FILE_NAME".into(), name.to_string()));
                     }
                 }
                 break;
             }
             Some(msg_type::VIDEO) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "video".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "video".into()));
                 if let Some(url) = item.video_item.as_ref().and_then(|v| v.cdn_url.as_deref()) {
                     if !url.is_empty() {
-                        env.push(("ILINK_VIDEO_URL".into(), url.to_string()));
+                        env.push(("AGENT_VIDEO_URL".into(), url.to_string()));
                     }
                 }
                 break;
@@ -237,8 +237,8 @@ pub(super) async fn run_cli(
         sanitize_env_value("AGENT_FROM_USER", from_user),
     );
     cmd.env(
-        "ILINK_CONTEXT_TOKEN",
-        sanitize_env_value("ILINK_CONTEXT_TOKEN", context_token),
+        "AGENT_CONTEXT_TOKEN",
+        sanitize_env_value("AGENT_CONTEXT_TOKEN", context_token),
     );
     cmd.env("AGENT_STREAMING", if cfg.streaming { "1" } else { "0" });
     cmd.env("AGENT_PROTOCOL_VERSION", AGENTPROC_PROTOCOL_VERSION);
@@ -340,16 +340,20 @@ pub(super) async fn run_cli(
                 }
                 if let Some(json_part) = trimmed.strip_prefix("AGENT_ERROR:") {
                     // AgentProc v0.3: agent reports an error via a JSON-encoded
-                    // string. We forward the decoded text to the user through the
-                    // existing partial channel (so it is visible immediately) and
-                    // drop further body lines for this turn. A full dedicated
-                    // error-reply channel is not yet wired through the dispatcher,
-                    // so we reuse the partial path as the minimal contract.
+                    // string. In streaming mode we forward the decoded text to the
+                    // user through the partial channel so it is visible immediately.
+                    // In non-streaming mode we append it to the captured body so it
+                    // is returned as the final reply (consistent with how AGENT_PARTIAL
+                    // is suppressed in that mode).
                     match serde_json::from_str::<String>(json_part) {
                         Ok(err_text) => {
                             warn!(error_text = %err_text, "agent reported AGENT_ERROR");
                             if !err_text.is_empty() {
-                                let _ = partial_tx.send(Some(err_text));
+                                if streaming {
+                                    let _ = partial_tx.send(Some(err_text));
+                                } else {
+                                    final_lines.push(format!("{err_text}\n"));
+                                }
                             }
                         }
                         Err(e) => {

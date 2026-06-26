@@ -3,15 +3,15 @@
 # Codex Bridge Profile（Shell 版）
 #
 # 通过 Codex CLI 的 JSONL 输出模式（--json）接收用户消息，
-# 支持多轮对话（exec resume <session_id>）和流式输出（ILINK_PARTIAL）。
+# 支持多轮对话（exec resume <session_id>）和流式输出（AGENT_PARTIAL）。
 #
 # ─── 依赖 ──────────────────────────────────────────────────────────────────
 #   必需：  codex CLI（已安装并认证：codex login）
-#           jq（JSON 解析与 ILINK_PARTIAL 编码：brew install jq）
+#           jq（JSON 解析与 AGENT_PARTIAL 编码：brew install jq）
 #
 # ─── 本地测试（不启动 bridge）──────────────────────────────────────────────
-#   ILINK_MESSAGE="你好，介绍一下自己" \
-#   ILINK_SESSION_ID="" \
+#   AGENT_MESSAGE="你好，介绍一下自己" \
+#   AGENT_SESSION_ID="" \
 #   bash handler.sh
 #
 # ─── 接入 bridge ────────────────────────────────────────────────────────────
@@ -21,13 +21,13 @@
 
 set -euo pipefail
 
-MESSAGE="${ILINK_MESSAGE:-}"
-SESSION_ID="${ILINK_SESSION_ID:-}"
+MESSAGE="${AGENT_MESSAGE:-}"
+SESSION_ID="${AGENT_SESSION_ID:-}"
 CODEX_BYPASS="--dangerously-bypass-approvals-and-sandbox"
 
-# 切换工作目录（由 YAML cwd 字段注入，或从 ILINK_CWD 读取）
-if [[ -n "${ILINK_CWD:-}" && -d "$ILINK_CWD" ]]; then
-    cd "$ILINK_CWD"
+# 切换工作目录（由 YAML cwd 字段注入，或从 AGENT_CWD 读取）
+if [[ -n "${AGENT_CWD:-}" && -d "$AGENT_CWD" ]]; then
+    cd "$AGENT_CWD"
 fi
 
 if ! command -v jq &>/dev/null; then
@@ -43,13 +43,13 @@ else
 fi
 
 # ── 流式处理 JSONL 输出 ──────────────────────────────────────────────────────
-# codex --json 逐行输出事件，边输出边解析，将 agent_message 通过 ILINK_PARTIAL 实时推送给用户。
+# codex --json 逐行输出事件，边输出边解析，将 agent_message 通过 AGENT_PARTIAL 实时推送给用户。
 #
 # 事件类型说明：
-#   thread.started          → session_id（保存，进程结束后输出 ILINK_SESSION:）
-#   item.completed (agent_message) → 回复文本（立即输出 ILINK_PARTIAL:）
+#   thread.started          → session_id（保存，进程结束后输出 AGENT_SESSION:）
+#   item.completed (agent_message) → 回复文本（立即输出 AGENT_PARTIAL:）
 #
-# ILINK_PARTIAL: 格式要求文本必须 JSON 编码（换行等特殊字符转义），用 jq -cn 完成。
+# AGENT_PARTIAL: 格式要求文本必须 JSON 编码（换行等特殊字符转义），用 jq -cn 完成。
 #
 NEW_SESSION_ID=""
 
@@ -69,14 +69,14 @@ while IFS= read -r line; do
                 if [[ -n "$text" ]]; then
                     # JSON-encode text so newlines and special chars are safely escaped on one line.
                     encoded=$(printf '%s' "$text" | jq -Rs '.')
-                    printf 'ILINK_PARTIAL:%s\n' "$encoded"
+                    printf 'AGENT_PARTIAL:%s\n' "$encoded"
                 fi
             fi
             ;;
     esac
 done < <(echo "" | codex "${CODEX_ARGS[@]}" $CODEX_BYPASS --json 2>/dev/null)
 
-# ── P0 协议输出：ILINK_SESSION（仅在有 session_id 时输出）───────────────────
+# ── P0 协议输出：AGENT_SESSION（仅在有 session_id 时输出）───────────────────
 if [[ -n "$NEW_SESSION_ID" ]]; then
-    printf 'ILINK_SESSION:%s\n' "$NEW_SESSION_ID"
+    printf 'AGENT_SESSION:%s\n' "$NEW_SESSION_ID"
 fi
