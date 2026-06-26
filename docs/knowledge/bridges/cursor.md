@@ -13,15 +13,15 @@ timestamp: 2026-06-18T10:00:00+08:00
 
 ## 工作原理
 
-1. 读取 [P0 环境变量](/bridges/profile-protocol.md)（`ILINK_MESSAGE`、`ILINK_SESSION_ID` 等）
+1. 读取 [P0 环境变量](/bridges/profile-protocol.md)（`AGENT_MESSAGE`、`AGENT_SESSION_ID` 等）
 2. 调用 `agent --print --trust --yolo --output-format stream-json [--model <model>] [--resume <uuid>]`
 3. 消息写入 `agent` 进程的 **stdin**（与 Claude Code 不同，后者用 `-p` 参数）
-4. 实时解析 stream-json 事件，每个 assistant 文本块输出一行 `ILINK_PARTIAL:<json>`
-5. 流结束后输出 `ILINK_SESSION:<new_session_id>`，不再输出正文（避免重复发送）
+4. 实时解析 stream-json 事件，每个 assistant 文本块输出一行 `AGENT_PARTIAL:<json>`
+5. 流结束后输出 `AGENT_SESSION:<new_session_id>`，不再输出正文（避免重复发送）
 
 ## 会话续传
 
-- 若 `ILINK_SESSION_ID` 非空，先尝试 `--resume <uuid>`
+- 若 `AGENT_SESSION_ID` 非空，先尝试 `--resume <uuid>`
 - 若 resume 失败（session 过期/不存在），自动回退为新会话重试，用户不会看到报错
 
 ## stream-json 事件格式
@@ -49,7 +49,7 @@ profiles:
 |------|--------------|--------------------------------------|
 | 消息传入方式 | stdin | `-p` 命令行参数 |
 | CLI 工具 | `agent` | `claude` |
-| `ILINK_STREAMING=0` 支持 | 否 | 是 |
+| `AGENT_STREAMING=0` 支持 | 否 | 是 |
 
 ## 相关文档
 

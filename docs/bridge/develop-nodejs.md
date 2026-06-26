@@ -1,6 +1,6 @@
 # 用 Node.js 开发 Bridge Profile
 
-> 最后更新：2026-06-08
+> 最后更新：2026-06-26
 
 本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。
 
@@ -19,7 +19,7 @@
 ```bash
 mkdir my-ai-profile && cd my-ai-profile
 npm init -y
-npm install ilink-bridge-profile
+npm install agentproc
 ```
 
 ---
@@ -29,7 +29,7 @@ npm install ilink-bridge-profile
 创建 `handler.js`：
 
 ```js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 
 createProfile(async ({ message, sessionId, fromUser }) => {
   // 这里写你的 AI 调用逻辑
@@ -39,7 +39,7 @@ createProfile(async ({ message, sessionId, fromUser }) => {
 ```
 
 `createProfile` 帮你做了所有样板工作：
-- 读取 `ILINK_MESSAGE`、`ILINK_SESSION_ID` 等环境变量
+- 读取 `AGENT_MESSAGE`、`AGENT_SESSION_ID` 等环境变量
 - 调用你的 handler 函数
 - 按 P0 协议把回复写到 stdout
 
@@ -50,7 +50,7 @@ npm install openai
 ```
 
 ```js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 const OpenAI = require('openai');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -71,9 +71,9 @@ createProfile(async ({ message }) => {
 不需要启动完整的 bridge，直接用环境变量模拟调用：
 
 ```bash
-ILINK_MESSAGE="你好，介绍一下自己" \
-ILINK_SESSION_ID="" \
-ILINK_FROM_USER="test-user" \
+AGENT_MESSAGE="你好，介绍一下自己" \
+AGENT_SESSION_ID="" \
+AGENT_FROM_USER="test-user" \
 node handler.js
 ```
 
@@ -114,7 +114,7 @@ ilink-hub-bridge --config profiles.yaml
 如果你直接调用 LLM API（不用 Claude Code），可以用 SDK 的历史管理功能保存上下文：
 
 ```js
-const { createProfile, loadHistory, appendHistory } = require('ilink-bridge-profile');
+const { createProfile, loadHistory, appendHistory } = require('agentproc');
 const OpenAI = require('openai');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -156,7 +156,7 @@ npm install @google/generative-ai
 
 ```js
 // gemini-profile.js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);

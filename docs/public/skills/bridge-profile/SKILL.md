@@ -25,7 +25,7 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 | **P0 协议** | bridge 与 handler 间的通信协议：env var 输入 + stdout 输出 |
 | **type: claude-code** | 内置类型，自动处理 Claude Code CLI 的 `--resume` 会话续接 |
 | **script:** | 指定脚本路径，bridge 按扩展名自动推断运行时（.py/.js/.ts/.sh/.rb） |
-| **SDK** | `ilink-bridge-profile`（Python/Node.js），封装 P0 协议样板代码 |
+| **SDK** | `agentproc`（Python/Node.js），封装 P0 协议样板代码 |
 
 ---
 
@@ -95,7 +95,7 @@ profiles:
     type: claude-code
     cwd: /path/to/project
     env:
-      ILINK_SESSION_ID: ""  # 空 SESSION_ID → 内置 handler 跳过 --resume，开新会话
+      AGENT_SESSION_ID: ""  # 空 SESSION_ID → 内置 handler 跳过 --resume，开新会话
 
 routing:
   strategy: prefix
@@ -195,15 +195,15 @@ bridge 通过以下 env var 传入输入，handler 向 stdout 写出输出：
 
 | 输入 env var | 说明 |
 |-------------|------|
-| `ILINK_MESSAGE` | 用户消息文本（前缀路由后的净文本） |
-| `ILINK_SESSION_ID` | Hub 持久化的 session UUID（空=新会话） |
-| `ILINK_SESSION_NAME` | session 可读名称（默认 `default`） |
-| `ILINK_FROM_USER` | 发送消息的用户 ID |
+| `AGENT_MESSAGE` | 用户消息文本（前缀路由后的净文本） |
+| `AGENT_SESSION_ID` | Hub 持久化的 session UUID（空=新会话） |
+| `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
+| `AGENT_FROM_USER` | 发送消息的用户 ID |
 | `ILINK_CONTEXT_TOKEN` | Hub context token |
 
 **stdout 输出格式：**
 ```
-[可选首行] ILINK_SESSION:<uuid>   ← 若需 session 追踪
+[可选首行] AGENT_SESSION:<uuid>   ← 若需 session 追踪
 <回复给微信用户的文本>
 ```
 
@@ -214,15 +214,15 @@ bridge 通过以下 env var 传入输入，handler 向 stdout 写出输出：
 ```bash
 mkdir my-profile && cd my-profile
 python3 -m venv .venv && source .venv/bin/activate
-pip install ilink-bridge-profile
+pip install agentproc
 ```
 
 **最简 handler（`handler.py`）：**
 
 ```python
-from ilink_bridge import create_profile, ProfileContext
+from agentproc import create_profile, AgentContext
 
-async def handler(ctx: ProfileContext) -> str:
+async def handler(ctx: AgentContext) -> str:
     return f"你说的是：{ctx.message}"
 
 create_profile(handler)
@@ -233,11 +233,11 @@ create_profile(handler)
 ```python
 import os
 import anthropic
-from ilink_bridge import create_profile, ProfileContext
+from agentproc import create_profile, AgentContext
 
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-async def handler(ctx: ProfileContext) -> str:
+async def handler(ctx: AgentContext) -> str:
     response = await client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2048,
@@ -253,14 +253,14 @@ create_profile(handler)
 ```python
 import os
 from openai import AsyncOpenAI
-from ilink_bridge import (
-    create_profile, ProfileContext, ProfileResult,
+from agentproc import (
+    create_profile, AgentContext, AgentResult,
     load_history, append_history, HistoryEntry,
 )
 
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-async def handler(ctx: ProfileContext) -> ProfileResult:
+async def handler(ctx: AgentContext) -> AgentResult:
     history = load_history(ctx.session_id)
     messages = [
         {"role": "system", "content": "你是一个友好的 AI 助手。"},
@@ -276,7 +276,7 @@ async def handler(ctx: ProfileContext) -> ProfileResult:
         HistoryEntry(role="user", content=ctx.message),
         HistoryEntry(role="assistant", content=reply),
     ])
-    return ProfileResult(response=reply, session_id=ctx.session_id)
+    return AgentResult(response=reply, session_id=ctx.session_id)
 
 create_profile(handler)
 ```
@@ -298,13 +298,13 @@ profiles:
 ```bash
 mkdir my-profile && cd my-profile
 npm init -y
-npm install ilink-bridge-profile
+npm install agentproc
 ```
 
 **最简 handler（`handler.js`）：**
 
 ```js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 
 createProfile(async ({ message }) => {
   return `你说的是：${message}`;
@@ -314,7 +314,7 @@ createProfile(async ({ message }) => {
 **接 OpenAI/Claude API（`handler.js`）：**
 
 ```js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 const Anthropic = require('@anthropic-ai/sdk');
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -332,7 +332,7 @@ createProfile(async ({ message }) => {
 **多轮对话（`handler.js`）：**
 
 ```js
-const { createProfile, loadHistory, appendHistory } = require('ilink-bridge-profile');
+const { createProfile, loadHistory, appendHistory } = require('agentproc');
 const OpenAI = require('openai');
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
@@ -375,22 +375,22 @@ profiles:
 
 ```bash
 # 测试内置 claude-code
-ILINK_MESSAGE="你好" ILINK_SESSION_ID="" \
+AGENT_MESSAGE="你好" AGENT_SESSION_ID="" \
   ilink-hub-bridge profile claude-code
 
 # 测试自定义 Python handler
-ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ILINK_SESSION_NAME="default" \
-  ILINK_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
+AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
+  AGENT_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
   python3 /path/to/handler.py
 
 # 测试自定义 JS handler
-ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ILINK_SESSION_NAME="default" \
-  ILINK_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
+AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
+  AGENT_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
   node /path/to/handler.js
 ```
 
 **验证输出：**
-- 若管理 session，首行应为 `ILINK_SESSION:<uuid>`
+- 若管理 session，首行应为 `AGENT_SESSION:<uuid>`
 - 其余行是给用户的回复文本
 - 退出码 0 = 成功
 

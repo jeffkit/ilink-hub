@@ -109,7 +109,7 @@ profiles:
     type: claude-code
     cwd: ~/your-project
     env:
-      ILINK_SESSION_ID: ""       # 强制新会话
+      AGENT_SESSION_ID: ""       # 强制新会话
 
 routing:
   strategy: prefix
@@ -151,8 +151,8 @@ INFO bridge: waiting for messages…
 ### 先验证 Bridge 本身能调通 Claude
 
 ```bash
-ILINK_MESSAGE="用一句话介绍你自己" \
-ILINK_SESSION_ID="" \
+AGENT_MESSAGE="用一句话介绍你自己" \
+AGENT_SESSION_ID="" \
 ilink-hub-bridge profile claude-code
 ```
 
