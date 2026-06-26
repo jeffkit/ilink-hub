@@ -8,7 +8,10 @@
 ## 里程碑表
 | 里程碑 | 状态 | 验证 | 审查 | E2E |
 |--------|------|------|------|-----|
-| M1 Rust bridge 协议改名 | in_progress | 待 | 待 | not-ready |
+| M1 Rust bridge 协议改名 | ✅ completed | ✅ 全过 | 降级自审 | not-ready |
+
+## 下一步
+Step 2：删除 sdk/python、sdk/node，examples 改用 agentproc 包
 
 ## 恢复指引
 - Worktree: `/Users/kongjie/projects/ilink-hub/.worktrees/feat/agentproc-protocol-align/`
