@@ -1,7 +1,7 @@
 //! Built-in profile handlers for `ilink-hub-bridge profile <type>`.
 //!
 //! Each handler reads the P0 env vars injected by the bridge and writes to stdout:
-//!   - Optional first line: `ILINK_SESSION:<uuid>`
+//!   - Optional first line: `AGENT_SESSION:<uuid>`
 //!   - Remaining lines: reply text for the WeChat user
 //!
 //! All built-ins follow the same P0 exec protocol as external scripts/SDKs.

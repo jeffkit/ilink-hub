@@ -2,17 +2,17 @@
 //!
 //! Reads P0 env vars, calls `agent --print --trust --yolo --output-format stream-json
 //! [--model <model>] [--resume <uuid>]`, and streams text output to the parent bridge
-//! via `ILINK_PARTIAL:` stdout lines.
+//! via `AGENT_PARTIAL:` stdout lines.
 //!
 //! Message is written to the `agent` process stdin (unlike `claude` which uses `-p`).
 //!
 //! Each assistant text chunk is written immediately as:
 //!
-//!   ILINK_PARTIAL:<json-encoded-string>
+//!   AGENT_PARTIAL:<json-encoded-string>
 //!
 //! When the stream ends, the final P0 session line is written:
 //!
-//!   ILINK_SESSION:<new_session_id>
+//!   AGENT_SESSION:<new_session_id>
 //!
 //! The response body is left empty so the bridge does not send a duplicate final message.
 //!
@@ -40,16 +40,16 @@ pub async fn run() -> Result<()> {
         .await?;
 
     // P0 output: optional session line only.
-    // All response text was already streamed via ILINK_PARTIAL during execution.
+    // All response text was already streamed via AGENT_PARTIAL during execution.
     common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
 
 /// Call `agent --output-format stream-json`, emit every assistant text chunk as an
-/// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
+/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via ILINK_PARTIAL. Cursor's `result.result`
+/// All visible response text is streamed via AGENT_PARTIAL. Cursor's `result.result`
 /// is the concatenation of every assistant text already streamed, so it is not re-sent
 /// in the normal case. The sole exception: when **no** assistant text events were emitted
 /// (the model responded with tool-only actions), `result.result` is used as a fallback
@@ -131,7 +131,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
-                    // "\n" between tool calls) do not produce an empty-looking ILINK_PARTIAL.
+                    // "\n" between tool calls) do not produce an empty-looking AGENT_PARTIAL.
                     if !text.trim().is_empty() {
                         assistant_event_count += 1;
                         assistant_total_chars += text.len();
@@ -218,7 +218,7 @@ mod tests {
     // ── Bug-fix regression tests ─────────────────────────────────────────────
 
     /// Bug #2: whitespace-only text blocks must not be counted as assistant events
-    /// or emitted as ILINK_PARTIAL. The old guard `!text.is_empty()` passed "\n";
+    /// or emitted as AGENT_PARTIAL. The old guard `!text.is_empty()` passed "\n";
     /// the fix uses `!text.trim().is_empty()`.
     #[test]
     fn whitespace_only_text_is_not_an_assistant_event() {

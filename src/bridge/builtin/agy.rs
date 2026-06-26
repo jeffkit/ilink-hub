@@ -9,7 +9,7 @@
 //!   - Resume: run `agy --conversation <uuid> -p <message>`, keep the same ID
 //!
 //! P0 output:
-//!   ILINK_SESSION:<conversation_id>   (if available)
+//!   AGENT_SESSION:<conversation_id>   (if available)
 //!   <response text>
 //!
 //! Note: agy requires stdin to be a pipe (not a terminal); the handler closes stdin

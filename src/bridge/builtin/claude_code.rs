@@ -1,15 +1,15 @@
 //! Built-in `claude-code` profile: wraps the `claude` CLI with session continuity.
 //!
 //! Reads P0 env vars, calls `claude --output-format stream-json [--resume <uuid>]`,
-//! and streams text output to the parent bridge via `ILINK_PARTIAL:` stdout lines.
+//! and streams text output to the parent bridge via `AGENT_PARTIAL:` stdout lines.
 //!
 //! Each assistant text chunk is written immediately as:
 //!
-//!   ILINK_PARTIAL:<json-encoded-string>
+//!   AGENT_PARTIAL:<json-encoded-string>
 //!
 //! When the stream ends, the final P0 session line is written:
 //!
-//!   ILINK_SESSION:<new_session_id>
+//!   AGENT_SESSION:<new_session_id>
 //!
 //! The response body is left empty so the bridge does not send a duplicate final message.
 //!
@@ -40,9 +40,9 @@ const ANTHROPIC_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn run() -> Result<()> {
     let (message, session_id) = common::read_message_and_session();
-    // ILINK_STREAMING is injected by the bridge: "1" (default) = stream partials,
-    // "0" = one-shot mode (emit full text to stdout at the end, no ILINK_PARTIAL lines).
-    let streaming = std::env::var("ILINK_STREAMING")
+    // AGENT_STREAMING is injected by the bridge: "1" (default) = stream partials,
+    // "0" = one-shot mode (emit full text to stdout at the end, no AGENT_PARTIAL lines).
+    let streaming = std::env::var("AGENT_STREAMING")
         .map(|v| v.trim() != "0")
         .unwrap_or(true);
 
@@ -55,7 +55,7 @@ pub async fn run() -> Result<()> {
     .await?;
 
     // P0 output: optional session line only.
-    // All response text was already streamed via ILINK_PARTIAL during execution.
+    // All response text was already streamed via AGENT_PARTIAL during execution.
     common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
@@ -71,11 +71,11 @@ async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Resu
 }
 
 /// Call `claude --output-format stream-json`, emit every assistant text chunk as an
-/// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
+/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via ILINK_PARTIAL. When the model uses tools
+/// All visible response text is streamed via AGENT_PARTIAL. When the model uses tools
 /// between turns, the final assistant reply may only appear in `result.result` (with no
-/// preceding `assistant` event); we emit it as an extra ILINK_PARTIAL in that case.
+/// preceding `assistant` event); we emit it as an extra AGENT_PARTIAL in that case.
 ///
 /// When the inbound message carries an image or file (URLs set by the bridge in
 /// `ILINK_IMAGE_URL` / `ILINK_FILE_URL`), switches to the bidirectional `stream-json`
@@ -180,7 +180,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
                     // "\n" emitted between tool calls) do not produce an empty-looking
-                    // ILINK_PARTIAL that the user sees as a blank message.
+                    // AGENT_PARTIAL that the user sees as a blank message.
                     if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
                         last_partial = Some(text);
@@ -492,8 +492,8 @@ async fn download_document_as_base64(url: &str) -> Result<(String, String)> {
 }
 
 /// Call `claude --output-format json` (one-shot) and print the full reply text to stdout
-/// so the bridge captures it as the final response body.  No `ILINK_PARTIAL:` lines are
-/// emitted; the session ID is written as `ILINK_SESSION:<id>` on the first stdout line.
+/// so the bridge captures it as the final response body.  No `AGENT_PARTIAL:` lines are
+/// emitted; the session ID is written as `AGENT_SESSION:<id>` on the first stdout line.
 async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--output-format".into(),
@@ -571,12 +571,12 @@ async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String
         // Emit session id first (bridge splits on cli_session_first_line_prefix).
         if let Some(ref sid) = found_session_id {
             if !sid.is_empty() {
-                println!("ILINK_SESSION:{sid}");
+                println!("AGENT_SESSION:{sid}");
             }
         }
         println!("{result_text}");
         std::io::Write::flush(&mut std::io::stdout()).ok();
-        // Return None so the outer run() does not emit a duplicate ILINK_SESSION line.
+        // Return None so the outer run() does not emit a duplicate AGENT_SESSION line.
         return Ok(None);
     }
 
@@ -1065,7 +1065,7 @@ mod tests {
     // ── Bug-fix regression tests ─────────────────────────────────────────────
 
     /// Bug #2: whitespace-only text blocks (e.g. a bare "\n" the model emits
-    /// between tool turns) must NOT produce an ILINK_PARTIAL. The old guard was
+    /// between tool turns) must NOT produce an AGENT_PARTIAL. The old guard was
     /// `!text.is_empty()` which passes "\n"; the fix uses `!text.trim().is_empty()`.
     #[test]
     fn whitespace_only_text_block_is_skipped_not_emitted() {
@@ -1105,7 +1105,7 @@ mod tests {
 
     /// Bug #1 (Claude side): when no prior partial has been sent (`last_partial = None`)
     /// and `result.result` is non-empty, `already_sent` must be false so the bridge
-    /// emits result.result as a final ILINK_PARTIAL (the model's only text output).
+    /// emits result.result as a final AGENT_PARTIAL (the model's only text output).
     #[test]
     fn result_with_no_prior_partial_always_emits() {
         let last_partial: Option<String> = None;
@@ -1130,7 +1130,7 @@ mod tests {
     }
 
     /// Empty or whitespace-only result.result is filtered before the dedup check so
-    /// we never emit an empty ILINK_PARTIAL when the model produced no text output.
+    /// we never emit an empty AGENT_PARTIAL when the model produced no text output.
     #[test]
     fn empty_and_whitespace_result_is_filtered() {
         for rt in ["", "\n", "  \t  "] {

@@ -1,9 +1,9 @@
 //! Shared helpers for the built-in profile handlers.
 //!
 //! Every built-in (`claude-code`, `codex`, `cursor`, `agy`) follows the same P0
-//! exec protocol: read `ILINK_MESSAGE` / `ILINK_SESSION_ID`, run the underlying
+//! exec protocol: read `AGENT_MESSAGE` / `AGENT_SESSION_ID`, run the underlying
 //! CLI (resuming the session when one exists, falling back to a fresh session on
-//! failure), stream partials, and finally print `ILINK_SESSION:<id>`. This module
+//! failure), stream partials, and finally print `AGENT_SESSION:<id>`. This module
 //! factors out that boilerplate so each handler only carries its CLI-specific glue.
 
 use std::future::Future;
@@ -17,8 +17,8 @@ use tokio::task::JoinHandle;
 /// Read the two P0 env vars injected by the bridge: the inbound user message and
 /// the existing session id (empty string = no session yet).
 pub fn read_message_and_session() -> (String, String) {
-    let message = std::env::var("ILINK_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("ILINK_SESSION_ID").unwrap_or_default();
+    let message = std::env::var("AGENT_MESSAGE").unwrap_or_default();
+    let session_id = std::env::var("AGENT_SESSION_ID").unwrap_or_default();
     (message, session_id)
 }
 
@@ -51,20 +51,20 @@ where
     }
 }
 
-/// Print the final P0 session line (`ILINK_SESSION:<id>`) when an id is present and
+/// Print the final P0 session line (`AGENT_SESSION:<id>`) when an id is present and
 /// non-empty. A no-op otherwise.
 pub fn emit_session_line(session_id: Option<&str>) {
     if let Some(sid) = session_id {
         if !sid.is_empty() {
-            println!("ILINK_SESSION:{sid}");
+            println!("AGENT_SESSION:{sid}");
         }
     }
 }
 
-/// Emit one streamed chunk as a P0 partial line (`ILINK_PARTIAL:<json-string>`) and
+/// Emit one streamed chunk as a P0 partial line (`AGENT_PARTIAL:<json-string>`) and
 /// flush stdout so the bridge forwards it immediately.
 pub fn emit_partial(text: &str) -> Result<()> {
-    println!("ILINK_PARTIAL:{}", serde_json::to_string(text)?);
+    println!("AGENT_PARTIAL:{}", serde_json::to_string(text)?);
     std::io::Write::flush(&mut std::io::stdout()).ok();
     Ok(())
 }

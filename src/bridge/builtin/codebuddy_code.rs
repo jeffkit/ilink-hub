@@ -1,7 +1,7 @@
 //! Built-in `codebuddy-code` profile: wraps the CodeBuddy Code CLI with session continuity.
 //!
 //! Reads P0 env vars, calls `codebuddy -p --output-format stream-json [--resume <uuid>]`,
-//! and streams text output to the parent bridge via `ILINK_PARTIAL:` stdout lines.
+//! and streams text output to the parent bridge via `AGENT_PARTIAL:` stdout lines.
 //!
 //! CodeBuddy Code CLI is compatible with Claude Code's `stream-json` protocol:
 //!   {"type":"system","session_id":"<uuid>", ...}
@@ -10,11 +10,11 @@
 //!
 //! Each assistant text chunk is written immediately as:
 //!
-//!   ILINK_PARTIAL:<json-encoded-string>
+//!   AGENT_PARTIAL:<json-encoded-string>
 //!
 //! When the stream ends, the final P0 session line is written:
 //!
-//!   ILINK_SESSION:<new_session_id>
+//!   AGENT_SESSION:<new_session_id>
 //!
 //! The response body is left empty so the bridge does not send a duplicate final message.
 //!
@@ -22,8 +22,8 @@
 //! fresh session so the user gets a response rather than a bare error.
 //!
 //! Supported env vars:
-//!   ILINK_MESSAGE          — inbound user message (P0)
-//!   ILINK_SESSION_ID       — existing session UUID to resume (P0, empty = new)
+//!   AGENT_MESSAGE          — inbound user message (P0)
+//!   AGENT_SESSION_ID       — existing session UUID to resume (P0, empty = new)
 //!   ILINK_CODEBUDDY_MODEL  — override the CodeBuddy model (e.g. claude-sonnet-4.6)
 
 use anyhow::{Context, Result};
@@ -50,18 +50,18 @@ pub async fn run() -> Result<()> {
     .await?;
 
     // P0 output: optional session line only.
-    // All response text was already streamed via ILINK_PARTIAL during execution.
+    // All response text was already streamed via AGENT_PARTIAL during execution.
     common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
 
 /// Call `codebuddy -p --output-format stream-json`, emit every assistant text chunk as an
-/// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
+/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
 /// When the model uses tools between turns, the final assistant reply may only appear
 /// in `result.result` (with no preceding `assistant` event); we emit it as an extra
-/// ILINK_PARTIAL in that case.
+/// AGENT_PARTIAL in that case.
 async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -137,7 +137,7 @@ async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<Stri
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
                     // "\n" emitted between tool calls) do not produce an empty-looking
-                    // ILINK_PARTIAL that the user sees as a blank message.
+                    // AGENT_PARTIAL that the user sees as a blank message.
                     if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
                         last_partial = Some(text);
