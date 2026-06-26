@@ -10,8 +10,12 @@
 |--------|------|------|------|-----|
 | M1 Rust bridge 协议改名 | ✅ completed | ✅ 全过 | 降级自审 | not-ready |
 
-## 下一步
-Step 2：删除 sdk/python、sdk/node，examples 改用 agentproc 包
+Step 2 ✅ 删除 sdk/ + examples（ilink-bridge-profile 依赖），commit b7d9c57
+Step 3 ✅ 文档同步（AGENT_* 协议名 + agentproc 包名），commit 577cb99
+Step 4 ✅ builtin 归属：保留 Rust builtin，不重写为 agentproc profile 脚本（决策确认，无代码改动）
+
+## 完成
+所有 4 步已完成，进入 Phase 4 归档。
 
 ## 恢复指引
 - Worktree: `/Users/kongjie/projects/ilink-hub/.worktrees/feat/agentproc-protocol-align/`
