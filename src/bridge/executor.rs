@@ -17,6 +17,11 @@ use crate::paths::expand_user_path;
 /// this cap is ~8000× any legitimate reply and never triggers in normal use.
 pub const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
+/// AgentProc protocol version implemented by this bridge, injected as
+/// `AGENT_PROTOCOL_VERSION` so profiles can feature-detect. Mirrors the
+/// `**Version:**` field in the agentproc spec.
+pub const AGENTPROC_PROTOCOL_VERSION: &str = "0.3";
+
 /// Replace `{{MESSAGE}}`, `{{SESSION_ID}}`, and `{{SESSION_NAME}}` in a template string.
 ///
 /// SEC-003: `message` is user-controlled (forwarded WeChat message text). We
@@ -84,7 +89,7 @@ fn sanitize_env_value(field: &str, value: &str) -> String {
             field = %field,
             has_nul = %has_nul,
             has_newline = %has_newline,
-            "ILINK env var value contains NUL/CR/LF control character; NUL removed, CR/LF replaced by space (SEC-011)"
+            "bridge env var value contains NUL/CR/LF control character; NUL removed, CR/LF replaced by space (SEC-011)"
         );
     }
 
@@ -152,31 +157,31 @@ pub(super) fn extract_media_env(msg: &WeixinMessage) -> Vec<(String, String)> {
     for item in items.iter() {
         match item.item_type {
             Some(msg_type::IMAGE) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "image".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "image".into()));
                 if let Some(url) = item.image_item.as_ref().and_then(|i| i.cdn_url.as_deref()) {
                     if !url.is_empty() {
-                        env.push(("ILINK_IMAGE_URL".into(), url.to_string()));
+                        env.push(("AGENT_IMAGE_URL".into(), url.to_string()));
                     }
                 }
                 break;
             }
             Some(msg_type::FILE) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "file".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "file".into()));
                 if let Some(fi) = item.file_item.as_ref() {
                     if let Some(url) = fi.cdn_url.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("ILINK_FILE_URL".into(), url.to_string()));
+                        env.push(("AGENT_FILE_URL".into(), url.to_string()));
                     }
                     if let Some(name) = fi.file_name.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("ILINK_FILE_NAME".into(), name.to_string()));
+                        env.push(("AGENT_FILE_NAME".into(), name.to_string()));
                     }
                 }
                 break;
             }
             Some(msg_type::VIDEO) => {
-                env.push(("ILINK_ITEM_TYPE".into(), "video".into()));
+                env.push(("AGENT_ITEM_TYPE".into(), "video".into()));
                 if let Some(url) = item.video_item.as_ref().and_then(|v| v.cdn_url.as_deref()) {
                     if !url.is_empty() {
-                        env.push(("ILINK_VIDEO_URL".into(), url.to_string()));
+                        env.push(("AGENT_VIDEO_URL".into(), url.to_string()));
                     }
                 }
                 break;
@@ -225,26 +230,27 @@ pub(super) async fn run_cli(
     }
 
     cmd.env(
-        "ILINK_MESSAGE",
-        sanitize_env_value("ILINK_MESSAGE", message),
+        "AGENT_MESSAGE",
+        sanitize_env_value("AGENT_MESSAGE", message),
     );
     cmd.env(
-        "ILINK_SESSION_ID",
-        sanitize_env_value("ILINK_SESSION_ID", session_id),
+        "AGENT_SESSION_ID",
+        sanitize_env_value("AGENT_SESSION_ID", session_id),
     );
     cmd.env(
-        "ILINK_SESSION_NAME",
-        sanitize_env_value("ILINK_SESSION_NAME", session_name),
+        "AGENT_SESSION_NAME",
+        sanitize_env_value("AGENT_SESSION_NAME", session_name),
     );
     cmd.env(
-        "ILINK_FROM_USER",
-        sanitize_env_value("ILINK_FROM_USER", from_user),
+        "AGENT_FROM_USER",
+        sanitize_env_value("AGENT_FROM_USER", from_user),
     );
     cmd.env(
-        "ILINK_CONTEXT_TOKEN",
-        sanitize_env_value("ILINK_CONTEXT_TOKEN", context_token),
+        "AGENT_CONTEXT_TOKEN",
+        sanitize_env_value("AGENT_CONTEXT_TOKEN", context_token),
     );
-    cmd.env("ILINK_STREAMING", if cfg.streaming { "1" } else { "0" });
+    cmd.env("AGENT_STREAMING", if cfg.streaming { "1" } else { "0" });
+    cmd.env("AGENT_PROTOCOL_VERSION", AGENTPROC_PROTOCOL_VERSION);
 
     for (k, v) in media_env {
         cmd.env(k, sanitize_env_value(k, v));
@@ -328,15 +334,39 @@ pub(super) async fn run_cli(
                     break;
                 }
                 let trimmed = line.trim_end_matches(['\n', '\r']);
-                if let Some(json_part) = trimmed.strip_prefix("ILINK_PARTIAL:") {
+                if let Some(json_part) = trimmed.strip_prefix("AGENT_PARTIAL:") {
                     if streaming {
                         match serde_json::from_str::<String>(json_part) {
                             Ok(chunk) => {
                                 let _ = partial_tx.send(Some(chunk));
                             }
                             Err(e) => {
-                                warn!(error = %e, raw = %json_part, "failed to decode ILINK_PARTIAL chunk; skipping");
+                                warn!(error = %e, raw = %json_part, "failed to decode AGENT_PARTIAL chunk; skipping");
                             }
+                        }
+                    }
+                    continue;
+                }
+                if let Some(json_part) = trimmed.strip_prefix("AGENT_ERROR:") {
+                    // AgentProc v0.3: agent reports an error via a JSON-encoded
+                    // string. In streaming mode we forward the decoded text to the
+                    // user through the partial channel so it is visible immediately.
+                    // In non-streaming mode we append it to the captured body so it
+                    // is returned as the final reply (consistent with how AGENT_PARTIAL
+                    // is suppressed in that mode).
+                    match serde_json::from_str::<String>(json_part) {
+                        Ok(err_text) => {
+                            warn!(error_text = %err_text, "agent reported AGENT_ERROR");
+                            if !err_text.is_empty() {
+                                if streaming {
+                                    let _ = partial_tx.send(Some(err_text));
+                                } else {
+                                    final_lines.push(format!("{err_text}\n"));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, raw = %json_part, "failed to decode AGENT_ERROR chunk; skipping");
                         }
                     }
                     continue;
@@ -484,14 +514,14 @@ mod tests {
     #[test]
     fn split_cli_session_first_line() {
         let (body, sid) =
-            split_cli_session_from_stdout("ILINK_SESSION:", "ILINK_SESSION:uuid-1\nhello\n");
+            split_cli_session_from_stdout("AGENT_SESSION:", "AGENT_SESSION:uuid-1\nhello\n");
         assert_eq!(sid.as_deref(), Some("uuid-1"));
         assert_eq!(body, "hello");
     }
 
     #[test]
     fn split_cli_session_no_match_returns_full() {
-        let (body, sid) = split_cli_session_from_stdout("ILINK_SESSION:", "plain\n");
+        let (body, sid) = split_cli_session_from_stdout("AGENT_SESSION:", "plain\n");
         assert!(sid.is_none());
         assert_eq!(body, "plain\n");
     }
@@ -586,5 +616,147 @@ mod tests {
         assert_eq!(sanitize_env_value("test", "\0\0\0"), "");
         assert_eq!(sanitize_env_value("test", "\n\n\r\r"), "    ");
         assert_eq!(sanitize_env_value("test", "a\0b\nc\rd"), "ab c d");
+    }
+
+    /// End-to-end: a profile that emits `AGENT_PARTIAL:` lines, an
+    /// `AGENT_SESSION:` first line, and a final body — verifying the renamed
+    /// agentproc v0.3 sentinel parsing and session extraction.
+    #[tokio::test]
+    async fn test_agentproc_partial_and_session_parsing() {
+        let script = "printf 'AGENT_SESSION:sess-xyz\\n'; printf 'AGENT_PARTIAL:%s\\n' '\"chunk-a\"'; printf 'AGENT_PARTIAL:%s\\n' '\"chunk-b\"'; printf 'final-body\\n'";
+        // Set cli_session_first_line_prefix so the AGENT_SESSION: line is
+        // parsed into a session id rather than treated as body.
+        let yaml = format!(
+            "{}cli_session_first_line_prefix: \"AGENT_SESSION:\"\n",
+            shell_profile_yaml(script, 5)
+        );
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+
+        let (body, cli_sid) = run_cli(
+            profile,
+            "test_profile",
+            "hello",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert_eq!(cli_sid.as_deref(), Some("sess-xyz"));
+        assert_eq!(body.trim(), "final-body");
+
+        let chunks = chunks.await.expect("collector panicked");
+        // watch channel only retains the latest value, so fast consecutive
+        // sends may coalesce — assert the most recent chunk is observed.
+        assert!(
+            chunks.iter().any(|c| c == "chunk-b"),
+            "expected chunk-b (latest partial) in forwarded partials, got {:?}",
+            chunks
+        );
+    }
+
+    /// The bridge injects `AGENT_PROTOCOL_VERSION` with the current constant
+    /// value. Verified by a profile that echoes it back as the reply body.
+    #[tokio::test]
+    async fn test_agentproc_protocol_version_injected() {
+        let script = "printf '%s\\n' \"$AGENT_PROTOCOL_VERSION\"";
+        let yaml = shell_profile_yaml(script, 5);
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        let (partial_tx, _partial_rx) = watch::channel::<Option<String>>(None);
+        let (body, _sid) = run_cli(
+            profile,
+            "test_profile",
+            "hello",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert_eq!(body.trim(), AGENTPROC_PROTOCOL_VERSION);
+    }
+
+    /// `AGENT_ERROR:` lines are decoded and forwarded as a partial chunk so
+    /// the user sees the agent's error text.
+    #[tokio::test]
+    async fn test_agentproc_error_forwarded_as_partial() {
+        let script = "printf 'AGENT_ERROR:%s\\n' '\"boom: bad model\"'";
+        let yaml = shell_profile_yaml(script, 5);
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+
+        let (body, _sid) = run_cli(
+            profile,
+            "test_profile",
+            "hello",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert!(
+            body.trim().is_empty(),
+            "body should be empty, got: {body:?}"
+        );
+
+        let chunks = chunks.await.expect("collector panicked");
+        assert!(
+            chunks.iter().any(|c| c == "boom: bad model"),
+            "AGENT_ERROR text not forwarded as partial; got {:?}",
+            chunks
+        );
+    }
+
+    /// Spawn a task that drains a partial watch channel into a Vec<String>,
+    /// returning a handle to the collected chunks. Skips the initial `None`
+    /// slot. Completes when the sender is dropped.
+    fn spawn_partial_collector(
+        mut rx: watch::Receiver<Option<String>>,
+    ) -> tokio::task::JoinHandle<Vec<String>> {
+        tokio::spawn(async move {
+            let mut out = Vec::new();
+            while rx.changed().await.is_ok() {
+                if let Some(c) = rx.borrow_and_update().clone() {
+                    out.push(c);
+                }
+            }
+            out
+        })
+    }
+
+    /// Build a bridge YAML that runs `sh <temp-script>` with no stdin. The
+    /// script is written to a temp file so YAML quoting of shell metacharacters
+    /// is a non-issue.
+    fn shell_profile_yaml(script: &str, timeout_secs: u64) -> String {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp script");
+        write!(tmp, "{script}").expect("write temp script");
+        let path = tmp.into_temp_path().keep().expect("keep temp script");
+        let path_str = path.to_string_lossy().to_string();
+        format!(
+            "command: /bin/sh\nargs:\n  - \"{path_str}\"\nstdin: none\ntimeout_secs: {timeout_secs}\n"
+        )
     }
 }

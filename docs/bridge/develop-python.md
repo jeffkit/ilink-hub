@@ -1,6 +1,6 @@
 # 用 Python 开发 Bridge Profile
 
-> 最后更新：2026-06-08
+> 最后更新：2026-06-26
 
 本教程带你从零开始，用 Python 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。
 
@@ -20,7 +20,7 @@
 mkdir my-ai-profile && cd my-ai-profile
 python3 -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install ilink-bridge-profile
+pip install agentproc
 ```
 
 ---
@@ -30,9 +30,9 @@ pip install ilink-bridge-profile
 创建 `handler.py`：
 
 ```python
-from ilink_bridge import create_profile, ProfileContext
+from agentproc import create_profile, AgentContext
 
-async def handler(ctx: ProfileContext) -> str:
+async def handler(ctx: AgentContext) -> str:
     # 这里写你的 AI 调用逻辑
     # 示例：简单的 echo 回复
     return f"你说的是：{ctx.message}"
@@ -41,7 +41,7 @@ create_profile(handler)
 ```
 
 `create_profile` 帮你做了所有样板工作：
-- 读取 `ILINK_MESSAGE`、`ILINK_SESSION_ID` 等环境变量
+- 读取 `AGENT_MESSAGE`、`AGENT_SESSION_ID` 等环境变量
 - 调用你的 async handler 函数
 - 按 P0 协议把回复写到 stdout
 
@@ -54,11 +54,11 @@ pip install openai
 ```python
 import os
 from openai import AsyncOpenAI
-from ilink_bridge import create_profile, ProfileContext
+from agentproc import create_profile, AgentContext
 
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-async def handler(ctx: ProfileContext) -> str:
+async def handler(ctx: AgentContext) -> str:
     completion = await client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": ctx.message}],
@@ -75,9 +75,9 @@ create_profile(handler)
 不需要启动完整的 bridge，直接用环境变量模拟调用：
 
 ```bash
-ILINK_MESSAGE="你好，介绍一下自己" \
-ILINK_SESSION_ID="" \
-ILINK_FROM_USER="test-user" \
+AGENT_MESSAGE="你好，介绍一下自己" \
+AGENT_SESSION_ID="" \
+AGENT_FROM_USER="test-user" \
 python3 handler.py
 ```
 
@@ -131,14 +131,14 @@ ilink-hub-bridge --config profiles.yaml
 ```python
 import os
 from openai import AsyncOpenAI
-from ilink_bridge import (
-    create_profile, ProfileContext, ProfileResult,
+from agentproc import (
+    create_profile, AgentContext, AgentResult,
     load_history, append_history, HistoryEntry,
 )
 
 client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-async def handler(ctx: ProfileContext) -> ProfileResult:
+async def handler(ctx: AgentContext) -> AgentResult:
     # 读取历史对话
     history = load_history(ctx.session_id)
     messages = [
@@ -159,7 +159,7 @@ async def handler(ctx: ProfileContext) -> ProfileResult:
         HistoryEntry(role="assistant", content=reply),
     ])
 
-    return ProfileResult(response=reply, session_id=ctx.session_id)
+    return AgentResult(response=reply, session_id=ctx.session_id)
 
 create_profile(handler)
 ```
@@ -178,11 +178,11 @@ pip install anthropic
 # claude-profile.py
 import os
 import anthropic
-from ilink_bridge import create_profile, ProfileContext
+from agentproc import create_profile, AgentContext
 
 client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-async def handler(ctx: ProfileContext) -> str:
+async def handler(ctx: AgentContext) -> str:
     message = await client.messages.create(
         model="claude-opus-4-5",
         max_tokens=1024,
@@ -219,12 +219,12 @@ requires = ["setuptools>=42"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ilink-bridge-profile-myai"
+name = "agentproc-myai"
 version = "0.1.0"
-dependencies = ["ilink-bridge-profile", "openai"]
+dependencies = ["agentproc", "openai"]
 
 [project.scripts]
-ilink-bridge-profile-myai = "myai_profile:main"
+agentproc-myai = "myai_profile:main"
 ```
 
 在 `myai_profile.py` 中把 `create_profile(handler)` 放到 `main()` 函数：
@@ -247,7 +247,7 @@ python -m twine upload dist/*
 ```yaml
 profiles:
   my-ai:
-    command: ilink-bridge-profile-myai
+    command: agentproc-myai
 ```
 
 ---

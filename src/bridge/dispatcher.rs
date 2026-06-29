@@ -1055,7 +1055,7 @@ async fn handle_one_message(
     info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
 
     // watch::channel bounds the partial-chunk buffer to a single slot: only
-    // the latest ILINK_PARTIAL chunk matters for UI streaming, and stale
+    // the latest AGENT_PARTIAL chunk matters for UI streaming, and stale
     // intermediate state is dropped automatically. This eliminates the
     // unbounded memory growth that mpsc::unbounded_channel caused when the
     // Hub returned Throttled during a long exponential backoff (up to ~300s).
@@ -1119,7 +1119,7 @@ async fn handle_one_message(
                         )
                         .await
                         {
-                            warn!(error = %e, "failed to persist cli_session_id after ILINK_PARTIAL-only reply")
+                            warn!(error = %e, "failed to persist cli_session_id after AGENT_PARTIAL-only reply")
                         }
                     }
                 }

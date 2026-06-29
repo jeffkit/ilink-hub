@@ -30,10 +30,10 @@ Enter
 Sleep 2000ms
 
 # ── 第三幕：直接测试 claude-code profile（单行命令）─────────────────────
-Type `export ILINK_MESSAGE="用 Python 写快速排序，只要函数，不要解释"`
+Type `export AGENT_MESSAGE="用 Python 写快速排序，只要函数，不要解释"`
 Enter
 Sleep 200ms
-Type "export ILINK_SESSION_ID=''"
+Type "export AGENT_SESSION_ID=''"
 Enter
 Sleep 200ms
 Type "export ILINK_CLAUDE_MODEL=sonnet"

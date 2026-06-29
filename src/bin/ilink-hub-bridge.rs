@@ -12,7 +12,7 @@
 //! **调试**：`ILINKHUB_BRIDGE_DUMP_MSG=1`（或 `true` / `yes`）时在 stderr 打印每条入站的完整 `WeixinMessage` JSON 与各 `item_list[*].extra`。
 //!
 //! **内置 Profile**：`ilink-hub-bridge profile <type>` 运行内置 profile 处理器（如 `claude-code`），
-//! 遵循 P0 exec 协议：从 `ILINK_*` 环境变量读取输入，向 stdout 写出回复。
+//! 遵循 P0 exec 协议：从 `AGENT_*` 环境变量读取输入，向 stdout 写出回复。
 //!
 //! 配置见 `docs/bridge/README.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
 
@@ -79,7 +79,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run a built-in profile handler (P0 exec protocol: reads ILINK_* env vars, writes to stdout).
+    /// Run a built-in profile handler (P0 exec protocol: reads AGENT_* env vars, writes to stdout).
     ///
     /// Example: ilink-hub-bridge profile claude-code
     ///

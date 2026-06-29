@@ -196,11 +196,16 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
         cmd.current_dir(&expanded_dir);
     }
 
-    cmd.env("ILINK_MESSAGE", message);
-    cmd.env("ILINK_SESSION_ID", "");
-    cmd.env("ILINK_SESSION_NAME", "default");
-    cmd.env("ILINK_FROM_USER", "probe");
-    cmd.env("ILINK_CONTEXT_TOKEN", "probe");
+    cmd.env("AGENT_MESSAGE", message);
+    cmd.env("AGENT_SESSION_ID", "");
+    cmd.env("AGENT_SESSION_NAME", "default");
+    cmd.env("AGENT_FROM_USER", "probe");
+    cmd.env("AGENT_CONTEXT_TOKEN", "probe");
+    cmd.env("AGENT_STREAMING", if profile.streaming { "1" } else { "0" });
+    cmd.env(
+        "AGENT_PROTOCOL_VERSION",
+        crate::bridge::executor::AGENTPROC_PROTOCOL_VERSION,
+    );
 
     for (k, v) in &profile.env {
         let v = v

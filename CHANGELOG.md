@@ -4,6 +4,44 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### agentproc 协议对齐 Step 1：Rust bridge 协议改名（2026-06-26）
+
+**⚠️ Breaking Change** — bridge ↔ profile 进程间的 P0 协议变量名从 `ILINK_*` 改名为 agentproc v0.3.0 的 `AGENT_*`。用户**自定义 YAML** 中若硬编码了 `cli_session_first_line_prefix: "ILINK_SESSION:"` 需更新为 `"AGENT_SESSION:"`。自定义 profile 脚本若读取 `ILINK_MESSAGE`/`ILINK_SESSION_ID`/`ILINK_PARTIAL:` 等需改读 `AGENT_*`；附件相关 env var（`ILINK_IMAGE_URL`/`ILINK_FILE_URL`/`ILINK_FILE_NAME`/`ILINK_VIDEO_URL`/`ILINK_ITEM_TYPE`）及 `ILINK_CONTEXT_TOKEN` 也一并改名（见下表）。Hub 自身配置变量（`ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等）**不变**。
+
+**协议名映射**
+
+| 旧 | 新 |
+|----|----|
+| `ILINK_MESSAGE` | `AGENT_MESSAGE` |
+| `ILINK_SESSION_ID` | `AGENT_SESSION_ID` |
+| `ILINK_SESSION_NAME` | `AGENT_SESSION_NAME` |
+| `ILINK_FROM_USER` | `AGENT_FROM_USER` |
+| `ILINK_STREAMING` | `AGENT_STREAMING` |
+| `ILINK_PARTIAL:` | `AGENT_PARTIAL:` |
+| `ILINK_SESSION:` | `AGENT_SESSION:` |
+| `ILINK_CONTEXT_TOKEN` | `AGENT_CONTEXT_TOKEN` |
+| `ILINK_ITEM_TYPE` | `AGENT_ITEM_TYPE` |
+| `ILINK_IMAGE_URL` | `AGENT_IMAGE_URL` |
+| `ILINK_FILE_URL` | `AGENT_FILE_URL` |
+| `ILINK_FILE_NAME` | `AGENT_FILE_NAME` |
+| `ILINK_VIDEO_URL` | `AGENT_VIDEO_URL` |
+
+**新增契约**
+
+- 注入 `AGENT_PROTOCOL_VERSION` 环境变量（值为常量 `AGENTPROC_PROTOCOL_VERSION = "0.3"`），供 profile feature-detect。
+- 解析 `AGENT_ERROR:<json-encoded-string>` 行：解码后通过现有 partial 通道转发给用户（最小实现；完整错误回复通道留待后续 step）。
+
+**保留原名（ilink-hub 自有机制，不在 agentproc 协议范畴）**
+
+- `ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等 Hub 自身配置/常量变量
+- `ILINK_CODEBUDDY_MODEL` 等 `ILINK_*_MODEL` 模型覆盖变量
+
+**后续步骤**（非本次）
+
+- Step 2：删除 `sdk/python`、`sdk/node`，改用 agentproc 官方包；`examples/` import 替换
+- Step 3：`docs/knowledge/bridges/profile-protocol.md` 等文档同步为"引用 agentproc spec"
+- Step 4：内置 Rust builtin profile 归属决策
+
 ### 架构评审修复（2026-06-21）
 
 **修复**

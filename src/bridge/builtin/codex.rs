@@ -2,7 +2,7 @@
 //!
 //! Reads P0 env vars, calls `codex exec [resume <thread_id>] <message>
 //! --dangerously-bypass-approvals-and-sandbox --json`, and streams `agent_message`
-//! items to the parent bridge via `ILINK_PARTIAL:` stdout lines.
+//! items to the parent bridge via `AGENT_PARTIAL:` stdout lines.
 //!
 //! JSONL event stream from `codex exec --json`:
 //!   {"type":"thread.started","thread_id":"<uuid>"}
@@ -11,11 +11,11 @@
 //!
 //! Each `agent_message` item is emitted immediately as:
 //!
-//!   ILINK_PARTIAL:<json-encoded-string>
+//!   AGENT_PARTIAL:<json-encoded-string>
 //!
 //! When the stream ends, the final P0 session line is written:
 //!
-//!   ILINK_SESSION:<thread_id>
+//!   AGENT_SESSION:<thread_id>
 //!
 //! The response body is left empty so the bridge does not send a duplicate final message.
 //!
@@ -59,14 +59,14 @@ pub async fn run() -> Result<()> {
         .await?;
 
     // P0 output: optional session line only.
-    // All response text was already streamed via ILINK_PARTIAL during execution.
+    // All response text was already streamed via AGENT_PARTIAL during execution.
     common::emit_session_line(new_thread_id.as_deref());
 
     Ok(())
 }
 
 /// Call `codex exec [resume <session_id>] <message> --json`, emit each `agent_message`
-/// item as an `ILINK_PARTIAL:` stdout line, and return the thread ID.
+/// item as an `AGENT_PARTIAL:` stdout line, and return the thread ID.
 async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>> {
     // Build: codex exec [resume <id>] <message> --dangerously-bypass-approvals-and-sandbox --json
     let mut args: Vec<String> = vec!["exec".into()];

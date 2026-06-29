@@ -2,20 +2,20 @@
 //!
 //! Reads P0 env vars, calls `agent --print --trust --yolo --output-format stream-json
 //! [--model <model>] [--resume <uuid>]`, and delivers the response in one of two modes
-//! depending on the `ILINK_STREAMING` env var injected by the bridge:
+//! depending on the `AGENT_STREAMING` env var injected by the bridge:
 //!
-//! **Streaming mode** (`ILINK_STREAMING=1`, default):
+//! **Streaming mode** (`AGENT_STREAMING=1`, default):
 //!   Each assistant text chunk is written immediately as:
-//!     ILINK_PARTIAL:<json-encoded-string>
+//!     AGENT_PARTIAL:<json-encoded-string>
 //!   When the stream ends, the final P0 session line is written:
-//!     ILINK_SESSION:<new_session_id>
+//!     AGENT_SESSION:<new_session_id>
 //!   The response body is left empty so the bridge does not send a duplicate final message.
 //!
-//! **One-shot mode** (`ILINK_STREAMING=0`):
+//! **One-shot mode** (`AGENT_STREAMING=0`):
 //!   Waits for the run to complete, then writes:
-//!     ILINK_SESSION:<new_session_id>
+//!     AGENT_SESSION:<new_session_id>
 //!     <full response text>
-//!   No ILINK_PARTIAL lines are emitted; the bridge sends a single final message.
+//!   No AGENT_PARTIAL lines are emitted; the bridge sends a single final message.
 //!
 //! Message is written to the `agent` process stdin (unlike `claude` which uses `-p`).
 //!
@@ -35,9 +35,9 @@ type CursorStreamEvent = common::StreamJsonEvent;
 
 pub async fn run() -> Result<()> {
     let (message, session_id) = common::read_message_and_session();
-    // ILINK_STREAMING is injected by the bridge: "1" (default) = stream partials,
-    // "0" = one-shot mode (emit full text to stdout at the end, no ILINK_PARTIAL lines).
-    let streaming = std::env::var("ILINK_STREAMING")
+    // AGENT_STREAMING is injected by the bridge: "1" (default) = stream partials,
+    // "0" = one-shot mode (emit full text to stdout at the end, no AGENT_PARTIAL lines).
+    let streaming = std::env::var("AGENT_STREAMING")
         .map(|v| v.trim() != "0")
         .unwrap_or(true);
 
@@ -52,18 +52,18 @@ pub async fn run() -> Result<()> {
         .await?;
 
     // P0 output: optional session line only.
-    // In streaming mode all response text was already emitted via ILINK_PARTIAL.
+    // In streaming mode all response text was already emitted via AGENT_PARTIAL.
     // In one-shot mode the session line + full text were already printed by oneshot_cursor,
-    // and it returns None to suppress a duplicate ILINK_SESSION line here.
+    // and it returns None to suppress a duplicate AGENT_SESSION line here.
     common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
 
 /// Call `agent --output-format stream-json`, emit every assistant text chunk as an
-/// `ILINK_PARTIAL:` stdout line, and return the session ID from the result event.
+/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via ILINK_PARTIAL. Cursor's `result.result`
+/// All visible response text is streamed via AGENT_PARTIAL. Cursor's `result.result`
 /// is the concatenation of every assistant text already streamed, so it is not re-sent
 /// in the normal case. The sole exception: when **no** assistant text events were emitted
 /// (the model responded with tool-only actions), `result.result` is used as a fallback
@@ -145,7 +145,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
-                    // "\n" between tool calls) do not produce an empty-looking ILINK_PARTIAL.
+                    // "\n" between tool calls) do not produce an empty-looking AGENT_PARTIAL.
                     if !text.trim().is_empty() {
                         assistant_event_count += 1;
                         assistant_total_chars += text.len();
@@ -197,8 +197,8 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
 }
 
 /// One-shot mode: run `agent --output-format stream-json`, collect all events, then
-/// emit `ILINK_SESSION:<sid>\n<text>` to stdout so the bridge sends a single final
-/// message without any ILINK_PARTIAL lines.
+/// emit `AGENT_SESSION:<sid>\n<text>` to stdout so the bridge sends a single final
+/// message without any AGENT_PARTIAL lines.
 ///
 /// Uses `result.result` as the response text (it equals the concatenation of every
 /// assistant chunk). Returns `None` so the outer `run()` does not emit a duplicate
@@ -286,7 +286,7 @@ async fn oneshot_cursor(message: &str, session_id: &str) -> Result<Option<String
         // then the full response text as the raw body.
         if let Some(ref sid) = found_session_id {
             if !sid.is_empty() {
-                println!("ILINK_SESSION:{sid}");
+                println!("AGENT_SESSION:{sid}");
             }
         }
         println!("{text}");
@@ -334,7 +334,7 @@ mod tests {
     // ── Bug-fix regression tests ─────────────────────────────────────────────
 
     /// Bug #2: whitespace-only text blocks must not be counted as assistant events
-    /// or emitted as ILINK_PARTIAL. The old guard `!text.is_empty()` passed "\n";
+    /// or emitted as AGENT_PARTIAL. The old guard `!text.is_empty()` passed "\n";
     /// the fix uses `!text.trim().is_empty()`.
     #[test]
     fn whitespace_only_text_is_not_an_assistant_event() {
@@ -414,10 +414,10 @@ mod tests {
         );
     }
 
-    // ── ILINK_STREAMING / oneshot mode tests ─────────────────────────────────
+    // ── AGENT_STREAMING / oneshot mode tests ─────────────────────────────────
 
-    /// When ILINK_STREAMING=0, the result event's text is the source of truth for
-    /// the one-shot reply, not ILINK_PARTIAL lines.
+    /// When AGENT_STREAMING=0, the result event's text is the source of truth for
+    /// the one-shot reply, not AGENT_PARTIAL lines.
     #[test]
     fn oneshot_uses_result_text() {
         let json = r#"{"type":"result","result":"Done in one shot.","session_id":"os-1"}"#;

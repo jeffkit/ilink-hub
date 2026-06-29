@@ -1,174 +1,17 @@
 # Bridge Profile 完整示例
 
-> 最后更新：2026-06-09
+> 最后更新：2026-06-26
 
 本页提供三个**开箱即用**的 Bridge Profile 示例，均已通过本地运行验证：
 
 | 示例 | 语言 | AI 工具 | 目录 |
 |------|------|---------|------|
-| [Claude Code（Node.js）](#claude-code-nodejs) | Node.js | Claude Code CLI | `examples/claude-code-nodejs/` |
-| [Cursor Agent（Python）](#cursor-python) | Python | Cursor Agent CLI | `examples/cursor-python/` |
 | [Codex（Shell）](#codex-shell) | Shell | OpenAI Codex CLI | `examples/codex-shell/` |
 
 所有示例均：
-- 通过 bridge SDK（`ilink-bridge-profile`）或标准 P0 协议接入
+- 通过 bridge SDK（`agentproc`）或标准 P0 协议接入
 - 支持**多轮对话**（session resume）
 - 可在**不启动 bridge** 的情况下单独测试
-
----
-
-## Claude Code（Node.js SDK）{#claude-code-nodejs}
-
-用 Node.js SDK 调用 Claude Code CLI，并通过 `ILINK_SESSION:` 前缀保持多轮对话上下文。
-
-### 前提条件
-
-```bash
-node --version          # 需要 18+
-npm install -g @anthropic-ai/claude-code
-claude login            # 或 export ANTHROPIC_API_KEY=sk-ant-...
-```
-
-### 安装与测试
-
-```bash
-cd examples/claude-code-nodejs
-npm install
-
-# 本地模拟调用（不需要启动 bridge）
-ILINK_MESSAGE="你好，介绍一下自己" \
-ILINK_SESSION_ID="" \
-CLAUDE_MODEL="sonnet" \
-node handler.js
-```
-
-预期输出：
-
-```
-ILINK_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-你好！我是 Claude，一个由 Anthropic 开发的 AI 助手。有什么可以帮你的吗？
-```
-
-### 接入 Bridge
-
-修改 `profiles.yaml` 中的 `cwd` 为你的项目目录，然后：
-
-```bash
-ilink-hub-bridge --config profiles.yaml
-```
-
-### 核心代码
-
-```javascript
-// examples/claude-code-nodejs/handler.js
-const { createProfile } = require('ilink-bridge-profile');
-const { spawn } = require('child_process');
-
-async function callClaude(message, sessionId) {
-  const args = ['--print', '--output-format', 'json'];
-  if (process.env.CLAUDE_MODEL) args.push('--model', process.env.CLAUDE_MODEL);
-  if (sessionId) args.push('--resume', sessionId);
-  args.push(message);
-
-  const stdout = await spawnClaude(args);  // 关闭 stdin，收集 stdout
-
-  const events = JSON.parse(stdout.trim());
-  const resultEvent = [...events].reverse().find((e) => e.type === 'result');
-  return {
-    result: resultEvent.result || '',
-    sessionId: resultEvent.is_error ? '' : (resultEvent.session_id || ''),
-  };
-}
-
-createProfile(async ({ message, sessionId }) => {
-  const { result, sessionId: newSessionId } = await callClaude(message, sessionId);
-  return { response: result, sessionId: newSessionId || undefined };
-});
-```
-
-**关键设计点：**
-- `spawnClaude()` 立即关闭 stdin（`child.stdin.end()`），避免 `claude` 等待管道输入
-- Claude 在 API 错误时也以非零退出码退出但会输出 JSON，所以**不以退出码判断成败**，而是解析 JSON 内容
-- 当 `is_error: true` 时，不保存 session_id（避免用损坏的 session 继续对话）
-- `--resume` 失败时自动降级为新会话
-
----
-
-## Cursor Agent（Python SDK）{#cursor-python}
-
-用 Python SDK 调用 Cursor Agent CLI（`agent` 命令），支持通过 `--resume` 保持对话上下文。
-
-### 前提条件
-
-```bash
-python3 --version       # 需要 3.10+
-agent --version         # Cursor Agent CLI 已安装（见 https://cursor.com/docs/cli/overview）
-agent login             # 或 export CURSOR_API_KEY=key-...
-```
-
-### 安装与测试
-
-```bash
-cd examples/cursor-python
-pip install -r requirements.txt
-
-# 本地模拟调用（不需要启动 bridge）
-ILINK_MESSAGE="你好，介绍一下自己" \
-ILINK_SESSION_ID="" \
-python3 handler.py
-```
-
-预期输出：
-
-```
-ILINK_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-你好！我是 Cursor Agent，有什么可以帮你的吗？
-```
-
-### 接入 Bridge
-
-修改 `profiles.yaml` 中的 `cwd` 为你的项目目录，然后：
-
-```bash
-ilink-hub-bridge --config profiles.yaml
-```
-
-### 核心代码
-
-```python
-# examples/cursor-python/handler.py
-from ilink_bridge import ProfileContext, ProfileResult, create_profile
-
-async def call_cursor_agent(message: str, session_id: str) -> tuple[str, str]:
-    cmd = ["agent", "--print", "--trust", "--output-format", "json"]
-    if session_id:
-        cmd += ["--resume", session_id]
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout_bytes, _ = await asyncio.wait_for(
-        proc.communicate(input=message.encode()),
-        timeout=300,
-    )
-
-    data = json.loads(stdout_bytes.decode())
-    return data.get("result", ""), data.get("session_id", "")
-
-async def handler(ctx: ProfileContext) -> ProfileResult:
-    response, new_session_id = await call_cursor_agent(ctx.message, ctx.session_id)
-    return ProfileResult(response=response, session_id=new_session_id or ctx.session_id)
-
-create_profile(handler)
-```
-
-**关键设计点：**
-- 消息通过 `stdin` 传入（`proc.communicate(input=message.encode())`），兼容多行消息
-- `agent --output-format json` 输出单行 JSON，包含 `result` 和 `session_id`
-- `--trust` 允许 agent 在不提示确认的情况下访问当前目录（等价于 `--yolo`）
 
 ---
 
@@ -190,16 +33,16 @@ jq --version            # brew install jq  或  sudo apt install jq
 cd examples/codex-shell
 
 # 本地模拟调用（不需要启动 bridge）
-ILINK_MESSAGE="你好，介绍一下自己" \
-ILINK_SESSION_ID="" \
-ILINK_CWD="$(pwd)" \
+AGENT_MESSAGE="你好，介绍一下自己" \
+AGENT_SESSION_ID="" \
+AGENT_CWD="$(pwd)" \
 bash handler.sh
 ```
 
 预期输出：
 
 ```
-ILINK_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+AGENT_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 你好！我是 Codex，一个 AI 编程助手。有什么可以帮你的吗？
 ```
 
@@ -215,8 +58,8 @@ ilink-hub-bridge --config profiles.yaml
 
 ```bash
 # examples/codex-shell/handler.sh
-MESSAGE="${ILINK_MESSAGE:-}"
-SESSION_ID="${ILINK_SESSION_ID:-}"
+MESSAGE="${AGENT_MESSAGE:-}"
+SESSION_ID="${AGENT_SESSION_ID:-}"
 
 # 有 session_id 时用 exec resume（多轮对话），否则新建会话
 if [[ -n "$SESSION_ID" ]]; then
@@ -235,8 +78,8 @@ NEW_SESSION_ID=$(printf '%s\n' "$JSON_OUTPUT" \
 RESPONSE=$(printf '%s\n' "$JSON_OUTPUT" \
     | jq -r 'select(.type=="item.completed" and .item.type=="agent_message") | .item.text // empty')
 
-# P0 输出：第一行为 ILINK_SESSION:<uuid>，其余为回复正文
-if [[ -n "$NEW_SESSION_ID" ]]; then echo "ILINK_SESSION:$NEW_SESSION_ID"; fi
+# P0 输出：第一行为 AGENT_SESSION:<uuid>，其余为回复正文
+if [[ -n "$NEW_SESSION_ID" ]]; then echo "AGENT_SESSION:$NEW_SESSION_ID"; fi
 printf '%s' "$RESPONSE"
 ```
 
@@ -263,13 +106,13 @@ printf '%s' "$RESPONSE"
 
 ```bash
 # 第一轮：获取 session_id
-ILINK_MESSAGE="用一句话说你好" ILINK_SESSION_ID="" bash handler.sh
-# 输出：ILINK_SESSION:019eac6a-...
+AGENT_MESSAGE="用一句话说你好" AGENT_SESSION_ID="" bash handler.sh
+# 输出：AGENT_SESSION:019eac6a-...
 #       你好。
 
 # 第二轮：用上一轮的 session_id 继续对话
-ILINK_MESSAGE="我上一条消息说了什么？" ILINK_SESSION_ID="019eac6a-..." bash handler.sh
-# 输出：ILINK_SESSION:019eac6a-...
+AGENT_MESSAGE="我上一条消息说了什么？" AGENT_SESSION_ID="019eac6a-..." bash handler.sh
+# 输出：AGENT_SESSION:019eac6a-...
 #       你上一条消息是："用一句话说你好"。
 ```
 

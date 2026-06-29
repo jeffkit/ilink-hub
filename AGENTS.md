@@ -44,4 +44,3 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 修改任意 `.rs` 文件 | `cargo fmt --all -- --check`，不通过则先跑 `cargo fmt --all` |
 | 修改任意 `.rs` 文件 | `cargo clippy -- -D warnings`，零 warning 才可提交 |
 | 新增或升级 Rust 依赖 | `cargo update` 后将 `Cargo.lock` 一并提交（Docker 构建使用 `--locked`）|
-| 修改 `sdk/node/src/` | **必须同步 bump `sdk/node/package.json` 的 `version` 字段**，否则 CI 会检测到版本已存在并跳过发布，新代码永远不会上线到 npm |

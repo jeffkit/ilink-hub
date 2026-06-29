@@ -1,15 +1,15 @@
 # SDK Profile 示例
 #
-# 展示如何用 ilink-bridge-profile SDK（Python / Node.js）编写自定义 profile，
+# 展示如何用 agentproc SDK（Python / Node.js）编写自定义 profile，
 # 并通过 `script:` 字段让 bridge 自动推断运行时。
 #
 # ─── 前提条件 ──────────────────────────────────────────────────────────────
 #
 #   Python SDK：
-#     pip install ilink-bridge-profile
+#     pip install agentproc
 #
 #   Node.js SDK：
-#     npm install ilink-bridge-profile
+#     npm install agentproc
 #
 # ─── bridge 如何运行你的脚本（script: 字段）─────────────────────────────────
 #
@@ -29,11 +29,11 @@
 # ─── 测试脚本 ─────────────────────────────────────────────────────────────
 #
 #   不启动 bridge，直接在终端模拟一次调用：
-#     ILINK_MESSAGE="你好" \
-#     ILINK_SESSION_ID="" \
-#     ILINK_SESSION_NAME="default" \
-#     ILINK_FROM_USER="test" \
-#     ILINK_CONTEXT_TOKEN="test-token" \
+#     AGENT_MESSAGE="你好" \
+#     AGENT_SESSION_ID="" \
+#     AGENT_SESSION_NAME="default" \
+#     AGENT_FROM_USER="test" \
+#     AGENT_CONTEXT_TOKEN="test-token" \
 #     python3 ./my_handler.py
 #
 # ─────────────────────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ profiles:
   #
   # 对应的 my_handler.py：
   #
-  #   from ilink_bridge import create_profile
+  #   from agentproc import create_profile
   #
   #   async def handler(ctx):
   #       reply = await my_ai_call(ctx.message)
@@ -61,7 +61,7 @@ profiles:
   #
   # 对应的 my_handler.js：
   #
-  #   const { createProfile } = require('ilink-bridge-profile');
+  #   const { createProfile } = require('agentproc');
   #
   #   createProfile(async ({ message, sessionId }) => {
   #     const reply = await myAICall(message);

@@ -1,6 +1,6 @@
 # Bridge Profile 规范（P0 Exec Protocol）
 
-> 最后更新：2026-06-16
+> 最后更新：2026-06-29
 
 iLink Hub Bridge 的 **profile** 就是一个可执行的脚本或程序：收到消息 → 做处理 → 把回复写到 stdout。
 
@@ -14,36 +14,36 @@ P0 仅依赖环境变量 + stdout，**完全跨平台**（macOS / Linux / Window
 
 | 变量名 | 说明 |
 |--------|------|
-| `ILINK_MESSAGE` | 用户消息文本（路由后的净文本，前缀已剥离） |
-| `ILINK_SESSION_ID` | Hub 持久化的后端 session UUID（空 = 新会话） |
-| `ILINK_SESSION_NAME` | session 可读名称（默认 `default`） |
-| `ILINK_FROM_USER` | 发送消息的用户 ID |
-| `ILINK_CONTEXT_TOKEN` | Hub context token |
-| `ILINK_STREAMING` | `1`（默认）= 流式模式，`0` = 一次性回复模式（见下文） |
+| `AGENT_MESSAGE` | 用户消息文本（路由后的净文本，前缀已剥离） |
+| `AGENT_SESSION_ID` | Hub 持久化的后端 session UUID（空 = 新会话） |
+| `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
+| `AGENT_FROM_USER` | 发送消息的用户 ID |
+| `AGENT_CONTEXT_TOKEN` | Hub context token |
+| `AGENT_STREAMING` | `1`（默认）= 流式模式，`0` = 一次性回复模式（见下文） |
 
-> 当 YAML 设置了 `stdin: message` 时，`ILINK_MESSAGE` 同时也会写入 stdin。
+> 当 YAML 设置了 `stdin: message` 时，`AGENT_MESSAGE` 同时也会写入 stdin。
 
 ### 输出（profile 写 stdout）
 
 ```
-[可选] ILINK_SESSION:<uuid>     ← 如需 session 追踪，首行输出这个
+[可选] AGENT_SESSION:<uuid>     ← 如需 session 追踪，首行输出这个
 <回复给微信用户的文本>
 ```
 
 Bridge 从进程启动开始**实时读取** stdout——profile 一旦写入并刷新缓冲区，bridge 立即处理。
 
-### 流式输出（ILINK_PARTIAL）
+### 流式输出（AGENT_PARTIAL）
 
-当 profile 需要把 AI 生成的文本**逐段发给用户**时，可在终端输出中夹杂 `ILINK_PARTIAL:` 行：
+当 profile 需要把 AI 生成的文本**逐段发给用户**时，可在终端输出中夹杂 `AGENT_PARTIAL:` 行：
 
 ```
-ILINK_PARTIAL:<JSON 编码的字符串>
+AGENT_PARTIAL:<JSON 编码的字符串>
 ```
 
 - bridge 读到该行后**立即**将解码后的文本通过 sendmessage 发给微信用户，无需等进程退出。
 - `<JSON 编码的字符串>` 是对分块文本调用 `json.dumps(text)` / `JSON.stringify(text)` 的结果，换行等特殊字符会被 JSON 转义，整个标记**只占 stdout 的一行**。
-- profile 内部**无需感知 iLink 协议**——`ILINK_PARTIAL:` 只是 profile 与 bridge 之间的约定，bridge 负责向 Hub 发消息的全部细节。
-- 进程**退出 = EOF**，bridge 结束读取，若剩余 stdout 非空则作为最终消息发送；若全部内容已通过 `ILINK_PARTIAL:` 发出，最终 body 为空时 bridge 会自动跳过最终 sendmessage。
+- profile 内部**无需感知 iLink 协议**——`AGENT_PARTIAL:` 只是 profile 与 bridge 之间的约定，bridge 负责向 Hub 发消息的全部细节。
+- 进程**退出 = EOF**，bridge 结束读取，若剩余 stdout 非空则作为最终消息发送；若全部内容已通过 `AGENT_PARTIAL:` 发出，最终 body 为空时 bridge 会自动跳过最终 sendmessage。
 
 #### 关闭流式（`streaming: false`）
 
@@ -58,8 +58,8 @@ profiles:
 ```
 
 关闭后：
-- bridge 忽略所有 `ILINK_PARTIAL:` 行，**不实时转发**给用户
-- 同时向子进程注入 `ILINK_STREAMING=0`，内置 profile（如 `claude-code`）会自动切换为一次性输出模式
+- bridge 忽略所有 `AGENT_PARTIAL:` 行，**不实时转发**给用户
+- 同时向子进程注入 `AGENT_STREAMING=0`，内置 profile（如 `claude-code`）会自动切换为一次性输出模式
 - 进程退出后，完整 stdout 作为最终回复**一次性**发送
 
 默认值为 `true`（流式开启）。
@@ -69,9 +69,9 @@ profiles:
 ```bash
 #!/usr/bin/env bash
 # 流式调用示例：用于测试，每秒发一段
-echo 'ILINK_PARTIAL:"第一段，1 秒前发出"'
+echo 'AGENT_PARTIAL:"第一段，1 秒前发出"'
 sleep 1
-echo 'ILINK_PARTIAL:"第二段，2 秒前发出"'
+echo 'AGENT_PARTIAL:"第二段，2 秒前发出"'
 sleep 1
 # 进程退出 → bridge 读到 EOF → 完成
 ```
@@ -126,13 +126,13 @@ SDK 把读取环境变量、写 stdout、管理对话历史的样板代码封装
 ### Python SDK
 
 ```bash
-pip install ilink-bridge-profile
+pip install agentproc
 ```
 
 创建 `my_handler.py`：
 
 ```python
-from ilink_bridge import create_profile
+from agentproc import create_profile
 
 async def handler(ctx):
     # ctx.message, ctx.session_id, ctx.from_user, ctx.context_token
@@ -145,20 +145,20 @@ create_profile(handler)
 **流式输出（`ctx.send_partial`）：**
 
 ```python
-from ilink_bridge import create_profile, ProfileResult
+from agentproc import create_profile, AgentResult
 
 async def handler(ctx):
     new_sid = ctx.session_id
     # AI 每产生一段文本，立即发给用户，无需等到全部完成
     async for chunk, new_sid in stream_ai(ctx.message, ctx.session_id):
-        await ctx.send_partial(chunk)   # 写 ILINK_PARTIAL: + flush
+        await ctx.send_partial(chunk)   # 写 AGENT_PARTIAL: + flush
     # 全部已流式发出，response 置空即可
-    return ProfileResult(response="", session_id=new_sid)
+    return AgentResult(response="", session_id=new_sid)
 
 create_profile(handler)
 ```
 
-`send_partial` 的实现只有两行：写 `ILINK_PARTIAL:{json.dumps(text)}\n` 并立即 `flush()`。Bridge 在实时读 stdout 时检测到该前缀，就立即向 Hub 发消息——**profile 完全不感知 iLink 协议**。
+`send_partial` 的实现只有两行：写 `AGENT_PARTIAL:{json.dumps(text)}\n` 并立即 `flush()`。Bridge 在实时读 stdout 时检测到该前缀，就立即向 Hub 发消息——**profile 完全不感知 iLink 协议**。
 
 YAML 配置：
 
@@ -172,13 +172,13 @@ profiles:
 ### Node.js SDK
 
 ```bash
-npm install ilink-bridge-profile
+npm install agentproc
 ```
 
 创建 `my_handler.js`：
 
 ```js
-const { createProfile } = require('ilink-bridge-profile');
+const { createProfile } = require('agentproc');
 
 createProfile(async ({ message, sessionId, fromUser }) => {
   const reply = await myAICall(message);
@@ -200,7 +200,7 @@ profiles:
 当你直接调用 LLM API 且需要携带上下文时，SDK 提供历史管理（存储于 `~/.ilink-hub/sessions/<session_id>.jsonl`）：
 
 ```python
-from ilink_bridge import create_profile, load_history, append_history, HistoryEntry, ProfileResult
+from agentproc import create_profile, load_history, append_history, HistoryEntry, AgentResult
 
 async def handler(ctx):
     history = load_history(ctx.session_id)
@@ -213,7 +213,7 @@ async def handler(ctx):
         HistoryEntry(role="user", content=ctx.message),
         HistoryEntry(role="assistant", content=reply),
     ])
-    return ProfileResult(response=reply, session_id=ctx.session_id)
+    return AgentResult(response=reply, session_id=ctx.session_id)
 
 create_profile(handler)
 ```
@@ -232,7 +232,7 @@ create_profile(handler)
 
 REPLY=$(curl -s https://api.example.com/chat \
   -H "Authorization: Bearer $MY_API_KEY" \
-  --data-urlencode "message=$ILINK_MESSAGE")
+  --data-urlencode "message=$AGENT_MESSAGE")
 
 echo "$REPLY"
 ```
@@ -250,7 +250,7 @@ profiles:
 ```python
 #!/usr/bin/env python3
 import os, sys
-message = os.environ.get('ILINK_MESSAGE', '')
+message = os.environ.get('AGENT_MESSAGE', '')
 reply = my_ai_call(message)
 sys.stdout.write(reply)
 ```
@@ -259,7 +259,7 @@ sys.stdout.write(reply)
 
 ```js
 #!/usr/bin/env node
-const message = process.env.ILINK_MESSAGE || '';
+const message = process.env.AGENT_MESSAGE || '';
 async function main() {
   const reply = await myAI(message);
   process.stdout.write(reply);
@@ -291,13 +291,13 @@ profiles:
     stdin: message
     cwd: /path/to/your/project
     timeout_secs: 300
-    cli_session_first_line_prefix: "ILINK_SESSION:"
+    cli_session_first_line_prefix: "AGENT_SESSION:"
 ```
 
 手动测试：
 
 ```bash
-ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ilink-hub-bridge profile claude-code
+AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
 ```
 
 ---
@@ -312,7 +312,7 @@ profiles:
     script: ./scripts/my_handler.py
 ```
 
-**公开发布**：发布为 npm 或 PyPI 包，包名约定 `ilink-bridge-profile-<type>`：
+**公开发布**：发布为 npm 或 PyPI 包，包名约定 `agentproc-<type>`：
 
 ```bash
 # 发布
@@ -324,7 +324,7 @@ npm publish            # 或 python -m twine upload dist/*
 ```yaml
 profiles:
   gemini:
-    command: ilink-bridge-profile-gemini
+    command: agentproc-gemini
 ```
 
 ---
@@ -334,18 +334,18 @@ profiles:
 模拟一次 bridge 调用（不启动完整 bridge）：
 
 ```bash
-ILINK_MESSAGE="你好" \
-ILINK_SESSION_ID="" \
-ILINK_SESSION_NAME="default" \
-ILINK_FROM_USER="test" \
-ILINK_CONTEXT_TOKEN="test-token" \
+AGENT_MESSAGE="你好" \
+AGENT_SESSION_ID="" \
+AGENT_SESSION_NAME="default" \
+AGENT_FROM_USER="test" \
+AGENT_CONTEXT_TOKEN="test-token" \
 python3 ./my_handler.py
 ```
 
 或用 bridge 内置子命令调用 built-in profile：
 
 ```bash
-ILINK_MESSAGE="你好" ILINK_SESSION_ID="" ilink-hub-bridge profile claude-code
+AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
 ```
 
 调试消息路由：

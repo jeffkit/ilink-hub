@@ -7,7 +7,7 @@ matching JSON.
 
 ## Why
 
-`src/bridge/builtin/claude_code.rs` writes these payloads when `ILINK_IMAGE_URL` / `ILINK_FILE_URL`
+`src/bridge/builtin/claude_code.rs` writes these payloads when `AGENT_IMAGE_URL` / `AGENT_FILE_URL`
 are set. Unit tests cover the JSON shape, but they cannot exercise the real CLI. Use these
 fixtures to manually verify a CLI version still accepts the protocol before shipping a release.
 

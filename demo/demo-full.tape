@@ -51,7 +51,7 @@ Sleep 600ms
 Type "# 第四步：bridge 直接调用 Claude Code"
 Enter
 Sleep 300ms
-Type "ILINK_MESSAGE='用 Python 写快速排序' ILINK_SESSION_ID='' ILINK_CLAUDE_MODEL=sonnet ilink-hub-bridge profile claude-code"
+Type "AGENT_MESSAGE='用 Python 写快速排序' AGENT_SESSION_ID='' ILINK_CLAUDE_MODEL=sonnet ilink-hub-bridge profile claude-code"
 Sleep 400ms
 Enter
 Sleep 12s

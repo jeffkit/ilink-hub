@@ -107,8 +107,8 @@ pub struct BridgeProfile {
     /// 会随 `sendmessage` 写入 Hub；其余行作为发给微信的正文。
     #[serde(default)]
     pub cli_session_first_line_prefix: Option<String>,
-    /// 是否启用流式部分回复（`ILINK_PARTIAL:`）。默认 `true`。
-    /// 设为 `false` 时，子进程仍可输出 `ILINK_PARTIAL:` 行，但 bridge 不转发，
+    /// 是否启用流式部分回复（`AGENT_PARTIAL:`）。默认 `true`。
+    /// 设为 `false` 时，子进程仍可输出 `AGENT_PARTIAL:` 行，但 bridge 不转发，
     /// 只等程序退出后将完整 stdout 作为最终回复一次性发送。
     #[serde(default = "default_true")]
     pub streaming: bool,
@@ -506,7 +506,7 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
         p.args = vec!["profile".to_string(), type_name.to_string()];
         p.stdin = StdinMode::Message;
         if with_session && p.cli_session_first_line_prefix.is_none() {
-            p.cli_session_first_line_prefix = Some("ILINK_SESSION:".to_string());
+            p.cli_session_first_line_prefix = Some("AGENT_SESSION:".to_string());
         }
         p
     }
