@@ -40,11 +40,11 @@ const ANTHROPIC_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn run() -> Result<()> {
     let (message, session_id) = common::read_message_and_session();
-    // ILINK_STREAMING is injected by the bridge: "1" (default) = stream partials,
-    // "0" = one-shot mode (emit full text to stdout at the end, no ILINK_PARTIAL lines).
+    // ILINK_STREAMING is injected by the bridge: "1" = stream partials,
+    // "0" or unset (default) = one-shot mode (emit full text to stdout at the end, no ILINK_PARTIAL lines).
     let streaming = std::env::var("ILINK_STREAMING")
-        .map(|v| v.trim() != "0")
-        .unwrap_or(true);
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
 
     let new_session_id = common::with_session_resume_fallback(
         "claude-code",

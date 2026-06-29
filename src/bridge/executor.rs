@@ -122,13 +122,22 @@ pub(super) fn split_cli_session_from_stdout(
     (stdout.to_string(), None)
 }
 
-pub(super) fn truncate_chars(s: &str, max_chars: usize, suffix: &str) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
+/// Split `s` into a sequence of parts, each at most `max_chars` Unicode chars.
+/// Returns at least one element (possibly an empty string when `s` is empty).
+pub(super) fn split_into_parts(s: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![s.to_string()];
     }
-    let budget = max_chars.saturating_sub(suffix.chars().count());
-    s.chars().take(budget).collect::<String>() + suffix
+    let mut parts = Vec::new();
+    let mut chars = s.chars().peekable();
+    while chars.peek().is_some() {
+        let part: String = chars.by_ref().take(max_chars).collect();
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
 }
 
 /// Extract media-related environment variables from a WeChat message so that CLI scripts
@@ -488,9 +497,34 @@ mod tests {
     }
 
     #[test]
-    fn truncate_respects_chars() {
-        let s = truncate_chars("abcde", 4, "…");
-        assert_eq!(s, "abc…");
+    fn split_into_parts_basic() {
+        let parts = split_into_parts("abcdefgh", 3);
+        assert_eq!(parts, vec!["abc", "def", "gh"]);
+    }
+
+    #[test]
+    fn split_into_parts_exact() {
+        let parts = split_into_parts("abcdef", 3);
+        assert_eq!(parts, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn split_into_parts_fits_in_one() {
+        let parts = split_into_parts("hi", 10);
+        assert_eq!(parts, vec!["hi"]);
+    }
+
+    #[test]
+    fn split_into_parts_empty() {
+        let parts = split_into_parts("", 8);
+        assert_eq!(parts, vec![""]);
+    }
+
+    #[test]
+    fn split_into_parts_unicode() {
+        // Each Chinese char is 1 Unicode scalar, so 2 chars per part → 3 parts.
+        let parts = split_into_parts("一二三四五", 2);
+        assert_eq!(parts, vec!["一二", "三四", "五"]);
     }
 
     #[tokio::test]

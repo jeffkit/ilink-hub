@@ -532,6 +532,11 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
             let count = clients.len();
             // Fallback default: use the first client only when no persisted default exists.
             let first_vtoken = clients.first().map(|c| c.vtoken.clone());
+            // Clients whose persona was never set (registered before auto-persona was
+            // introduced) get a default name + emoji written back to the DB here so they
+            // show correctly in /list and in outbound reply headers without requiring a
+            // --force-register or manual SQL update.
+            let mut missing_persona: Vec<(String, String)> = Vec::new();
             {
                 let mut registry = state.clients.registry.write().await;
                 for c in &clients {
@@ -540,14 +545,27 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                         c.label.clone(),
                         Some(c.vtoken.clone()),
                     );
-                    // Restore persona fields — register_with_vtoken does not carry them.
-                    if c.persona_name.is_some() || c.persona_emoji.is_some() {
-                        registry.set_persona(
-                            &c.vtoken,
-                            c.persona_name.clone(),
-                            c.persona_emoji.clone(),
-                        );
-                    }
+                    // Fill in persona: use DB values when present, otherwise default to
+                    // (name, "🤖") and queue a DB back-fill.
+                    let (persona_name, persona_emoji) =
+                        if c.persona_name.is_some() || c.persona_emoji.is_some() {
+                            (c.persona_name.clone(), c.persona_emoji.clone())
+                        } else {
+                            missing_persona.push((c.vtoken.clone(), c.name.clone()));
+                            (Some(c.name.clone()), Some("🤖".to_string()))
+                        };
+                    registry.set_persona(&c.vtoken, persona_name, persona_emoji);
+                }
+            }
+            // Back-fill DB for clients that had no persona — fire-and-forget, non-fatal.
+            for (vtoken, name) in missing_persona {
+                if let Err(e) = store
+                    .update_client_persona(&vtoken, Some(&name), Some("🤖"))
+                    .await
+                {
+                    tracing::warn!(error = %e, client = %name, "failed to back-fill persona");
+                } else {
+                    info!(client = %name, "back-filled default persona");
                 }
             }
             // Prefer the explicitly persisted default (HUB_DEFAULT_SENTINEL row) so that a

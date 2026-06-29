@@ -163,28 +163,9 @@ async def call_cursor_agent(message: str, session_id: str) -> tuple[str, str]:
 
 
 async def handler(ctx: ProfileContext) -> ProfileResult:
-    new_session_id = ctx.session_id
-    try:
-        # Stream agent events via ILINK_PARTIAL so the user sees output immediately.
-        # Only assistant events carry new text; empirically the result event's text equals
-        # the last assistant event and is already streamed — so we skip re-sending it and
-        # only capture the session_id from the result event.
-        # When all content is sent via ILINK_PARTIAL, response="" skips the duplicate final send.
-        async for text, chunk_session_id, is_final in stream_cursor_agent(
-            ctx.message, ctx.session_id
-        ):
-            if chunk_session_id:
-                new_session_id = chunk_session_id
-            if not is_final and text:
-                await ctx.send_partial(text)
-    except Exception:
-        # Fallback: non-streaming call when agent doesn't support stream-json.
-        fallback_text, new_session_id = await call_cursor_agent(ctx.message, ctx.session_id)
-        if fallback_text:
-            await ctx.send_partial(fallback_text)
-
+    response_text, new_session_id = await call_cursor_agent(ctx.message, ctx.session_id)
     return ProfileResult(
-        response="",
+        response=response_text,
         session_id=new_session_id or ctx.session_id or None,
     )
 

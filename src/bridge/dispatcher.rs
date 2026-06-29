@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::executor::{extract_media_env, run_cli, truncate_chars};
+use super::executor::{extract_media_env, run_cli, split_into_parts};
 use super::AUTH_ERROR_KEYWORDS;
 use crate::bridge::config::BridgeApp;
 use crate::bridge::connection::hub_response_token_rejected;
@@ -637,17 +637,36 @@ async fn run_session_worker(
         // feedback to the user.
         let ctx_for_err = msg.context_token.clone().unwrap_or_default();
         let from_for_err = msg.from_user_id.clone().unwrap_or_default();
+        // Capture the session name so the shutdown error reply carries the same session in
+        // its ilink_hub_ext. Without this the Hub appends the *current active* session to
+        // the footer and registers the error message under that session in the quote_index,
+        // causing any quote-reply to that "响应中断" message to be routed to the wrong session.
+        let session_name_for_err = msg
+            .ilink_hub_ext
+            .as_ref()
+            .and_then(|e| e.session_name.clone())
+            .filter(|s| !s.trim().is_empty());
 
         let result = tokio::select! {
             biased;
             // Shutdown arrived while we were processing — cancel the AI call and tell user.
             _ = shutdown.cancelled() => {
                 if app.send_error_reply && !ctx_for_err.is_empty() {
-                    let req = SendMessageRequest::reply(
+                    let mut req = SendMessageRequest::reply(
                         ctx_for_err,
                         "⚠️ 响应中断（服务正在重启），请稍后重发消息".to_string(),
                         &from_for_err,
                     );
+                    // Attach the session name so Hub appends the correct session to the
+                    // footer and registers the error reply under the right session in the
+                    // quote_index. This prevents a quote-reply on this message from being
+                    // routed to whichever session happens to be active at shutdown time.
+                    if let Some(ref sn) = session_name_for_err {
+                        if let Some(ref mut msg) = req.msg {
+                            let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                            ext.session_name = Some(sn.clone());
+                        }
+                    }
                     match client.sendmessage(req).await {
                         Ok(SendOutcome::Sent) => {}
                         Ok(SendOutcome::Throttled { ret, errmsg }) => {
@@ -1076,12 +1095,8 @@ async fn handle_one_message(
 
     match cli_result {
         Ok((raw_body, cli_session)) => {
-            let body = truncate_chars(
-                &raw_body,
-                profile.max_reply_chars,
-                &profile.truncation_suffix,
-            );
-            if body.trim().is_empty() {
+            if raw_body.trim().is_empty() {
+                // Empty body: only send if we need to persist a cli_session_id.
                 if let Some(sid) = cli_session {
                     if !sid.trim().is_empty() {
                         let mut req = SendMessageRequest::reply_text(
@@ -1110,21 +1125,30 @@ async fn handle_one_message(
                 }
                 return Ok(());
             }
-            let mut req = SendMessageRequest::reply_text(ctx, body, &from_user, cli_session);
-            if let Some(ref mut msg) = req.msg {
-                let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                hub_ext.session_name = Some(session_name_for_cli.clone());
+            // Split long replies into multiple messages instead of truncating.
+            let parts = split_into_parts(&raw_body, profile.max_reply_chars);
+            let total = parts.len();
+            for (i, part) in parts.into_iter().enumerate() {
+                let is_last = i + 1 == total;
+                // cli_session_id is attached only to the last part so it is persisted once.
+                let session_id = if is_last { cli_session.clone() } else { None };
+                let mut req =
+                    SendMessageRequest::reply_text(ctx.clone(), part, &from_user, session_id);
+                if let Some(ref mut msg) = req.msg {
+                    let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+                    hub_ext.session_name = Some(session_name_for_cli.clone());
+                }
+                send_final_with_retry(
+                    client,
+                    req,
+                    backoff_for,
+                    retry_budget,
+                    &shutdown,
+                    "final reply",
+                )
+                .await
+                .map_err(|e| HandleError::from(e.context("sendmessage reply")))?;
             }
-            send_final_with_retry(
-                client,
-                req,
-                backoff_for,
-                retry_budget,
-                &shutdown,
-                "final reply",
-            )
-            .await
-            .map_err(|e| HandleError::from(e.context("sendmessage reply")))?;
         }
         Err(e) => {
             error!(error = %e, "CLI failed; sending error reply to user");
