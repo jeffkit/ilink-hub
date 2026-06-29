@@ -31,7 +31,7 @@ profiles:
       # 若你写包装脚本，可把 Hub 注入的 CLI 会话 id 交给脚本做 --resume（勿把密钥写进仓库）
       ILINK_CLI_SESSION: "{{SESSION_ID}}"
 
-  # 多会话 / --resume：由脚本根据 {{SESSION_ID}}（或自建映射）拼出 claude --resume 目标
+  # 多会话 / --resume：由脚本根据 AGENT_SESSION_ID（bridge 自动注入）拼出 claude --resume 目标
   claude_via_wrapper:
     command: /path/to/ilink-claude-bridge.sh
     args: ["{{MESSAGE}}"]
@@ -39,8 +39,10 @@ profiles:
     cwd: /path/to/your/project
     timeout_secs: 600
     max_reply_chars: 8000
+    # 脚本首行输出 AGENT_SESSION:<uuid>，配此前缀让 bridge 提取并回报 Hub 以续接下一轮
+    cli_session_first_line_prefix: "AGENT_SESSION:"
     env:
-      ILINK_CLI_SESSION: "{{SESSION_ID}}"
+      AGENT_SESSION_ID: "{{SESSION_ID}}"
 
 routing:
   strategy: fixed
