@@ -24,16 +24,16 @@ sudo apt install jq   # Ubuntu/Debian
 不需要启动完整的 bridge，直接模拟一次调用：
 
 ```bash
-ILINK_MESSAGE="你好，用一句话介绍你自己" \
-ILINK_SESSION_ID="" \
-ILINK_CWD="$(pwd)" \
+AGENT_MESSAGE="你好，用一句话介绍你自己" \
+AGENT_SESSION_ID="" \
+AGENT_CWD="$(pwd)" \
 bash handler.sh
 ```
 
 预期输出（第一行为 session_id，其余为 Codex 的回复）：
 
 ```
-ILINK_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+AGENT_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 你好！我是 Codex，一个 AI 编程助手。有什么可以帮你的吗？
 ```
 
@@ -57,7 +57,7 @@ ilink-hub-bridge --config profiles.yaml
               │  SESSION_ID 非空 → codex exec resume <UUID> <消息>（接续上文）
               │  SESSION_ID 为空 → codex exec <消息>（全新会话）
               └───────────────┤
-                              │ stdout: ILINK_SESSION:<uuid>
+                              │ stdout: AGENT_SESSION:<uuid>
                               │         <回复文本>
 ```
 

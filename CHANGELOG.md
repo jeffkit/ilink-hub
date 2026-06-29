@@ -6,7 +6,7 @@ All notable changes to this project will be documented in this file.
 
 ### agentproc 协议对齐 Step 1：Rust bridge 协议改名（2026-06-26）
 
-**⚠️ Breaking Change** — bridge ↔ profile 进程间的 P0 协议变量名从 `ILINK_*` 改名为 agentproc v0.3.0 的 `AGENT_*`。用户**自定义 YAML** 中若硬编码了 `cli_session_first_line_prefix: "ILINK_SESSION:"` 需更新为 `"AGENT_SESSION:"`。自定义 profile 脚本若读取 `ILINK_MESSAGE`/`ILINK_SESSION_ID`/`ILINK_PARTIAL:` 等需改读 `AGENT_*`。Hub 自身配置变量（`ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等）**不变**。
+**⚠️ Breaking Change** — bridge ↔ profile 进程间的 P0 协议变量名从 `ILINK_*` 改名为 agentproc v0.3.0 的 `AGENT_*`。用户**自定义 YAML** 中若硬编码了 `cli_session_first_line_prefix: "ILINK_SESSION:"` 需更新为 `"AGENT_SESSION:"`。自定义 profile 脚本若读取 `ILINK_MESSAGE`/`ILINK_SESSION_ID`/`ILINK_PARTIAL:` 等需改读 `AGENT_*`；附件相关 env var（`ILINK_IMAGE_URL`/`ILINK_FILE_URL`/`ILINK_FILE_NAME`/`ILINK_VIDEO_URL`/`ILINK_ITEM_TYPE`）及 `ILINK_CONTEXT_TOKEN` 也一并改名（见下表）。Hub 自身配置变量（`ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等）**不变**。
 
 **协议名映射**
 
@@ -19,6 +19,12 @@ All notable changes to this project will be documented in this file.
 | `ILINK_STREAMING` | `AGENT_STREAMING` |
 | `ILINK_PARTIAL:` | `AGENT_PARTIAL:` |
 | `ILINK_SESSION:` | `AGENT_SESSION:` |
+| `ILINK_CONTEXT_TOKEN` | `AGENT_CONTEXT_TOKEN` |
+| `ILINK_ITEM_TYPE` | `AGENT_ITEM_TYPE` |
+| `ILINK_IMAGE_URL` | `AGENT_IMAGE_URL` |
+| `ILINK_FILE_URL` | `AGENT_FILE_URL` |
+| `ILINK_FILE_NAME` | `AGENT_FILE_NAME` |
+| `ILINK_VIDEO_URL` | `AGENT_VIDEO_URL` |
 
 **新增契约**
 
@@ -27,8 +33,8 @@ All notable changes to this project will be documented in this file.
 
 **保留原名（ilink-hub 自有机制，不在 agentproc 协议范畴）**
 
-- `ILINK_CONTEXT_TOKEN`（Hub 内部 context token）
-- `ILINK_ITEM_TYPE` / `ILINK_IMAGE_URL` / `ILINK_FILE_URL` / `ILINK_FILE_NAME` / `ILINK_VIDEO_URL`（附件契约；agentproc `AGENT_ATTACHMENTS` 仍为 draft，附件对齐留待后续 step）
+- `ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等 Hub 自身配置/常量变量
+- `ILINK_CODEBUDDY_MODEL` 等 `ILINK_*_MODEL` 模型覆盖变量
 
 **后续步骤**（非本次）
 

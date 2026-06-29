@@ -9,15 +9,15 @@
 #
 #   stdin:        用户消息文本（需在 YAML 里配置 stdin: message）
 #   环境变量：
-#     ILINK_SESSION_ID    当前 Hub session 对应的 Claude session UUID（空 = 新会话）
-#     ILINK_SESSION_NAME  当前 Hub session 可读名称（如 "feature-a"，默认 "default"）
-#     ILINK_CWD           工作目录（可选，覆盖脚本内默认值；推荐在 YAML cwd 里配置）
+#     AGENT_SESSION_ID    当前 Hub session 对应的 Claude session UUID（空 = 新会话）
+#     AGENT_SESSION_NAME  当前 Hub session 可读名称（如 "feature-a"，默认 "default"）
+#     AGENT_CWD           工作目录（可选，覆盖脚本内默认值；推荐在 YAML cwd 里配置）
 #     ANTHROPIC_API_KEY   API Key（若尚未 claude login；可选）
 #     CLAUDE_EXTRA_ARGS   追加给 claude 的额外参数（空格分隔，可选）
 #
 # ─── 输出格式──────────────────────────────────────────────────────────────────
 #
-#   第 1 行：ILINK_SESSION:<session_uuid>   ← bridge 的 cli_session_first_line_prefix
+#   第 1 行：AGENT_SESSION:<session_uuid>   ← bridge 的 cli_session_first_line_prefix
 #   其余行：Claude 的回复正文
 #
 # ─── 依赖─────────────────────────────────────────────────────────────────────
@@ -33,23 +33,23 @@
 #   3. 在 YAML 里配置：
 #        command: /path/to/ilink-claude-bridge.sh
 #        stdin: message
-#        cli_session_first_line_prefix: "ILINK_SESSION:"
+#        cli_session_first_line_prefix: "AGENT_SESSION:"
 #        env:
-#          ILINK_SESSION_ID: "{{SESSION_ID}}"
-#          ILINK_SESSION_NAME: "{{SESSION_NAME}}"
-#          ILINK_CWD: "/path/to/your/project"
+#          AGENT_SESSION_ID: "{{SESSION_ID}}"
+#          AGENT_SESSION_NAME: "{{SESSION_NAME}}"
+#          AGENT_CWD: "/path/to/your/project"
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -euo pipefail
 
 # ── 读取入参 ──────────────────────────────────────────────────────────────────
 MESSAGE="$(cat)"                               # 从 stdin 读取用户消息
-SESSION_ID="${ILINK_SESSION_ID:-}"             # Hub 存储的 Claude session UUID
-SESSION_NAME="${ILINK_SESSION_NAME:-default}"  # Hub session 可读名称
+SESSION_ID="${AGENT_SESSION_ID:-}"             # Hub 存储的 Claude session UUID
+SESSION_NAME="${AGENT_SESSION_NAME:-default}"  # Hub session 可读名称
 
-# 工作目录：优先使用 ILINK_CWD，其次是脚本执行时的 cwd
-if [[ -n "${ILINK_CWD:-}" && -d "$ILINK_CWD" ]]; then
-    cd "$ILINK_CWD"
+# 工作目录：优先使用 AGENT_CWD，其次是脚本执行时的 cwd
+if [[ -n "${AGENT_CWD:-}" && -d "$AGENT_CWD" ]]; then
+    cd "$AGENT_CWD"
 fi
 
 # ── 构造 claude 参数 ──────────────────────────────────────────────────────────
@@ -129,6 +129,6 @@ fi
 
 # ── 输出（bridge 读取第 1 行提取 session_id，其余作为回复正文）────────────────
 if [[ -n "$NEW_SESSION_ID" ]]; then
-    echo "ILINK_SESSION:$NEW_SESSION_ID"
+    echo "AGENT_SESSION:$NEW_SESSION_ID"
 fi
 printf '%s' "$RESULT_TEXT"

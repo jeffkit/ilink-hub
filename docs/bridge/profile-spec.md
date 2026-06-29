@@ -1,6 +1,6 @@
 # Bridge Profile 规范（P0 Exec Protocol）
 
-> 最后更新：2026-06-26
+> 最后更新：2026-06-29
 
 iLink Hub Bridge 的 **profile** 就是一个可执行的脚本或程序：收到消息 → 做处理 → 把回复写到 stdout。
 
@@ -18,7 +18,7 @@ P0 仅依赖环境变量 + stdout，**完全跨平台**（macOS / Linux / Window
 | `AGENT_SESSION_ID` | Hub 持久化的后端 session UUID（空 = 新会话） |
 | `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
 | `AGENT_FROM_USER` | 发送消息的用户 ID |
-| `ILINK_CONTEXT_TOKEN` | Hub context token |
+| `AGENT_CONTEXT_TOKEN` | Hub context token |
 | `AGENT_STREAMING` | `1`（默认）= 流式模式，`0` = 一次性回复模式（见下文） |
 
 > 当 YAML 设置了 `stdin: message` 时，`AGENT_MESSAGE` 同时也会写入 stdin。
@@ -338,7 +338,7 @@ AGENT_MESSAGE="你好" \
 AGENT_SESSION_ID="" \
 AGENT_SESSION_NAME="default" \
 AGENT_FROM_USER="test" \
-ILINK_CONTEXT_TOKEN="test-token" \
+AGENT_CONTEXT_TOKEN="test-token" \
 python3 ./my_handler.py
 ```
 

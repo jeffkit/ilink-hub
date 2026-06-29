@@ -199,7 +199,7 @@ bridge 通过以下 env var 传入输入，handler 向 stdout 写出输出：
 | `AGENT_SESSION_ID` | Hub 持久化的 session UUID（空=新会话） |
 | `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
 | `AGENT_FROM_USER` | 发送消息的用户 ID |
-| `ILINK_CONTEXT_TOKEN` | Hub context token |
+| `AGENT_CONTEXT_TOKEN` | Hub context token |
 
 **stdout 输出格式：**
 ```
@@ -380,12 +380,12 @@ AGENT_MESSAGE="你好" AGENT_SESSION_ID="" \
 
 # 测试自定义 Python handler
 AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
-  AGENT_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
+  AGENT_FROM_USER="test" AGENT_CONTEXT_TOKEN="test-token" \
   python3 /path/to/handler.py
 
 # 测试自定义 JS handler
 AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
-  AGENT_FROM_USER="test" ILINK_CONTEXT_TOKEN="test-token" \
+  AGENT_FROM_USER="test" AGENT_CONTEXT_TOKEN="test-token" \
   node /path/to/handler.js
 ```
 

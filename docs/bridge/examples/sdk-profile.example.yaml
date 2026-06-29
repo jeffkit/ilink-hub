@@ -33,7 +33,7 @@
 #     AGENT_SESSION_ID="" \
 #     AGENT_SESSION_NAME="default" \
 #     AGENT_FROM_USER="test" \
-#     ILINK_CONTEXT_TOKEN="test-token" \
+#     AGENT_CONTEXT_TOKEN="test-token" \
 #     python3 ./my_handler.py
 #
 # ─────────────────────────────────────────────────────────────────────────
