@@ -1,221 +1,350 @@
-# 提案：把 iLink Hub 变成「多 Agent 群聊」
+# 提案：iLink Hub 多 Agent 协同
 
 | 项 | 值 |
 |---|---|
-| 状态 | **Draft / 讨论中**（暂不落地） |
+| 状态 | **Active — Phase 1/2 设计中** |
 | 作者 | iLink Hub 团队 |
 | 创建 | 2026-06-14 |
+| 更新 | 2026-07-01 |
 | 前置依赖 | 已实现的 `@<后端>` 快捷指令、引用回复路由、`(vctx, vtoken, session)` 会话隔离、origin footer |
-| 决策 | 先在 **P0 阶段**（人当路由器）体验一段时间，再决定是否推进 P1+ |
 
 ---
 
-## 1. 背景与动机
+## 1. 背景与现状
 
-iLink Hub 当前已支持：
+iLink Hub 当前已支持（Phase 0 ✅ 已验证）：
 
-- 一个微信会话同时接入**多个后端 Agent**（每个后端是一个注册的 vtoken）。
-- `/use <名称>` 切换当前活跃后端；`/broadcast` 广播。
-- **引用回复**：引用某条机器人消息后再发送，会精确路由回发出该消息的后端及其会话。
-- **`@<名称> <消息>`**：临时在指定后端上**新建一个会话**处理这条消息，不改变当前 `/use` 的后端与活跃会话（一次性快捷操作）。
+- 用 `@<名称>` 让指定后端处理一条消息
+- 用引用回复精确续会话
+- 用 `/use` 切换活跃后端
 
-这意味着：**用户已经可以在一个微信里同时触达多个后端的 Agent。** 自然延伸出一个大胆的设想：
-
-> 能否让 iLink Hub 把这个机器人变成一个「群聊」？让各个 Agent 知道彼此的存在，并允许一个 Agent 在它的回复里用 `@` 语法去调用 / 与另一个 Agent 通讯。
-
-本提案梳理这个设想的**模型选择、核心难点（尤其是会话语义）、技术映射、风险与分阶段落地路径**，作为未来讨论与实现的基础。
-
-### 1.1 目标
-
-- 在同一个微信会话里，让多个 Agent 像「群成员」一样协作。
-- 一个 Agent 能感知其他 Agent 的存在（roster）。
-- 一个 Agent 能通过明确的语法把任务交接 / 委派给另一个 Agent，并（可选）拿回结果。
-- 人在微信里看到的是一段可读的「群聊」记录。
-
-### 1.2 非目标
-
-- 不追求一上来就实现「全自主多 Agent 自由对话」。
-- 不改变现有「人 `@` 后端 = 新建一次性会话」的语义。
-- 不要求各后端 Agent 共享同一份完整上下文（每个 Agent 仍持有各自的私有会话上下文）。
+**已验证**：用户可以在同一个微信里手动协调多个 Agent（人当路由器）。现在进一步让 **Agent 之间自动协调**。
 
 ---
 
-## 2. 两种「群聊」模型
+## 2. 核心设计
 
-### 模型 A — 共享转录群（真·群聊）
+### 2.1 分层：通讯层 vs 展示层
 
-每条消息（人 + 任意 Agent）都广播给所有成员，每个 Agent 都能看到全部对话。
+| 层 | 机制 | 说明 |
+|----|------|------|
+| **通讯层** | MCP 工具调用 | Agent 通过 Hub 暴露的 MCP Server 发现和调用其他 Agent |
+| **展示层** | 微信 `@agent` 消息 | Hub 把 Agent 间的调用/回复以 `@名称` 格式实时展示给用户 |
 
-- **致命问题**：
-  - 每个后端的 `getupdates` 只 drain 自己的队列，Agent 之间天然互不可见；要做成共享转录，Hub 必须把每条消息扇出到所有成员队列。
-  - 每个 Agent 每轮都要决定「我该不该说话」，否则要么全员抢答、要么死循环。
-  - 成本随成员数 ×N 增长；每个 Agent 的私有 session 模型无法承载「全群上下文」。
-- **结论**：不作为起点。
+两者解耦：通讯走 MCP（可靠、结构化），展示走微信消息（透明、可读）。
 
-### 模型 B — `@` 路由的协作群（提及驱动）✅ 推荐
+### 2.2 Hub MCP Server
 
-人照常和 Agent 对话；当某个 Agent 的**回复里**出现对另一个 Agent 的调用指令时，Hub 把它转成对方的一条入站消息；对方的回复同时：
+Hub 新增一个 MCP Server 端点，暴露以下工具：
 
-1. **贴回微信群**（人能看到，带 origin footer 标明是谁说的）；
-2. **（可选）回传给发起方 Agent**，让发起方在自己的会话里继续。
+#### 工具 1：`list_agents`
 
-人在微信里看到的就是一段「群聊」。这个模型**高度复用现有原语**，是本提案的基础。
-
-> 下文均基于模型 B。
-
----
-
-## 3. 核心难点：会话语义（本提案要解决的关键问题）
-
-### 3.1 问题陈述
-
-现有的 `@`（人用）语义是「**每次新建会话**」——这对人的「一次性发问」是对的。但如果 Agent A `@` Agent B，B 回复，而这条回复又被当作一次新的 `@`（再新建会话），就会出现：
-
-1. A↔B 每来回一次都新建一个会话 → **没有上下文连续性**。
-2. B 的回复**该路由回哪里**、用哪个会话续聊，没有定义。
-
-### 3.2 解法：区分「人的一次性 @」与「Agent 的线程化 @」
-
-它们是**两个不同的原语**：
-
-| 场景 | 语义 | 会话策略 |
-|---|---|---|
-| 人 `@后端`（已实现） | 一次性发问 | **每次新建** session |
-| Agent A `@` Agent B（本提案新增） | 开启 / 延续一条 A↔B 线程 | **首次新建、后续复用同一** session |
-
-### 3.3 有向边表（Edge Map）
-
-为每个会话（`vctx`）维护一张 Agent 间的有向边表：
-
-```
-edge(vctx, 发起方 session S_A, 被叫方 vtoken B) → 被叫方 session S_B  (+ parent = S_A)
+```json
+{
+  "name": "list_agents",
+  "description": "获取当前 iLink Hub 上在线的 Agent 列表及其简介",
+  "inputSchema": {
+    "type": "object",
+    "properties": {}
+  }
+}
 ```
 
-流程：
-
-1. **A 第一次 `@B`**：新建 `S_B`，记录边 `S_A → (B, S_B)` 与 `parent = S_A`；把调用内容作为入站消息推给 B，并打上「来自 Agent A」的来源标记。
-2. **A 再次 `@B`（同一线程）**：查边表命中，**复用 `S_B`** → B 上下文连续，不再每次新建。
-3. **B 回复**时，Hub 做两件事：
-   - **贴回微信**（footer 显示 `— B · S_B`）；
-   - **回传给 A**：依据 `parent` 把 B 的回复作为入站消息喂给 `S_A`（标记「B 说：…」），A 在自己原会话里继续，而非新建会话。
-
-> 这样「新建只发生一次（开线程），之后复用；回传靠 parent 链路由回发起方 session」就同时解决了「不重复新建」与「谁回给谁」。
-
-### 3.4 与现有引用机制的关系
-
-现有「引用→精确会话」机制其实就是这套边表的**人肉版**：引用一条 B 的回复，就能把后续路由回 `(B, S_B)`。因此：
-
-- 即使不做边表，**人引用**也能让某条线程续聊（P0/P2 可先靠它）。
-- 边表是为了让 **Agent 之间**能**自动**续聊（P3）。
-
-### 3.5 各方「看到什么」
-
-- 每个 Agent 的 session 只持有**它参与的那段**子对话（A 的 session = 人↔A + 回传的 B 答复；B 的 session = A↔B 子线程）。
-- **人**在微信里持有**全景**（所有被贴回的消息）。
-
-这是一致且自洽的：Agent 持局部视图，人持全局视图。
-
----
-
-## 4. 技术映射（落到现有代码）
-
-| 能力 | 复用 / 新增 | 落点 |
-|---|---|---|
-| 成员名单（roster） | 复用 registry 的 `name`（与 `/use`、`@` 完全一致） | `src/hub/registry.rs` |
-| 解析 Agent 回复里的调用指令 | **新增** | `src/server/routes.rs` 的 `sendmessage` 入口（今天已在此写 `cli_session_id`、加 footer） |
-| 合成入站消息（Agent→Agent / 回传） | 复用 broadcast 的「Hub 自行构造消息塞队列」 | `src/hub/mod.rs`（`push_to_queue` 等） |
-| 会话隔离 / resume | 复用 `(vctx, vtoken, session_name)` + `backend_sessions_v2` | `src/store/mod.rs` |
-| 注入会话/来源 | 复用 `build_hub_ext_for_vctx`、origin footer | `src/hub/mod.rs`、`src/hub/outbound_label.rs` |
-| 有向边表 + parent 链 | **新增**（内存表，必要时持久化） | 新增模块，如 `src/hub/group.rs` |
-
-### 4.1 调用指令协议（必须严格、不歧义）
-
-通用 coding agent 的回复是自由文本，可能随口提到「@某人」。**不能复用人那种随意的 `@`**，否则会误触发。建议用独占一行的显式指令，例如：
-
-```
-@@call code-reviewer: 请审一下这段 diff，重点看并发安全
+返回：
+```json
+{
+  "agents": [
+    { "name": "code-reviewer", "description": "专注代码审查与安全分析" },
+    { "name": "researcher", "description": "网络搜索与信息整合" }
+  ]
+}
 ```
 
-或一个 fenced 代码块约定。要点：
+#### 工具 2：`call_agent`
 
-- 解析失败 / 不匹配已注册成员 → **当作普通回复**，不触发（容错优先）。
-- 早期**限制单跳单目标**（一条回复只允许调用一个 Agent），避免扇出。
+```json
+{
+  "name": "call_agent",
+  "description": "向另一个 Agent 发送消息并等待回复（同步阻塞）",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "agent_name": { "type": "string", "description": "目标 Agent 的注册名称" },
+      "message": { "type": "string", "description": "发送给目标 Agent 的消息内容" }
+    },
+    "required": ["agent_name", "message"]
+  }
+}
+```
 
-### 4.2 合成入站消息的注意点
-
-- Agent→Agent 的消息不是真实微信用户消息（无上游 `real_ctx`），由 Hub 像 broadcast 那样**自行构造**。
-- `from_user_id` 用合成身份（如 `agent:<name>`）。**注意**：引用作用域按 `from_user_id` 隔离，合成身份不要破坏人原本的引用作用域——A2A 续聊走边表、不依赖引用，可规避此问题。
-- 需要 `message_type` 等字段正确，避免被「bot echo 跳过」逻辑误丢。
-
-### 4.3 Roster 注入
-
-Hub 在消息前注入一小段「群成员名单 + 调用语法」前言（成员 = registry 在线 name）。否则 Agent 不会主动、规范地使用 `@@call`。可做成可开关、可定制的前言模板。
-
----
-
-## 5. 风险（决定可行性的部分）
-
-管道改造**可行性高**；但要让它「表现得像个正常群」而非失控，难点集中在**控制问题**：
-
-1. **死循环 / 成本爆炸** —— A@B、B@A… 无限乒乓，每跳都是一次真实（昂贵）的 Agent 推理。
-   - 缓解：**硬性 hop 深度上限**、**环检测**（A→B→A）、**每会话回合 / 预算上限**、**明确终止约定**（不再 `@@call` 即结束）。这是 **#1 风险**。
-2. **回合扇出** —— 一条回复调用多个 Agent → 叠加回传 → 组合爆炸。
-   - 缓解：早期限制单跳单目标。
-3. **协议可靠性** —— 模型未必稳定输出 `@@call` 格式；解析自由文本天生脆弱。
-   - 缓解：强约定 + 容错（失败即降级为普通回复）+ roster 注入引导。
-4. **来源与可读性** —— 人要能看懂「谁对谁说」。
-   - 缓解：扩展 origin footer，显示「A → @B」线程关系。
-5. **可观测性与熔断** —— 需要 metrics（hop 数、A2A 触发数、预算命中）与一键熔断（关闭某会话的 A2A）。
-
-> 结论：**底层路由/会话改造是中等工作量且与现有架构自洽；「自主多 Agent 群且不失控」主要是产品/控制设计问题，而非 Hub 管道问题。**
+返回：
+```json
+{
+  "response": "目标 Agent 的回复内容"
+}
+```
 
 ---
 
-## 6. 分阶段落地路径
+## 3. call_agent 内部流程
 
-每个阶段都能独立交付价值，并把最危险的「自主循环」留到最后、在有充分护栏时才开放。
+```
+Agent A (Claude Code / Cursor) 调用 MCP tool: call_agent('code-reviewer', 'task')
+         │
+         ▼
+Hub MCP Handler:
+  1. 生成 correlation_id
+  2. 向微信发送: @code-reviewer\ntask  (展示层，标注来自 A)
+  3. 构造合成入站消息 → 推入 code-reviewer 的队列
+  4. 在 a2a_pending 表中登记: correlation_id → oneshot::Sender
+  5. 等待 (async, 最长 120s)
+         │
+         ▼
+code-reviewer Bridge 收到合成消息 → 处理 → sendmessage
+         │
+         ▼
+Hub sendmessage Handler:
+  - 检测 ilink_hub_ext.a2a_correlation_id 是否有值
+  - 若有: 向微信发送 code-reviewer 的回复，同时 resolve oneshot
+  - 若无: 正常转发给 iLink upstream
+         │
+         ▼
+MCP call_agent 返回 code-reviewer 的回复给 Agent A
+         │
+         ▼
+Agent A 拿到结果，继续生成最终回复 → 正常走 sendmessage → 发到微信
+```
 
-### Phase 0 —— 人当路由器（**已具备，当前体验阶段**）
+### 关键点
 
-- 人用 `@` + 引用，已经能在一个微信里手动编排多个 Agent。
-- 这其实就是「人当路由器的群聊」。**先在此阶段体验，沉淀真实需求。**
-
-### Phase 1 —— Roster 感知（零循环风险）
-
-- Hub 注入成员名单与调用语法，Agent 知道彼此、可建议「可以问问 @code-reviewer」，但仍由**人转达**。
-- 改动很小；先验证「Agent 知道队友」是否真的带来价值。
-
-### Phase 2 —— 单跳交接（call，不自动回传）
-
-- Agent 回复里用 `@@call` 把任务交给另一个 Agent；Hub 在**稳定线程 session** 上路由过去；被叫方直接答到微信群。
-- 是否回传给发起方由**人引用**触发。**有界、无环。**
-
-### Phase 3 —— 自动 call/return + 严格预算（完整形态）
-
-- 边表 + parent 回传 + 深度上限 + 环检测 + 回合/成本预算 + 终止约定。
-- 这才是「Agent 自主互相 `@` 协作」的完整愿景。
+- **Agent A 的子进程在整个 call_agent 期间保持运行**（HTTP 长连接阻塞等待），这和 Claude Code / Cursor Agent 调用其他 MCP 工具的方式完全一样。
+- **不引入多 Turn**：从用户角度，A 发出一条消息，最终收到 A 的最终回复，中间的 A↔B 交互自动发生。
+- **微信全程透明**：A 调用 B 时 Hub 立即发消息到微信（用户看到），B 回复时也立即发消息（用户看到）。
 
 ---
 
-## 7. 待讨论的开放问题
+## 4. 微信展示效果
 
-- **群的边界**：是「所有在线后端自动成群」，还是需要显式「建群 / 拉人」（如 `/group new`, `/group add <name>`）？
-- **调用协议形态**：`@@call name: ...` 单行指令，还是结构化 fenced 块？是否需要「回传」与「仅广播」两种动词（如 `@@ask` vs `@@notify`）？
-- **预算单位**：按 hop 数、按 wall-clock、按 token/成本，还是组合？默认值？
-- **人的角色**：人是否始终是「群主」，可随时插话 / 终止 / 把某 Agent 踢出当前线程？
-- **持久化**：边表与线程关系是否需要落库（重启恢复），还是内存 + TTL 足够（参考 `QuoteRouteIndex`）？
-- **隐私 / 隔离**：A↔B 子线程内容是否对人完全可见？是否允许「私聊」不贴回群？
+```
+用户：帮我审查这段 Rust 代码
+
+— claude：
+(正在向 @code-reviewer 咨询...)
+@code-reviewer：请检查以下代码的并发安全性
+
+— code-reviewer：
+分析完成，发现 2 个问题：
+1. 第 38 行 Mutex 存在锁逆序风险
+2. 第 52 行有 TOCTOU 问题
+
+— claude：
+综合 code-reviewer 的分析，修改建议如下：...
+```
+
+其中：
+- A 的 `call_agent` 触发时，Hub 立即向微信发一条：`@code-reviewer\n[任务内容]`，带 claude 的 footer
+- B 的回复通过 `sendmessage` 正常发到微信，带 code-reviewer 的 footer
+- A 拿到 B 的结果后，继续生成最终回复，正常发到微信
 
 ---
 
-## 8. 附：当前可直接体验的「P0 群聊」用法
+## 5. 技术实现
 
-无需任何新代码，今天即可在一个微信会话里这样玩：
+### 5.1 Hub 侧新增内容
 
-1. `/list` 查看在线后端（= 群成员）。
-2. `@<后端A> <任务>` 临时让 A 处理（新建会话）。
-3. `@<后端B> <任务>` 临时让 B 处理（各自独立会话，互不干扰）。
-4. 想让某个 Agent 继续之前的线程：**引用**它的那条回复再发送即可。
-5. 把 A 的产出**引用**后转给 B，让 B 接力——人即「路由器 / 群主」。
+#### A. MCP Server 路由（`src/server/mod.rs` + 新模块）
 
-请在此模式下体验一段时间，把真实的协作痛点与高频场景记录下来，作为推进 Phase 1+ 的输入。
+Hub 的 Axum server 新增路由，支持 MCP Streamable HTTP Transport（2025-11-05 规范）：
+
+```
+POST /hub/mcp            ← MCP JSON-RPC endpoint（带 auth）
+GET  /hub/agents/list    ← 简化 REST 版（给 SDK 用，可选）
+```
+
+认证：Bearer vtoken（与现有 `sendmessage` 等一致）。
+
+#### B. A2A 状态（`src/hub/state.rs`）
+
+在 `HubState` 中新增：
+
+```rust
+pub struct HubState {
+    // ...existing fields...
+    pub a2a: Arc<A2AState>,
+}
+
+pub struct A2AState {
+    /// 等待中的 call_agent 请求: correlation_id → 回传通道
+    pub pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+}
+```
+
+#### C. HubExt 新增字段（`src/hub/dispatch.rs` 或相关类型）
+
+```rust
+pub struct HubExt {
+    // ...existing fields...
+    /// 若本条消息是 A2A 合成消息，此字段存回传 correlation_id
+    pub a2a_correlation_id: Option<String>,
+    /// 若本条消息是 A2A 合成消息，此字段存发起方名称（用于展示 "@来自 X"）
+    pub a2a_caller: Option<String>,
+}
+```
+
+#### D. sendmessage 修改（`src/server/routes.rs`）
+
+在发送 upstream 之前，检测 HubExt 中的 `a2a_correlation_id`：
+
+```rust
+if let Some(correlation_id) = hub_ext.a2a_correlation_id {
+    // 从 pending 表中取出回传通道
+    if let Some(tx) = state.a2a.pending.lock().await.remove(&correlation_id) {
+        let _ = tx.send(response_text.clone());
+        // 不 return，继续正常 upstream 发送（让用户也看到 B 的回复）
+    }
+}
+```
+
+#### E. MCP call_agent Handler
+
+```rust
+async fn handle_mcp_call_agent(
+    state: Arc<HubState>,
+    caller_vtoken: String,
+    agent_name: String,
+    message: String,
+    caller_vctx: String,
+) -> Result<String, A2AError> {
+    // 1. 查找目标 vtoken
+    let target_vtoken = state.clients.registry.lock().await
+        .find_by_name(&agent_name)
+        .ok_or(A2AError::AgentNotFound(agent_name.clone()))?;
+
+    // 2. 向微信推送 A→B 的展示消息（带 caller 的 footer）
+    post_delegation_to_wechat(&state, &caller_vctx, &caller_vtoken, &agent_name, &message).await?;
+
+    // 3. 生成 correlation_id，注册到 pending 表
+    let correlation_id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel::<String>();
+    state.a2a.pending.lock().await.insert(correlation_id.clone(), tx);
+
+    // 4. 构造合成入站消息推给 B
+    let synthetic = build_a2a_synthetic_message(
+        &caller_vctx, &agent_name, &message, &correlation_id
+    );
+    state.clients.queue.push(&target_vtoken, synthetic).await?;
+
+    // 5. 等待 B 的回复（超时 120s）
+    tokio::time::timeout(Duration::from_secs(120), rx)
+        .await
+        .map_err(|_| A2AError::Timeout)?
+        .map_err(|_| A2AError::ChannelClosed)
+}
+```
+
+#### F. A2A 会话隔离
+
+合成消息的 session_name 使用独立命名空间：
+
+```
+a2a-{caller_name}-{timestamp}    示例: a2a-claude-20260701-143022
+```
+
+使用现有 `backend_sessions_v2` 表，无需新表。
+
+### 5.2 Node SDK 新增（`sdk/node/src/`）
+
+为使用 `createProfile` 的 Node.js 场景提供便利方法：
+
+```typescript
+// ctx 新增 agents 命名空间
+interface ProfileContext {
+  // ...existing fields...
+  agents: {
+    list(): Promise<AgentInfo[]>;
+    call(name: string, message: string): Promise<string>;
+  };
+}
+```
+
+内部实现：直接 HTTP POST 到 Hub 的 REST API（`/hub/agents/list`、`/hub/mcp`），使用 Bridge 已知的 Hub URL + vtoken 鉴权。
+
+**新增 env var**（Bridge 向子进程传递）：
+- `ILINK_HUB_BASE_URL`：Hub 的 HTTP 地址（如 `http://localhost:8765`）
+- `ILINK_VTOKEN`：本 backend 的 vtoken（用于 MCP 调用鉴权）
+
+### 5.3 Claude Code / Cursor Agent 配置
+
+对于使用 Claude Code 或 Cursor 的 profile，在其 MCP 配置中添加 Hub MCP Server：
+
+```json
+{
+  "mcpServers": {
+    "ilink-hub": {
+      "url": "http://localhost:8765/hub/mcp",
+      "headers": {
+        "Authorization": "Bearer {ILINK_VTOKEN}"
+      }
+    }
+  }
+}
+```
+
+profile 脚本可在启动 Claude Code 前动态写入此配置（读取 `ILINK_HUB_BASE_URL` + `ILINK_VTOKEN` env var）。
+
+---
+
+## 6. 分阶段落地
+
+### Phase 0 ✅（已完成）
+人当路由器，手动转发消息在多个 Agent 间协作。
+
+### Phase 1 — Hub MCP Server + list_agents（基础设施）
+
+**改动范围**：
+- `src/server/mod.rs`：新增 `/hub/mcp` 路由
+- `src/hub/mcp.rs`（新模块）：MCP JSON-RPC 处理、`list_agents` 实现
+- `src/hub/state.rs`：新增 `A2AState`
+
+**验收**：Claude Code / Cursor 能通过 MCP 查询在线 Agent 列表。
+
+### Phase 2 — call_agent 实现（核心能力）
+
+**改动范围**：
+- `src/hub/mcp.rs`：实现 `call_agent` handler
+- `src/server/routes.rs`：`sendmessage` 中处理 `a2a_correlation_id`
+- `src/hub/dispatch.rs`：`build_a2a_synthetic_message()`
+- `HubExt`：新增 `a2a_correlation_id`、`a2a_caller` 字段
+- `sdk/node/src/index.js`：新增 `ctx.agents.call/list`（可选，后续补）
+
+**验收**：
+- Agent A 调用 `call_agent('B', 'task')` → 微信显示 A→B 委派消息 → B 自动处理 → 微信显示 B 回复 → A 拿到结果继续 → 微信显示 A 最终回复
+- 全程无需用户介入
+
+---
+
+## 7. 风险与控制
+
+| 风险 | 缓解 |
+|------|------|
+| 死循环（A→B→A→...） | MCP 层记录调用深度，超过阈值（默认 5）直接报错返回 |
+| call_agent 超时 | 120s 硬超时，超时后 MCP 返回错误，A 可降级处理 |
+| 合成消息被 bot-echo 过滤误丢 | `from_user_id` 使用 `agent:{name}` 格式，不触发 bot-echo 跳过逻辑 |
+| B 的 sendmessage 未携带 correlation_id | Bridge 需要完整回传 HubExt；在集成测试中覆盖 |
+| 多个并发 call_agent 到同一 B | 每个调用有独立 correlation_id + session，天然隔离 |
+
+---
+
+## 8. 已确认的设计决策
+
+| 决策点 | 结论 |
+|--------|------|
+| MCP Transport | **Streamable HTTP**（MCP 2025-11-05 标准，Claude Code / Cursor 均已支持） |
+| Agent 简介来源 | **backend 注册时提供**：`/hub/register` 新增 `description` 字段 |
+| 连锁委派 | 允许（B 也可以 `call_agent(C)`），用深度计数（默认上限 5）控制 |
+| 微信展示格式 | A→B 委派消息用 A 的 footer，B 回复用 B 的 footer |
+
+## 9. 后续开放问题
+
+- `/hub/register` 的 `description` 字段是必填还是选填？（建议选填，默认为空）
+- A2A session 是否需要落库持久化（重启恢复），还是内存 + TTL 清理？

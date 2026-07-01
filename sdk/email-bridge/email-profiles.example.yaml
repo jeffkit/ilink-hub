@@ -1,0 +1,31 @@
+# Email Bridge Profile 配置
+# 使用邮件主题前缀 [profile-name] 来指定用哪个 Profile 处理
+# 例如: Subject: [cursor] 帮我看看这段代码
+#
+# default: 没有匹配到任何前缀时使用的 Profile 名称
+default: claude
+
+profiles:
+  # Claude Code — 默认 AI 助手
+  claude:
+    command: node
+    args:
+      - ../../examples/claude-code-nodejs/handler.js
+    description: Claude Code AI 助手（默认）
+    trigger: claude
+
+  # Cursor AI
+  cursor:
+    command: python3
+    args:
+      - ../../examples/cursor-python/handler.py
+    description: Cursor AI 编程助手
+    trigger: cursor
+
+  # 内置 echo 测试（不依赖外部 AI）
+  echo:
+    command: node
+    args:
+      - ../../examples/email-bridge/echo-profile.js
+    description: 原样回显（调试用）
+    trigger: echo

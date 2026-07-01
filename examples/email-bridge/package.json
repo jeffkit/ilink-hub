@@ -1,0 +1,14 @@
+{
+  "name": "email-bridge",
+  "version": "1.0.0",
+  "description": "iLink Hub Email Bridge — 轮询 Agently Mail 邮箱，用 Claude 自动处理和回复邮件",
+  "main": "handler.js",
+  "scripts": {
+    "start": "node handler.js",
+    "dev": "POLL_INTERVAL_MS=30000 DRY_RUN=1 node handler.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}
