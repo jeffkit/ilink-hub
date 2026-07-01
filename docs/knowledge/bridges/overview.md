@@ -3,7 +3,7 @@ type: Concept
 title: Bridge 概览
 description: Bridge 是 ilink-hub 的客户端适配层，每种 AI 工具对应一种 Bridge 实现。
 tags: [bridge, architecture]
-timestamp: 2026-06-18T10:00:00+08:00
+timestamp: 2026-06-30T09:00:00+08:00
 ---
 
 # Bridge 概览
@@ -16,6 +16,10 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 |--------|------|---------|
 | `cursor` | `src/bridge/builtin/cursor.rs` | [Cursor Bridge](cursor.md) |
 | `claude-code` | `src/bridge/builtin/claude_code.rs` | [Claude Code Bridge](claude-code.md) |
+| `codebuddy-code` | `src/bridge/builtin/codebuddy_code.rs` | CodeBuddy Code CLI |
+| `codex` | `src/bridge/builtin/codex.rs` | OpenAI Codex CLI |
+| `agy` | `src/bridge/builtin/agy.rs` | Google Antigravity CLI |
+| `recursive` | `src/bridge/builtin/recursive.rs` | [Recursive Bridge](recursive.md) |
 
 ## Bridge 的工作方式
 
@@ -34,8 +38,13 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 src/bridge/
 ├── mod.rs              # Bridge trait 定义与注册
 └── builtin/
+    ├── agy.rs          # Google Antigravity CLI Bridge
+    ├── claude_code.rs  # Claude Code Bridge 实现
+    ├── codebuddy_code.rs # CodeBuddy Code CLI Bridge
+    ├── codex.rs        # OpenAI Codex CLI Bridge
+    ├── common.rs       # 共享工具函数（P0 协议、流式输出）
     ├── cursor.rs       # Cursor Bridge 实现
-    └── claude_code.rs  # Claude Code Bridge 实现
+    └── recursive.rs    # Recursive Agent CLI Bridge
 ```
 
 ## 相关文档

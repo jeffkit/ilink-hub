@@ -548,6 +548,9 @@ pub struct HubState {
     /// Set to `true` once the quote-reply index warmup from DB completes.
     /// Exposed in `/metrics` as `ilink_hub_quote_index_ready`.
     pub quote_index_warmed: Arc<AtomicBool>,
+    /// Pending Agent-to-Agent reply waiters.  MCP `call_agent` registers a
+    /// oneshot here; the target Agent's `sendmessage` resolves it.
+    pub a2a_waiter: Arc<crate::mcp::A2aWaiter>,
 }
 
 impl HubState {
@@ -575,6 +578,7 @@ impl HubState {
             relay_secret,
             admin,
             quote_index_warmed: Arc::new(AtomicBool::new(false)),
+            a2a_waiter: Arc::new(crate::mcp::A2aWaiter::new()),
         })
     }
 

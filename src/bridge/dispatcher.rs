@@ -1050,9 +1050,17 @@ async fn handle_one_message(
         128,
     )
     .unwrap_or_else(|| "default".to_string());
+    // Echoed on outbound sendmessage so Hub can resolve the MCP `call_agent` waiter.
+    let a2a_call_id = msg
+        .ilink_hub_ext
+        .as_ref()
+        .and_then(|e| e.a2a_call_id.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
+    let is_a2a_inbound = a2a_call_id.is_some();
 
     tracing::Span::current().record("profile", profile_name);
-    info!(%profile_name, %profile.command, session_name = %session_name_for_cli, "running bridge profile");
+    info!(%profile_name, %profile.command, session_name = %session_name_for_cli, a2a = is_a2a_inbound, "running bridge profile");
 
     // watch::channel bounds the partial-chunk buffer to a single slot: only
     // the latest AGENT_PARTIAL chunk matters for UI streaming, and stale
@@ -1061,22 +1069,30 @@ async fn handle_one_message(
     // Hub returned Throttled during a long exponential backoff (up to ~300s).
     let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
 
-    let fwd_client = client.clone();
-    let fwd_ctx = ctx.clone();
-    let fwd_from_user = from_user.clone();
-    let fwd_session_name = session_name_for_cli.clone();
-    let fwd_shutdown = shutdown.clone();
+    let forward_handle = if is_a2a_inbound {
+        // A2A: partials must not reach WeChat; the caller's MCP flow surfaces
+        // the final reply with caller persona + @mention after the waiter resolves.
+        None
+    } else {
+        let fwd_client = client.clone();
+        let fwd_ctx = ctx.clone();
+        let fwd_from_user = from_user.clone();
+        let fwd_session_name = session_name_for_cli.clone();
+        let fwd_shutdown = shutdown.clone();
+        let retry_budget = retry_budget(profile.timeout_secs);
+        Some(tokio::spawn(run_partial_forward_loop(
+            fwd_client,
+            partial_rx,
+            fwd_ctx,
+            fwd_from_user,
+            fwd_session_name,
+            fwd_shutdown,
+            backoff_for,
+            retry_budget,
+        )))
+    };
+
     let retry_budget = retry_budget(profile.timeout_secs);
-    let forward_handle = tokio::spawn(run_partial_forward_loop(
-        fwd_client,
-        partial_rx,
-        fwd_ctx,
-        fwd_from_user,
-        fwd_session_name,
-        fwd_shutdown,
-        backoff_for,
-        retry_budget,
-    ));
 
     let cli_result = run_cli(
         profile,
@@ -1091,7 +1107,9 @@ async fn handle_one_message(
     )
     .await;
 
-    let _ = forward_handle.await;
+    if let Some(forward_handle) = forward_handle {
+        let _ = forward_handle.await;
+    }
 
     match cli_result {
         Ok((raw_body, cli_session)) => {
@@ -1105,10 +1123,11 @@ async fn handle_one_message(
                             &from_user,
                             Some(sid),
                         );
-                        if let Some(ref mut msg) = req.msg {
-                            let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                            hub_ext.session_name = Some(session_name_for_cli.clone());
-                        }
+                        attach_outbound_hub_ext(
+                            &mut req,
+                            &session_name_for_cli,
+                            a2a_call_id.as_deref(),
+                        );
                         if let Err(e) = send_final_with_retry(
                             client,
                             req,
@@ -1125,6 +1144,24 @@ async fn handle_one_message(
                 }
                 return Ok(());
             }
+            if is_a2a_inbound {
+                // Single sendmessage with a2a_call_id; Hub suppresses upstream
+                // delivery and resolves the caller's MCP waiter instead.
+                let mut req =
+                    SendMessageRequest::reply_text(ctx, raw_body, &from_user, cli_session);
+                attach_outbound_hub_ext(&mut req, &session_name_for_cli, a2a_call_id.as_deref());
+                send_final_with_retry(
+                    client,
+                    req,
+                    backoff_for,
+                    retry_budget,
+                    &shutdown,
+                    "a2a final reply",
+                )
+                .await
+                .map_err(|e| HandleError::from(e.context("sendmessage a2a reply")))?;
+                return Ok(());
+            }
             // Split long replies into multiple messages instead of truncating.
             let parts = split_into_parts(&raw_body, profile.max_reply_chars);
             let total = parts.len();
@@ -1134,10 +1171,7 @@ async fn handle_one_message(
                 let session_id = if is_last { cli_session.clone() } else { None };
                 let mut req =
                     SendMessageRequest::reply_text(ctx.clone(), part, &from_user, session_id);
-                if let Some(ref mut msg) = req.msg {
-                    let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                    hub_ext.session_name = Some(session_name_for_cli.clone());
-                }
+                attach_outbound_hub_ext(&mut req, &session_name_for_cli, None);
                 send_final_with_retry(
                     client,
                     req,
@@ -1185,6 +1219,21 @@ async fn handle_one_message(
     Ok(())
 }
 
+/// Attach session metadata (and optional A2A call-id) to an outbound sendmessage.
+fn attach_outbound_hub_ext(
+    req: &mut SendMessageRequest,
+    session_name: &str,
+    a2a_call_id: Option<&str>,
+) {
+    if let Some(ref mut msg) = req.msg {
+        let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
+        hub_ext.session_name = Some(session_name.to_string());
+        if let Some(id) = a2a_call_id.filter(|s| !s.is_empty()) {
+            hub_ext.a2a_call_id = Some(id.to_string());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,6 +1246,7 @@ mod tests {
                 session_id: Some(String::new()),
                 session_name: Some(session_name.into()),
                 cli_session_id: None,
+                a2a_call_id: None,
             }),
             item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),

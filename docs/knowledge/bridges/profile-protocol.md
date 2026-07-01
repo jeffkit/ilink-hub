@@ -83,6 +83,10 @@ profiles:
 |-----------|------|---------|
 | `claude-code` | 包装 `claude` CLI | [Claude Code Bridge](claude-code.md) |
 | `cursor` | 包装 Cursor `agent` CLI | [Cursor Bridge](cursor.md) |
+| `codebuddy-code` | 包装 `codebuddy` CLI | — |
+| `codex` | 包装 OpenAI `codex` CLI | — |
+| `agy` | 包装 Google `agy` CLI | — |
+| `recursive` | 包装 `recursive` agent CLI | [Recursive Bridge](recursive.md) |
 
 ## 自定义 Profile
 

@@ -78,7 +78,10 @@ pub mod ilink_status {
     }
 }
 
-pub use dispatch::{spawn_dispatcher, spawn_quote_index_evictor};
+pub use dispatch::{
+    build_hub_ext_for_vctx, push_to_queue_pub, resolve_vctx_for_message, spawn_dispatcher,
+    spawn_quote_index_evictor,
+};
 pub use health::spawn_health_checker;
 pub use outbound_label::{
     append_outbound_origin_footer_to_first_text_item, apply_persona_and_footer_to_first_text_item,

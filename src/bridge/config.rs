@@ -487,6 +487,7 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
 /// | `codex`       | `codex`       | ✗              | `ILINK_CODEX_MODEL`                  |
 /// | `cursor`      | `cursor`      | ✓ (optional)   | `ILINK_CURSOR_MODEL`, `ILINK_CURSOR_WORKSPACE`, `ILINK_CURSOR_EXTRA_ARGS` |
 /// | `agy`         | `agy`         | ✓              | `ILINK_AGY_MODEL`, `ILINK_AGY_ADD_DIR`, `ILINK_AGY_SANDBOX`, `ILINK_AGY_EXTRA_ARGS` |
+/// | `recursive`   | `recursive`   | ✓              | `RECURSIVE_*` (see recursive bridge docs) |
 ///
 /// If `profile_type` is `None` or the command is already set, returns the profile unchanged.
 fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
@@ -517,9 +518,10 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
         "codex" => Ok(make_builtin(p, "codex", false)),
         "cursor" => Ok(make_builtin(p, "cursor", true)),
         "agy" => Ok(make_builtin(p, "agy", true)),
+        "recursive" => Ok(make_builtin(p, "recursive", true)),
         other => anyhow::bail!(
             "profile `{name}`: unknown `type: {other}`; \
-             supported built-in types: claude-code, codebuddy-code, codex, cursor, agy"
+             supported built-in types: claude-code, codebuddy-code, codex, cursor, agy, recursive"
         ),
     }
 }
@@ -850,6 +852,47 @@ routing:
   default_profile: x
 "#;
         assert!(BridgeApp::parse_yaml(y).is_err());
+    }
+
+    #[test]
+    fn type_recursive_expands_to_builtin_with_session_prefix() {
+        let y = r#"
+profiles:
+  rec:
+    type: recursive
+    cwd: ~/projects/recursive
+routing:
+  strategy: fixed
+  default_profile: rec
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "ilink-hub-bridge");
+        assert_eq!(p.args, vec!["profile", "recursive"]);
+        assert_eq!(p.stdin, StdinMode::Message);
+        assert_eq!(
+            p.cli_session_first_line_prefix.as_deref(),
+            Some("AGENT_SESSION:")
+        );
+    }
+
+    #[test]
+    fn type_unknown_errors() {
+        let y = r#"
+profiles:
+  x:
+    type: not-a-real-type
+routing:
+  strategy: fixed
+  default_profile: x
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown `type: not-a-real-type`"), "{msg}");
+        assert!(
+            msg.contains("recursive"),
+            "supported list should include recursive: {msg}"
+        );
     }
 
     // ── expand_env_var ────────────────────────────────────────────────────────

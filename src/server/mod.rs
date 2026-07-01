@@ -147,9 +147,12 @@ pub fn build_router(state: Arc<HubState>) -> Router {
         .route("/health", get(|| async { "ok" }))
         .layer(middleware::from_fn(admin_audit_log));
 
+    let mcp_api = crate::mcp::mcp_router();
+
     Router::new()
         .merge(bot_api)
         .merge(admin_api)
+        .merge(mcp_api)
         .layer(TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(state)

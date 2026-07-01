@@ -216,6 +216,10 @@ pub struct HubExt {
     /// 下游 → Hub：下游在 `sendmessage` 时填入，Hub 将其写入当前活跃 session 的存储。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cli_session_id: Option<String>,
+    /// A2A call identifier.  Set by Hub on the inbound message to the target Agent;
+    /// the target echoes it back in its `sendmessage` so Hub can resolve the waiter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_call_id: Option<String>,
 }
 
 impl WeixinMessage {

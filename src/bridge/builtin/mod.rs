@@ -15,6 +15,7 @@
 //! | `codex`            | `codex`       | ✗              | OpenAI Codex CLI (`@openai/codex`)        |
 //! | `cursor`           | `cursor`      | ✓ (optional)   | Cursor background agent CLI               |
 //! | `agy`              | `agy`         | ✓ (`--conversation`) | Google Antigravity CLI             |
+//! | `recursive`        | `recursive`   | ✓ (`-r`)       | Recursive agent CLI (session UUID from stderr) |
 
 mod agy;
 mod claude_code;
@@ -22,6 +23,7 @@ mod codebuddy_code;
 mod codex;
 mod common;
 mod cursor;
+mod recursive;
 
 /// Dispatch to a built-in profile handler by type name.
 ///
@@ -33,9 +35,10 @@ pub async fn run_builtin_profile(profile_type: &str) -> anyhow::Result<()> {
         "codex" => codex::run().await,
         "cursor" => cursor::run().await,
         "agy" => agy::run().await,
+        "recursive" => recursive::run().await,
         other => anyhow::bail!(
             "unknown built-in profile type `{other}`; \
-             supported: claude-code, codebuddy-code, codex, cursor, agy"
+             supported: claude-code, codebuddy-code, codex, cursor, agy, recursive"
         ),
     }
 }

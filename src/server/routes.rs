@@ -41,6 +41,11 @@ pub(crate) fn is_valid_vtoken(s: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Public re-export for the MCP router.
+pub fn extract_vtoken_pub(headers: &axum::http::HeaderMap) -> Option<String> {
+    extract_vtoken(headers)
+}
+
 fn extract_vtoken(headers: &axum::http::HeaderMap) -> Option<String> {
     headers
         .get("authorization")
@@ -500,6 +505,8 @@ pub async fn sendmessage(
         active_session = replied_session_name.clone().or(Some(db_session_name));
 
         // Read cli_session_id from hub_ext and persist it to the correct session.
+        // Also resolve any pending A2A call waiter.
+        let mut is_a2a_reply = false;
         if let Some(ext) = msg.ilink_hub_ext.as_mut() {
             if let Some(cli_sid) = ext.cli_session_id.take() {
                 let t = cli_sid.trim().to_string();
@@ -520,6 +527,28 @@ pub async fn sendmessage(
                     }
                 }
             }
+
+            // A2A: if this reply is the response to a `call_agent` MCP call,
+            // resolve the waiter so the caller can proceed. The caller's MCP
+            // flow is responsible for delivering the reply to the WeChat user
+            // (with @-mention + persona), so we suppress this target's own
+            // upstream send to avoid a duplicate.
+            if let Some(call_id) = ext.a2a_call_id.take() {
+                is_a2a_reply = true;
+                if let Some(reply_text) = msg.text().map(str::to_string) {
+                    if !call_id.is_empty() && !reply_text.is_empty() {
+                        state.a2a_waiter.resolve(&call_id, reply_text);
+                    }
+                }
+            }
+        }
+
+        // A2A reply: cli_session_id (if any) was persisted above and the waiter
+        // was resolved. Skip footer / quote-index / history / upstream send —
+        // the caller's `call_agent` flow is the one that surfaces this reply
+        // to the WeChat user.
+        if is_a2a_reply {
+            return Json(SendMessageResponse::ok());
         }
         // Strip ilink_hub_ext before forwarding to upstream iLink.
         msg.ilink_hub_ext = None;

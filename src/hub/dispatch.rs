@@ -299,6 +299,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         session_id: session_id.clone(),
                         session_name: Some(session_name.clone()),
                         cli_session_id: None,
+                        a2a_call_id: None,
                     },
                 );
                 push_shared_to_queue(
@@ -532,6 +533,16 @@ fn set_first_text_item(msg: &mut WeixinMessage, text: String) {
 }
 
 /// Push a prepared message to the per-client queue and update metrics.
+/// Public for the MCP `call_agent` tool which needs to push synthetic messages.
+pub async fn push_to_queue_pub(
+    queue: &Arc<dyn MessageQueue>,
+    metrics: &Metrics,
+    vtoken: &str,
+    msg: WeixinMessage,
+) {
+    push_to_queue(queue, metrics, vtoken, msg).await;
+}
+
 async fn push_to_queue(
     queue: &Arc<dyn MessageQueue>,
     metrics: &Metrics,
@@ -590,7 +601,7 @@ async fn push_shared_to_queue(
 /// attached across turns.
 ///
 /// All lookups go directly to the DB via `store.find_or_create_vctx`.
-pub(super) async fn resolve_vctx_for_message(
+pub async fn resolve_vctx_for_message(
     state: &HubState,
     real_ctx: &str,
     peer_user_id: &str,
@@ -617,7 +628,7 @@ pub(super) async fn resolve_vctx_for_message(
 ///
 /// When `session_override` is provided (from a quote-reply), that session is used directly
 /// instead of the current active session, so the message is routed to the correct conversation.
-pub(super) async fn build_hub_ext_for_vctx(
+pub async fn build_hub_ext_for_vctx(
     store: &Store,
     vctx: &str,
     vtoken: &str,
@@ -650,6 +661,7 @@ pub(super) async fn build_hub_ext_for_vctx(
             session_id,
             session_name: Some(name),
             cli_session_id: None,
+            a2a_call_id: None,
         });
     }
 
@@ -676,6 +688,7 @@ pub(super) async fn build_hub_ext_for_vctx(
         session_id,
         session_name: Some(session_name),
         cli_session_id: None,
+        a2a_call_id: None,
     })
 }
 

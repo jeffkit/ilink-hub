@@ -31,8 +31,9 @@ launchd 服务 `com.ilink-hub.bridge-manager` 的 plist 指向 `/opt/homebrew/bi
 
 ```bash
 # 1. 递增 Cargo.toml 的 version（patch 位）
-# 2. 本地构建并经 brew 安装到 /opt/homebrew/bin，顺带重载 bridge-manager
-ILINK_RELOAD_LAUNCHD=1 scripts/deploy-local-brew.sh
+# 2. 本地构建并经 brew 安装到 /opt/homebrew/bin，默认重载 bridge-manager launchd
+scripts/deploy-local-brew.sh
+# 想只换二进制不动服务：ILINK_NO_RELOAD_LAUNCHD=1 scripts/deploy-local-brew.sh
 ```
 
 脚本流程：本地 `cargo build --release` → ad-hoc 重签（避免 macOS AMFI `killed: 9`）→

@@ -13,8 +13,8 @@
 #   5. 还原 tap formula（git checkout），保持 tap 干净
 #
 # 用法：
-#   scripts/deploy-local-brew.sh                      # 用 Cargo.toml 的版本
-#   ILINK_RELOAD_LAUNCHD=1 scripts/deploy-local-brew.sh   # 顺带重载 bridge-manager launchd
+#   scripts/deploy-local-brew.sh                          # 用 Cargo.toml 的版本，默认重载 launchd
+#   ILINK_NO_RELOAD_LAUNCHD=1 scripts/deploy-local-brew.sh  # 跳过重载（仅换二进制，不动服务）
 #
 # 注意：这是「本机调试」路径。要让其它机器 / 公共 tap 拿到新版本，请用方案 1
 # （打 v*-mac tag 触发 release-mac-fast.yml）或完整 release（打 vX.Y.Z tag）。
@@ -126,7 +126,7 @@ echo "==> 安装结果"
 /opt/homebrew/bin/ilink-hub --version || true
 /opt/homebrew/bin/ilink-hub-bridge --version || true
 
-if [[ "${ILINK_RELOAD_LAUNCHD:-0}" == "1" ]]; then
+if [[ "${ILINK_NO_RELOAD_LAUNCHD:-0}" != "1" ]]; then
   uid="$(id -u)"
   PLIST="$HOME/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist"
   if [[ -f "$PLIST" ]]; then
@@ -136,8 +136,12 @@ if [[ "${ILINK_RELOAD_LAUNCHD:-0}" == "1" ]]; then
     launchctl bootstrap "gui/$uid" "$PLIST"
     echo "    已重载，等待 5s 后查看进程"
     sleep 5
-    pgrep -fl "ilink-hub-bridge manager" || true
+    pgrep -fl "ilink-hub-bridge manager" || echo "!! bridge-manager 未起来，请检查 ~/ilink-logs/bridge-manager-error.log"
+  else
+    echo "!! 未找到 $PLIST，跳过 launchd 重载" >&2
   fi
+else
+  echo "==> ILINK_NO_RELOAD_LAUNCHD=1，跳过 launchd 重载（bridge-manager 维持原状态）"
 fi
 
 echo "本地 brew 部署完成 v${VERSION} 。tap formula 已还原（保持 jeffkit/tap 干净）。"

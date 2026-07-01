@@ -3,6 +3,7 @@ pub mod client;
 pub mod error;
 pub mod hub;
 pub mod ilink;
+pub mod mcp;
 pub mod metrics;
 pub mod paths;
 pub mod relay;
