@@ -220,6 +220,11 @@ pub struct HubExt {
     /// the target echoes it back in its `sendmessage` so Hub can resolve the waiter.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a_call_id: Option<String>,
+    /// A2A call chain depth (0 = direct user message, N = N levels deep in A2A calls).
+    /// Set by Hub on synthetic A2A inbound messages; Bridge echoes it back in sendmessage.
+    /// Hub rejects `call_agent` when depth >= MAX_A2A_DEPTH.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub a2a_depth: Option<u8>,
 }
 
 impl WeixinMessage {

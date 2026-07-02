@@ -63,7 +63,8 @@ impl Store {
 
     pub async fn list_clients(&self) -> Result<Vec<ClientRow>> {
         let rows = sqlx::query(
-            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji FROM clients ORDER BY name",
+            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji, \
+             COALESCE(description, '') AS description FROM clients ORDER BY name",
         )
         .fetch_all(&self.rpool)
         .await?;
@@ -77,13 +78,18 @@ impl Store {
                 last_seen: r.get::<Option<String>, _>("last_seen"),
                 persona_name: r.get("persona_name"),
                 persona_emoji: r.get("persona_emoji"),
+                description: {
+                    let s: String = r.get("description");
+                    if s.is_empty() { None } else { Some(s) }
+                },
             })
             .collect())
     }
 
     pub async fn get_client_by_name(&self, name: &str) -> Result<Option<ClientRow>> {
         let row = sqlx::query(
-            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji FROM clients WHERE name = $1",
+            "SELECT vtoken, name, label, last_seen, persona_name, persona_emoji, \
+             COALESCE(description, '') AS description FROM clients WHERE name = $1",
         )
         .bind(name)
         .fetch_optional(&self.rpool)
@@ -96,7 +102,25 @@ impl Store {
             last_seen: r.get::<Option<String>, _>("last_seen"),
             persona_name: r.get("persona_name"),
             persona_emoji: r.get("persona_emoji"),
+            description: {
+                let s: String = r.get("description");
+                if s.is_empty() { None } else { Some(s) }
+            },
         }))
+    }
+
+    /// Set or clear the description for a client (identified by hashed vtoken).
+    pub async fn update_client_description(
+        &self,
+        vtoken: &str,
+        description: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query("UPDATE clients SET description = $2 WHERE vtoken = $1")
+            .bind(vtoken)
+            .bind(description)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn update_client_persona(
@@ -197,4 +221,5 @@ pub struct ClientRow {
     pub last_seen: Option<String>,
     pub persona_name: Option<String>,
     pub persona_emoji: Option<String>,
+    pub description: Option<String>,
 }

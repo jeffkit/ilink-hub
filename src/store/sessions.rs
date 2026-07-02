@@ -295,6 +295,86 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Upsert active session together with the A2A call depth for a (vctx, vtoken) pair.
+    ///
+    /// Called on every inbound message dispatch:
+    /// - Regular user messages: `a2a_depth = 0`
+    /// - Synthetic A2A messages: `a2a_depth = parent_depth + 1`
+    ///
+    /// This ensures `get_active_ctx_for_vtoken` can always find a row to check depth.
+    pub async fn set_active_session_with_depth(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+        a2a_depth: u8,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO active_sessions (vctx, vtoken, session_name, a2a_depth)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (vctx, vtoken) DO UPDATE SET
+                session_name = excluded.session_name,
+                a2a_depth    = excluded.a2a_depth,
+                updated_at   = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(i32::from(a2a_depth))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Resolve the most recently active conversation context for a given vtoken.
+    ///
+    /// Returns `(vctx, real_ctx, peer_user_id, a2a_depth)` by joining `active_sessions`
+    /// with `context_token_map`, ordered by most recently updated session.
+    ///
+    /// Used by the MCP `call_agent` handler to auto-fill context without requiring the
+    /// calling LLM to pass hidden `_hub_vctx` / `_hub_real_ctx` / `_hub_peer` arguments.
+    pub async fn get_active_ctx_for_vtoken(
+        &self,
+        vtoken: &str,
+    ) -> Result<Option<ActiveCtxInfo>> {
+        let row = sqlx::query(
+            "SELECT a.vctx, \
+                    COALESCE(a.a2a_depth, 0) AS a2a_depth, \
+                    c.real_ctx, \
+                    COALESCE(c.peer_user_id, '') AS peer_user_id \
+             FROM active_sessions a \
+             JOIN context_token_map c ON a.vctx = c.vctx \
+             WHERE a.vtoken = $1 \
+             ORDER BY a.updated_at DESC \
+             LIMIT 1",
+        )
+        .bind(vtoken)
+        .fetch_optional(&self.rpool)
+        .await?;
+
+        Ok(row.map(|r| {
+            let depth_raw: i32 = r.try_get("a2a_depth").unwrap_or(0);
+            ActiveCtxInfo {
+                vctx: r.get("vctx"),
+                real_ctx: r.get("real_ctx"),
+                peer_user_id: r.get("peer_user_id"),
+                a2a_depth: u8::try_from(depth_raw.max(0)).unwrap_or(u8::MAX),
+            }
+        }))
+    }
+}
+
+/// Active conversation context info returned by `get_active_ctx_for_vtoken`.
+#[derive(Debug, Clone)]
+pub struct ActiveCtxInfo {
+    pub vctx: String,
+    pub real_ctx: String,
+    pub peer_user_id: String,
+    /// Current A2A call-chain depth (0 = direct user message).
+    pub a2a_depth: u8,
 }
 
 #[derive(Debug, Clone)]

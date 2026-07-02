@@ -174,6 +174,27 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             let hub_ext =
                 build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
 
+            // Fire-and-forget: reset a2a_depth to 0 for this (vctx, vtoken) pair so
+            // that subsequent `call_agent` calls start from depth 0.  Uses the active
+            // session name if available; falls back to "default".
+            {
+                let session_name_for_depth = hub_ext
+                    .as_ref()
+                    .and_then(|e| e.session_name.as_deref())
+                    .unwrap_or("default")
+                    .to_string();
+                let store_d = state.store.clone();
+                let (vctx_d, vtoken_d) = (vctx.clone(), vtoken.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = store_d
+                        .set_active_session_with_depth(&vctx_d, &vtoken_d, &session_name_for_depth, 0)
+                        .await
+                    {
+                        warn!(error = %e, "failed to reset a2a_depth on user message dispatch");
+                    }
+                });
+            }
+
             // Fire-and-forget: record user message to history.
             if let Some(content) = msg.text().map(str::to_string) {
                 let session_name = hub_ext
@@ -300,6 +321,7 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                         session_name: Some(session_name.clone()),
                         cli_session_id: None,
                         a2a_call_id: None,
+                        a2a_depth: None,
                     },
                 );
                 push_shared_to_queue(
@@ -662,6 +684,7 @@ pub async fn build_hub_ext_for_vctx(
             session_name: Some(name),
             cli_session_id: None,
             a2a_call_id: None,
+            a2a_depth: None,
         });
     }
 
@@ -689,6 +712,7 @@ pub async fn build_hub_ext_for_vctx(
         session_name: Some(session_name),
         cli_session_id: None,
         a2a_call_id: None,
+        a2a_depth: None,
     })
 }
 

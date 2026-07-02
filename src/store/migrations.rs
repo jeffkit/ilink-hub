@@ -260,6 +260,8 @@ impl Store {
         self.migrate_to_v8_tx(&mut tx).await?;
         self.migrate_to_v9_tx(&mut tx).await?;
         self.migrate_to_v10_tx(&mut tx).await?;
+        self.migrate_to_v11_tx(&mut tx).await?;
+        self.migrate_to_v12_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -866,6 +868,143 @@ impl Store {
         Ok(())
     }
 
+    /// v11: Add `a2a_depth` column to `active_sessions` for A2A call-depth tracking.
+    pub(super) async fn migrate_to_v11_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 11).await? {
+            return Ok(());
+        }
+        // Guard: active_sessions table may be absent in partial-schema test environments.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => {
+                sqlx::query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_sessions'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some()
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = 'active_sessions' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+
+        if table_exists {
+            let col_exists = match self.kind {
+                DatabaseKind::Sqlite => sqlx::query(
+                    "SELECT 1 FROM pragma_table_info('active_sessions') WHERE name = 'a2a_depth'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+                DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'active_sessions' AND column_name = 'a2a_depth' LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+            };
+            if !col_exists {
+                sqlx::query(V11_ADD_A2A_DEPTH)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V11_ADD_A2A_DEPTH}\n  Error: {e}")
+                    })?;
+            }
+            tracing::info!(version = 11, "migration applied: active_sessions.a2a_depth");
+        } else {
+            tracing::debug!(
+                "v11 migration: active_sessions table absent (partial schema), skipping a2a_depth column"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v11(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v11_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// v12: Add `description` column to `clients` for MCP `list_agents`.
+    pub(super) async fn migrate_to_v12_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 12).await? {
+            return Ok(());
+        }
+        // Guard: clients table may be absent in partial-schema test environments.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => {
+                sqlx::query(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some()
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'clients' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+
+        if table_exists {
+            let col_exists = match self.kind {
+                DatabaseKind::Sqlite => sqlx::query(
+                    "SELECT 1 FROM pragma_table_info('clients') WHERE name = 'description'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+                DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'clients' AND column_name = 'description' LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+            };
+            if !col_exists {
+                sqlx::query(V12_ADD_DESCRIPTION)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V12_ADD_DESCRIPTION}\n  Error: {e}")
+                    })?;
+            }
+            tracing::info!(version = 12, "migration applied: clients.description");
+        } else {
+            tracing::debug!(
+                "v12 migration: clients table absent (partial schema), skipping description column"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v12(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v12_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -1007,3 +1146,7 @@ const V9_MESSAGES_LOOKUP_IDX: &str =
     include_str!("../../migrations/0009_messages_lookup_index.sql");
 
 const V10_DDLS: &[&str] = &[include_str!("../../migrations/0010_client_persona.sql")];
+
+const V11_ADD_A2A_DEPTH: &str = include_str!("../../migrations/0011_a2a_depth.sql");
+
+const V12_ADD_DESCRIPTION: &str = include_str!("../../migrations/0012_client_description.sql");

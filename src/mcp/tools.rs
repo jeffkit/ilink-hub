@@ -22,11 +22,15 @@ pub async fn list_agents(state: &Arc<HubState>) -> Value {
         clients
             .iter()
             .map(|c| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": c.name,
                     "online": c.online,
                     "label": c.label,
-                })
+                });
+                if let Some(desc) = &c.description {
+                    entry["description"] = serde_json::Value::String(desc.clone());
+                }
+                entry
             })
             .collect()
     };
@@ -50,14 +54,20 @@ pub struct CallAgentContext {
     /// Hashed vtoken of the calling Agent (derived from Bearer header).
     pub caller_vtoken: String,
     /// The WeChat conversation context token the caller is currently serving.
-    /// Extracted from `HubExt` that was injected when the caller received the
-    /// original user message.  Without this we cannot push messages to WeChat.
+    /// Auto-filled by the Hub router from the most-recently updated `active_sessions` row.
     pub vctx: String,
     /// Real WeChat context token (mapped from vctx via the store).
     pub real_ctx: String,
     /// The WeChat peer user id for the conversation.
     pub peer_user_id: String,
+    /// Current A2A call-chain depth (0 = direct user message; N = N levels of A2A nesting).
+    /// Checked against `MAX_A2A_DEPTH` before proceeding; incremented for the target.
+    pub a2a_depth: u8,
 }
+
+/// Maximum allowed A2A call-chain depth.  A call at this depth is rejected to
+/// prevent runaway recursive agent loops.
+pub const MAX_A2A_DEPTH: u8 = 5;
 
 pub async fn call_agent(
     state: &Arc<HubState>,
@@ -107,10 +117,29 @@ pub async fn call_agent(
     // 4. Register a waiter before pushing the message, so we never miss a fast reply.
     let (call_id, reply_rx) = state.a2a_waiter.register();
 
-    // 5. Push the message into the target Agent's queue.
+    // 5. Persist the target's active session with the incremented depth BEFORE pushing
+    //    the message — this ensures `get_active_ctx_for_vtoken` on the target returns
+    //    the correct depth when the target itself calls `call_agent`.
+    let target_depth = ctx.a2a_depth.saturating_add(1);
+    if let Err(e) = state
+        .store
+        .set_active_session_with_depth(&ctx.vctx, &target_vtoken, &session_name, target_depth)
+        .await
+    {
+        warn!(error = %e, target = %target_name, "failed to persist a2a_depth for target");
+    }
+
+    // 6. Push the message into the target Agent's queue.
     //    We construct a synthetic WeixinMessage so the target sees a normal user message.
-    let hub_ext =
-        build_hub_ext_for_a2a(state, &ctx.vctx, &target_vtoken, &session_name, &call_id).await;
+    let hub_ext = build_hub_ext_for_a2a(
+        state,
+        &ctx.vctx,
+        &target_vtoken,
+        &session_name,
+        &call_id,
+        target_depth,
+    )
+    .await;
     let synthetic_msg =
         build_synthetic_message(&ctx.vctx, &ctx.peer_user_id, &params.message, hub_ext);
 
@@ -122,7 +151,7 @@ pub async fn call_agent(
     )
     .await;
 
-    // 6. Push the "caller @target: message" notification to WeChat.
+    // 7. Push the "caller @target: message" notification to WeChat.
     let target_handle = persona_handle(
         &target_name,
         target_persona_name.as_deref(),
@@ -140,7 +169,7 @@ pub async fn call_agent(
     )
     .await;
 
-    // 7. Wait for the target's reply (or timeout).
+    // 8. Wait for the target's reply (or timeout).
     let reply = match tokio::time::timeout(CALL_AGENT_TIMEOUT, reply_rx).await {
         Ok(Ok(text)) => text,
         Ok(Err(_)) => {
@@ -168,7 +197,7 @@ pub async fn call_agent(
         "a2a call_agent received reply"
     );
 
-    // 8. Push the reply to WeChat as if spoken by the target (target persona
+    // 9. Push the reply to WeChat as if spoken by the target (target persona
     // header), with the body `@`-mentioning the caller so the user sees which
     // agent the reply is addressed to. The target's own sendmessage is
     // suppressed in the Hub (A2A waiter path) and never reaches WeChat.
@@ -189,7 +218,7 @@ pub async fn call_agent(
     )
     .await;
 
-    // 9. Return the reply as MCP tool content, including the session name so
+    // 10. Return the reply as MCP tool content, including the session name so
     //    the caller can resume the conversation later.
     serde_json::json!({
         "content": [{
@@ -213,14 +242,15 @@ fn error_content(msg: String) -> Value {
     })
 }
 
-/// Build `HubExt` for the synthetic A2A message, injecting the call-id so
-/// `sendmessage` can resolve the waiter when the target replies.
+/// Build `HubExt` for the synthetic A2A message, injecting the call-id and depth so
+/// `sendmessage` can resolve the waiter when the target replies and depth is propagated.
 async fn build_hub_ext_for_a2a(
     state: &Arc<HubState>,
     vctx: &str,
     target_vtoken: &str,
     session_name: &str,
     call_id: &str,
+    a2a_depth: u8,
 ) -> Option<HubExt> {
     let mut ext = crate::hub::build_hub_ext_for_vctx(
         &state.store,
@@ -231,6 +261,7 @@ async fn build_hub_ext_for_a2a(
     .await;
     if let Some(ref mut e) = ext {
         e.a2a_call_id = Some(call_id.to_string());
+        e.a2a_depth = Some(a2a_depth);
     }
     ext
 }

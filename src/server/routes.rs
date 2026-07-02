@@ -105,6 +105,9 @@ pub struct RegisterRequest {
     /// Optional emoji avatar shown alongside `persona_name` in `/list` and replies.
     #[serde(default)]
     pub persona_emoji: Option<String>,
+    /// Optional one-line description returned by the MCP `list_agents` tool.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +206,23 @@ pub async fn register(
             .await
         {
             warn!(error = %e, name = %req.name, "failed to persist persona on registration");
+        }
+    }
+
+    // Persist description if provided.
+    if let Some(desc) = &req.description {
+        if !desc.is_empty() {
+            {
+                let mut registry = state.clients.registry.write().await;
+                registry.set_description(&outcome.hashed, Some(desc.clone()));
+            }
+            if let Err(e) = state
+                .store
+                .update_client_description(&outcome.hashed, Some(desc.as_str()))
+                .await
+            {
+                warn!(error = %e, name = %req.name, "failed to persist description on registration");
+            }
         }
     }
 

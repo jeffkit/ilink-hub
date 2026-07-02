@@ -25,7 +25,7 @@ use crate::hub::HubState;
 use crate::server::routes::{extract_vtoken_pub, UNKNOWN_VTOKEN_MSG};
 
 use super::protocol::{self, JsonRpcRequest, JsonRpcResponse};
-use super::tools::{call_agent, list_agents, CallAgentContext, CallAgentParams};
+use super::tools::{call_agent, list_agents, CallAgentContext, CallAgentParams, MAX_A2A_DEPTH};
 
 pub fn mcp_router() -> Router<Arc<HubState>> {
     Router::new().route("/mcp", post(handle_mcp))
@@ -155,37 +155,34 @@ async fn handle_tools_call(
                 .and_then(Value::as_str)
                 .map(str::to_string);
 
-            // We need the caller's vctx to push WeChat messages.  The caller
-            // must supply it in the `_hub_vctx` meta-argument, which the Hub
-            // injects into every inbound message via HubExt.  When the bridge
-            // relays the message to the Agent, the Agent receives this in its
-            // tool call context (stored in `HubExt.session_name` and decoded
-            // from the message's `context_token`).
-            //
-            // Practical approach: the caller passes `_hub_vctx` and
-            // `_hub_real_ctx` and `_hub_peer` as hidden arguments.  The bridge
-            // SDK should fill these automatically from the HubExt it received.
-            let vctx = arguments
-                .get("_hub_vctx")
-                .and_then(Value::as_str)
-                .ok_or("Missing '_hub_vctx' in call_agent arguments (should be set by the bridge)")?
-                .to_string();
-            let real_ctx = arguments
-                .get("_hub_real_ctx")
-                .and_then(Value::as_str)
-                .ok_or("Missing '_hub_real_ctx' in call_agent arguments")?
-                .to_string();
-            let peer_user_id = arguments
-                .get("_hub_peer")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            // Auto-fill context from DB: look up the most recently active conversation
+            // for the caller's vtoken.  This eliminates the need for the LLM to supply
+            // hidden `_hub_vctx` / `_hub_real_ctx` / `_hub_peer` arguments.
+            let ctx_info = state
+                .store
+                .get_active_ctx_for_vtoken(caller_vtoken)
+                .await
+                .map_err(|e| format!("DB error resolving caller context: {e}"))?
+                .ok_or_else(|| {
+                    "No active conversation found for caller; \
+                     the Hub must have delivered at least one message to this Agent first."
+                        .to_string()
+                })?;
+
+            // Depth guard: reject calls that would exceed the maximum chain length.
+            if ctx_info.a2a_depth >= MAX_A2A_DEPTH {
+                return Err(format!(
+                    "A2A call rejected: maximum call depth ({MAX_A2A_DEPTH}) reached. \
+                     This prevents runaway recursive agent loops."
+                ));
+            }
 
             let ctx = CallAgentContext {
                 caller_vtoken: caller_vtoken.to_string(),
-                vctx,
-                real_ctx,
-                peer_user_id,
+                vctx: ctx_info.vctx,
+                real_ctx: ctx_info.real_ctx,
+                peer_user_id: ctx_info.peer_user_id,
+                a2a_depth: ctx_info.a2a_depth,
             };
             let call_params = CallAgentParams {
                 target_name,

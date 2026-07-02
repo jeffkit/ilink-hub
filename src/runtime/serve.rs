@@ -555,6 +555,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                             (Some(c.name.clone()), Some("🤖".to_string()))
                         };
                     registry.set_persona(&c.vtoken, persona_name, persona_emoji);
+                    registry.set_description(&c.vtoken, c.description.clone());
                 }
             }
             // Back-fill DB for clients that had no persona — fire-and-forget, non-fatal.

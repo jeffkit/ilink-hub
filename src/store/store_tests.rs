@@ -7,17 +7,17 @@ static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 async fn test_schema_version_tracking() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
 
-    // All ten migrations must be applied after a fresh connect.
+    // All twelve migrations must be applied after a fresh connect.
     let version = store
         .get_current_version()
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 10,
-        "expected all 10 migrations to be applied on a fresh DB"
+        version, 12,
+        "expected all 12 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=10 {
+    for v in 1..=12 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -50,8 +50,8 @@ async fn test_migration_idempotency() {
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 10,
-        "version must remain 10 after idempotent re-run"
+        version, 12,
+        "version must remain 12 after idempotent re-run"
     );
 }
 
@@ -154,9 +154,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 10, "must reach v10 after incremental migration");
+    assert_eq!(version, 12, "must reach v12 after incremental migration");
 
-    for v in 1..=10 {
+    for v in 1..=12 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -250,7 +250,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 10, "current version must be 9, got {}", cur_ver);
+    assert_eq!(cur_ver, 12, "current version must be 12, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -604,13 +604,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        10,
-        "writer #1 must see all v1-v10 applied"
+        12,
+        "writer #1 must see all v1-v12 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        10,
-        "writer #2 must see all v1-v10 applied"
+        12,
+        "writer #2 must see all v1-v12 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -678,8 +678,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            10,
-            "connect #{i} must see all v1-v10 applied"
+            12,
+            "connect #{i} must see all v1-v12 applied"
         );
     }
 }
@@ -892,7 +892,7 @@ async fn adversarial_version_api_boundaries() {
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
     // get_current_version: 9 (the highest applied).
-    assert_eq!(store.get_current_version().await.unwrap(), 10);
+    assert_eq!(store.get_current_version().await.unwrap(), 12);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -1058,9 +1058,11 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v8().await.expect("v8 re-run");
     store.migrate_to_v9().await.expect("v9 re-run");
     store.migrate_to_v10().await.expect("v10 re-run");
+    store.migrate_to_v11().await.expect("v11 re-run");
+    store.migrate_to_v12().await.expect("v12 re-run");
 
-    // Still at v10.
-    assert_eq!(store.get_current_version().await.unwrap(), 10);
+    // Still at v12.
+    assert_eq!(store.get_current_version().await.unwrap(), 12);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1240,7 +1242,7 @@ async fn m2_run_migrations_records_all_versions_in_order() {
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 10);
+    assert_eq!(store.get_current_version().await.unwrap(), 12);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1252,7 +1254,7 @@ async fn m2_run_migrations_idempotent_double_call() {
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
     // Version stays at 9 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 10);
+    assert_eq!(store.get_current_version().await.unwrap(), 12);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1922,8 +1924,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 10,
-        "database must still be at v10 after ensure_sqlite_file"
+        v, 12,
+        "database must still be at v12 after ensure_sqlite_file"
     );
 }
 
@@ -1974,7 +1976,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 10);
+    assert_eq!(v, 12);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate

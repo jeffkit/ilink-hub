@@ -31,6 +31,8 @@ pub struct ClientInfo {
     pub persona_name: Option<String>,
     /// Optional emoji avatar accompanying `persona_name` (e.g. "🤖").
     pub persona_emoji: Option<String>,
+    /// Optional one-line description returned by the MCP `list_agents` tool.
+    pub description: Option<String>,
 }
 
 impl ClientInfo {
@@ -56,6 +58,7 @@ impl ClientInfo {
             online: false,
             persona_name: None,
             persona_emoji: None,
+            description: None,
         }
     }
 }
@@ -227,6 +230,13 @@ impl ClientRegistry {
         if let Some(info) = self.by_vtoken.get_mut(vtoken) {
             info.persona_name = persona_name;
             info.persona_emoji = persona_emoji;
+        }
+    }
+
+    /// Set the description for a registered client.
+    pub fn set_description(&mut self, vtoken: &str, description: Option<String>) {
+        if let Some(info) = self.by_vtoken.get_mut(vtoken) {
+            info.description = description;
         }
     }
 

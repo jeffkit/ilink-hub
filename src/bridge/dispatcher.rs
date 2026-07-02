@@ -1247,6 +1247,7 @@ mod tests {
                 session_name: Some(session_name.into()),
                 cli_session_id: None,
                 a2a_call_id: None,
+                a2a_depth: None,
             }),
             item_list: Some(std::sync::Arc::new(vec![MessageItem {
                 item_type: Some(1),
