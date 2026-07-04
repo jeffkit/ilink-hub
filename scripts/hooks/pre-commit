@@ -1,0 +1,16 @@
+#!/bin/sh
+# Run pre-commit checks on staged Rust changes.
+# Delegates to scripts/check.sh so behavior stays in sync with what CI runs.
+
+# Skip when no Rust files are staged (speed, and avoids spurious failures)
+if ! git diff --cached --name-only | grep -q '\.rs$'; then
+    exit 0
+fi
+
+repo_root="$(git rev-parse --show-toplevel)"
+"$repo_root/scripts/check.sh" || {
+    echo ""
+    echo "❌ pre-commit checks failed."
+    echo "   Run \`scripts/check.sh --fix\` to auto-format, then re-stage and commit."
+    exit 1
+}

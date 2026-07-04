@@ -41,5 +41,6 @@ package-lock.json
 # agy (Google Antigravity CLI) local session state
 .antigravitycli/
 
-# Claude Code local state (worktrees, session data)
+# Claude Code local state (worktrees, session data, local permissions)
 .claude/worktrees/
+.claude/settings.local.json
