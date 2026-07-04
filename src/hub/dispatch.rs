@@ -943,6 +943,62 @@ mod tests {
         }
     }
 
+    /// F5 / AT2: @mention → quote-reply L3 footer routing.
+    ///
+    /// Registers a client named "ilink-claude". Constructs a WeixinMessage whose
+    /// ref_msg.text_item carries a footer `---\nilink-claude · at-20260704-103000`.
+    /// Uses a very old timestamp so L1 timestamp and L2 content-prefix DB lookups
+    /// won't match. Verifies that `resolve_quote_from_footer` returns
+    /// `QuoteOrigin::Client` with `session_name = Some("at-20260704-103000")` and
+    /// the correct vtoken for the registered "ilink-claude" client.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the specific client that the footer references by name.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        let session_name = "at-20260704-103000";
+        // The footer format is: `\n---\n{name} · {session}`.
+        // `parse_footer_from_quoted_text` extracts name="ilink-claude" and
+        // session=Some("at-20260704-103000") from this footer.
+        let quoted_text = format!("Some reply text\n\n---\nilink-claude · {session_name}");
+
+        // Very old timestamp — ensures L1 timestamp lookup won't match any DB row.
+        let old_ms = 1_000_000i64;
+        let msg = make_quote_msg("user1", old_ms, Some(&quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "L3 footer lookup must find the ilink-claude client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match the registered ilink-claude client"
+                );
+                assert_eq!(
+                    sn,
+                    Some(session_name.to_string()),
+                    "session_name must be parsed from the footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
     /// AT3: LIKE injection protection in content-prefix lookup.
     ///
     /// Inserts two rows — one with content containing a literal `%` character, another

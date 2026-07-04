@@ -1,0 +1,44 @@
+milestone: "M2: 新增 DB fallback 回归测试"
+requested_at: "2026-07-04 11:38"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "src/hub/dispatch.rs"
+      change_type: modified
+      summary: "Added at_mention_quote_reply_l3_footer_routing test for L3 footer fallback routing"
+  diff_stats:
+    files_changed: 1
+    insertions: 56
+    deletions: 0
+
+change_summary: |
+  Added the L3 footer fallback regression test `at_mention_quote_reply_l3_footer_routing` in
+  `src/hub/dispatch.rs`. The test registers a client named "ilink-claude", constructs a
+  WeixinMessage whose quoted text contains a footer `---\nilink-claude · at-20260704-103000`,
+  uses an ancient timestamp so L1 and L2 DB lookups don't match, then calls
+  `resolve_quote_from_footer` and asserts it returns `QuoteOrigin::Client` with the correct
+  vtoken and `session_name = Some("at-20260704-103000")`. This completes the three-test
+  regression suite (L1 timestamp, L2 content-prefix, L3 footer) verifying the DB fallback
+  routing chain after the in-memory QuoteRouteIndex was removed in M1.
+
+acceptance_criteria:
+  - "test_quote_route_via_footer: 引用消息带有 ---\\nbackend-name · session footer → 通过 footer 解析找到正确 backend"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+  e2e: skipped
+
+focus_areas:
+  - "Test correctly exercises resolve_quote_from_footer (fast path via registry.get_by_name), not the slow DB path"
+  - "Footer format matches parse_footer_from_quoted_text expectations (\\n---\\n separator)"
+  - "Old timestamp (1_000_000 ms) effectively rules out L1/L2 interference"
+
+e2e_verification:
+  applicable: false
+  platform: "argusai"
+  run_result: skipped
+  run_id: ""

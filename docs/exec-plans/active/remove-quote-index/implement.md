@@ -23,10 +23,15 @@
 ## M2 — 新增 DB fallback 回归测试
 
 ### Decisions
-（待填写）
+- 新增 `at_mention_quote_reply_l3_footer_routing` 测试，与已有的 L1/L2 测试并列于 `dispatch.rs` 末尾的 `tests` 模块中，统一测试风格。
+- 选择在同一 in-memory state 上额外注册 "ilink-claude" 客户端（调用 `make_state_with_client()` 后追加注册），避免重复实现 state 构建逻辑。
+- 使用 `resolve_quote_from_footer` 作为直接入口（而非 `resolve_quote_from_db`），因为 M2 目标是覆盖 L3 footer 路径的快速注册表查找逻辑。
+- Footer 文本格式 `Some reply text\n\n---\nilink-claude · at-20260704-103000` 严格遵循 `parse_footer_from_quoted_text` 的 `\n---\n` 分隔符约定。
 
-### Problems
-（待填写）
+### Problems & Solutions
+- `cargo fmt` 检测到 `let (_, ilink_claude_vtoken, _) = state.clients.registry...` 的链式调用需要缩进换行 → 执行 `cargo fmt --all` 自动修复。
 
 ### Outcome
-（待填写）
+- 验证通过：`cargo test at_mention_quote_reply_l3` ✅ / `cargo test -- --test-threads=4` ✅ / `cargo clippy -- -D warnings` ✅ / `cargo fmt --all -- --check` ✅
+- 新增 56 行（+56 / -0），覆盖 L3 footer fallback 的快速路径（registry lookup）
+- Commit: 2d69677
