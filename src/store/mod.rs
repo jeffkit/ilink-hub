@@ -22,7 +22,7 @@ mod sessions;
 
 pub use clients::{ClientRow, HUB_DEFAULT_SENTINEL};
 
-pub use messages::{MessageRow, RecentOutboundRow, SessionStatusEntry};
+pub use messages::{MessageRow, SessionStatusEntry};
 
 pub use sessions::BackendSessionRow;
 

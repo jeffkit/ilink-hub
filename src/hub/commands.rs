@@ -91,36 +91,7 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
     };
 
     debug!(to = %from_user_id, "sending hub command reply");
-    let mut send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
-    if let Some(m) = &mut send_req.msg {
-        m.ensure_outbound();
-        let index_hub_quote = matches!(
-            &cmd,
-            HubCommand::List
-                | HubCommand::Status
-                | HubCommand::Help
-                | HubCommand::UseClient(_)
-                | HubCommand::SessionList
-                | HubCommand::SessionNew(_, _)
-                | HubCommand::SessionUse(_)
-                | HubCommand::SessionDelete(_)
-        );
-        if index_hub_quote {
-            // Content path: works even though iLink never echoes the bot copy back.
-            if let Some(text) = m.text().map(str::to_string) {
-                state
-                    .routing
-                    .quote_index
-                    .lock()
-                    .await
-                    .register_outbound_content(
-                        &from_user_id,
-                        &text,
-                        quote_route::QuoteOrigin::Hub { cmd: cmd.clone() },
-                    );
-            }
-        }
-    }
+    let send_req = SendMessageRequest::reply(real_ctx, reply_text, &from_user_id);
     match state.ilink.upstream.send_message(send_req).await {
         Err(e) => error!(error = %e, "failed to send hub command reply"),
         Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {

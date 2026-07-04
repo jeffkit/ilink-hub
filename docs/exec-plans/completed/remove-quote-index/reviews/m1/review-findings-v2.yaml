@@ -1,0 +1,165 @@
+milestone: "M1: 删除内存路由层"
+reviewed_at: "2026-07-04 11:35"
+reviewer: "adversarial-reviewer"
+iteration: 2
+based_on: "review-findings.yaml (iteration 1, commit 70c6229)"
+
+verdict: PASS
+
+# ─── Re-verification of iteration-1 findings ──────────────────────────────────
+
+prior_findings_status:
+  - id: "f1"
+    severity: HIGH
+    original_issue: "三条 DB fallback 无超时保护"
+    verification: CONFIRMED_FIXED
+    evidence: |
+      dispatch.rs:342-381 (L1)、407-445 (L2)、489-505 + 506-541 (L3 两次串行 DB 调用)
+      全部使用 tokio::time::timeout(Duration::from_secs(2), ...)，超时分支均 warn!+return None。
+      与 build_hub_ext_for_vctx 的 5s pattern 一致。
+
+  - id: "f2"
+    severity: HIGH
+    original_issue: "三层全 miss 时无可观测信号"
+    verification: CONFIRMED_FIXED
+    evidence: |
+      1. state.rs:171 — pub quote_resolve_miss_total: AtomicU64，已加入 Metrics struct。
+      2. state.rs:195 — quote_resolve_miss_total: AtomicU64::new(0)，初始化正确。
+      3. dispatch.rs:105-113 — quoted.is_none() + ref_ms_hint.is_some() 双条件门控，
+         fetch_add(1)+debug! 日志，语义正确（仅对"有 ref_ms 但三层全 miss"计数）。
+      4. metrics.rs:107-111 — 注册 ilink_hub_quote_resolve_miss_total IntCounter。
+      5. metrics.rs:181-186 — gather_metrics 中赋值完整。
+      6. metrics.rs 测试 test_all_metrics_present + test_concurrent_calls_independent_registries
+         明确断言 "ilink_hub_quote_resolve_miss_total" 在输出中存在，共两处覆盖。
+
+  - id: "f3"
+    severity: MEDIUM
+    original_issue: "peer_user_id scope 推导三处拷贝"
+    verification: CONFIRMED_FIXED
+    evidence: |
+      dispatch.rs:315-329 提取 derive_peer_scope(msg) -> Option<String>，
+      三个 resolve_quote_* 函数分别在 340、395、488 行调用，无冗余拷贝。
+      函数逻辑：group 优先 → peer → None，覆盖所有 scope 格式。
+
+  - id: "f4"
+    severity: MEDIUM
+    original_issue: "quote_route.rs doc comment 仍引用 in-memory index cold"
+    verification: PARTIALLY_FIXED
+    evidence: |
+      quote_route.rs:52-54 已更新为 "DB-backed quote resolver (L3 footer parsing layer).
+      Called after timestamp and content-prefix lookups both miss." ✓
+      quote_route.rs:105-107 同样更新 ✓
+      但 store/messages.rs:58 仍保留原始措辞（见 nf1）。
+
+  - id: "f5"
+    severity: MEDIUM
+    original_issue: "@mention → quote-reply 全链路集成测试缺失"
+    verification: CONFIRMED_FIXED
+    evidence: |
+      dispatch.rs::tests 底部新增三个 #[tokio::test]，逻辑验证如下：
+      · at_mention_quote_reply_l1_timestamp_routing：save_message(peer="peer:user1",
+        session="at-20260704-103000000")，make_quote_msg 构造 create_time_ms=now_ms，
+        derive_peer_scope("user1") -> "peer:user1"，与存储 key 一致。±10s 窗口安全。✓
+      · at_mention_quote_reply_l2_content_routing：store content="Hello from @mention
+        session—…"，old_ms=1_000_000 使 L1 跳过，L2 命中正确 session。✓
+      · like_injection_protection_in_content_lookup："100%bonus plan" escape 为
+        "100\%bonus plan%"，不命中 "100xplan"，断言 session_name="session-percent"。✓
+
+  - id: "f6"
+    severity: LOW
+    original_issue: "全空白 prefix 触发全表 LIKE 扫描"
+    verification: CONFIRMED_FIXED
+    evidence: |
+      dispatch.rs:398-399 先检 is_empty()，dispatch.rs:403-406 再检 trim().is_empty()，
+      两层守卫均提前 return None，注释说明防御全空白 (non-breaking spaces 场景)。✓
+
+# ─── New findings (introduced or exposed by fix) ──────────────────────────────
+
+findings:
+  - id: "nf1"
+    severity: MEDIUM
+    category: maintainability
+    description: |
+      store/messages.rs:58 的 doc comment 仍残留重构前措辞：
+      "Used as DB-backed fallback for quote-reply routing when the in-memory
+      QuoteRouteIndex is cold (e.g. after a Hub restart)."
+      f4 的修复仅覆盖 src/hub/quote_route.rs（两处），但遗漏了同样在 changed_files
+      列表中的 store/messages.rs。重构后 DB path 是主路径而非冷启动回退，误导性
+      描述会让维护者误判该函数为"低频冷启动路径"，影响后续监控/测试投入决策。
+    suggestion: |
+      将 store/messages.rs find_assistant_message_by_content 的 doc comment 更新为：
+      "DB-backed quote resolver (L2 content-prefix layer). Scans messages table
+      for the most recent assistant message whose content starts with `content_prefix`.
+      Called on every quote-reply after the L1 timestamp lookup misses."
+      同时删除 "in-memory QuoteRouteIndex is cold (e.g. after a Hub restart)" 句。
+    location: "src/store/messages.rs:56-58"
+    status: open
+
+  - id: "nf2"
+    severity: LOW
+    category: maintainability
+    description: |
+      store/store_tests.rs:3154 的模块注释仍引用已删除的 QuoteRouteIndex：
+      "before looking up the QuoteRouteIndex and the DB"。
+      该文件在本次 changed_files 列表中（修改类型：已删除 recent_outbound_messages 相关测试），
+      说明编写者回顾了该文件，但未更新此处的历史注释。残留引用会在 code review 或
+      grep 搜索 "QuoteRouteIndex" 时混淆审查者（误以为仍有依赖）。
+    suggestion: |
+      将 store/store_tests.rs:3154 的注释从
+      "before looking up the QuoteRouteIndex and the DB."
+      更新为：
+      "before querying the DB via the three-layer fallback (timestamp → content-prefix → footer)."
+    location: "src/store/store_tests.rs:3154"
+    status: open
+
+# ─── Adversarial tests (carry-over + new) ─────────────────────────────────────
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: |
+      L1 timestamp 全链路路由（已实现）：at_mention_quote_reply_l1_timestamp_routing。
+      验证 save_message + resolve_quote_from_timestamp 返回正确 session_name。
+    expected_behavior: "QuoteOrigin::Client { session_name: Some(\"at-20260704-103000000\") }"
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::at_mention_quote_reply_l1_timestamp_routing"
+
+  - id: "at2"
+    type: unit
+    description: |
+      L2 content-prefix 路由（已实现）：at_mention_quote_reply_l2_content_routing。
+      验证 resolve_quote_from_db 在 L1 跳过后命中正确会话。
+    expected_behavior: "QuoteOrigin::Client { session_name: Some(\"at-20260704-103000000\") }"
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::at_mention_quote_reply_l2_content_routing"
+
+  - id: "at3"
+    type: unit
+    description: |
+      LIKE 注入防护（已实现）：like_injection_protection_in_content_lookup。
+      验证 % 字符被正确转义，不命中通配符命中行。
+    expected_behavior: "返回 session-percent 行，不返回 session-x 行"
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::like_injection_protection_in_content_lookup"
+
+  - id: "at4"
+    type: unit
+    description: |
+      新增（本次迭代提议）：验证 quote_resolve_miss_total 计数器在三层全 miss 且
+      携带 ref_ms 的消息时确实递增。构造 in-memory store 中无对应消息的 quote 消息，
+      在 dispatch_message 调用后读取 state.metrics.quote_resolve_miss_total，
+      断言 load(Relaxed) == 1。验证 f2 修复的端到端可观测性。
+    expected_behavior: "quote_resolve_miss_total = 1，base routing 被使用，无 panic"
+    added_to_suite: false
+    note: |
+      需要将 dispatch_message 的 quoted 解析块提取为可独立测试的 helper，
+      或通过 make_state_with_client 模拟全 miss 路径，复杂度适中，建议在下一个
+      维护窗口补充。
+
+summary: |
+  所有 HIGH 级问题（f1 DB 超时、f2 miss 指标可观测性）均已正确修复且通过代码核验。
+  MEDIUM/LOW 修复（f3 scope dedup、f5 集成测试、f6 空白前缀守卫）均到位。
+  f4 的修复不完整：quote_route.rs 两处已更新，但 store/messages.rs:58 与
+  store/store_tests.rs:3154 各有一处残留 "in-memory QuoteRouteIndex" 引用（nf1 MEDIUM、
+  nf2 LOW），属维护性文档问题，无运行时功能影响。
+  无 HIGH 或 CRITICAL 新发现，本次迭代总体验证通过。

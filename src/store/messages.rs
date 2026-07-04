@@ -28,22 +28,6 @@ pub struct SessionStatusEntry {
     pub user_msg_created_at: Option<String>,
 }
 
-/// One warmup row: a recent outbound (assistant) message from `messages`.
-///
-/// `from_user` is the conversation scope (`peer_user_id`) the Hub sent the
-/// message into — what `QuoteRouteIndex::register_outbound_content` keys on.
-/// `created_at` is the message's persisted timestamp (ISO-8601 string) used
-/// by the index to break ties when identical text was sent at the same
-/// second; we expose it raw and let the index decide what to do with it.
-#[derive(Debug, Clone)]
-pub struct RecentOutboundRow {
-    pub from_user: String,
-    pub text: String,
-    pub vtoken: Option<String>,
-    pub session_name: String,
-    pub created_at: String,
-}
-
 impl Store {
     pub async fn save_message(
         &self,
@@ -69,44 +53,8 @@ impl Store {
         Ok(())
     }
 
-    /// Load the most recent N outbound messages (`role = 'assistant'`) from
-    /// the `messages` table, newest first.
-    ///
-    /// `limit` is clamped to `[1, 10000]` to keep a runaway startup arg from
-    /// materialising an unbounded number of rows into memory.
-    ///
-    /// The query selects the columns needed to repopulate the in-memory
-    /// `QuoteRouteIndex`: `peer_user_id` (the conversation scope), `content`
-    /// (the text the index keys on), `vtoken` (the destination client), and
-    /// `session_name` (the active session). Inbound (`role = 'user'`) rows are
-    /// skipped — only the Hub's outbound replies are ever indexed.
-    pub async fn recent_outbound_messages(&self, limit: i64) -> Result<Vec<RecentOutboundRow>> {
-        let clamped = limit.clamp(1, 10_000);
-        let rows = sqlx::query(
-            "SELECT peer_user_id, content, vtoken, session_name, created_at \
-             FROM messages \
-             WHERE role = 'assistant' AND content IS NOT NULL AND content != '' \
-             ORDER BY id DESC LIMIT $1",
-        )
-        .bind(clamped)
-        .fetch_all(&self.rpool)
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| RecentOutboundRow {
-                from_user: r.get("peer_user_id"),
-                text: r.get("content"),
-                vtoken: r.get("vtoken"),
-                session_name: r.get("session_name"),
-                created_at: r.get("created_at"),
-            })
-            .collect())
-    }
-
     /// Find the most recent assistant message in a conversation whose content starts with
-    /// `content_prefix`. Used as DB-backed fallback for quote-reply routing when the
-    /// in-memory QuoteRouteIndex is cold (e.g. after a Hub restart).
+    /// `content_prefix`. Used as the L2 (content-prefix) DB fallback for quote-reply routing.
     pub async fn find_assistant_message_by_content(
         &self,
         peer_user_id: &str,

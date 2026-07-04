@@ -14,26 +14,6 @@ use crate::store::Store;
 // modules, …) are re-exported by the `hub` module.
 use super::*;
 
-// ─── Quote index background eviction ─────────────────────────────────────────
-
-pub fn spawn_quote_index_evictor(state: Arc<HubState>) {
-    let mut shutdown = state.ilink.shutdown.clone();
-    tokio::spawn(async move {
-        const EVICT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                _ = tokio::time::sleep(EVICT_INTERVAL) => {
-                    state.routing.quote_index.lock().await.evict_expired();
-                }
-            }
-        }
-    });
-}
-
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
 
 pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: mpsc::Receiver<WeixinMessage>) {
@@ -103,51 +83,34 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         router.route(&msg)
     };
 
+    // Pre-extract ref_ms to detect "has quote but all fallbacks missed" later without
+    // re-running the item scan after the resolution block.
+    let ref_ms_hint = quote_route::collect_quoted_timestamp(&msg);
     let quoted = {
-        // Normalise the conversation scope to match what `find_or_create_vctx`
-        // stores in `context_token_map.peer_user_id` and what `resolve_send_context`
-        // returns for the outbound registration path: "group:<id>" for group chats,
-        // "peer:<id>" for DMs.  Previously we used the raw `from_user_id` ("o9cq80…")
-        // which never matched the "peer:o9cq80…" form used during registration →
-        // every quote-reply silently missed the in-memory index and the DB fallback.
-        let scope = {
-            let group_id = msg.group_id.as_deref().unwrap_or_default();
-            let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
-            if !group_id.is_empty() {
-                format!("group:{group_id}")
-            } else if !from_user_id.is_empty() {
-                format!("peer:{from_user_id}")
-            } else {
-                String::new()
-            }
-        };
-        // Only the in-memory index lookup needs the `quote_index` lock. Release it
-        // BEFORE the DB/footer fallbacks: those await on the store and registry, and
-        // holding `quote_index` across them would serialise every quote-routed message
-        // and block the outbound index (sendmessage) and the periodic evictor.
-        let from_index = {
-            let mut q = state.routing.quote_index.lock().await;
-            q.resolve_user_quote(&scope, &msg)
-        };
-        if from_index.is_some() {
-            from_index
+        // Try timestamp lookup first (most reliable — iLink always provides
+        // create_time_ms even when text is absent), then content-prefix DB lookup,
+        // then footer text parsing as last resort.
+        let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+        if from_ts.is_some() {
+            from_ts
         } else {
-            // Cold index (e.g. after a Hub restart): try timestamp lookup first (most
-            // reliable — iLink always provides create_time_ms even when text is absent),
-            // then content-prefix DB lookup, then footer text parsing as last resort.
-            let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
-            if from_ts.is_some() {
-                from_ts
+            let from_db = resolve_quote_from_db(&state, &msg).await;
+            if from_db.is_some() {
+                from_db
             } else {
-                let from_db = resolve_quote_from_db(&state, &msg).await;
-                if from_db.is_some() {
-                    from_db
-                } else {
-                    resolve_quote_from_footer(&state, &msg).await
-                }
+                resolve_quote_from_footer(&state, &msg).await
             }
         }
     };
+    if quoted.is_none() {
+        if let Some(ref_ms) = ref_ms_hint {
+            state
+                .metrics
+                .quote_resolve_miss_total
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(ref_ms, "all quote fallbacks missed, using base routing");
+        }
+    }
     let routing = merge_routing_with_quote(routing, quoted);
 
     match routing {
@@ -349,6 +312,22 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     }
 }
 
+/// Derive the normalised peer scope string (`"peer:<id>"` or `"group:<id>"`) from a message.
+///
+/// Returns `None` when neither `from_user_id` nor `group_id` is present — the caller
+/// should return `None` immediately in that case.
+fn derive_peer_scope(msg: &crate::ilink::types::WeixinMessage) -> Option<String> {
+    let group_id = msg.group_id.as_deref().unwrap_or_default();
+    let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+    if !group_id.is_empty() {
+        Some(format!("group:{group_id}"))
+    } else if !from_user_id.is_empty() {
+        Some(format!("peer:{from_user_id}"))
+    } else {
+        None
+    }
+}
+
 /// Timestamp-based quote resolver: use `ref_msg.create_time_ms` to find the assistant message
 /// sent at approximately that time. This is the most reliable fallback because iLink always
 /// provides a timestamp in `ref_msg.message_item` even when it omits the text content.
@@ -356,29 +335,19 @@ async fn resolve_quote_from_timestamp(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let ref_ms = quote_route::QuoteRouteIndex::collect_quoted_timestamp(msg)?;
+    let ref_ms = quote_route::collect_quoted_timestamp(msg)?;
     let ref_unix_secs = ref_ms / 1000;
-    let peer_user_id = {
-        let group_id = msg.group_id.as_deref().unwrap_or_default();
-        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
-        if !group_id.is_empty() {
-            format!("group:{group_id}")
-        } else if !from_user_id.is_empty() {
-            format!("peer:{from_user_id}")
-        } else {
-            String::new()
-        }
-    };
-    if peer_user_id.is_empty() {
-        return None;
-    }
+    let peer_user_id = derive_peer_scope(msg)?;
     // Allow ±10 s window to handle minor clock skew between iLink and DB.
-    match state
-        .store
-        .find_assistant_message_by_timestamp(&peer_user_id, ref_unix_secs, 10)
-        .await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state
+            .store
+            .find_assistant_message_by_timestamp(&peer_user_id, ref_unix_secs, 10),
+    )
+    .await
     {
-        Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
+        Ok(Ok(Some((vtoken, session_name)))) if !vtoken.is_empty() => {
             let (name, label) = {
                 let registry = state.clients.registry.read().await;
                 registry
@@ -391,7 +360,7 @@ async fn resolve_quote_from_timestamp(
                 vtoken = %crate::redact_token(&vtoken),
                 session = ?session_name,
                 ref_unix_secs,
-                "quote index miss — resolved via timestamp lookup"
+                "resolved via timestamp lookup"
             );
             Some(QuoteOrigin::Client {
                 vtoken,
@@ -400,50 +369,50 @@ async fn resolve_quote_from_timestamp(
                 session_name,
             })
         }
-        Ok(_) => None,
-        Err(e) => {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
             warn!(error = %e, "timestamp quote lookup failed");
+            None
+        }
+        Err(_) => {
+            warn!(peer = %peer_user_id, "timeout in timestamp quote lookup");
             None
         }
     }
 }
 
 /// DB-backed quote resolver: query the messages table by peer_user_id + content prefix.
-/// Runs when the in-memory QuoteRouteIndex is cold. Returns the vtoken + session_name
-/// recorded when the assistant message was originally sent, independent of footer format.
+/// Returns the vtoken + session_name recorded when the assistant message was originally sent,
+/// independent of footer format.
 async fn resolve_quote_from_db(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let (quoted_text, _) = quote_route::QuoteRouteIndex::collect_quoted(msg)?;
+    let (quoted_text, _) = quote_route::collect_quoted(msg)?;
     // Use the same scope normalisation as the quote-index lookup path so the DB
     // query uses the same "peer:<id>" / "group:<id>" format stored by
     // `find_or_create_vctx` / `resolve_send_context`.
-    let peer_user_id = {
-        let group_id = msg.group_id.as_deref().unwrap_or_default();
-        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
-        if !group_id.is_empty() {
-            format!("group:{group_id}")
-        } else if !from_user_id.is_empty() {
-            format!("peer:{from_user_id}")
-        } else {
-            String::new()
-        }
-    };
-    if peer_user_id.is_empty() {
-        return None;
-    }
+    let peer_user_id = derive_peer_scope(msg)?;
     // Use the first 48 chars as prefix (same constant as CONTENT_PREFIX_CHARS in quote_route).
     let prefix: String = quoted_text.trim().chars().take(48).collect();
     if prefix.is_empty() {
         return None;
     }
-    match state
-        .store
-        .find_assistant_message_by_content(&peer_user_id, &prefix)
-        .await
+    // Guard against all-whitespace prefix (e.g. quoted_text built entirely of
+    // non-breaking spaces): after the outer trim, an all-whitespace 48-char
+    // slice would still trigger a full-table LIKE '% % … %' scan.
+    if prefix.trim().is_empty() {
+        return None;
+    }
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state
+            .store
+            .find_assistant_message_by_content(&peer_user_id, &prefix),
+    )
+    .await
     {
-        Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
+        Ok(Ok(Some((vtoken, session_name)))) if !vtoken.is_empty() => {
             let (name, label) = {
                 let registry = state.clients.registry.read().await;
                 registry
@@ -455,7 +424,7 @@ async fn resolve_quote_from_db(
                 peer = %peer_user_id,
                 vtoken = %crate::redact_token(&vtoken),
                 session = ?session_name,
-                "quote index miss — resolved via DB message history"
+                "resolved via DB message history"
             );
             Some(QuoteOrigin::Client {
                 vtoken,
@@ -464,17 +433,20 @@ async fn resolve_quote_from_db(
                 session_name,
             })
         }
-        Ok(_) => None,
-        Err(e) => {
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
             warn!(error = %e, "DB quote lookup failed, falling back to footer");
+            None
+        }
+        Err(_) => {
+            warn!(peer = %peer_user_id, "timeout in DB content quote lookup");
             None
         }
     }
 }
 
 /// Fallback quote resolver: parse the origin footer from the quoted message text and look up
-/// the backend by name in the client registry. Used when the in-memory quote index is cold
-/// (e.g. after a Hub restart).
+/// the backend by name in the client registry.
 ///
 /// Handles both footer formats:
 /// - Full: `---\nilink-claude · at-20260615-114019`  → name = "ilink-claude"
@@ -485,7 +457,7 @@ async fn resolve_quote_from_footer(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let (name, session_name) = quote_route::QuoteRouteIndex::footer_from_user_quote(msg)?;
+    let (name, session_name) = quote_route::footer_from_user_quote(msg)?;
 
     // Fast path: the footer contains an explicit backend name.
     {
@@ -494,7 +466,7 @@ async fn resolve_quote_from_footer(
             debug!(
                 backend = %name,
                 session = ?session_name,
-                "quote index miss — resolved via footer fallback"
+                "resolved via footer fallback"
             );
             return Some(QuoteOrigin::Client {
                 vtoken: client.vtoken.clone(),
@@ -513,23 +485,31 @@ async fn resolve_quote_from_footer(
         session_name.as_deref()
     };
     let skey = session_key?;
-    let vctx = {
-        let group_id = msg.group_id.as_deref().unwrap_or_default();
-        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
-        let scope = if !group_id.is_empty() {
-            format!("group:{group_id}")
-        } else if !from_user_id.is_empty() {
-            format!("peer:{from_user_id}")
-        } else {
+    let scope = derive_peer_scope(msg)?;
+    let vctx = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.store.find_vctx_for_scope(&scope),
+    )
+    .await
+    {
+        Ok(Ok(Some(v))) => v,
+        Ok(Ok(None)) => return None,
+        Ok(Err(e)) => {
+            warn!(error = %e, "DB scope lookup failed in footer resolver");
             return None;
-        };
-        match state.store.find_vctx_for_scope(&scope).await {
-            Ok(Some(v)) => v,
-            _ => return None,
+        }
+        Err(_) => {
+            warn!(scope = %scope, "timeout in footer resolver scope lookup");
+            return None;
         }
     };
-    match state.store.find_vtoken_for_session(&vctx, skey).await {
-        Ok(Some(vtoken)) => {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state.store.find_vtoken_for_session(&vctx, skey),
+    )
+    .await
+    {
+        Ok(Ok(Some(vtoken))) => {
             let (client_name, label) = {
                 let registry = state.clients.registry.read().await;
                 registry
@@ -540,7 +520,7 @@ async fn resolve_quote_from_footer(
             debug!(
                 session = %skey,
                 vtoken = %crate::redact_token(&vtoken),
-                "quote index miss — resolved via persona-footer session lookup"
+                "resolved via persona-footer session lookup"
             );
             Some(QuoteOrigin::Client {
                 vtoken,
@@ -549,7 +529,15 @@ async fn resolve_quote_from_footer(
                 session_name: Some(skey.to_string()),
             })
         }
-        _ => None,
+        Ok(Ok(None)) => None,
+        Ok(Err(e)) => {
+            warn!(error = %e, "DB session lookup failed in footer resolver");
+            None
+        }
+        Err(_) => {
+            warn!(session = %skey, "timeout in footer resolver session lookup");
+            None
+        }
     }
 }
 
@@ -799,4 +787,482 @@ fn build_no_backend_reply(user_text: Option<&str>) -> String {
     }
 
     messages::NO_BACKEND_ONLINE.to_string()
+}
+
+// ─── Dispatch tests ───────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{AdminConfig, InMemoryQueue};
+    use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
+    use crate::ilink::UpstreamClient;
+    use crate::store::Store;
+
+    async fn make_state_with_client() -> (Arc<HubState>, String) {
+        let store = Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let upstream =
+            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"));
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = HubState::new(
+            upstream,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        );
+        let (_, vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("test-backend".to_string(), None, None);
+        (state, vtoken)
+    }
+
+    /// Build a WeixinMessage that carries a quote-reply ref_msg with the given
+    /// `create_time_ms` and optional quoted text.
+    fn make_quote_msg(
+        from_user_id: &str,
+        ref_create_time_ms: i64,
+        quoted_text: Option<&str>,
+    ) -> WeixinMessage {
+        let mut mi_obj = serde_json::Map::new();
+        mi_obj.insert(
+            "create_time_ms".to_string(),
+            serde_json::Value::Number(ref_create_time_ms.into()),
+        );
+        if let Some(t) = quoted_text {
+            mi_obj.insert("text_item".to_string(), serde_json::json!({"text": t}));
+        }
+
+        let extra = serde_json::json!({
+            "ref_msg": {
+                "message_item": serde_json::Value::Object(mi_obj)
+            }
+        });
+
+        let item = MessageItem {
+            item_type: Some(1),
+            text_item: Some(TextItem {
+                text: Some("this is the follow-up reply".to_string()),
+            }),
+            extra,
+            ..Default::default()
+        };
+
+        WeixinMessage {
+            from_user_id: Some(from_user_id.to_string()),
+            item_list: Some(Arc::new(vec![item])),
+            ..Default::default()
+        }
+    }
+
+    /// F5 / AT1: @mention → quote-reply L1 timestamp routing.
+    ///
+    /// Inserts an assistant message for peer:user1 with session_name="at-20260704-103000000".
+    /// Constructs a WeixinMessage whose ref_msg.create_time_ms falls within ±10 s of the
+    /// inserted row's timestamp. Verifies that `resolve_quote_from_timestamp` returns the
+    /// correct QuoteOrigin with `session_name = Some("at-20260704-103000000")`.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l1_timestamp_routing() {
+        let (state, vtoken) = make_state_with_client().await;
+        let peer_user_id = "peer:user1";
+        let session_name = "at-20260704-103000000";
+
+        state
+            .store
+            .save_message(
+                "vctx-test",
+                Some(&vtoken),
+                session_name,
+                peer_user_id,
+                "assistant",
+                "Hello from @mention session",
+            )
+            .await
+            .expect("save message");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        // Build a quote-reply message with create_time_ms at the current second —
+        // within the ±10 s window used by find_assistant_message_by_timestamp.
+        let msg = make_quote_msg("user1", now_ms, None);
+        let result = resolve_quote_from_timestamp(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "L1 timestamp lookup must find the at-mention session"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                session_name: sn,
+                vtoken: vt,
+                ..
+            } => {
+                assert_eq!(sn, Some(session_name.to_string()));
+                assert_eq!(vt, vtoken);
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// F5 / AT1 (variant): @mention → quote-reply L2 content-prefix routing.
+    ///
+    /// Inserts an assistant message with a known content prefix. Constructs a WeixinMessage
+    /// whose ref_msg carries that same text via text_item. Verifies that
+    /// `resolve_quote_from_db` returns QuoteOrigin::Client with the correct session_name.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l2_content_routing() {
+        let (state, vtoken) = make_state_with_client().await;
+        let peer_user_id = "peer:user1";
+        let session_name = "at-20260704-103000000";
+        let content = "Hello from @mention session — this content prefix will match the quote";
+
+        state
+            .store
+            .save_message(
+                "vctx-test",
+                Some(&vtoken),
+                session_name,
+                peer_user_id,
+                "assistant",
+                content,
+            )
+            .await
+            .expect("save message");
+
+        // Use a very old timestamp so L1 timestamp lookup won't match; only L2 content
+        // lookup should succeed.
+        let old_ms = 1_000_000i64;
+        let msg = make_quote_msg("user1", old_ms, Some(content));
+        let result = resolve_quote_from_db(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "L2 content lookup must find the at-mention session"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                session_name: sn, ..
+            } => assert_eq!(sn, Some(session_name.to_string())),
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// F5 / AT2: @mention → quote-reply L3 footer routing.
+    ///
+    /// Registers a client named "ilink-claude". Constructs a WeixinMessage whose
+    /// ref_msg.text_item carries a footer `---\nilink-claude · at-20260704-103000`.
+    /// Uses a very old timestamp so L1 timestamp and L2 content-prefix DB lookups
+    /// won't match. Verifies that `resolve_quote_from_footer` returns
+    /// `QuoteOrigin::Client` with `session_name = Some("at-20260704-103000")` and
+    /// the correct vtoken for the registered "ilink-claude" client.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the specific client that the footer references by name.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        let session_name = "at-20260704-103000";
+        // The footer format is: `\n---\n{name} · {session}`.
+        // `parse_footer_from_quoted_text` extracts name="ilink-claude" and
+        // session=Some("at-20260704-103000") from this footer.
+        let quoted_text = format!("Some reply text\n\n---\nilink-claude · {session_name}");
+
+        // Very old timestamp — ensures L1 timestamp lookup won't match any DB row.
+        let old_ms = 1_000_000i64;
+        let msg = make_quote_msg("user1", old_ms, Some(&quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "L3 footer lookup must find the ilink-claude client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match the registered ilink-claude client"
+                );
+                assert_eq!(
+                    sn,
+                    Some(session_name.to_string()),
+                    "session_name must be parsed from the footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT3: LIKE injection protection in content-prefix lookup.
+    ///
+    /// Inserts two rows — one with content containing a literal `%` character, another
+    /// that would match if `%` were interpreted as a LIKE wildcard. Verifies that
+    /// `resolve_quote_from_db` returns only the exact-prefix match.
+    #[tokio::test]
+    async fn like_injection_protection_in_content_lookup() {
+        let (state, vtoken) = make_state_with_client().await;
+        let peer_user_id = "peer:user1";
+
+        // "100%bonus plan" — contains a literal % that must NOT become a wildcard.
+        state
+            .store
+            .save_message(
+                "vctx-test",
+                Some(&vtoken),
+                "session-percent",
+                peer_user_id,
+                "assistant",
+                "100%bonus plan",
+            )
+            .await
+            .expect("save message: percent row");
+
+        // "100xplan" — would match LIKE '100%' if % is unescaped.
+        state
+            .store
+            .save_message(
+                "vctx-test",
+                Some(&vtoken),
+                "session-x",
+                peer_user_id,
+                "assistant",
+                "100xplan",
+            )
+            .await
+            .expect("save message: x row");
+
+        // Quote the first row.
+        let msg = make_quote_msg("user1", 1_000_000, Some("100%bonus plan"));
+        let result = resolve_quote_from_db(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "LIKE lookup must find the percent-content row"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                session_name: sn, ..
+            } => assert_eq!(
+                sn,
+                Some("session-percent".to_string()),
+                "must return the percent row, not the wildcard-hit x row"
+            ),
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT1: Persona-mode footer slow path.
+    ///
+    /// When the footer is `---\nat-20260704-103000` (name starts with `at-`, no explicit
+    /// backend name), `resolve_quote_from_footer` must take the slow path: look up the vctx
+    /// via `find_vctx_for_scope`, then look up the vtoken via `find_vtoken_for_session`.
+    /// Verifies that a pre-seeded backend_sessions_v2 row is found and the correct
+    /// QuoteOrigin is returned.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_persona_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the named client that owns this persona session.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // Create a vctx for "user1" so the scope lookup can find it.
+        let vctx = state
+            .store
+            .find_or_create_vctx("user1", None, "ctx-at1")
+            .await
+            .expect("find_or_create_vctx");
+
+        // Seed the backend session entry that the slow path will resolve.
+        state
+            .store
+            .set_backend_session(
+                &vctx,
+                &ilink_claude_vtoken,
+                "at-20260704-103000",
+                "cli-uuid",
+            )
+            .await
+            .expect("set_backend_session");
+
+        // Footer contains only the session identifier (no explicit backend name).
+        // parse_footer_from_quoted_text will return name="at-20260704-103000", session=Some("at-20260704-103000").
+        let quoted_text = "body\n\n---\nat-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "persona-mode footer slow path must resolve the session to a client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match the registered ilink-claude client"
+                );
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be the at-key from the footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT2: Unknown backend name in footer returns None.
+    ///
+    /// When the footer is `---\nghost-client · at-20260704-103000` and "ghost-client" is not
+    /// in the registry (and no matching session exists in the DB), `resolve_quote_from_footer`
+    /// must return `None` without panicking.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_unregistered_name_returns_none() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // "ghost-client" is deliberately never registered.
+        let quoted_text = "body\n\n---\nghost-client · at-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_none(),
+            "unregistered backend name must yield None, not panic"
+        );
+    }
+
+    /// AT3: Full L1→L2→L3 cascade fallback.
+    ///
+    /// With an empty message history (L1 timestamp miss, L2 content miss), a quote-reply
+    /// whose footer names a registered backend must fall through all three layers and be
+    /// resolved by L3. Exercises the cascade block at dispatch.rs lines 93-103.
+    #[tokio::test]
+    async fn quote_reply_l3_full_cascade_fallback() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the specific client the footer references.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // DB is empty — L1 and L2 will both miss.
+        let old_ms = 1_000_000i64;
+        let quoted_text = "body\n\n---\nilink-claude · at-20260704-103000";
+        let msg = make_quote_msg("user1", old_ms, Some(quoted_text));
+
+        // L1: timestamp lookup — must return None (no messages in DB).
+        let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+        assert!(from_ts.is_none(), "L1 must miss on empty DB");
+
+        // L2: content-prefix DB lookup — must return None (no messages in DB).
+        let from_db = resolve_quote_from_db(&state, &msg).await;
+        assert!(from_db.is_none(), "L2 must miss on empty DB");
+
+        // L3: footer lookup — must succeed because "ilink-claude" is registered.
+        let from_footer = resolve_quote_from_footer(&state, &msg).await;
+        assert!(
+            from_footer.is_some(),
+            "L3 footer lookup must succeed after L1 and L2 both miss"
+        );
+        match from_footer.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                name: n,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(vt, ilink_claude_vtoken, "vtoken must match ilink-claude");
+                assert_eq!(n, "ilink-claude", "name must be ilink-claude");
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be parsed from footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT4: Three-part footer with label — `ilink-claude · office · at-20260704-103000`.
+    ///
+    /// Verifies that `resolve_quote_from_footer` correctly extracts `name = "ilink-claude"`
+    /// and `session_name = Some("at-20260704-103000")` when a label segment is present in
+    /// the middle, and that the label does not interfere with the registry lookup.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_with_label_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the client whose name appears in the first footer segment.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // Three-part footer: name · label · session.
+        let quoted_text = "body\n\n---\nilink-claude · office · at-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "three-part footer must resolve the named client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                name: n,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match ilink-claude (first footer segment)"
+                );
+                assert_eq!(n, "ilink-claude", "name must be the first footer segment");
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be the last footer segment"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
 }

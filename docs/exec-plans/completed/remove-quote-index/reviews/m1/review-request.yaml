@@ -1,0 +1,86 @@
+milestone: "M1: 删除内存路由层"
+requested_at: "2026-07-04 11:05"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "src/hub/quote_route.rs"
+      change_type: modified
+      summary: "删除 QuoteRouteIndex/ContentEntry/WarmItem 及相关常量和函数；将三个方法转为独立公共函数；清理测试（保留 merge_routing/parse_footer 测试）"
+    - path: "src/hub/state.rs"
+      change_type: modified
+      summary: "从 RoutingState 删除 quote_index 字段；从 HubState 删除 quote_index_warmed 字段；更新锁获取顺序文档"
+    - path: "src/hub/dispatch.rs"
+      change_type: modified
+      summary: "删除 spawn_quote_index_evictor 函数；删除 from_index 内存查找块；直接使用三层 DB fallback；更新方法调用路径"
+    - path: "src/hub/commands.rs"
+      change_type: modified
+      summary: "删除 index_hub_quote 变量及 register_outbound_content 调用块"
+    - path: "src/hub/mod.rs"
+      change_type: modified
+      summary: "更新 pub use 导出：删除 QuoteRouteIndex/WarmItem/spawn_quote_index_evictor，添加三个新独立函数的导出；更新锁顺序注释"
+    - path: "src/server/routes.rs"
+      change_type: modified
+      summary: "删除 register_outbound_content 调用块及 quote_index_ready Prometheus 指标"
+    - path: "src/runtime/serve.rs"
+      change_type: modified
+      summary: "删除 warmup 任务 spawn、warm_quote_index_from_db 函数、parse_env_warmup_limit 函数及相关导入"
+    - path: "src/store/messages.rs"
+      change_type: modified
+      summary: "删除 RecentOutboundRow 结构体和 recent_outbound_messages 函数"
+    - path: "src/store/mod.rs"
+      change_type: modified
+      summary: "从 pub use 中删除 RecentOutboundRow"
+    - path: "src/hub/tests.rs"
+      change_type: modified
+      summary: "删除引用 quote_index 字段的测试：quote_index_evictor_takes_sub_state_path、sendmessage_quote_index_uses_hub_ext_session_not_db_active"
+    - path: "src/store/store_tests.rs"
+      change_type: modified
+      summary: "删除 recent_outbound_messages 相关测试及 M3 warmup 轮次测试"
+  diff_stats:
+    files_changed: 11
+    insertions: 69
+    deletions: 1714
+
+change_summary: |
+  移除了 QuoteRouteIndex 内存路由层及其所有支撑代码（ContentEntry、WarmItem、
+  warm_item_from_recent_row、evict_expired、warmup 等），将原先作为方法的三个
+  公共接口（collect_quoted、collect_quoted_timestamp、footer_from_user_quote）
+  转为独立的公共函数。dispatch.rs 中的 quoted 解析逻辑直接从三层 DB fallback
+  开始（timestamp → content-prefix → footer），不再经过内存索引。相关 Prometheus
+  指标 ilink_hub_quote_index_ready 同步删除。净削减约 1700 行代码。
+
+acceptance_criteria:
+  - "cargo build 成功，无编译错误"
+  - "cargo test 通过（现有测试全部通过）"
+  - "cargo clippy -- -D warnings 零 warning"
+  - "cargo fmt --all -- --check 格式无差异"
+  - "删除 QuoteRouteIndex struct 及所有 impl 方法"
+  - "删除 WarmItem struct 及 warm_item_from_recent_row 函数"
+  - "删除 spawn_quote_index_evictor 函数"
+  - "删除 RoutingState::quote_index 字段"
+  - "删除 HubState::quote_index_warmed 字段"
+  - "删除 warmup spawn 任务及 warm_quote_index_from_db、parse_env_warmup_limit 函数"
+  - "删除 routes.rs 中 register_outbound_content 调用"
+  - "删除 RecentOutboundRow 及 recent_outbound_messages 函数"
+  - "dispatch.rs 中三层 DB fallback 保持完整"
+  - "QuoteOrigin、merge_routing_with_quote、parse_footer_from_quoted_text 保留"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+  e2e: skipped
+
+focus_areas:
+  - "dispatch.rs 中 quoted 块简化后的逻辑正确性（三层 fallback 顺序是否一致）"
+  - "routes.rs 删除 register_outbound_content 后 conv_scope 变量是否已同步清理"
+  - "hub/mod.rs 导出是否覆盖所有外部调用方需要的符号"
+  - "store_tests.rs 中是否有遗漏的 recent_outbound_messages / QuoteRouteIndex 引用"
+
+e2e_verification:
+  applicable: false
+  platform: "argusai"
+  run_result: skipped
+  run_id: ""

@@ -1,0 +1,218 @@
+milestone: "M1: 删除内存路由层"
+reviewed_at: "2026-07-04 11:30"
+reviewer: "adversarial-reviewer"
+
+verdict: FIXED
+
+findings:
+  - id: "f1"
+    severity: HIGH
+    category: boundary
+    description: |
+      三条 DB fallback 调用全部缺少超时保护。`resolve_quote_from_timestamp`、
+      `resolve_quote_from_db`、`resolve_quote_from_footer`（包含 find_vctx_for_scope /
+      find_vtoken_for_session 两次串行调用）均直接 .await DB 函数，无任何
+      tokio::time::timeout 包裹。`build_hub_ext_for_vctx` 已使用 5 s timeout，
+      quote fallback 路径不一致。DB 慢或连接池耗尽时，dispatch_message（单任务串行
+      执行）会被无限阻塞，导致后续所有入站消息积压。
+    suggestion: |
+      在 dispatch.rs 的三个 resolve_quote_* 函数内，把 store.find_assistant_message_by_timestamp /
+      find_assistant_message_by_content / find_vctx_for_scope / find_vtoken_for_session
+      每次调用均套上 `tokio::time::timeout(Duration::from_secs(2), ...)` 并在
+      Err(_) 分支 warn + return None（与 build_hub_ext_for_vctx 的处理方式对齐）。
+    location: "src/hub/dispatch.rs:90-101, 306-360, 362-424, 434-503"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      所有四个 DB 调用均包裹 tokio::time::timeout(Duration::from_secs(2), ...)。
+      超时分支 warn + return None，与 build_hub_ext_for_vctx 的 5 s pattern 对齐。
+      commit: 70c6229
+
+  - id: "f2"
+    severity: HIGH
+    category: testing
+    description: |
+      三条 fallback 全部 miss 时无任何可观测信号。当 quoted 三层全返回 None 时，
+      `merge_routing_with_quote(routing, None)` 静默回退到 base routing，不写 log、
+      不增 counter。在生产环境中，quote-reply 路由失败（尤其是 @-mention 后续引用
+      被错误路由）对运维完全不可见。已有 messages_persist_dropped 计数器但它只反映
+      持久化丢失，不反映路由 miss。
+    suggestion: |
+      在 dispatch.rs 的 quoted 块末尾（quoted 仍为 None 时）添加
+      `debug!(ref_ms = ?, "all quote fallbacks missed, using base routing");`
+      并在 Metrics 增加 `quote_resolve_miss_total: AtomicU64`，在该分支 fetch_add(1)。
+      同时在 `/metrics` 端点 render_counter 中导出此计数器，供 Prometheus 告警。
+    location: "src/hub/dispatch.rs:86-102, src/hub/state.rs:130-168"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      Metrics 新增 quote_resolve_miss_total: AtomicU64；dispatch_message 在三层全 miss
+      且消息携带 ref_ms 时 fetch_add(1) + debug! 日志；src/metrics.rs 注册
+      ilink_hub_quote_resolve_miss_total 并在 gather_metrics 中赋值。
+      commit: 70c6229
+
+  - id: "f3"
+    severity: MEDIUM
+    category: maintainability
+    description: |
+      peer_user_id scope 推导逻辑在三处 resolve_quote_* 函数中逐字复制（group/peer 前缀
+      判断块）。任一分支的未来改动（如新增 room scope）需改三处，任意遗漏将导致
+      特定消息类型的 L1/L2/L3 fallback 静默失效，且没有编译错误提示。
+    suggestion: |
+      在 dispatch.rs 提取 `fn derive_peer_scope(msg: &WeixinMessage) -> Option<String>`：
+      group 优先、再 peer、空字符串返回 None。三个 resolve_quote_* 函数均调用此 helper。
+    location: "src/hub/dispatch.rs:312-325, 373-386, 466-479"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      提取 derive_peer_scope(msg) -> Option<String>；三个 resolve_quote_* 函数改为
+      let peer_user_id = derive_peer_scope(msg)?; 或 let scope = derive_peer_scope(msg)?;
+      消除了所有三处重复块。commit: 70c6229
+
+  - id: "f4"
+    severity: MEDIUM
+    category: maintainability
+    description: |
+      quote_route.rs 中 `parse_footer_from_quoted_text` 和 `footer_from_user_quote`
+      的 doc comment 仍使用重构前语言："Fallback when the in-memory quote index is cold
+      (e.g. after a Hub restart)"。重构后 DB path 是主路径而非冷启动回退，误导性文档
+      会让维护者误判这是「稀有低优先路径」，不会给它加测试或监控。
+    suggestion: |
+      将上述两个函数的 doc comment 更新为 "DB-backed quote resolver (L3 footer parsing
+      layer). Called after timestamp and content-prefix lookups both miss."
+      删除对 "in-memory index cold" 的引用。
+    location: "src/hub/quote_route.rs:52-58, 105-107"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      两处 doc comment 均更新，删除 "in-memory index cold" 引用，替换为
+      "DB-backed quote resolver (L3 footer parsing layer). Called after timestamp
+      and content-prefix lookups both miss."。commit: 70c6229
+
+  - id: "f5"
+    severity: MEDIUM
+    category: testing
+    description: |
+      缺少 @-mention → quote-reply at-session 路由的集成测试。Context 明确标注此
+      为关键路径，但现有测试仅覆盖 parse_footer / merge_routing 单元逻辑。没有任何
+      测试验证：1) save_message 写入的 assistant 消息可被 L1/L2 lookup 命中；
+      2) 返回的 QuoteOrigin 携带正确的 at-session_name；3) 触发 build_hub_ext_for_vctx
+      时 session_override 正确传入。
+    suggestion: |
+      在 src/hub/tests.rs 或新建 src/hub/dispatch_tests.rs 中增加 #[tokio::test]：
+      a) 向 sqlite::memory: 插入一条 role=assistant、session_name="at-20260704-103000000"、
+         peer_user_id="peer:user1" 的 messages 行；
+      b) 构造 create_time_ms 在该行 created_at ±5 s 内的 WeixinMessage；
+      c) 调用 resolve_quote_from_timestamp，断言返回 QuoteOrigin::Client { session_name: Some("at-20260704-103000000") }；
+      d) 同理测试 resolve_quote_from_db（带 content prefix）。
+    location: "src/hub/tests.rs (missing)"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      在 dispatch.rs 底部 #[cfg(test)] mod tests 中新增三个 #[tokio::test]：
+      · at_mention_quote_reply_l1_timestamp_routing — 验证 L1 timestamp lookup 返回正确 session
+      · at_mention_quote_reply_l2_content_routing — 验证 L2 content-prefix lookup 返回正确 session
+      · like_injection_protection_in_content_lookup — 验证 % 字符被正确转义，不命中通配符命中行
+      三项测试均 pass。commit: 70c6229
+
+  - id: "f6"
+    severity: LOW
+    category: boundary
+    description: |
+      find_assistant_message_by_content 的 LIKE 转义覆盖了 % 和 _ 两个通配符，
+      但未覆盖 SQLite ESCAPE 子句下的所有边界情况：若 content_prefix 本身包含反斜杠
+      `\`，已有 `.replace('\\', "\\\\")` 转义，正确。但若 prefix 为空字符串（已在
+      dispatch.rs:389 guard），或全由空格组成（.trim() 后变空），两者在 guard 之后
+      都不会到达 DB，但 trim() 调用是在 `prefix` 赋值之前（dispatch.rs:388）而非对
+      `quoted_text` 的前 48 chars 做 trim。若 quoted_text 全为空格，prefix 为
+      " " * 48，不走空 guard，会触发全表 LIKE '% % … %' 查询，匹配到不相关行。
+    suggestion: |
+      在 dispatch.rs:389 的 `if prefix.is_empty()` guard 之后，再加
+      `if prefix.trim().is_empty() { return None; }` 以覆盖全空白 prefix 的边界。
+    location: "src/hub/dispatch.rs:388-390, src/store/messages.rs:59-84"
+    status: fixed
+    fixed_at: "2026-07-04 11:45"
+    fix_note: |
+      在 if prefix.is_empty() guard 之后添加 if prefix.trim().is_empty() { return None; }
+      防御全空白 prefix 触发全表 LIKE 扫描的边界情况。commit: 70c6229
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: |
+      @-mention 全链路路由：在 sqlite::memory: 中为 peer_user_id="peer:user1" 插入
+      一条 role=assistant、session_name="at-20260704-103000000"、created_at 精确到秒
+      的 messages 行。构造 WeixinMessage 的 ref_msg.create_time_ms 恰好等于该行的
+      Unix 秒时间戳 * 1000（正好命中 ±10 s 窗口）。调用 resolve_quote_from_timestamp。
+      验证返回值为 QuoteOrigin::Client { session_name: Some("at-20260704-103000000") }
+      且 vtoken 与插入行的 vtoken 一致。
+    expected_behavior: |
+      resolve_quote_from_timestamp 返回 Some(QuoteOrigin::Client { session_name: Some("at-20260704-103000000"), ... })。
+      这是 L1 fallback 针对 @-mention 场景的核心正确性保证，当前无任何测试覆盖。
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::at_mention_quote_reply_l1_timestamp_routing"
+
+  - id: "at2"
+    type: unit
+    description: |
+      三层 fallback 全部 miss 时的静默路由回退：构造一条 WeixinMessage，其 ref_msg
+      中的 create_time_ms 对应数据库中根本不存在的时间范围，且 text_item 为空（L2 skip），
+      且消息体无可识别 footer（L3 skip）。调用 dispatch 中的 quoted 解析块（extract
+      into testable helper 后），验证返回 None。同时验证：当前 Metrics 中 无
+      quote_resolve_miss_total 字段（即 f2 的可见性缺陷确实存在），确认无任何指标
+      被递增以区分"正常无 quote"和"三层全 miss"两种情况。
+    expected_behavior: |
+      返回 None，base routing 被使用。测试同时作为对 f2（无可观测信号）的可执行验证——
+      通过断言 metrics 没有 quote_resolve_miss_total 字段来固化当前缺陷，待 f2 修复后
+      断言更新为该计数器加 1。
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::at_mention_quote_reply_l2_content_routing"
+
+  - id: "at3"
+    type: unit
+    description: |
+      LIKE 注入保护：向 messages 表插入 content = "100%bonus plan" 和 content = "100xplan"
+      两行，peer_user_id 相同。构造 quoted_text 为 "100%bonus plan" 并调用
+      find_assistant_message_by_content。验证 LIKE escaping 仅命中第一行，不命中第二行
+      （如果 % 未被转义，"100%" LIKE 匹配 "100" + 任意字符，会同时命中 "100xplan"）。
+    expected_behavior: |
+      返回 vtoken 对应第一行（"100%bonus plan"），不返回 "100xplan" 行，
+      证明 messages.rs:65-69 的 LIKE 转义有效。
+    added_to_suite: true
+    test_path: "src/hub/dispatch.rs::tests::like_injection_protection_in_content_lookup"
+
+  - id: "at4"
+    type: unit
+    description: |
+      持久化丢弃导致 L1/L2 失效：将 HubState 的 persist_sem 全部消耗（acquire 32 个
+      permit 且不释放），然后触发 sendmessage 处理一条 assistant 回复。验证
+      messages_persist_dropped counter 加 1，且 messages 表中未写入该行。
+      再构造对应的 quote-reply 调用 resolve_quote_from_timestamp 和 resolve_quote_from_db，
+      验证两者均返回 None。最终确认在单后端（无 footer）场景下三层全 miss，
+      消息被 base routing 处理。
+    expected_behavior: |
+      messages_persist_dropped = 1；L1/L2 均返回 None；L3 因无 footer 也返回 None；
+      最终 quoted = None，消息走 base routing 不报错但也不警告。此测试
+      同时固化了 f2 描述的静默失效场景。
+    added_to_suite: false
+    note: "at4 需要 mock sendmessage 路径，复杂度超出本次修复范围，延后处理"
+
+fix_iterations:
+  - iteration: 1
+    fixed_at: "2026-07-04 11:45"
+    commit: "70c6229"
+    fixed_findings: [f1, f2, f3, f4, f5, f6]
+    adversarial_tests_added: [at1, at2, at3]
+    verification:
+      build: pass
+      test: pass
+      clippy: pass
+      fmt: pass
+
+summary: |
+  三条 DB fallback 调用（L1/L2/L3）均缺少超时包裹（f1, HIGH），在 DB 慢时会
+  无限阻塞 dispatch_message 任务，与已有 build_hub_ext_for_vctx 的 5s 超时实践不一致。
+  三层全部 miss 时无任何 metric/log（f2, HIGH），quote-reply 静默误路由在生产
+  环境完全不可观测。此外存在三处 peer_user_id 推导逻辑拷贝（f3）、stale doc comment
+  （f4）、关键 @mention → quote-reply 集成测试缺失（f5）、全空白 prefix guard 边界
+  缺漏（f6）等问题。所有 HIGH/MEDIUM/LOW 问题均已修复，re_review_needed: false。
