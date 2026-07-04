@@ -14,26 +14,6 @@ use crate::store::Store;
 // modules, …) are re-exported by the `hub` module.
 use super::*;
 
-// ─── Quote index background eviction ─────────────────────────────────────────
-
-pub fn spawn_quote_index_evictor(state: Arc<HubState>) {
-    let mut shutdown = state.ilink.shutdown.clone();
-    tokio::spawn(async move {
-        const EVICT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() { return; }
-                }
-                _ = tokio::time::sleep(EVICT_INTERVAL) => {
-                    state.routing.quote_index.lock().await.evict_expired();
-                }
-            }
-        }
-    });
-}
-
 // ─── Message Dispatcher ───────────────────────────────────────────────────────
 
 pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: mpsc::Receiver<WeixinMessage>) {
@@ -104,47 +84,18 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
     };
 
     let quoted = {
-        // Normalise the conversation scope to match what `find_or_create_vctx`
-        // stores in `context_token_map.peer_user_id` and what `resolve_send_context`
-        // returns for the outbound registration path: "group:<id>" for group chats,
-        // "peer:<id>" for DMs.  Previously we used the raw `from_user_id` ("o9cq80…")
-        // which never matched the "peer:o9cq80…" form used during registration →
-        // every quote-reply silently missed the in-memory index and the DB fallback.
-        let scope = {
-            let group_id = msg.group_id.as_deref().unwrap_or_default();
-            let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
-            if !group_id.is_empty() {
-                format!("group:{group_id}")
-            } else if !from_user_id.is_empty() {
-                format!("peer:{from_user_id}")
-            } else {
-                String::new()
-            }
-        };
-        // Only the in-memory index lookup needs the `quote_index` lock. Release it
-        // BEFORE the DB/footer fallbacks: those await on the store and registry, and
-        // holding `quote_index` across them would serialise every quote-routed message
-        // and block the outbound index (sendmessage) and the periodic evictor.
-        let from_index = {
-            let mut q = state.routing.quote_index.lock().await;
-            q.resolve_user_quote(&scope, &msg)
-        };
-        if from_index.is_some() {
-            from_index
+        // Try timestamp lookup first (most reliable — iLink always provides
+        // create_time_ms even when text is absent), then content-prefix DB lookup,
+        // then footer text parsing as last resort.
+        let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+        if from_ts.is_some() {
+            from_ts
         } else {
-            // Cold index (e.g. after a Hub restart): try timestamp lookup first (most
-            // reliable — iLink always provides create_time_ms even when text is absent),
-            // then content-prefix DB lookup, then footer text parsing as last resort.
-            let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
-            if from_ts.is_some() {
-                from_ts
+            let from_db = resolve_quote_from_db(&state, &msg).await;
+            if from_db.is_some() {
+                from_db
             } else {
-                let from_db = resolve_quote_from_db(&state, &msg).await;
-                if from_db.is_some() {
-                    from_db
-                } else {
-                    resolve_quote_from_footer(&state, &msg).await
-                }
+                resolve_quote_from_footer(&state, &msg).await
             }
         }
     };
@@ -356,7 +307,7 @@ async fn resolve_quote_from_timestamp(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let ref_ms = quote_route::QuoteRouteIndex::collect_quoted_timestamp(msg)?;
+    let ref_ms = quote_route::collect_quoted_timestamp(msg)?;
     let ref_unix_secs = ref_ms / 1000;
     let peer_user_id = {
         let group_id = msg.group_id.as_deref().unwrap_or_default();
@@ -391,7 +342,7 @@ async fn resolve_quote_from_timestamp(
                 vtoken = %crate::redact_token(&vtoken),
                 session = ?session_name,
                 ref_unix_secs,
-                "quote index miss — resolved via timestamp lookup"
+                "resolved via timestamp lookup"
             );
             Some(QuoteOrigin::Client {
                 vtoken,
@@ -409,13 +360,13 @@ async fn resolve_quote_from_timestamp(
 }
 
 /// DB-backed quote resolver: query the messages table by peer_user_id + content prefix.
-/// Runs when the in-memory QuoteRouteIndex is cold. Returns the vtoken + session_name
-/// recorded when the assistant message was originally sent, independent of footer format.
+/// Returns the vtoken + session_name recorded when the assistant message was originally sent,
+/// independent of footer format.
 async fn resolve_quote_from_db(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let (quoted_text, _) = quote_route::QuoteRouteIndex::collect_quoted(msg)?;
+    let (quoted_text, _) = quote_route::collect_quoted(msg)?;
     // Use the same scope normalisation as the quote-index lookup path so the DB
     // query uses the same "peer:<id>" / "group:<id>" format stored by
     // `find_or_create_vctx` / `resolve_send_context`.
@@ -455,7 +406,7 @@ async fn resolve_quote_from_db(
                 peer = %peer_user_id,
                 vtoken = %crate::redact_token(&vtoken),
                 session = ?session_name,
-                "quote index miss — resolved via DB message history"
+                "resolved via DB message history"
             );
             Some(QuoteOrigin::Client {
                 vtoken,
@@ -473,8 +424,7 @@ async fn resolve_quote_from_db(
 }
 
 /// Fallback quote resolver: parse the origin footer from the quoted message text and look up
-/// the backend by name in the client registry. Used when the in-memory quote index is cold
-/// (e.g. after a Hub restart).
+/// the backend by name in the client registry.
 ///
 /// Handles both footer formats:
 /// - Full: `---\nilink-claude · at-20260615-114019`  → name = "ilink-claude"
@@ -485,7 +435,7 @@ async fn resolve_quote_from_footer(
     state: &Arc<HubState>,
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<QuoteOrigin> {
-    let (name, session_name) = quote_route::QuoteRouteIndex::footer_from_user_quote(msg)?;
+    let (name, session_name) = quote_route::footer_from_user_quote(msg)?;
 
     // Fast path: the footer contains an explicit backend name.
     {
@@ -494,7 +444,7 @@ async fn resolve_quote_from_footer(
             debug!(
                 backend = %name,
                 session = ?session_name,
-                "quote index miss — resolved via footer fallback"
+                "resolved via footer fallback"
             );
             return Some(QuoteOrigin::Client {
                 vtoken: client.vtoken.clone(),
@@ -540,7 +490,7 @@ async fn resolve_quote_from_footer(
             debug!(
                 session = %skey,
                 vtoken = %crate::redact_token(&vtoken),
-                "quote index miss — resolved via persona-footer session lookup"
+                "resolved via persona-footer session lookup"
             );
             Some(QuoteOrigin::Client {
                 vtoken,

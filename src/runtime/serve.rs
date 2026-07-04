@@ -15,8 +15,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
 use crate::hub::{
-    spawn_dispatcher, spawn_health_checker, spawn_quote_index_evictor, AdminConfig, HubState,
-    InMemoryQueue, MessageQueue,
+    spawn_dispatcher, spawn_health_checker, AdminConfig, HubState, InMemoryQueue, MessageQueue,
 };
 use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
@@ -290,29 +289,12 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
 
     load_clients_from_db(state.clone(), store.clone()).await;
 
-    // Replay the most recent outbound messages into the in-memory
-    // `QuoteRouteIndex` so a quote-reply arriving right after Hub boot still
-    // resolves through the in-memory path instead of falling back to the
-    // slower `LIKE`-based SQL query (see the cold-start note in
-    // `HubState::routing.quote_index`). Spawned rather than awaited so a slow
-    // DB never delays the HTTP listener coming up.
-    let warmup_state = state.clone();
-    let warmup_store = store.clone();
-    let warmup_limit = parse_env_warmup_limit()
-        .unwrap_or(crate::hub::quote_route::DEFAULT_QUOTE_INDEX_WARMUP_LIMIT);
-    let warmup_flag = state.quote_index_warmed.clone();
-    tokio::spawn(async move {
-        warm_quote_index_from_db(warmup_state, warmup_store, warmup_limit).await;
-        warmup_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
-
     let (tx, rx) =
         mpsc::channel::<crate::ilink::types::WeixinMessage>(runtime_cfg.dispatch_channel_size);
 
     spawn_dispatcher(state.clone(), rx);
 
     spawn_health_checker(state.clone());
-    spawn_quote_index_evictor(state.clone());
 
     {
         let upstream_clone = upstream.clone();
@@ -458,70 +440,6 @@ async fn perform_qr_login(
     store.save_credentials(&token, &base).await?;
     info!("iLink login successful, token saved");
     Ok((token, base))
-}
-
-/// Read `ILINK_QUOTE_INDEX_WARMUP_LIMIT` from the environment. Returns the
-/// parsed value if it is in `[1, 10000]`; returns `None` (caller falls back
-/// to [`DEFAULT_QUOTE_INDEX_WARMUP_LIMIT`]) on missing, empty, unparseable,
-/// or out-of-range input. The upper bound mirrors the clamp inside
-/// [`Store::recent_outbound_messages`] so a runaway env var cannot blow
-/// past the index's `MAX_BY_CONTENT_KEYS`.
-fn parse_env_warmup_limit() -> Option<i64> {
-    let raw = std::env::var("ILINK_QUOTE_INDEX_WARMUP_LIMIT").ok()?;
-    if raw.trim().is_empty() {
-        return None;
-    }
-    match raw.trim().parse::<i64>() {
-        Ok(v) if (1..=10_000).contains(&v) => Some(v),
-        Ok(v) => {
-            tracing::warn!(
-                value = v,
-                "ILINK_QUOTE_INDEX_WARMUP_LIMIT out of range [1, 10000]; using default"
-            );
-            None
-        }
-        Err(_) => {
-            tracing::warn!(
-                value = %raw,
-                "ILINK_QUOTE_INDEX_WARMUP_LIMIT is not a valid integer; using default"
-            );
-            None
-        }
-    }
-}
-
-/// Replay the most recent N outbound messages from the `messages` table into
-/// the in-memory `QuoteRouteIndex`. Runs as a detached tokio task on the
-/// startup path; errors are logged at WARN, never propagated — a DB hiccup
-/// at boot must not take down the Hub, the SQL fallback covers the gap.
-async fn warm_quote_index_from_db(state: Arc<HubState>, store: Arc<Store>, limit: i64) {
-    match store.recent_outbound_messages(limit).await {
-        Ok(rows) => {
-            let total = rows.len();
-            let warm_items: Vec<crate::hub::quote_route::WarmItem> = rows
-                .iter()
-                .filter_map(crate::hub::quote_route::warm_item_from_recent_row)
-                .collect();
-            let mut idx = state.routing.quote_index.lock().await;
-            let indexed = idx.warm_from_history(&warm_items);
-            if total > 0 {
-                info!(
-                    requested = limit,
-                    rows_loaded = total,
-                    rows_indexed = indexed,
-                    "quote_index warmup complete: {indexed} items"
-                );
-            } else {
-                info!("quote_index warmup complete: 0 items (no history)");
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "quote_index warmup failed; SQL fallback will cover the cold-start window"
-            );
-        }
-    }
 }
 
 async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {

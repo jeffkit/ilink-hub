@@ -1,6 +1,5 @@
 use super::dispatch::build_hub_ext_for_vctx;
 use super::*;
-use crate::hub::quote_route::QuoteOrigin;
 use crate::hub::InMemoryQueue;
 use crate::ilink::UpstreamClient;
 use crate::store::Store;
@@ -360,7 +359,6 @@ fn sub_state_structs_carry_expected_fields() {
     }
     fn assert_routing_fields(_s: &RoutingState) {
         let _ = &_s.router;
-        let _ = &_s.quote_index;
     }
     fn assert_client_fields(_s: &ClientState) {
         let _ = &_s.registry;
@@ -405,19 +403,6 @@ async fn hub_state_metrics_are_shared_with_sub_state_paths() {
     // clone (which is the production pattern).
     let metrics_clone = Arc::clone(&state.metrics);
     assert_eq!(metrics_clone.messages_dispatched.load(Ordering::Relaxed), 7);
-}
-
-#[tokio::test]
-async fn quote_index_evictor_takes_sub_state_path() {
-    // spawn_quote_index_evictor is the closest existing call to a
-    // sub-state-only path: it only needs routing.quote_index and the
-    // shutdown signal. Run a single iteration by exercising the lock
-    // through the same `state.routing.quote_index` path the evictor
-    // uses, and verify the lock is reachable (i.e. the path is wired).
-
-    let state = make_state().await;
-    let mut quote_idx = state.routing.quote_index.lock().await;
-    quote_idx.evict_expired();
 }
 
 // ─── N-02: LatencyHistogram microsecond precision ───────────────────────
@@ -642,187 +627,6 @@ async fn test_extracted_hub_commands() {
     let delete_active_res =
         handle_cmd_session_delete(&state, from_user, real_ctx, None, "session-2").await;
     assert!(delete_active_res.contains("无法删除当前活跃的 session"));
-}
-
-// ─── Bug repro: sendmessage hub_ext.session_name fallback ────────────────────
-//
-// Production incident (2026-06-24): When `@ilink-claude` dispatches to a fresh
-// at-session (e.g. "at-20260624-092041904"), the bridge may reply via sendmessage
-// WITHOUT echoing back the at-session in hub_ext.session_name (or the Tauri home
-// bridge strips hub_ext entirely before forwarding).
-//
-// In that case the sendmessage handler falls back to `db_session_name`, which is
-// the vtoken's *current active session* from `resolve_send_context`. If the user
-// last ran `/sn` yesterday, that will be "session-20260623-181249" — the old
-// session. The quote_index then registers the reply with the wrong session name,
-// so a subsequent quote-reply routes the new message into the stale 1249 session
-// instead of the freshly-created at-1904 session.
-//
-// The fix: the sendmessage handler must use the session_name from hub_ext when
-// present; when hub_ext is missing, it should not silently use the active session —
-// it should fall back to the session embedded in the reply footer (already indexed
-// by the dispatch side). This test pins the contract that the quote_index entry
-// carries the session_name from hub_ext, NOT from the DB active session.
-
-#[tokio::test]
-async fn sendmessage_quote_index_uses_hub_ext_session_not_db_active() {
-    // Arrange: a store with two sessions for the same (vctx, vtoken).
-    //   - active session (in DB): session-20260623-181249 (old)
-    //   - at-session dispatched via @mention: at-20260624-092041904 (new)
-    let store = Arc::new(
-        Store::connect("sqlite::memory:")
-            .await
-            .expect("in-memory store"),
-    );
-    let upstream =
-        Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
-    let queue = Arc::new(InMemoryQueue::new());
-    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let state = Arc::new(HubState::new(
-        upstream,
-        Arc::clone(&store),
-        queue,
-        shutdown_rx,
-        "test-relay-secret".to_string(),
-        AdminConfig::from_env(),
-    ));
-
-    let vtoken = "vt-ilink-claude";
-    let vctx = "vctx-test-123";
-    let peer = "peer:user@wx";
-    let old_session = "session-20260623-181249";
-    let at_session = "at-20260624-092041904";
-
-    // Seed DB: register the vctx→peer mapping.
-    store
-        .find_or_create_vctx(peer, None, "real-ctx-abc")
-        .await
-        .expect("create vctx");
-
-    // Set the *old* session as active (simulates yesterday's /sn command).
-    store
-        .set_backend_session(vctx, vtoken, old_session, "cli-session-old")
-        .await
-        .expect("set old session");
-    store
-        .set_active_session_name(vctx, vtoken, old_session)
-        .await
-        .expect("set active session");
-
-    // Simulate: the @mention dispatch set hub_ext.session_name = at-session,
-    // and the bridge echoed it back in the sendmessage reply.
-    // The sendmessage handler resolves active_session = hub_ext.session_name (at-session).
-    // It should register the reply in quote_index with session_name = at-session.
-    let reply_text = format!(
-        "只有 codebuddy 那个文件里提到 GLM\n\n---\nilink-claude · KONGJIE-MC3 · {at_session}"
-    );
-
-    // Directly exercise the quote_index registration with hub_ext session_name.
-    // This mirrors what routes.rs::sendmessage_handler does (lines 554-566):
-    //   active_session = replied_session_name.or(db_session_name)
-    //   register_outbound_content(..., session_name: active_session)
-    let hub_ext_session_name: Option<String> = Some(at_session.to_string()); // echoed back by bridge
-    let db_active_session: String = old_session.to_string(); // what DB says is active
-    let effective_session = hub_ext_session_name.or(Some(db_active_session));
-
-    {
-        let origin = QuoteOrigin::Client {
-            vtoken: vtoken.to_string(),
-            name: "ilink-claude".to_string(),
-            label: Some("KONGJIE-MC3".to_string()),
-            session_name: effective_session.clone(),
-        };
-        state
-            .routing
-            .quote_index
-            .lock()
-            .await
-            .register_outbound_content(peer, &reply_text, origin);
-    }
-
-    // Assert: the quote_index must have recorded the at-session, not the old session.
-    assert_eq!(
-        effective_session.as_deref(),
-        Some(at_session),
-        "sendmessage must use hub_ext.session_name (at-session) when present, not db active session (old session)"
-    );
-
-    // Verify via quote_index resolution: a quote-reply on that message must route
-    // back to the at-session.
-    let quoted_msg = {
-        use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
-        let ref_item = serde_json::json!({
-            "ref_msg": {
-                "message_item": {
-                    "type": 1,
-                    "text_item": { "text": reply_text },
-                    "create_time_ms": 1750000100000_i64
-                }
-            }
-        });
-        WeixinMessage {
-            message_type: Some(1),
-            from_user_id: Some(peer.to_string()),
-            item_list: Some(std::sync::Arc::new(vec![MessageItem {
-                item_type: Some(1),
-                text_item: Some(TextItem {
-                    text: Some("在用户目录下的.ilinkhub-bridge-profile下面哦。".to_string()),
-                }),
-                extra: ref_item,
-                ..Default::default()
-            }])),
-            ..Default::default()
-        }
-    };
-    let resolved = state
-        .routing
-        .quote_index
-        .lock()
-        .await
-        .resolve_user_quote(peer, &quoted_msg)
-        .expect("quote_index must resolve the at-session reply");
-
-    match resolved {
-        QuoteOrigin::Client {
-            vtoken: resolved_vtoken,
-            session_name,
-            ..
-        } => {
-            assert_eq!(resolved_vtoken, vtoken);
-            assert_eq!(
-                session_name.as_deref(),
-                Some(at_session),
-                "quote-reply must route to at-session, not old session-1249"
-            );
-        }
-        QuoteOrigin::Hub { .. } => panic!("expected Client origin"),
-    }
-}
-
-/// Negative case: when hub_ext.session_name is absent (bridge didn't echo it back,
-/// or Tauri home bridge stripped hub_ext), the effective session falls back to the
-/// DB active session. This causes the quote_index to record the wrong session name,
-/// which is the root cause of the 2026-06-24 incident. This test documents the
-/// current (buggy) behavior so we can see exactly when the fix lands.
-#[tokio::test]
-async fn sendmessage_without_hub_ext_session_falls_back_to_db_active_session() {
-    let hub_ext_session_name: Option<String> = None; // bridge did NOT echo back session_name
-    let db_active_session: String = "session-20260623-181249".to_string();
-    let at_session = "at-20260624-092041904";
-
-    let effective_session = hub_ext_session_name.or(Some(db_active_session.clone()));
-
-    // This is the current behavior: effective_session = db active session (wrong).
-    assert_eq!(
-        effective_session.as_deref(),
-        Some(db_active_session.as_str()),
-        "WITHOUT hub_ext: effective session falls back to DB active session (documents the bug)"
-    );
-    assert_ne!(
-        effective_session.as_deref(),
-        Some(at_session),
-        "the fallback session is NOT the at-session — this is the bug that caused incident 2026-06-24"
-    );
 }
 
 #[tokio::test]

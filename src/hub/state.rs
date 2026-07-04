@@ -3,14 +3,14 @@
 
 use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use crate::ilink::{QrLoginUiEvent, UpstreamSink};
 use crate::store::Store;
 
-// Hub-internal re-exports (Router, QuoteRouteIndex, ClientRegistry, PairingRegistry,
+// Hub-internal re-exports (Router, ClientRegistry, PairingRegistry,
 // MessageQueue) and the `ilink_status` module come from the crate's `hub` module.
 use super::*;
 
@@ -423,19 +423,16 @@ impl IlinkConnState {
     }
 }
 
-/// Routing-layer state: per-message dispatch decisions, conversation vctx
-/// mapping, and quote-reply tracking. Pure in-memory; no I/O.
+/// Routing-layer state: per-message dispatch decisions and conversation vctx
+/// mapping. Pure in-memory; no I/O.
 pub struct RoutingState {
     pub router: Mutex<Router>,
-    /// Quote-reply → backend / hub command (see [`quote_route`]).
-    pub quote_index: Mutex<QuoteRouteIndex>,
 }
 
 impl RoutingState {
     pub(crate) fn new() -> Self {
         Self {
             router: Mutex::new(Router::new(None)),
-            quote_index: Mutex::new(QuoteRouteIndex::default()),
         }
     }
 }
@@ -545,9 +542,6 @@ pub struct HubState {
     pub relay_secret: String,
     /// Admin authentication config, parsed once at startup.
     pub admin: AdminConfig,
-    /// Set to `true` once the quote-reply index warmup from DB completes.
-    /// Exposed in `/metrics` as `ilink_hub_quote_index_ready`.
-    pub quote_index_warmed: Arc<AtomicBool>,
     /// Pending Agent-to-Agent reply waiters.  MCP `call_agent` registers a
     /// oneshot here; the target Agent's `sendmessage` resolves it.
     pub a2a_waiter: Arc<crate::mcp::A2aWaiter>,
@@ -577,7 +571,6 @@ impl HubState {
             persist_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PERSIST_TASKS)),
             relay_secret,
             admin,
-            quote_index_warmed: Arc::new(AtomicBool::new(false)),
             a2a_waiter: Arc::new(crate::mcp::A2aWaiter::new()),
         })
     }

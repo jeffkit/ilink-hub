@@ -15,13 +15,12 @@
 //!
 //! ## Lock acquisition order (read this before adding cross-cutting changes)
 //!
-//! `HubState` holds three primary locks that may be acquired in the same
+//! `HubState` holds two primary locks that may be acquired in the same
 //! request path. Deadlock is avoided by acquiring them in a **strict total
 //! order** and **never holding more than one at a time**:
 //!
 //! 1. `state.routing.router` (`tokio::sync::Mutex<Router>`)
-//! 2. `state.routing.quote_index` (`tokio::sync::Mutex<QuoteRouteIndex>`)
-//! 3. `state.clients.registry` (`tokio::sync::RwLock<ClientRegistry>`)
+//! 2. `state.clients.registry` (`tokio::sync::RwLock<ClientRegistry>`)
 //!
 //! Rules:
 //!
@@ -80,7 +79,6 @@ pub mod ilink_status {
 
 pub use dispatch::{
     build_hub_ext_for_vctx, push_to_queue_pub, resolve_vctx_for_message, spawn_dispatcher,
-    spawn_quote_index_evictor,
 };
 pub use health::spawn_health_checker;
 pub use outbound_label::{
@@ -90,7 +88,8 @@ pub use outbound_label::{
 pub use pairing::PairingRegistry;
 pub use queue::{InMemoryQueue, MessageQueue};
 pub use quote_route::{
-    merge_routing_with_quote, parse_footer_from_quoted_text, QuoteOrigin, QuoteRouteIndex, WarmItem,
+    collect_quoted, collect_quoted_timestamp, footer_from_user_quote, merge_routing_with_quote,
+    parse_footer_from_quoted_text, QuoteOrigin,
 };
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};

@@ -581,8 +581,6 @@ pub async fn sendmessage(
         // Strip ilink_hub_ext before forwarding to upstream iLink.
         msg.ilink_hub_ext = None;
 
-        // Conversation scope for the quote index (captured before peer_user_id is moved).
-        let conv_scope = peer_user_id.clone();
         // Replace virtual context_token with real one and inject to_user_id if missing
         msg.context_token = Some(real_ctx);
         if msg.to_user_id.is_none() && !peer_user_id.is_empty() {
@@ -632,25 +630,6 @@ pub async fn sendmessage(
                     active_session.as_deref(),
                 );
             }
-        }
-
-        // Index this outbound reply so a later quote-reply in the same conversation routes
-        // back to this backend + session. Content-based by necessity: real iLink never echoes
-        // bot messages and strips `msg_id` from the quoted `ref_msg`, leaving only the text.
-        let outbound_text = msg.text().map(str::to_string);
-        if let (Some((name, label, _, _)), Some(text)) = (client_meta, outbound_text) {
-            let origin = crate::hub::quote_route::QuoteOrigin::Client {
-                vtoken: vtoken.clone(),
-                name,
-                label,
-                session_name: active_session.clone(),
-            };
-            state
-                .routing
-                .quote_index
-                .lock()
-                .await
-                .register_outbound_content(&conv_scope, &text, origin);
         }
     }
 
@@ -1406,13 +1385,6 @@ pub async fn metrics(
     out.push_str("# HELP ilink_hub_ilink_status iLink upstream connection status (0=unknown 1=connected 2=needs_login 3=logging_in)\n");
     out.push_str("# TYPE ilink_hub_ilink_status gauge\n");
     out.push_str(&format!("ilink_hub_ilink_status {}\n", ilink_status));
-
-    let quote_index_ready = state.quote_index_warmed.load(Ordering::Relaxed) as u8;
-    out.push_str("# HELP ilink_hub_quote_index_ready 1 if the in-memory quote-reply index has finished warming up from DB, 0 during cold-start window\n");
-    out.push_str("# TYPE ilink_hub_quote_index_ready gauge\n");
-    out.push_str(&format!(
-        "ilink_hub_quote_index_ready {quote_index_ready}\n"
-    ));
 
     // Histograms. We render them in Prometheus text format (cumulative
     // bucket counts, plus `_count`, `_sum`, and `_created` siblings). The bucket layout
