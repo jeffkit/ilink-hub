@@ -165,6 +165,10 @@ pub struct Metrics {
     pub persist_fire_and_forget_failures_forward: AtomicU64,
     /// Failed fire-and-forget persist operations on the broadcast fan-out path.
     pub persist_fire_and_forget_failures_broadcast: AtomicU64,
+    /// Number of quote-reply messages where all three DB fallback layers (timestamp,
+    /// content-prefix, footer) returned `None`. Non-zero values indicate quote-reply
+    /// routing silently fell back to base routing — useful for detecting DB write gaps.
+    pub quote_resolve_miss_total: AtomicU64,
 }
 
 impl Metrics {
@@ -188,6 +192,7 @@ impl Metrics {
             dispatcher_lagged: AtomicU64::new(0),
             persist_fire_and_forget_failures_forward: AtomicU64::new(0),
             persist_fire_and_forget_failures_broadcast: AtomicU64::new(0),
+            quote_resolve_miss_total: AtomicU64::new(0),
         }
     }
 }

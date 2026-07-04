@@ -49,9 +49,9 @@ pub enum QuoteOrigin {
     Hub { cmd: HubCommand },
 }
 
-/// Fallback when the in-memory quote index is cold (e.g. after a Hub restart): parse the
-/// outbound origin footer embedded in the quoted message text and return `(backend_name,
-/// session_name)`.
+/// DB-backed quote resolver (L3 footer parsing layer). Called after timestamp and
+/// content-prefix lookups both miss. Parse the outbound origin footer embedded in the
+/// quoted message text and return `(backend_name, session_name)`.
 ///
 /// Handles two historical footer formats:
 /// * New (current): `…\n\n---\n{name} [· label] [· session]`
@@ -103,7 +103,8 @@ pub fn collect_quoted(msg: &crate::ilink::types::WeixinMessage) -> Option<(Strin
 }
 
 /// Extract `(backend_name, session_name)` from the footer embedded in the quoted message
-/// text. Used as a fallback when the in-memory index is cold (e.g. after a Hub restart).
+/// text. DB-backed quote resolver (L3 footer parsing layer). Called after timestamp and
+/// content-prefix lookups both miss.
 pub fn footer_from_user_quote(
     msg: &crate::ilink::types::WeixinMessage,
 ) -> Option<(String, Option<String>)> {

@@ -104,6 +104,12 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
     )?;
     registry.register(Box::new(persist_faf_failures.clone()))?;
 
+    let quote_resolve_miss_total = IntCounter::new(
+        "ilink_hub_quote_resolve_miss_total",
+        "Quote-reply messages where all three DB fallback layers (timestamp, content-prefix, footer) missed; non-zero rate indicates silent routing fallback to base routing",
+    )?;
+    registry.register(Box::new(quote_resolve_miss_total.clone()))?;
+
     // ── Read values from HubState ───────────────────────────────────────────
 
     let (online, total, client_names_by_vtoken) = {
@@ -172,6 +178,12 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
                 .persist_fire_and_forget_failures_broadcast
                 .load(Ordering::Relaxed),
         );
+    quote_resolve_miss_total.inc_by(
+        state
+            .metrics
+            .quote_resolve_miss_total
+            .load(Ordering::Relaxed),
+    );
 
     // ── Encode ──────────────────────────────────────────────────────────────
 
@@ -264,6 +276,7 @@ mod tests {
             "ilink_hub_ilink_status",
             "ilink_hub_queue_size",
             "ilink_hub_persist_fire_and_forget_failures_total",
+            "ilink_hub_quote_resolve_miss_total",
         ];
         for name in &expected_names {
             assert!(output.contains(name), "missing metric: {name}");
@@ -430,6 +443,7 @@ mod tests {
             "ilink_hub_ilink_status",
             "ilink_hub_queue_size",
             "ilink_hub_persist_fire_and_forget_failures_total",
+            "ilink_hub_quote_resolve_miss_total",
         ] {
             assert!(out_a.contains(name), "hub-a missing: {name}");
             assert!(out_b.contains(name), "hub-b missing: {name}");
@@ -471,7 +485,7 @@ mod tests {
             help_names, type_names,
             "every HELP must have a matching TYPE"
         );
-        assert_eq!(help_names.len(), 14, "expected exactly 14 metric families");
+        assert_eq!(help_names.len(), 15, "expected exactly 15 metric families");
     }
 
     #[tokio::test]
