@@ -1,0 +1,138 @@
+milestone: "M2: 新增 DB fallback 回归测试"
+reviewed_at: "2026-07-04 11:41"
+reviewer: "adversarial-reviewer"
+
+verdict: PASS
+
+findings:
+  - id: "f1"
+    severity: MEDIUM
+    category: testing
+    description: |
+      `resolve_quote_from_footer` 存在快慢双路：快路（footer 含显式 backend 名）已被测试，
+      慢路（persona-mode footer，格式 `---\nat-YYYYMMDD-*`，name 以 `at-`/`session-` 开头，
+      需通过 `find_vctx_for_scope` + `find_vtoken_for_session` DB 二次查询）完全没有测试覆盖。
+      这条路径有独立的 2 s DB timeout 守卫，如果逻辑出错只会静默返回 None，
+      用户的 persona-mode quote-reply 会无声地路由失败。
+    suggestion: |
+      在 dispatch.rs 的 tests 模块新增 `at_mention_quote_reply_l3_footer_persona_routing` 测试：
+      1. register "ilink-claude" 客户端，取得 vtoken；
+      2. 调用 `store.find_or_create_vctx("user1", None, "ctx-1")` 创建 vctx；
+      3. 调用 `store.set_backend_session(vctx, vtoken, "at-20260704-103000", "some-session-id")` 写入 session；
+      4. 构造 msg：`from_user_id = "user1"`，quoted_text 为 `"body\n\n---\nat-20260704-103000"`
+         （无 backend name，name 以 `at-` 开头，触发慢路）；
+      5. 调用 `resolve_quote_from_footer`，断言返回 `QuoteOrigin::Client { vtoken, session_name: Some("at-20260704-103000"), .. }`。
+    location: "src/hub/dispatch.rs:482-541"
+    status: open
+
+  - id: "f2"
+    severity: MEDIUM
+    category: testing
+    description: |
+      三个测试（L1、L2、L3）各自对单个解析函数做单元级调用，没有任何测试覆盖三层串联瀑布
+      `resolve_quote_from_timestamp → resolve_quote_from_db → resolve_quote_from_footer`
+      在 `dispatch_message` 内部的完整执行路径（即代码第 93-103 行的 `quoted` 块）。
+      若日后有人修改 fallback 顺序或在某层中提前 short-circuit，现有三个孤立测试不会发现问题。
+    suggestion: |
+      新增集成测试 `quote_reply_l3_full_cascade_fallback`：
+      1. 使用同一个 `state`（注册 "ilink-claude"）；
+      2. 在 DB 中**不插入**任何 message 历史（保证 L1、L2 均 miss）；
+      3. 构造 `msg`：`old_ms = 1_000_000`，quoted_text 含 `\n\n---\nilink-claude · at-20260704-103000`；
+      4. 直接复现 dispatch.rs 第 93-103 行的串联逻辑：
+         先调 `resolve_quote_from_timestamp`（应返回 None），
+         再调 `resolve_quote_from_db`（应返回 None），
+         最后调 `resolve_quote_from_footer`（应返回 Some）；
+      5. 断言最终 `quoted` 为 `Some(QuoteOrigin::Client { name: "ilink-claude", .. })`。
+      这样可同时保证三个 resolver 的 None 分支和最终 L3 成功路径在同一上下文中被验证。
+    location: "src/hub/dispatch.rs:93-103"
+    status: open
+
+  - id: "f3"
+    severity: LOW
+    category: testing
+    description: |
+      `resolve_quote_from_footer` 在 footer 中包含未注册的 backend 名（且不以 `at-`/`session-` 开头）时
+      应返回 `None`，但无测试覆盖这条失败路径。
+      若逻辑被意外修改为 panic 或返回错误的客户端，也不会被测试发现。
+    suggestion: |
+      在 dispatch.rs tests 新增 `at_mention_quote_reply_l3_footer_unregistered_name_returns_none`：
+      构造 quoted_text = `"body\n\n---\nunknown-client · at-20260704-103000"`，
+      调用 `resolve_quote_from_footer`，断言结果为 `None`。
+    location: "src/hub/dispatch.rs:456-542"
+    status: open
+
+  - id: "f4"
+    severity: LOW
+    category: testing
+    description: |
+      `parse_footer_from_quoted_text` 支持三段式 footer（`name · label · session`），
+      这在 quote_route.rs 内的单元测试中有验证，但 `resolve_quote_from_footer` 的集成路径
+      没有测试带 label 的 footer（例如 `ilink-claude · office · at-20260704-103000`），
+      无法验证 `registry.get_by_name(name)` 在三段式场景下也能正确匹配第一段。
+    suggestion: |
+      在 at_mention_quote_reply_l3_footer_routing 中增加一个 variant，
+      或新增独立测试 `at_mention_quote_reply_l3_footer_with_label_routing`：
+      quoted_text = `"body\n\n---\nilink-claude · office · at-20260704-103000"`，
+      断言返回 `QuoteOrigin::Client { name: "ilink-claude", session_name: Some("at-20260704-103000"), .. }`。
+    location: "src/hub/dispatch.rs:955-1000"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: |
+      Persona-mode footer（慢路）：quoted_text 为 `"body\n\n---\nat-20260704-103000"`
+      （无显式 backend 名，name 以 `at-` 开头），DB 中有对应 (vctx, vtoken, session) 记录。
+      调用 `resolve_quote_from_footer`，验证慢路 DB 查询能正确解析 persona-mode 引用。
+    expected_behavior: |
+      返回 `Some(QuoteOrigin::Client { session_name: Some("at-20260704-103000"), vtoken: <ilink-claude vtoken>, .. })`
+    added_to_suite: true
+    test_name: "at_mention_quote_reply_l3_footer_persona_routing"
+    location: "src/hub/dispatch.rs"
+
+  - id: "at2"
+    type: unit
+    description: |
+      Footer 含未注册 backend 名且不以 `at-`/`session-` 开头：
+      quoted_text = `"body\n\n---\nghost-client · at-20260704-103000"`，
+      registry 中无 "ghost-client"，DB 中亦无对应 session 记录。
+      调用 `resolve_quote_from_footer`，验证未知 backend 名会被静默返回 `None` 而非 panic。
+    expected_behavior: |
+      返回 `None`，不 panic，不影响后续正常路由。
+    added_to_suite: true
+    test_name: "at_mention_quote_reply_l3_footer_unregistered_name_returns_none"
+    location: "src/hub/dispatch.rs"
+
+  - id: "at3"
+    type: unit
+    description: |
+      全三层串联 cascade：DB 无历史记录（L1、L2 均 miss），
+      quoted_text 含 `\n\n---\nilink-claude · at-20260704-103000`。
+      顺序调用 resolve_quote_from_timestamp → resolve_quote_from_db → resolve_quote_from_footer，
+      验证三层串联逻辑（dispatch.rs L93-103 块）在 L1/L2 全部 miss 后确实降级到 L3。
+    expected_behavior: |
+      resolve_quote_from_timestamp 返回 None，resolve_quote_from_db 返回 None，
+      resolve_quote_from_footer 返回 Some(QuoteOrigin::Client { name: "ilink-claude", .. })。
+    added_to_suite: true
+    test_name: "quote_reply_l3_full_cascade_fallback"
+    location: "src/hub/dispatch.rs"
+
+  - id: "at4"
+    type: unit
+    description: |
+      三段式 footer（含 label）：quoted_text = `"body\n\n---\nilink-claude · office · at-20260704-103000"`，
+      调用 `resolve_quote_from_footer`，验证 name 能从三段式格式中正确提取第一段，
+      session_name 从最后一段正确提取。
+    expected_behavior: |
+      返回 `Some(QuoteOrigin::Client { name: "ilink-claude", session_name: Some("at-20260704-103000"), .. })`，
+      label 段（"office"）被正确忽略而不干扰 registry 查找。
+    added_to_suite: true
+    test_name: "at_mention_quote_reply_l3_footer_with_label_routing"
+    location: "src/hub/dispatch.rs"
+
+summary: |
+  M2 新增的 `at_mention_quote_reply_l3_footer_routing` 测试验证了 L3 footer 快路（registry 按名查找），
+  逻辑正确，footer 格式与 `parse_footer_from_quoted_text` 实现完全匹配，测试隔离性良好（独立内存 SQLite + 独立注册）。
+  主要覆盖缺口：①persona-mode footer 慢路（需 DB session 查询）完全无测试；
+  ②三层串联 cascade 未作整体集成验证，各 resolver 目前仅被单独调用。
+  两处缺口均为 MEDIUM 级别，建议在后续 sprint 补充，不阻塞当前里程碑合并。
