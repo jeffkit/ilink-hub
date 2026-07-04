@@ -24,6 +24,10 @@ pub struct ClientInfo {
     pub vtoken: String,
     /// Human-readable label shown in `/list`
     pub label: Option<String>,
+    /// Detailed description of the Agent's capabilities.
+    /// Exposed via the MCP `list_agents` tool so other Agents can understand
+    /// what this Agent can do before calling it.
+    pub description: Option<String>,
     /// Wall-clock registration time; survives display across restarts.
     pub registered_at: SystemTime,
     pub online: bool,
@@ -39,21 +43,30 @@ impl ClientInfo {
     /// Build a `ClientInfo` for a freshly-issued plaintext vtoken. Returns a tuple
     /// of the constructed `ClientInfo` (holding the hashed token) and the `String`
     /// plaintext token.
-    pub fn new(name: String, label: Option<String>) -> (Self, String) {
+    pub fn new(name: String, label: Option<String>, description: Option<String>) -> (Self, String) {
         let plain = format!("vhub_{}", Uuid::new_v4().simple());
         let hashed = hash_vtoken(&plain);
-        (Self::with_hashed_vtoken(name, label, hashed), plain)
+        (
+            Self::with_hashed_vtoken(name, label, description, hashed),
+            plain,
+        )
     }
 
     /// Build a `ClientInfo` whose `vtoken` field is already the canonical
     /// hash. Used by the startup loader (`load_clients_from_db`) which
     /// reads hash values directly from the `clients` table and must NOT
     /// re-hash them.
-    fn with_hashed_vtoken(name: String, label: Option<String>, vtoken_hash: String) -> Self {
+    fn with_hashed_vtoken(
+        name: String,
+        label: Option<String>,
+        description: Option<String>,
+        vtoken_hash: String,
+    ) -> Self {
         Self {
             name,
             vtoken: vtoken_hash,
             label,
+            description,
             registered_at: SystemTime::now(),
             online: false,
             persona_name: None,
@@ -104,17 +117,25 @@ impl ClientRegistry {
     ///   and `is_new = false`. Callers that need to roll back a
     ///   speculative register MUST honour `is_new`: rolling back a reused
     ///   entry evicts the legitimate client (F-M1-A).
-    pub fn register(&mut self, name: String, label: Option<String>) -> (String, String, bool) {
+    pub fn register(
+        &mut self,
+        name: String,
+        label: Option<String>,
+        description: Option<String>,
+    ) -> (String, String, bool) {
         if let Some(existing_hash) = self.by_name.get(&name).cloned() {
             if let Some(info) = self.by_vtoken.get_mut(&existing_hash) {
                 if label.is_some() {
                     info.label = label;
                 }
+                if description.is_some() {
+                    info.description = description;
+                }
                 info.online = true;
             }
             return (String::new(), existing_hash, false);
         }
-        let (info, plain) = ClientInfo::new(name.clone(), label);
+        let (info, plain) = ClientInfo::new(name.clone(), label, description);
         let hashed = info.vtoken.clone();
         self.by_name.insert(name, hashed.clone());
         self.by_vtoken.insert(hashed.clone(), info);
@@ -137,6 +158,7 @@ impl ClientRegistry {
         &mut self,
         name: String,
         label: Option<String>,
+        description: Option<String>,
         vtoken: Option<String>,
     ) -> (String, bool) {
         if let Some(existing_vtoken) = self.by_name.get(&name) {
@@ -144,6 +166,9 @@ impl ClientRegistry {
             if let Some(info) = self.by_vtoken.get_mut(&existing_vtoken) {
                 if label.is_some() {
                     info.label = label;
+                }
+                if description.is_some() {
+                    info.description = description;
                 }
                 info.online = true;
             }
@@ -153,12 +178,17 @@ impl ClientRegistry {
         let (info, plain_or_hash) = match vtoken {
             Some(hashed) => {
                 // Caller is the load path; the value is already the canonical hash.
-                let info = ClientInfo::with_hashed_vtoken(name.clone(), label, hashed.clone());
+                let info = ClientInfo::with_hashed_vtoken(
+                    name.clone(),
+                    label,
+                    description,
+                    hashed.clone(),
+                );
                 (info, hashed)
             }
             None => {
                 // Fresh registration: generate plaintext, hash, store, and return plaintext.
-                let (info, plain) = ClientInfo::new(name.clone(), label);
+                let (info, plain) = ClientInfo::new(name.clone(), label, description);
                 (info, plain)
             }
         };
@@ -175,12 +205,14 @@ impl ClientRegistry {
         &mut self,
         name: String,
         label: Option<String>,
+        description: Option<String>,
         vtoken_hash: String,
     ) -> Result<(), UpdateClientError> {
         if self.by_name.contains_key(&name) {
             return Err(UpdateClientError::NameTaken);
         }
-        let info = ClientInfo::with_hashed_vtoken(name.clone(), label, vtoken_hash.clone());
+        let info =
+            ClientInfo::with_hashed_vtoken(name.clone(), label, description, vtoken_hash.clone());
         self.by_name.insert(name, vtoken_hash.clone());
         self.by_vtoken.insert(vtoken_hash, info);
         Ok(())
@@ -219,18 +251,42 @@ impl ClientRegistry {
         sorted.get(n - 1).copied()
     }
 
+    /// Update metadata fields on an already-registered client (identified by hashed vtoken).
+    /// Used by the startup loader and the admin update API.
+    pub fn update_metadata(
+        &mut self,
+        vtoken: &str,
+        label: Option<String>,
+        description: Option<String>,
+        persona_name: Option<String>,
+        persona_emoji: Option<String>,
+    ) {
+        if let Some(info) = self.by_vtoken.get_mut(vtoken) {
+            if label.is_some() {
+                info.label = label;
+            }
+            if description.is_some() {
+                info.description = description;
+            }
+            if persona_name.is_some() {
+                info.persona_name = persona_name;
+            }
+            if persona_emoji.is_some() {
+                info.persona_emoji = persona_emoji;
+            }
+        }
+    }
+
     /// Set persona fields on an already-registered client (identified by hashed vtoken).
     /// Used by the startup loader and the admin update API.
+    /// Deprecated: use `update_metadata` instead.
     pub fn set_persona(
         &mut self,
         vtoken: &str,
         persona_name: Option<String>,
         persona_emoji: Option<String>,
     ) {
-        if let Some(info) = self.by_vtoken.get_mut(vtoken) {
-            info.persona_name = persona_name;
-            info.persona_emoji = persona_emoji;
-        }
+        self.update_metadata(vtoken, None, None, persona_name, persona_emoji);
     }
 
     /// Set the description for a registered client.
@@ -342,7 +398,7 @@ mod tests {
     fn registered_count_single_vs_multi() {
         let mut reg = ClientRegistry::new();
         assert_eq!(reg.all_clients().len(), 0);
-        let (plain1, _, is_new1) = reg.register("a".into(), None);
+        let (plain1, _, is_new1) = reg.register("a".into(), None, None);
         assert!(is_new1);
         assert!(!plain1.is_empty());
         assert!(
@@ -350,7 +406,7 @@ mod tests {
             "plaintext vtoken must be returned exactly once"
         );
         assert_eq!(reg.all_clients().len(), 1);
-        let (plain2, _, is_new2) = reg.register("b".into(), Some("B".into()));
+        let (plain2, _, is_new2) = reg.register("b".into(), Some("B".into()), None);
         assert!(is_new2);
         assert!(!plain2.is_empty());
         assert!(plain2.starts_with("vhub_"));
@@ -360,11 +416,11 @@ mod tests {
     #[test]
     fn register_same_name_reuses_vtoken() {
         let mut reg = ClientRegistry::new();
-        let (_plain1, hash1, is_new1) = reg.register("w".into(), None);
+        let (_plain1, hash1, is_new1) = reg.register("w".into(), None, None);
         assert!(is_new1);
         // Re-registration of the same name does not mint a new plaintext;
         // the registry returns the existing hash and an empty plaintext.
-        let (plain2, hash2, is_new2) = reg.register("w".into(), Some("lbl".into()));
+        let (plain2, hash2, is_new2) = reg.register("w".into(), Some("lbl".into()), None);
         assert!(!is_new2, "second register of same name is NOT new");
         assert!(plain2.is_empty(), "no new plaintext on re-registration");
         assert_eq!(hash1, hash2, "same name reuses hashed vtoken");
@@ -374,7 +430,7 @@ mod tests {
     #[test]
     fn stored_vtoken_is_hash_not_plaintext() {
         let mut reg = ClientRegistry::new();
-        let (plain, hashed, _) = reg.register("echo".into(), Some("echo test".into()));
+        let (plain, hashed, _) = reg.register("echo".into(), Some("echo test".into()), None);
         let c = reg.get_by_name("echo").expect("client");
         assert_ne!(
             c.vtoken, plain,
@@ -396,7 +452,7 @@ mod tests {
     #[test]
     fn get_by_vtoken_uses_hash() {
         let mut reg = ClientRegistry::new();
-        let (plain, _, _) = reg.register("a".into(), None);
+        let (plain, _, _) = reg.register("a".into(), None, None);
         let hashed = crate::hub::hash_vtoken(&plain);
         assert!(reg.get_by_vtoken(&hashed).is_some());
         assert!(
@@ -408,7 +464,7 @@ mod tests {
     #[test]
     fn get_by_name_roundtrip() {
         let mut reg = ClientRegistry::new();
-        reg.register("echo".into(), Some("echo test".into()));
+        reg.register("echo".into(), Some("echo test".into()), None);
         let c = reg.get_by_name("echo").expect("client");
         assert_eq!(c.name, "echo");
         assert_eq!(c.label.as_deref(), Some("echo test"));
@@ -421,9 +477,9 @@ mod tests {
         let mut reg = ClientRegistry::new();
         // Register in non-sorted insertion order to prove the numeric path
         // does not depend on insertion order.
-        reg.register("charlie".into(), None);
-        reg.register("alpha".into(), None);
-        reg.register("bravo".into(), None);
+        reg.register("charlie".into(), None, None);
+        reg.register("alpha".into(), None, None);
+        reg.register("bravo".into(), None, None);
         // Exact name wins even if a numeric alias could also resolve.
         assert_eq!(reg.get_by_alias("alpha").unwrap().name, "alpha");
         assert_eq!(reg.get_by_alias("bravo").unwrap().name, "bravo");
@@ -432,9 +488,9 @@ mod tests {
     #[test]
     fn get_by_alias_numeric_uses_sorted_index() {
         let mut reg = ClientRegistry::new();
-        reg.register("charlie".into(), None);
-        reg.register("alpha".into(), None);
-        reg.register("bravo".into(), None);
+        reg.register("charlie".into(), None, None);
+        reg.register("alpha".into(), None, None);
+        reg.register("bravo".into(), None, None);
         // Sorted: alpha(1), bravo(2), charlie(3)
         assert_eq!(reg.get_by_alias("1").unwrap().name, "alpha");
         assert_eq!(reg.get_by_alias("2").unwrap().name, "bravo");
@@ -444,7 +500,7 @@ mod tests {
     #[test]
     fn get_by_alias_rejects_zero_and_overflow() {
         let mut reg = ClientRegistry::new();
-        reg.register("alpha".into(), None);
+        reg.register("alpha".into(), None, None);
         assert!(reg.get_by_alias("0").is_none(), "0 is not a valid alias");
         assert!(
             reg.get_by_alias("2").is_none(),
@@ -455,7 +511,7 @@ mod tests {
     #[test]
     fn get_by_alias_unknown_name_returns_none() {
         let mut reg = ClientRegistry::new();
-        reg.register("alpha".into(), None);
+        reg.register("alpha".into(), None, None);
         assert!(reg.get_by_alias("nope").is_none());
         assert!(
             reg.get_by_alias("999").is_none(),
@@ -472,13 +528,13 @@ mod tests {
     #[test]
     fn mark_online_offline_uses_hash() {
         let mut reg = ClientRegistry::new();
-        let (_plain, hashed, _) = reg.register("a".into(), None);
+        let (_plain, hashed, _) = reg.register("a".into(), None, None);
         reg.mark_online(&hashed);
         assert!(reg.get_by_name("a").unwrap().online);
         reg.mark_offline(&hashed);
         assert!(!reg.get_by_name("a").unwrap().online);
         // plaintext must NOT flip the state
-        let (plain2, _, _) = reg.register("b".into(), None);
+        let (plain2, _, _) = reg.register("b".into(), None, None);
         reg.mark_online(&plain2);
         assert!(
             !reg.get_by_name("b").unwrap().online,
@@ -489,7 +545,7 @@ mod tests {
     #[test]
     fn update_client_renames_and_updates_label() {
         let mut reg = ClientRegistry::new();
-        let (_, hashed, _) = reg.register("old".into(), Some("old label".into()));
+        let (_, hashed, _) = reg.register("old".into(), Some("old label".into()), None);
         reg.update_client("old", "new", Some("new label".into()))
             .unwrap();
         assert!(reg.get_by_name("old").is_none());
@@ -501,8 +557,8 @@ mod tests {
     #[test]
     fn update_client_rejects_duplicate_name() {
         let mut reg = ClientRegistry::new();
-        reg.register("a".into(), None);
-        reg.register("b".into(), None);
+        reg.register("a".into(), None, None);
+        reg.register("b".into(), None, None);
         assert_eq!(
             reg.update_client("a", "b", None),
             Err(UpdateClientError::NameTaken)
@@ -514,13 +570,13 @@ mod tests {
         // Simulate the load_clients_from_db path: caller has the DB-side hash
         // and wants to insert it without hashing a second time.
         let mut reg = ClientRegistry::new();
-        let (_, _, _) = reg.register("first".into(), None);
+        let (_, _, _) = reg.register("first".into(), None, None);
         let stored_first_hash = reg.get_by_name("first").unwrap().vtoken.clone();
 
         // A different name + the SAME hash: the load path takes the supplied
         // value as the canonical hash and does not double-hash.
         let (stored, is_new) =
-            reg.register_with_vtoken("second".into(), None, Some(stored_first_hash.clone()));
+            reg.register_with_vtoken("second".into(), None, None, Some(stored_first_hash.clone()));
         assert!(is_new);
         assert_eq!(
             stored, stored_first_hash,
@@ -531,5 +587,29 @@ mod tests {
             c.vtoken, stored_first_hash,
             "register_with_vtoken must store the supplied value verbatim"
         );
+    }
+
+    #[test]
+    fn register_with_description() {
+        let mut reg = ClientRegistry::new();
+        let (plain, _hashed, _) = reg.register(
+            "agent".into(),
+            Some("Test Agent".into()),
+            Some("An agent for testing".into()),
+        );
+        assert!(!plain.is_empty());
+        let c = reg.get_by_name("agent").expect("client");
+        assert_eq!(c.label.as_deref(), Some("Test Agent"));
+        assert_eq!(c.description.as_deref(), Some("An agent for testing"));
+    }
+
+    #[test]
+    fn register_updates_description() {
+        let mut reg = ClientRegistry::new();
+        let (_, hash1, _) = reg.register("agent".into(), None, None);
+        let (_, hash2, _) = reg.register("agent".into(), None, Some("New description".into()));
+        assert_eq!(hash1, hash2, "same name reuses hashed vtoken");
+        let c = reg.get_by_name("agent").expect("client");
+        assert_eq!(c.description.as_deref(), Some("New description"));
     }
 }

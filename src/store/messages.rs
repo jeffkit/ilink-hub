@@ -134,6 +134,41 @@ impl Store {
         }))
     }
 
+    /// Find the most recent assistant message in a conversation sent within ±`window_secs`
+    /// of the given Unix timestamp. Used as a reliable fallback for quote-reply routing
+    /// when the iLink protocol does not carry text in `ref_msg.message_item` (only a
+    /// `create_time_ms` timestamp is available).
+    ///
+    /// Returns `(vtoken, session_name)` of the closest matching row, or `None`.
+    pub async fn find_assistant_message_by_timestamp(
+        &self,
+        peer_user_id: &str,
+        ref_unix_secs: i64,
+        window_secs: i64,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let lo = ref_unix_secs - window_secs;
+        let hi = ref_unix_secs + window_secs;
+        // SQLite stores created_at as "YYYY-MM-DD HH:MM:SS" (UTC). Cast via unixepoch().
+        let row = sqlx::query(
+            "SELECT vtoken, session_name FROM messages \
+             WHERE peer_user_id = $1 AND role = 'assistant' \
+               AND CAST(strftime('%s', created_at) AS INTEGER) BETWEEN $2 AND $3 \
+             ORDER BY ABS(CAST(strftime('%s', created_at) AS INTEGER) - $4) ASC \
+             LIMIT 1",
+        )
+        .bind(peer_user_id)
+        .bind(lo)
+        .bind(hi)
+        .bind(ref_unix_secs)
+        .fetch_optional(&self.rpool)
+        .await?;
+        Ok(row.map(|r| {
+            let vtoken: Option<String> = r.get("vtoken");
+            let session_name: String = r.get("session_name");
+            (vtoken.unwrap_or_default(), Some(session_name))
+        }))
+    }
+
     pub async fn list_messages(&self, vctx: &str, limit: i64) -> Result<Vec<MessageRow>> {
         let rows = sqlx::query(
             "SELECT id, vctx, vtoken, session_name, peer_user_id, role, content, created_at \

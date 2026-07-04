@@ -264,6 +264,27 @@ impl QuoteRouteIndex {
         parse_footer_from_quoted_text(&text)
     }
 
+    /// Extract the `create_time_ms` timestamp from the `ref_msg` in a user's quote-reply,
+    /// without requiring `text_item` to be present. iLink often omits the text content
+    /// from `ref_msg.message_item` but always provides the timestamp, making this the
+    /// most reliable signal for quote-reply routing.
+    pub fn collect_quoted_timestamp(msg: &crate::ilink::types::WeixinMessage) -> Option<i64> {
+        let items = msg.item_list.as_ref()?;
+        for item in items.iter() {
+            let Some(extra) = item.extra.as_object() else {
+                continue;
+            };
+            let Some(mi) = extra.get("ref_msg").and_then(|r| r.get("message_item")) else {
+                continue;
+            };
+            // create_time_ms may be present even when text_item is absent.
+            if let Some(ms) = mi.get("create_time_ms").and_then(|v| v.as_i64()) {
+                return Some(ms);
+            }
+        }
+        None
+    }
+
     pub fn evict_expired(&mut self) {
         let now = Instant::now();
         // Walk by_content first (source of truth), removing dead entries and

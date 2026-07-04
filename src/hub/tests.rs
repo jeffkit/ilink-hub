@@ -155,8 +155,13 @@ async fn concurrent_register_and_route_does_not_deadlock() {
         let s = Arc::clone(&state);
         handles.push(tokio::spawn(async move {
             for j in 0..10 {
-                crate::server::pairing::register_client_in_hub(&s, format!("client-{i}-{j}"), None)
-                    .await;
+                crate::server::pairing::register_client_in_hub(
+                    &s,
+                    format!("client-{i}-{j}"),
+                    None,
+                    None,
+                )
+                .await;
             }
         }));
     }
@@ -553,10 +558,12 @@ async fn test_extracted_hub_commands() {
 
     // 3. Register client-a and client-b
     let out_a =
-        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
+        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None, None)
+            .await;
     let vt_a = out_a.hashed;
     let out_b =
-        crate::server::pairing::register_client_in_hub(&state, "client-b".to_string(), None).await;
+        crate::server::pairing::register_client_in_hub(&state, "client-b".to_string(), None, None)
+            .await;
     let vt_b = out_b.hashed;
 
     // Initially online is false
@@ -857,7 +864,8 @@ async fn test_adversarial_hub_commands() {
 
     // Register a client and select it
     let out_a =
-        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None).await;
+        crate::server::pairing::register_client_in_hub(&state, "client-a".to_string(), None, None)
+            .await;
     let vt_a = out_a.hashed;
     state.clients.registry.write().await.mark_online(&vt_a);
     let _ = handle_cmd_use(&state, from_user, "client-a").await;

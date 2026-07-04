@@ -30,6 +30,10 @@ pub async fn list_agents(state: &Arc<HubState>) -> Value {
                 if let Some(desc) = &c.description {
                     entry["description"] = serde_json::Value::String(desc.clone());
                 }
+                entry["persona"] = serde_json::json!({
+                    "name": c.persona_name,
+                    "emoji": c.persona_emoji
+                });
                 entry
             })
             .collect()

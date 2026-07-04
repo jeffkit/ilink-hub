@@ -60,7 +60,8 @@ async fn register(state: &Arc<HubState>, name: &str) -> (String, String) {
     // `Authorization: Bearer`) and the hash (the canonical in-memory /
     // DB / queue key).
     let outcome =
-        ilink_hub::server::pairing::register_client_in_hub(state, name.to_string(), None).await;
+        ilink_hub::server::pairing::register_client_in_hub(state, name.to_string(), None, None)
+            .await;
     (outcome.plaintext, outcome.hashed)
 }
 
@@ -493,6 +494,7 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
                     &s,
                     format!("client-{i}-{j}"),
                     None,
+                    None,
                 )
                 .await;
             }
@@ -514,9 +516,13 @@ async fn concurrent_register_and_pair_confirm_does_not_deadlock() {
                 };
                 if let Some(csrf) = csrf {
                     let name = format!("pair-client-{i}-{j}");
-                    let outcome =
-                        ilink_hub::server::pairing::register_client_in_hub(&s, name.clone(), None)
-                            .await;
+                    let outcome = ilink_hub::server::pairing::register_client_in_hub(
+                        &s,
+                        name.clone(),
+                        None,
+                        None,
+                    )
+                    .await;
                     let res = {
                         let mut reg = s.clients.pairing.write().await;
                         reg.confirm(&code, name, None, outcome.plaintext, &csrf)
@@ -583,6 +589,7 @@ async fn pair_confirm_race_yields_single_winner_and_no_orphan_vtoken() {
                     match ilink_hub::server::pairing::register_confirmed_client_in_hub(
                         s.as_ref(),
                         name.clone(),
+                        None,
                         None,
                         vtoken_plain,
                     )
@@ -1230,7 +1237,8 @@ async fn rollback_preserves_legit_client_when_name_collides() {
     // 3. Attacker: speculative register of "alice" reuses legit_vtoken,
     //    then confirm with a WRONG csrf → CsrfMismatch.
     let attacker_outcome =
-        ilink_hub::server::pairing::register_client_in_hub(&state, "alice".into(), None).await;
+        ilink_hub::server::pairing::register_client_in_hub(&state, "alice".into(), None, None)
+            .await;
     assert_eq!(
         attacker_outcome.hashed, legit_vtoken,
         "register reuses legit vtoken (hashed form)"
@@ -1329,6 +1337,7 @@ async fn rollback_cas_aborts_when_legit_re_register_happened() {
         registry.register_with_vtoken(
             "alice".into(),
             Some("legit replacement".into()),
+            None, // description
             Some(fresh_vt.clone()),
         );
         fresh_vt
@@ -1360,9 +1369,9 @@ async fn rollback_cas_aborts_when_legit_re_register_happened() {
 #[test]
 fn register_returns_is_new_flag() {
     let mut reg = ilink_hub::hub::registry::ClientRegistry::new();
-    let (plain1, hash1, is_new1) = reg.register("x".into(), None);
+    let (plain1, hash1, is_new1) = reg.register("x".into(), None, None);
     assert!(is_new1, "first register of a fresh name is_new=true");
-    let (plain2, hash2, is_new2) = reg.register("x".into(), Some("lbl".into()));
+    let (plain2, hash2, is_new2) = reg.register("x".into(), Some("lbl".into()), None);
     assert!(!is_new2, "second register of the same name is_new=false");
     assert_eq!(hash1, hash2, "hashed vtoken is reused for the same name");
     assert!(

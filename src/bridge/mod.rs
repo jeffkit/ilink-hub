@@ -12,6 +12,7 @@ mod executor;
 pub mod manager;
 mod paths;
 mod probe;
+pub mod vtoken_env;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy, StdinMode};
 pub use connection::{

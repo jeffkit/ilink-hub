@@ -543,6 +543,7 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                     registry.register_with_vtoken(
                         c.name.clone(),
                         c.label.clone(),
+                        None, // description not loaded from DB in older versions
                         Some(c.vtoken.clone()),
                     );
                     // Fill in persona: use DB values when present, otherwise default to

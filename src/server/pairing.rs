@@ -283,6 +283,7 @@ pub async fn register_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
+    description: Option<String>,
 ) -> RegisterClientOutcome {
     // Lock order: registry → router (always). MUST NOT be called while
     // `state.clients.pairing.write()` is held; doing so would introduce a new
@@ -290,7 +291,8 @@ pub async fn register_client_in_hub(
     // future code path that takes registry+router and then pairing. (F-M1-1)
     let (plaintext, hashed, is_new, is_first) = {
         let mut registry = state.clients.registry.write().await;
-        let (plaintext, hashed, is_new) = registry.register(name.clone(), label.clone());
+        let (plaintext, hashed, is_new) =
+            registry.register(name.clone(), label.clone(), description.clone());
         let is_first = is_new && registry.all_clients().len() == 1;
         (plaintext, hashed, is_new, is_first)
     };
@@ -327,6 +329,7 @@ pub async fn register_confirmed_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
+    description: Option<String>,
     vtoken_plain: String,
 ) -> Result<RegisterClientOutcome, PairingError> {
     use crate::hub::hash_vtoken;
@@ -335,7 +338,12 @@ pub async fn register_confirmed_client_in_hub(
     let is_first = {
         let mut registry = state.clients.registry.write().await;
         if registry
-            .register_confirmed(name.clone(), label.clone(), hashed.clone())
+            .register_confirmed(
+                name.clone(),
+                label.clone(),
+                description.clone(),
+                hashed.clone(),
+            )
             .is_err()
         {
             return Err(PairingError::NameCollision);
@@ -949,6 +957,7 @@ pub async fn pair_confirm(
                 state.as_ref(),
                 name.clone(),
                 label,
+                None, // description not supported in pairing flow
                 vtoken_plain.clone(),
             )
             .await

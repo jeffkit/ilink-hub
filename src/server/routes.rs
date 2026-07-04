@@ -98,6 +98,11 @@ impl FromRequestParts<Arc<HubState>> for AdminGuard {
 pub struct RegisterRequest {
     pub name: String,
     pub label: Option<String>,
+    /// Optional description of the Agent's capabilities.
+    /// Exposed via the MCP `list_agents` tool so other Agents can understand
+    /// what this Agent can do before calling it.
+    #[serde(default)]
+    pub description: Option<String>,
     /// Optional display name shown in `/list` and prepended to replies.
     /// Defaults to the client name when omitted on the bridge side.
     #[serde(default)]
@@ -165,7 +170,13 @@ pub async fn register(
         }
     }
 
-    let outcome = register_client_in_hub(state.as_ref(), req.name.clone(), req.label.clone()).await;
+    let outcome = register_client_in_hub(
+        state.as_ref(),
+        req.name.clone(),
+        req.label.clone(),
+        req.description.clone(),
+    )
+    .await;
 
     // M1: plaintext is only available for brand-new registrations. When an existing
     // client name is re-registered the original plaintext is irrecoverable (only the

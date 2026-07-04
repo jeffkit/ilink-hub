@@ -221,7 +221,7 @@ mod tests {
                 .registry
                 .write()
                 .await
-                .register("test-client".to_string(), None)
+                .register("test-client".to_string(), None, None)
         };
         // Push a message to create a queue entry so queue_sizes() returns data.
         let msg = WeixinMessage {
@@ -498,12 +498,11 @@ mod tests {
         // Register a client with special characters and push a message so
         // queue_size gauge has a label value with special chars.
         let (_, vtoken, _) = {
-            state
-                .clients
-                .registry
-                .write()
-                .await
-                .register("bad\"client\nname".to_string(), None)
+            state.clients.registry.write().await.register(
+                "bad\"client\nname".to_string(),
+                None,
+                None,
+            )
         };
         use crate::ilink::types::WeixinMessage;
         let msg = WeixinMessage {
@@ -606,7 +605,7 @@ mod tests {
                 .registry
                 .write()
                 .await
-                .register("busy-client".to_string(), None)
+                .register("busy-client".to_string(), None, None)
         };
         use crate::ilink::types::WeixinMessage;
         for i in 0u32..50 {

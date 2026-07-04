@@ -132,13 +132,19 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
         if from_index.is_some() {
             from_index
         } else {
-            // Cold index (e.g. after a Hub restart): first try DB lookup, then fall back to
-            // footer text parsing as last resort. Neither helper touches `quote_index`.
-            let from_db = resolve_quote_from_db(&state, &msg).await;
-            if from_db.is_some() {
-                from_db
+            // Cold index (e.g. after a Hub restart): try timestamp lookup first (most
+            // reliable — iLink always provides create_time_ms even when text is absent),
+            // then content-prefix DB lookup, then footer text parsing as last resort.
+            let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+            if from_ts.is_some() {
+                from_ts
             } else {
-                resolve_quote_from_footer(&state, &msg).await
+                let from_db = resolve_quote_from_db(&state, &msg).await;
+                if from_db.is_some() {
+                    from_db
+                } else {
+                    resolve_quote_from_footer(&state, &msg).await
+                }
             }
         }
     };
@@ -187,7 +193,12 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 let (vctx_d, vtoken_d) = (vctx.clone(), vtoken.clone());
                 tokio::spawn(async move {
                     if let Err(e) = store_d
-                        .set_active_session_with_depth(&vctx_d, &vtoken_d, &session_name_for_depth, 0)
+                        .set_active_session_with_depth(
+                            &vctx_d,
+                            &vtoken_d,
+                            &session_name_for_depth,
+                            0,
+                        )
                         .await
                     {
                         warn!(error = %e, "failed to reset a2a_depth on user message dispatch");
@@ -334,6 +345,65 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
                 )
                 .await;
             }
+        }
+    }
+}
+
+/// Timestamp-based quote resolver: use `ref_msg.create_time_ms` to find the assistant message
+/// sent at approximately that time. This is the most reliable fallback because iLink always
+/// provides a timestamp in `ref_msg.message_item` even when it omits the text content.
+async fn resolve_quote_from_timestamp(
+    state: &Arc<HubState>,
+    msg: &crate::ilink::types::WeixinMessage,
+) -> Option<QuoteOrigin> {
+    let ref_ms = quote_route::QuoteRouteIndex::collect_quoted_timestamp(msg)?;
+    let ref_unix_secs = ref_ms / 1000;
+    let peer_user_id = {
+        let group_id = msg.group_id.as_deref().unwrap_or_default();
+        let from_user_id = msg.from_user_id.as_deref().unwrap_or_default();
+        if !group_id.is_empty() {
+            format!("group:{group_id}")
+        } else if !from_user_id.is_empty() {
+            format!("peer:{from_user_id}")
+        } else {
+            String::new()
+        }
+    };
+    if peer_user_id.is_empty() {
+        return None;
+    }
+    // Allow ±10 s window to handle minor clock skew between iLink and DB.
+    match state
+        .store
+        .find_assistant_message_by_timestamp(&peer_user_id, ref_unix_secs, 10)
+        .await
+    {
+        Ok(Some((vtoken, session_name))) if !vtoken.is_empty() => {
+            let (name, label) = {
+                let registry = state.clients.registry.read().await;
+                registry
+                    .get_by_vtoken(&vtoken)
+                    .map(|c| (c.name.clone(), c.label.clone()))
+                    .unwrap_or_else(|| (vtoken.clone(), None))
+            };
+            debug!(
+                peer = %peer_user_id,
+                vtoken = %crate::redact_token(&vtoken),
+                session = ?session_name,
+                ref_unix_secs,
+                "quote index miss — resolved via timestamp lookup"
+            );
+            Some(QuoteOrigin::Client {
+                vtoken,
+                name,
+                label,
+                session_name,
+            })
+        }
+        Ok(_) => None,
+        Err(e) => {
+            warn!(error = %e, "timestamp quote lookup failed");
+            None
         }
     }
 }

@@ -132,7 +132,12 @@ pub async fn validate_hub_token(hub_url: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result<String> {
+async fn register_via_hub_http(
+    hub_url: &str,
+    name: &str,
+    label: &str,
+    description: Option<&str>,
+) -> Result<String> {
     let client = reqwest::Client::new();
     let url = format!("{}/hub/register", hub_url.trim().trim_end_matches('/'));
     let mut req = client.post(&url).json(&serde_json::json!({
@@ -140,6 +145,7 @@ async fn register_via_hub_http(hub_url: &str, name: &str, label: &str) -> Result
         "label": label,
         "persona_name": name,
         "persona_emoji": "🤖",
+        "description": description,
     }));
     if let Ok(admin) = std::env::var("ILINK_ADMIN_TOKEN") {
         let admin = admin.trim();
@@ -292,11 +298,12 @@ async fn auto_register_and_save(
     register_client_name: Option<&str>,
     saved_client_name: Option<&str>,
     config_path: Option<&Path>,
+    description: Option<&str>,
 ) -> Result<(String, String)> {
     let hub = hub.trim().trim_end_matches('/').to_string();
     let name = auto_client_name(register_client_name, saved_client_name, config_path);
     let label = local_hostname();
-    let vtoken = register_via_hub_http(&hub, &name, &label).await.with_context(|| {
+    let vtoken = register_via_hub_http(&hub, &name, &label, description).await.with_context(|| {
         "自动调用 /hub/register 失败。若返回体为业务错误：检查 `ILINK_ADMIN_TOKEN` 是否与 Hub 一致；\
          或改用 `WEIXIN_TOKEN` / `--pair`。"
     })?;
@@ -332,6 +339,7 @@ pub async fn resolve_hub_connection(
     register_client_name: Option<&str>,
     force_register: bool,
     config_path: Option<&Path>,
+    description: Option<&str>,
 ) -> Result<(String, String)> {
     let hub = hub_url.trim().trim_end_matches('/').to_string();
 
@@ -378,6 +386,7 @@ pub async fn resolve_hub_connection(
                     register_client_name,
                     saved_name,
                     config_path,
+                    description,
                 )
                 .await;
             }
@@ -392,12 +401,28 @@ pub async fn resolve_hub_connection(
             Ok((hub, creds.token))
         }
         LocalCredState::Missing => {
-            auto_register_and_save(&path, &hub, register_client_name, None, config_path).await
+            auto_register_and_save(
+                &path,
+                &hub,
+                register_client_name,
+                None,
+                config_path,
+                description,
+            )
+            .await
         }
         LocalCredState::ExistsUnusable => {
             if force_register {
                 let _ = tokio::fs::remove_file(&path).await;
-                auto_register_and_save(&path, &hub, register_client_name, None, config_path).await
+                auto_register_and_save(
+                    &path,
+                    &hub,
+                    register_client_name,
+                    None,
+                    config_path,
+                    description,
+                )
+                .await
             } else {
                 anyhow::bail!(
                     "凭证文件 {} 已存在但无法使用（内容损坏或 token 为空）。\

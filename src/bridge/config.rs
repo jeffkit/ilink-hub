@@ -112,6 +112,9 @@ pub struct BridgeProfile {
     /// 只等程序退出后将完整 stdout 作为最终回复一次性发送。
     #[serde(default = "default_true")]
     pub streaming: bool,
+    /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl Default for BridgeProfile {
@@ -130,6 +133,7 @@ impl Default for BridgeProfile {
             include_stderr_in_reply: false,
             cli_session_first_line_prefix: None,
             streaming: true,
+            description: None,
         }
     }
 }
@@ -180,6 +184,9 @@ pub struct BridgeConfig {
     pub cli_session_first_line_prefix: Option<String>,
     #[serde(default = "default_true")]
     pub streaming: bool,
+    /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 impl BridgeConfig {
@@ -252,6 +259,7 @@ impl BridgeApp {
             include_stderr_in_reply: c.include_stderr_in_reply,
             cli_session_first_line_prefix: c.cli_session_first_line_prefix.clone(),
             streaming: c.streaming,
+            description: c.description,
         };
         warn_shell_injection_risk(&profile, "default");
         let mut profiles = HashMap::new();

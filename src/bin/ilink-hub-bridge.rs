@@ -261,6 +261,11 @@ async fn main() -> Result<()> {
             tokio::pin!(sigterm_fut);
 
             'reconnect: loop {
+                // Get description from default profile for registration
+                let description = app
+                    .profile(app.default_profile_name())
+                    .and_then(|p| p.description.as_deref());
+
                 let (hub_url, token) = resolve_hub_connection(
                     &cli.hub_url,
                     explicit_token(&cli),
@@ -269,6 +274,7 @@ async fn main() -> Result<()> {
                     cli.register_name.as_deref(),
                     cli.force_register,
                     Some(config_path.as_path()),
+                    description,
                 )
                 .await?;
                 info!(%hub_url, "using Hub base URL for downstream");
