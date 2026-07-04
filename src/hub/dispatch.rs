@@ -774,6 +774,21 @@ pub async fn build_hub_ext_for_vctx(
     })
 }
 
+/// Reply text when no AI backend is online.
+/// Varies slightly based on whether the user sent a hub command (handled separately)
+/// or a regular message.
+fn build_no_backend_reply(user_text: Option<&str>) -> String {
+    let is_command = user_text
+        .map(|t| t.trim().starts_with('/'))
+        .unwrap_or(false);
+
+    if is_command {
+        return messages::UNRECOGNIZED_COMMAND.to_string();
+    }
+
+    messages::NO_BACKEND_ONLINE.to_string()
+}
+
 // ─── Dispatch tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1250,19 +1265,4 @@ mod tests {
             other => panic!("expected QuoteOrigin::Client, got {other:?}"),
         }
     }
-}
-
-/// Reply text when no AI backend is online.
-/// Varies slightly based on whether the user sent a hub command (handled separately)
-/// or a regular message.
-fn build_no_backend_reply(user_text: Option<&str>) -> String {
-    let is_command = user_text
-        .map(|t| t.trim().starts_with('/'))
-        .unwrap_or(false);
-
-    if is_command {
-        return messages::UNRECOGNIZED_COMMAND.to_string();
-    }
-
-    messages::NO_BACKEND_ONLINE.to_string()
 }
