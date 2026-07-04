@@ -110,9 +110,6 @@ pub struct RegisterRequest {
     /// Optional emoji avatar shown alongside `persona_name` in `/list` and replies.
     #[serde(default)]
     pub persona_emoji: Option<String>,
-    /// Optional one-line description returned by the MCP `list_agents` tool.
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

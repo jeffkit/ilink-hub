@@ -878,14 +878,12 @@ impl Store {
         }
         // Guard: active_sessions table may be absent in partial-schema test environments.
         let table_exists = match self.kind {
-            DatabaseKind::Sqlite => {
-                sqlx::query(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_sessions'",
-                )
-                .fetch_optional(&mut **tx)
-                .await?
-                .is_some()
-            }
+            DatabaseKind::Sqlite => sqlx::query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_sessions'",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
             DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
                 "SELECT 1 FROM information_schema.tables \
                  WHERE table_name = 'active_sessions' LIMIT 1",
@@ -948,12 +946,10 @@ impl Store {
         // Guard: clients table may be absent in partial-schema test environments.
         let table_exists = match self.kind {
             DatabaseKind::Sqlite => {
-                sqlx::query(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'",
-                )
-                .fetch_optional(&mut **tx)
-                .await?
-                .is_some()
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='clients'")
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some()
             }
             DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
                 "SELECT 1 FROM information_schema.tables WHERE table_name = 'clients' LIMIT 1",

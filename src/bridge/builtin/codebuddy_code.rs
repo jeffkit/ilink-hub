@@ -40,29 +40,44 @@ type CodeBuddyStreamEvent = common::StreamJsonEvent;
 
 pub async fn run() -> Result<()> {
     let (message, session_id) = common::read_message_and_session();
+    let streaming = std::env::var("AGENT_STREAMING").as_deref() != Ok("0");
 
-    let new_session_id = common::with_session_resume_fallback(
+    let (new_session_id, buffered_reply) = common::with_session_resume_fallback(
         "codebuddy-code",
         &message,
         &session_id,
-        |m, s| async move { stream_codebuddy(&m, &s).await },
+        |m, s| async move { stream_codebuddy(&m, &s, streaming).await },
     )
     .await?;
 
+    // In non-streaming mode the full reply was not emitted as AGENT_PARTIAL lines;
+    // print it now as a plain body so the bridge can forward it as a single message.
+    if !streaming {
+        if let Some(reply) = buffered_reply.filter(|s| !s.is_empty()) {
+            print!("{reply}");
+        }
+    }
+
     // P0 output: optional session line only.
-    // All response text was already streamed via AGENT_PARTIAL during execution.
     common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
 
 /// Call `codebuddy -p --output-format stream-json`, emit every assistant text chunk as an
-/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
+/// `AGENT_PARTIAL:` stdout line (when `streaming` is true), or accumulate chunks into a
+/// single String (when `streaming` is false).
+///
+/// Returns `(session_id, buffered_reply)`. `buffered_reply` is `Some` only when
+/// `streaming` is false and contains the full concatenated reply.
 ///
 /// When the model uses tools between turns, the final assistant reply may only appear
-/// in `result.result` (with no preceding `assistant` event); we emit it as an extra
-/// AGENT_PARTIAL in that case.
-async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<String>> {
+/// in `result.result` (with no preceding `assistant` event); we handle it in both modes.
+async fn stream_codebuddy(
+    message: &str,
+    session_id: &str,
+    streaming: bool,
+) -> Result<(Option<String>, Option<String>)> {
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--output-format".into(),
@@ -109,8 +124,10 @@ async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<Stri
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_session_id: Option<String> = None;
-    // Track the last partial text sent so we can detect when result.result differs.
-    let mut last_partial: Option<String> = None;
+    // Track the last text chunk sent/buffered so we can detect when result.result differs.
+    let mut last_chunk: Option<String> = None;
+    // Buffer for non-streaming mode: accumulate all assistant text here.
+    let mut buffer: Option<String> = if streaming { None } else { Some(String::new()) };
 
     loop {
         line.clear();
@@ -137,10 +154,14 @@ async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<Stri
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
                     // "\n" emitted between tool calls) do not produce an empty-looking
-                    // AGENT_PARTIAL that the user sees as a blank message.
+                    // message that the user sees as blank.
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
-                        last_partial = Some(text);
+                        if streaming {
+                            common::emit_partial(&text)?;
+                        } else if let Some(buf) = &mut buffer {
+                            buf.push_str(&text);
+                        }
+                        last_chunk = Some(text);
                     }
                 }
             }
@@ -148,11 +169,16 @@ async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<Stri
                 found_session_id = event.session_id;
                 // When the model uses tools between turns, the final assistant reply text
                 // may only appear in result.result and have no corresponding assistant event.
-                // Send it as a partial if it differs from the last streamed chunk.
+                // Handle it in both streaming and non-streaming modes if it differs from
+                // the last chunk already sent/buffered.
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
-                    if !already_sent {
-                        common::emit_partial(&result_text)?;
+                    let already_handled = last_chunk.as_deref() == Some(result_text.as_str());
+                    if !already_handled {
+                        if streaming {
+                            common::emit_partial(&result_text)?;
+                        } else if let Some(buf) = &mut buffer {
+                            buf.push_str(&result_text);
+                        }
                     }
                 }
             }
@@ -165,7 +191,7 @@ async fn stream_codebuddy(message: &str, session_id: &str) -> Result<Option<Stri
 
     common::ensure_success("codebuddy", status, &stderr, found_session_id.is_some())?;
 
-    Ok(found_session_id)
+    Ok((found_session_id, buffer))
 }
 
 #[cfg(test)]
@@ -214,24 +240,24 @@ mod tests {
     }
 
     #[test]
-    fn result_with_no_prior_partial_always_emits() {
-        let last_partial: Option<String> = None;
+    fn result_with_no_prior_chunk_always_emits() {
+        let last_chunk: Option<String> = None;
         let result_text = "The answer is 42.";
-        let already_sent = last_partial.as_deref() == Some(result_text);
+        let already_handled = last_chunk.as_deref() == Some(result_text);
         assert!(
-            !already_sent,
-            "when no prior partial exists, result must NOT be skipped"
+            !already_handled,
+            "when no prior chunk exists, result must NOT be skipped"
         );
     }
 
     #[test]
-    fn result_matching_last_partial_is_not_resent() {
-        let last_partial: Option<String> = Some("Hi!".to_string());
+    fn result_matching_last_chunk_is_not_resent() {
+        let last_chunk: Option<String> = Some("Hi!".to_string());
         let result_text = "Hi!";
-        let already_sent = last_partial.as_deref() == Some(result_text);
+        let already_handled = last_chunk.as_deref() == Some(result_text);
         assert!(
-            already_sent,
-            "result matching last_partial must be skipped to avoid duplicate"
+            already_handled,
+            "result matching last_chunk must be skipped to avoid duplicate"
         );
     }
 
@@ -265,7 +291,7 @@ mod tests {
         ];
 
         let mut found_session_id: Option<String> = None;
-        let mut last_partial: Option<String> = None;
+        let mut last_chunk: Option<String> = None;
         let mut emitted: Vec<String> = Vec::new();
 
         for line in &lines {
@@ -276,14 +302,14 @@ mod tests {
                         let text = msg.text();
                         if !text.trim().is_empty() {
                             emitted.push(text.clone());
-                            last_partial = Some(text);
+                            last_chunk = Some(text);
                         }
                     }
                 }
                 Some("result") => {
                     found_session_id = event.session_id;
                     if let Some(rt) = event.result.filter(|t| !t.trim().is_empty()) {
-                        if last_partial.as_deref() != Some(rt.as_str()) {
+                        if last_chunk.as_deref() != Some(rt.as_str()) {
                             emitted.push(rt);
                         }
                     }
@@ -302,5 +328,53 @@ mod tests {
             found_session_id.as_deref(),
             Some("72f18735-deb2-42e1-be58-c07489548e02")
         );
+    }
+
+    #[test]
+    fn non_streaming_mode_buffers_all_chunks_into_reply() {
+        // Simulate the same event sequence but in non-streaming mode.
+        // All text should be accumulated into a single buffer, not emitted as AGENT_PARTIAL.
+        let lines = [
+            r#"{"type":"system","subtype":"init","uuid":"72f18735","session_id":"72f18735"}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"thinking","signature":""}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hello, "}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"world!"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"world!","session_id":"72f18735"}"#,
+        ];
+
+        let mut found_session_id: Option<String> = None;
+        let mut last_chunk: Option<String> = None;
+        let mut buffer = String::new();
+
+        for line in &lines {
+            let event: StreamJsonEvent = serde_json::from_str(line).unwrap();
+            match event.event_type.as_deref() {
+                Some("assistant") => {
+                    if let Some(msg) = &event.message {
+                        let text = msg.text();
+                        if !text.trim().is_empty() {
+                            buffer.push_str(&text);
+                            last_chunk = Some(text);
+                        }
+                    }
+                }
+                Some("result") => {
+                    found_session_id = event.session_id;
+                    if let Some(rt) = event.result.filter(|t| !t.trim().is_empty()) {
+                        if last_chunk.as_deref() != Some(rt.as_str()) {
+                            buffer.push_str(&rt);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Both chunks concatenated; "world!" from result is deduped (matches last_chunk).
+        assert_eq!(
+            buffer, "Hello, world!",
+            "non-streaming buffer must contain all chunks"
+        );
+        assert_eq!(found_session_id.as_deref(), Some("72f18735"));
     }
 }

@@ -331,6 +331,7 @@ async fn auto_register_and_save(
 ///
 /// `force_register`: if the credential file exists but is unusable, delete it and run auto-register.
 /// Does not affect a **valid** saved file (that path returns early).
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_hub_connection(
     hub_url: &str,
     explicit_token: Option<&str>,

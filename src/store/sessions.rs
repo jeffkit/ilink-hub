@@ -336,10 +336,7 @@ impl Store {
     ///
     /// Used by the MCP `call_agent` handler to auto-fill context without requiring the
     /// calling LLM to pass hidden `_hub_vctx` / `_hub_real_ctx` / `_hub_peer` arguments.
-    pub async fn get_active_ctx_for_vtoken(
-        &self,
-        vtoken: &str,
-    ) -> Result<Option<ActiveCtxInfo>> {
+    pub async fn get_active_ctx_for_vtoken(&self, vtoken: &str) -> Result<Option<ActiveCtxInfo>> {
         let row = sqlx::query(
             "SELECT a.vctx, \
                     COALESCE(a.a2a_depth, 0) AS a2a_depth, \

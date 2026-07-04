@@ -80,7 +80,11 @@ impl Store {
                 persona_emoji: r.get("persona_emoji"),
                 description: {
                     let s: String = r.get("description");
-                    if s.is_empty() { None } else { Some(s) }
+                    if s.is_empty() {
+                        None
+                    } else {
+                        Some(s)
+                    }
                 },
             })
             .collect())
@@ -104,7 +108,11 @@ impl Store {
             persona_emoji: r.get("persona_emoji"),
             description: {
                 let s: String = r.get("description");
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             },
         }))
     }
