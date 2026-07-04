@@ -348,3 +348,243 @@ fn build_display_text(
     let header = persona_handle(sender_name, persona_name, persona_emoji);
     format!("{header}\n{text}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{AdminConfig, HubState, InMemoryQueue};
+    use crate::ilink::UpstreamClient;
+    use crate::store::Store;
+    use std::sync::Arc;
+
+    // ─── persona_handle ──────────────────────────────────────────────────────
+
+    #[test]
+    fn persona_handle_with_emoji_and_name() {
+        let handle = persona_handle("backend-a", Some("Claude"), Some("🤖"));
+        assert_eq!(handle, "🤖 Claude");
+    }
+
+    #[test]
+    fn persona_handle_name_only_no_emoji() {
+        let handle = persona_handle("backend-a", Some("Claude"), None);
+        assert_eq!(handle, "Claude");
+    }
+
+    #[test]
+    fn persona_handle_falls_back_to_backend_name_when_no_persona() {
+        let handle = persona_handle("backend-a", None, None);
+        assert_eq!(handle, "backend-a");
+    }
+
+    #[test]
+    fn persona_handle_emoji_without_name_falls_back_to_backend_name() {
+        // The match arm `(Some(_emoji), None)` hits `_ => backend_name`
+        let handle = persona_handle("backend-a", None, Some("🤖"));
+        assert_eq!(handle, "backend-a");
+    }
+
+    // ─── build_display_text ──────────────────────────────────────────────────
+
+    #[test]
+    fn build_display_text_with_persona_prepends_header() {
+        let text = build_display_text("Hello!", "backend-a", Some("Claude"), Some("🤖"));
+        assert!(
+            text.starts_with("🤖 Claude\n"),
+            "must start with persona header: {text:?}"
+        );
+        assert!(
+            text.ends_with("Hello!"),
+            "must end with message body: {text:?}"
+        );
+    }
+
+    #[test]
+    fn build_display_text_without_persona_uses_backend_name() {
+        let text = build_display_text("Hello!", "backend-a", None, None);
+        assert!(text.starts_with("backend-a\n"));
+        assert!(text.contains("Hello!"));
+    }
+
+    #[test]
+    fn build_display_text_empty_body_produces_only_header() {
+        let text = build_display_text("", "backend-a", None, None);
+        assert_eq!(text, "backend-a\n");
+    }
+
+    // ─── build_synthetic_message ─────────────────────────────────────────────
+
+    #[test]
+    fn build_synthetic_message_has_correct_fields() {
+        let msg = build_synthetic_message("vctx-1", "user-1", "hello agent", None);
+        assert_eq!(msg.context_token.as_deref(), Some("vctx-1"));
+        assert_eq!(msg.from_user_id.as_deref(), Some("user-1"));
+        assert_eq!(msg.message_type, Some(1), "must be text message type");
+
+        let items = msg.item_list.expect("item_list must be present");
+        assert_eq!(items.len(), 1);
+        let text = items[0]
+            .text_item
+            .as_ref()
+            .expect("text_item must be present");
+        assert_eq!(text.text.as_deref(), Some("hello agent"));
+    }
+
+    #[test]
+    fn build_synthetic_message_with_hub_ext_injects_ext() {
+        use crate::ilink::types::HubExt;
+        let hub_ext = HubExt {
+            session_name: Some("test-session".to_string()),
+            session_id: None,
+            cli_session_id: None,
+            a2a_call_id: Some("call-123".to_string()),
+            a2a_depth: Some(1),
+        };
+        let msg = build_synthetic_message("vctx-1", "user-1", "hi", Some(hub_ext));
+        let ext = msg.ilink_hub_ext.expect("hub_ext must be set");
+        assert_eq!(ext.a2a_call_id.as_deref(), Some("call-123"));
+        assert_eq!(ext.a2a_depth, Some(1));
+        assert_eq!(ext.session_name.as_deref(), Some("test-session"));
+    }
+
+    // ─── list_agents integration test ────────────────────────────────────────
+
+    async fn make_state() -> Arc<HubState> {
+        let upstream =
+            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("upstream"));
+        let store = Arc::new(
+            Store::connect("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        HubState::new(
+            upstream,
+            store,
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_agents_returns_empty_array_when_no_clients() {
+        let state = make_state().await;
+        let result = list_agents(&state).await;
+
+        let content = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        let text = content[0]
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let agents: serde_json::Value = serde_json::from_str(text).expect("agents JSON");
+        assert_eq!(agents, serde_json::json!([]), "no clients → empty array");
+    }
+
+    #[tokio::test]
+    async fn list_agents_includes_registered_client_fields() {
+        let state = make_state().await;
+
+        // Register a client.
+        crate::server::pairing::register_client_in_hub(
+            &state,
+            "test-agent".to_string(),
+            None,
+            None,
+        )
+        .await;
+
+        let result = list_agents(&state).await;
+        let content = result
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content array");
+        let text = content[0]
+            .get("text")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        let agents: Vec<serde_json::Value> = serde_json::from_str(text).expect("agents JSON");
+
+        assert_eq!(agents.len(), 1);
+        let agent = &agents[0];
+        assert_eq!(
+            agent.get("name").and_then(|v| v.as_str()),
+            Some("test-agent")
+        );
+        assert!(
+            agent.get("online").is_some(),
+            "online field must be present"
+        );
+        assert!(
+            agent.get("persona").is_some(),
+            "persona field must be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_returns_clients_sorted_by_name() {
+        let state = make_state().await;
+
+        for name in &["zebra", "alpha", "mango"] {
+            crate::server::pairing::register_client_in_hub(&state, name.to_string(), None, None)
+                .await;
+        }
+
+        let result = list_agents(&state).await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let agents: Vec<serde_json::Value> = serde_json::from_str(text).expect("JSON");
+        let names: Vec<&str> = agents.iter().filter_map(|a| a["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha", "mango", "zebra"],
+            "must be sorted alphabetically"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_includes_description_when_set() {
+        use crate::store::Store;
+        let upstream =
+            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("upstream"));
+        let store = Arc::new(
+            Store::connect("sqlite::memory:")
+                .await
+                .expect("in-memory store"),
+        );
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = HubState::new(
+            upstream,
+            store,
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        );
+
+        // Register client with a description.
+        let out = crate::server::pairing::register_client_in_hub(
+            &state,
+            "described-agent".to_string(),
+            None,
+            Some("This agent does cool things".to_string()),
+        )
+        .await;
+        let _ = out;
+
+        let result = list_agents(&state).await;
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        let agents: Vec<serde_json::Value> = serde_json::from_str(text).expect("JSON");
+        let agent = &agents[0];
+        assert_eq!(
+            agent.get("description").and_then(|v| v.as_str()),
+            Some("This agent does cool things")
+        );
+    }
+}

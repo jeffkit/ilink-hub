@@ -449,45 +449,54 @@ async fn no_backend_online_triggers_fallback_reply_to_user() {
     );
 }
 
-/// Multiple bridges registered → a message from a user with no per-user route
-/// is broadcast to all online bridges. Each bridge's `getupdates` returns
-/// exactly one copy.
-// Pre-existing failure on main unrelated to security-p1 changes; tracked separately.
+/// Multiple bridges registered with no per-user route and no default: the Hub
+/// no longer broadcasts to every online bridge.  Instead it sends the user a
+/// Help reply via the mock upstream instructing them to pick a backend.
+/// Neither bridge's `getupdates` should return any message.
+///
+/// (Broadcast was removed to prevent confusing duplicate replies when multiple
+/// backends are online.  Users must now explicitly pick one via /use or /list.)
 #[tokio::test]
-#[ignore]
-async fn broadcast_dispatches_to_every_online_bridge() {
+async fn no_default_no_route_sends_help_not_broadcast() {
     let h = boot_without_default().await;
     let v1 = register_client(&h.base_url, "claude").await;
     let v2 = register_client(&h.base_url, "codex").await;
 
-    // The two /register calls re-set claude as default (the first registration
-    // always becomes default). Clear it again so subsequent messages fall
-    // through to broadcast instead of being forwarded to claude.
+    // Clear the default that the first /register set, so the message falls
+    // through to HubInternal(Help).
     h.state.routing.router.lock().await.unset_default();
 
-    // The first /register would have set claude as default; the helper
-    // already cleared that, so subsequent messages with no per-user route
-    // fall through to broadcast. Mark both bridges as online via a no-poll
-    // getupdates so broadcast finds them in `online_clients()`.
-    let pre_poll = async |v: &str| {
-        let _ = poll_for_messages(&h.base_url, v, 0).await;
-    };
-    pre_poll(&v1).await;
-    pre_poll(&v2).await;
+    // Mark both bridges online (getupdates with timeout=0 is the real path).
+    let _ = poll_for_messages(&h.base_url, &v1, 0).await;
+    let _ = poll_for_messages(&h.base_url, &v2, 0).await;
+
+    // Clear any upstream messages produced by the polls above.
+    let _ = h.mock.sent_messages().await;
 
     h._dispatch_tx
         .try_send(user_text_msg("carol@wechat", "real-ctx-bcast", "ping"))
         .unwrap();
 
-    // Give the dispatcher a beat to fan out and write to both queues.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let a = poll_for_messages(&h.base_url, &v1, 1).await;
-    let b = poll_for_messages(&h.base_url, &v2, 1).await;
-    assert_eq!(a.len(), 1, "claude should receive one message");
-    assert_eq!(b.len(), 1, "codex should receive one message");
-    assert_eq!(a[0].text(), Some("ping"));
-    assert_eq!(b[0].text(), Some("ping"));
+    // Neither bridge should have received the raw user message.
+    let a = poll_for_messages(&h.base_url, &v1, 0).await;
+    let b = poll_for_messages(&h.base_url, &v2, 0).await;
+    assert!(
+        a.is_empty(),
+        "claude must NOT receive message when no route set"
+    );
+    assert!(
+        b.is_empty(),
+        "codex must NOT receive message when no route set"
+    );
+
+    // The Hub should have sent a Help reply to the user upstream.
+    let sent = h.mock.sent_messages().await;
+    assert!(
+        !sent.is_empty(),
+        "Hub must send a help reply to the user when no backend is selected"
+    );
 }
 
 // ─── Session continuity (cli_session_id round-trip) ──────────────────────────
@@ -581,9 +590,15 @@ async fn cli_session_id_round_trips_through_persistence() {
 /// User quote-replies a message that was produced by backend A while the
 /// current `/use` route points at backend B. The Hub must route the quoted
 /// reply to A (not B).
-// Pre-existing failure on main unrelated to security-p1 changes; tracked separately.
+///
+/// Setup: user routes to claude via `/use claude`, claude replies, user
+/// switches to codex via `/use codex`, user then quote-replies claude's
+/// answer. The quote-reply must land on claude, not codex.
+///
+/// Quote resolution uses the 3-layer DB fallback:
+///   L1 timestamp window, L2 content prefix LIKE, L3 footer parsing.
+/// This test exercises L2 (content prefix) and L3 (footer `---\nclaude`).
 #[tokio::test]
-#[ignore]
 async fn quote_reply_routes_back_to_originating_backend() {
     let h = boot_without_default().await;
     let va = register_client(&h.base_url, "claude").await;
@@ -591,37 +606,34 @@ async fn quote_reply_routes_back_to_originating_backend() {
     let user = "alice@wechat";
     let real_ctx = "real-ctx-quote-001";
 
-    // Both clients must be `online=true` for broadcast to fan out. `register`
-    // doesn't mark them online; only a real `getupdates` call does (mark_seen).
-    // We short-poll both with timeout=0 to flip them online without consuming
-    // the messages we'll want later.
+    // Mark both bridges as online via a short poll.
     let _ = poll_for_messages(&h.base_url, &va, 0).await;
     let _ = poll_for_messages(&h.base_url, &vb, 0).await;
 
-    // Drop the Hub-internal default that `register` set on the first client.
-    // Now both clients are reachable only via broadcast (no per-user route).
-    h.state.routing.router.lock().await.unset_default();
+    // ── Turn 1: user explicitly routes to claude via /use.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use claude"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Drain /use ack from upstream.
+    let _ = h.mock.sent_messages().await;
 
-    // ── Turn 1: broadcast a question; claude (and codex) both receive it.
+    // ── Turn 1b: user asks claude a question.
     h._dispatch_tx
         .try_send(user_text_msg(user, real_ctx, "what is foo?"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
-    let codex_msgs = poll_for_messages(&h.base_url, &vb, 1).await;
-    assert_eq!(claude_msgs.len(), 1, "broadcast must reach claude");
-    assert_eq!(codex_msgs.len(), 1, "broadcast must reach codex");
+    assert_eq!(
+        claude_msgs.len(),
+        1,
+        "/use claude must route message to claude"
+    );
     let claude_vctx = claude_msgs[0].context_token.as_deref().unwrap().to_string();
 
-    // Drain the codex copy so it doesn't bleed into the next assertion. Claude's
-    // copy is also drained via poll_for_messages above.
-    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
-
-    // ── Claude replies via `sendmessage`. The Hub registers the outbound body
-    // (including the origin footer it appends) into the QuoteRouteIndex. The
-    // footer is `"\n\n---\nclaude"` because `should_append_outbound_origin_label`
-    // returns true with 2+ online clients and no env override.
+    // ── Claude replies. The Hub persists this message to the DB and appends
+    // the footer `"\n\n---\nclaude"` (2+ online clients → label appended).
     let claude_body = "the meaning of foo is 42";
     let _ = bridge_send_with_session(
         &h.base_url,
@@ -633,21 +645,20 @@ async fn quote_reply_routes_back_to_originating_backend() {
         None,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Let the DB write settle before the quote-reply arrives.
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Pin the user's default to codex so we can prove the quote override wins
-    // against a non-broadcast base decision (ForwardTo{codex} rather than Broadcast).
+    // ── User switches to codex.
     h._dispatch_tx
         .try_send(user_text_msg(user, real_ctx, "/use codex"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    // Discard the /use ack that landed on the mock upstream.
+    // Discard the /use ack from upstream.
     let _ = h.mock.sent_messages().await;
 
-    // ── Turn 2: user quote-replies claude's answer. The ref_msg must carry
-    // exactly the text the Hub indexed — body + appended footer — otherwise
-    // content-based matching misses and the message falls through to /use.
-    let quoted_registered_text = format!("{claude_body}\n\n---\nclaude");
+    // ── Turn 2: user quote-replies claude's answer.
+    // `ref_msg.text` contains the full registered text (body + footer).
+    let quoted_text = format!("{claude_body}\n\n---\nclaude");
     let quote_text = "but what about bar?";
     let mut msg = user_text_msg(user, real_ctx, quote_text);
     let items = std::sync::Arc::make_mut(msg.item_list.as_mut().unwrap());
@@ -655,27 +666,27 @@ async fn quote_reply_routes_back_to_originating_backend() {
         "ref_msg": {
             "message_item": {
                 "type": 1,
-                "text_item": { "text": quoted_registered_text },
+                "text_item": { "text": quoted_text },
                 "create_time_ms": chrono_millis_now(),
             }
         }
     });
     h._dispatch_tx.try_send(msg).unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
-    // Codex (the user's current /use default) must NOT receive the quoted reply.
+    // Codex (current /use default) must NOT receive the quote-reply.
     let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
     assert!(
         codex_after.is_empty(),
-        "quote-reply should NOT land on codex (current /use default); got {:?}",
+        "quote-reply must NOT land on codex (current /use default); got {:?}",
         codex_after.iter().map(|m| m.text()).collect::<Vec<_>>()
     );
-    // Claude (the origin of the quoted message) MUST receive it.
+    // Claude (origin of the quoted message) MUST receive the quote-reply.
     let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
     assert_eq!(
         claude_after.len(),
         1,
-        "quote-reply must route back to claude"
+        "quote-reply must route back to claude (the message originator)"
     );
     assert_eq!(claude_after[0].text(), Some(quote_text));
 }

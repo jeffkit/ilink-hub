@@ -106,65 +106,51 @@ async fn no_online_clients_message_is_dropped() {
     assert!(sizes.is_empty() || sizes.values().all(|&s| s == 0));
 }
 
-/// With two registered clients and no per-user route set, a message is
-/// broadcast to both queues (Broadcast path).
+/// With two registered clients but no per-user route and no default set,
+/// the Hub no longer broadcasts — instead it treats the message as a Help
+/// command and sends a reply instructing the user to pick a backend via /list
+/// or /use.  Neither client's queue should receive the raw user message.
 ///
-/// The default client is cleared so routing falls through to Broadcast.
-// Pre-existing failure on main unrelated to security-p1 changes; tracked separately.
+/// (Broadcast was removed to prevent duplicate AI replies when multiple
+/// backends are online.  Users must now explicitly choose a backend.)
 #[tokio::test]
-#[ignore]
-async fn two_clients_both_receive_broadcast_message() {
+async fn no_route_no_default_does_not_broadcast_to_both_clients() {
     let state = make_state().await;
     let (_plain_a, vtoken_a) = register(&state, "claude").await;
     let (_plain_b, vtoken_b) = register(&state, "codex").await;
 
-    // Mark both clients as online (normally done by getupdates handler).
+    // Mark both clients as online.
     {
         let mut registry = state.clients.registry.write().await;
         registry.mark_online(&vtoken_a);
         registry.mark_online(&vtoken_b);
     }
 
-    // Remove routes for both clients so no default remains → routing falls
-    // through to Broadcast. (With a default set, the message would ForwardTo
-    // one client only.)
+    // Clear the default (first registration sets it).
     {
         let mut router = state.routing.router.lock().await;
-        router.remove_routes_for_vtoken(&vtoken_a, None);
-        router.remove_routes_for_vtoken(&vtoken_b, None);
+        router.unset_default();
     }
 
     let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
-    let msg = make_user_msg("user@wx", "real-ctx-003", "broadcast me");
+    let msg = make_user_msg("user@wx", "real-ctx-003", "hello anyone?");
     tx.try_send(msg).unwrap();
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // Neither client should receive the raw message — routing falls through to
+    // HubInternal(Help) which sends a reply upstream, not a queue push.
     let msgs_a = state.clients.queue.drain(&vtoken_a).await.unwrap();
     let msgs_b = state.clients.queue.drain(&vtoken_b).await.unwrap();
-
-    assert_eq!(msgs_a.len(), 1, "client A should receive the message");
-    assert_eq!(msgs_b.len(), 1, "client B should receive the message");
-
-    // Both clients receive the same stable virtual context token (conversation-scoped,
-    // not per-backend). This enables session continuity: a conversation started via
-    // Broadcast and later routed via /use shares the same vctx so Claude --resume works.
-    // Sessions are isolated by (vctx, vtoken), so each backend's session is still independent.
-    let vctx_a = msgs_a[0].context_token.as_deref().unwrap_or("");
-    let vctx_b = msgs_b[0].context_token.as_deref().unwrap_or("");
     assert!(
-        vctx_a.starts_with("vctx_"),
-        "context_token should be a vctx"
+        msgs_a.is_empty(),
+        "client A must NOT receive message when no route is set"
     );
     assert!(
-        vctx_b.starts_with("vctx_"),
-        "context_token should be a vctx"
-    );
-    assert_eq!(
-        vctx_a, vctx_b,
-        "broadcast uses one shared vctx per conversation for session continuity"
+        msgs_b.is_empty(),
+        "client B must NOT receive message when no route is set"
     );
 }
 
