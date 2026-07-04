@@ -1056,6 +1056,200 @@ mod tests {
             other => panic!("expected QuoteOrigin::Client, got {other:?}"),
         }
     }
+
+    /// AT1: Persona-mode footer slow path.
+    ///
+    /// When the footer is `---\nat-20260704-103000` (name starts with `at-`, no explicit
+    /// backend name), `resolve_quote_from_footer` must take the slow path: look up the vctx
+    /// via `find_vctx_for_scope`, then look up the vtoken via `find_vtoken_for_session`.
+    /// Verifies that a pre-seeded backend_sessions_v2 row is found and the correct
+    /// QuoteOrigin is returned.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_persona_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the named client that owns this persona session.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // Create a vctx for "user1" so the scope lookup can find it.
+        let vctx = state
+            .store
+            .find_or_create_vctx("user1", None, "ctx-at1")
+            .await
+            .expect("find_or_create_vctx");
+
+        // Seed the backend session entry that the slow path will resolve.
+        state
+            .store
+            .set_backend_session(
+                &vctx,
+                &ilink_claude_vtoken,
+                "at-20260704-103000",
+                "cli-uuid",
+            )
+            .await
+            .expect("set_backend_session");
+
+        // Footer contains only the session identifier (no explicit backend name).
+        // parse_footer_from_quoted_text will return name="at-20260704-103000", session=Some("at-20260704-103000").
+        let quoted_text = "body\n\n---\nat-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "persona-mode footer slow path must resolve the session to a client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match the registered ilink-claude client"
+                );
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be the at-key from the footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT2: Unknown backend name in footer returns None.
+    ///
+    /// When the footer is `---\nghost-client · at-20260704-103000` and "ghost-client" is not
+    /// in the registry (and no matching session exists in the DB), `resolve_quote_from_footer`
+    /// must return `None` without panicking.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_unregistered_name_returns_none() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // "ghost-client" is deliberately never registered.
+        let quoted_text = "body\n\n---\nghost-client · at-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_none(),
+            "unregistered backend name must yield None, not panic"
+        );
+    }
+
+    /// AT3: Full L1→L2→L3 cascade fallback.
+    ///
+    /// With an empty message history (L1 timestamp miss, L2 content miss), a quote-reply
+    /// whose footer names a registered backend must fall through all three layers and be
+    /// resolved by L3. Exercises the cascade block at dispatch.rs lines 93-103.
+    #[tokio::test]
+    async fn quote_reply_l3_full_cascade_fallback() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the specific client the footer references.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // DB is empty — L1 and L2 will both miss.
+        let old_ms = 1_000_000i64;
+        let quoted_text = "body\n\n---\nilink-claude · at-20260704-103000";
+        let msg = make_quote_msg("user1", old_ms, Some(quoted_text));
+
+        // L1: timestamp lookup — must return None (no messages in DB).
+        let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+        assert!(from_ts.is_none(), "L1 must miss on empty DB");
+
+        // L2: content-prefix DB lookup — must return None (no messages in DB).
+        let from_db = resolve_quote_from_db(&state, &msg).await;
+        assert!(from_db.is_none(), "L2 must miss on empty DB");
+
+        // L3: footer lookup — must succeed because "ilink-claude" is registered.
+        let from_footer = resolve_quote_from_footer(&state, &msg).await;
+        assert!(
+            from_footer.is_some(),
+            "L3 footer lookup must succeed after L1 and L2 both miss"
+        );
+        match from_footer.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                name: n,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(vt, ilink_claude_vtoken, "vtoken must match ilink-claude");
+                assert_eq!(n, "ilink-claude", "name must be ilink-claude");
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be parsed from footer"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
+
+    /// AT4: Three-part footer with label — `ilink-claude · office · at-20260704-103000`.
+    ///
+    /// Verifies that `resolve_quote_from_footer` correctly extracts `name = "ilink-claude"`
+    /// and `session_name = Some("at-20260704-103000")` when a label segment is present in
+    /// the middle, and that the label does not interfere with the registry lookup.
+    #[tokio::test]
+    async fn at_mention_quote_reply_l3_footer_with_label_routing() {
+        let (state, _vtoken) = make_state_with_client().await;
+
+        // Register the client whose name appears in the first footer segment.
+        let (_, ilink_claude_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("ilink-claude".to_string(), None, None);
+
+        // Three-part footer: name · label · session.
+        let quoted_text = "body\n\n---\nilink-claude · office · at-20260704-103000";
+        let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+        let result = resolve_quote_from_footer(&state, &msg).await;
+
+        assert!(
+            result.is_some(),
+            "three-part footer must resolve the named client"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                name: n,
+                session_name: sn,
+                ..
+            } => {
+                assert_eq!(
+                    vt, ilink_claude_vtoken,
+                    "vtoken must match ilink-claude (first footer segment)"
+                );
+                assert_eq!(n, "ilink-claude", "name must be the first footer segment");
+                assert_eq!(
+                    sn,
+                    Some("at-20260704-103000".to_string()),
+                    "session_name must be the last footer segment"
+                );
+            }
+            other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+        }
+    }
 }
 
 /// Reply text when no AI backend is online.
