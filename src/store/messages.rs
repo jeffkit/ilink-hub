@@ -54,8 +54,7 @@ impl Store {
     }
 
     /// Find the most recent assistant message in a conversation whose content starts with
-    /// `content_prefix`. Used as DB-backed fallback for quote-reply routing when the
-    /// in-memory QuoteRouteIndex is cold (e.g. after a Hub restart).
+    /// `content_prefix`. Used as the L2 (content-prefix) DB fallback for quote-reply routing.
     pub async fn find_assistant_message_by_content(
         &self,
         peer_user_id: &str,
