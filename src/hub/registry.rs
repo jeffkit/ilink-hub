@@ -609,4 +609,158 @@ mod tests {
         let c = reg.get_by_name("agent").expect("client");
         assert_eq!(c.description.as_deref(), Some("New description"));
     }
+
+    // ── update_metadata / set_persona / set_description ───────────────
+
+    #[test]
+    fn update_metadata_persists_all_fields() {
+        let mut reg = ClientRegistry::new();
+        let (_, hash, _) = reg.register("bot".into(), None, None);
+
+        reg.update_metadata(
+            &hash,
+            Some("my-label".into()),
+            Some("desc".into()),
+            Some("Aria".into()),
+            Some("🤖".into()),
+        );
+
+        let c = reg.get_by_vtoken(&hash).expect("client");
+        assert_eq!(
+            c.label.as_deref(),
+            Some("my-label"),
+            "label must be updated"
+        );
+        assert_eq!(
+            c.description.as_deref(),
+            Some("desc"),
+            "description must be updated"
+        );
+        assert_eq!(
+            c.persona_name.as_deref(),
+            Some("Aria"),
+            "persona_name must be updated"
+        );
+        assert_eq!(
+            c.persona_emoji.as_deref(),
+            Some("🤖"),
+            "persona_emoji must be updated"
+        );
+    }
+
+    #[test]
+    fn set_persona_persists_persona_fields() {
+        let mut reg = ClientRegistry::new();
+        let (_, hash, _) = reg.register("bot".into(), None, None);
+
+        reg.set_persona(&hash, Some("Claude".into()), Some("🧠".into()));
+
+        let c = reg.get_by_vtoken(&hash).expect("client");
+        assert_eq!(c.persona_name.as_deref(), Some("Claude"));
+        assert_eq!(c.persona_emoji.as_deref(), Some("🧠"));
+    }
+
+    #[test]
+    fn set_description_persists_description() {
+        let mut reg = ClientRegistry::new();
+        let (_, hash, _) = reg.register("bot".into(), None, None);
+
+        reg.set_description(&hash, Some("helpful assistant".into()));
+        assert_eq!(
+            reg.get_by_vtoken(&hash).unwrap().description.as_deref(),
+            Some("helpful assistant")
+        );
+
+        // Clearing description with None
+        reg.set_description(&hash, None);
+        assert_eq!(
+            reg.get_by_vtoken(&hash).unwrap().description,
+            None,
+            "description must be cleared"
+        );
+    }
+
+    // ── online_clients ─────────────────────────────────────────────────
+
+    #[test]
+    fn online_clients_returns_only_online() {
+        let mut reg = ClientRegistry::new();
+        let (_, ha, _) = reg.register("a".into(), None, None);
+        let (_, hb, _) = reg.register("b".into(), None, None);
+        let (_, _hc, _) = reg.register("c".into(), None, None);
+
+        reg.mark_online(&ha);
+        reg.mark_online(&hb);
+        // c stays offline
+
+        let online: Vec<_> = reg
+            .online_clients()
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(online.len(), 2, "only 2 online clients");
+        assert!(online.contains(&"a"));
+        assert!(online.contains(&"b"));
+        assert!(!online.contains(&"c"), "offline client must not appear");
+    }
+
+    // ── pick_default_after_remove ───────────────────────────────────────
+
+    #[test]
+    fn pick_default_after_remove_returns_another_online_client() {
+        let mut reg = ClientRegistry::new();
+        let (_, ha, _) = reg.register("a".into(), None, None);
+        let (_, hb, _) = reg.register("b".into(), None, None);
+        reg.mark_online(&ha);
+        reg.mark_online(&hb);
+
+        // Remove a; b should be picked as the new default.
+        let new_default = reg.pick_default_after_remove(&ha);
+        assert_eq!(
+            new_default.as_deref(),
+            Some(hb.as_str()),
+            "another online client should be picked"
+        );
+    }
+
+    #[test]
+    fn pick_default_after_remove_falls_back_to_offline_client() {
+        let mut reg = ClientRegistry::new();
+        let (_, ha, _) = reg.register("a".into(), None, None);
+        let (_, hb, _) = reg.register("b".into(), None, None);
+        // Neither is online; removing a should still pick b (from all_clients).
+        let new_default = reg.pick_default_after_remove(&ha);
+        assert_eq!(
+            new_default.as_deref(),
+            Some(hb.as_str()),
+            "falls back to offline client when no online clients remain"
+        );
+    }
+
+    #[test]
+    fn pick_default_after_remove_returns_none_when_no_other_client() {
+        let mut reg = ClientRegistry::new();
+        let (_, ha, _) = reg.register("a".into(), None, None);
+
+        // Only one client exists; after removing it there is no alternative.
+        let new_default = reg.pick_default_after_remove(&ha);
+        assert_eq!(
+            new_default, None,
+            "must return None when no other client exists"
+        );
+    }
+
+    #[test]
+    fn pick_default_after_remove_skips_the_removed_token() {
+        let mut reg = ClientRegistry::new();
+        let (_, ha, _) = reg.register("a".into(), None, None);
+        reg.mark_online(&ha);
+
+        // Only client a exists and is online; removing it must not pick itself.
+        let new_default = reg.pick_default_after_remove(&ha);
+        assert_eq!(
+            new_default, None,
+            "the removed token must not be picked as its own replacement"
+        );
+    }
 }

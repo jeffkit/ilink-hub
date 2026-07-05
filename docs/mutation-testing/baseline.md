@@ -129,8 +129,63 @@ fn evicts_stale_keys_when_over_limit() {
 
 ---
 
+---
+
+## Phase 2：Hub 核心状态管理模块
+
+**范围**：`router.rs`、`registry.rs`、`queue.rs`、`health.rs`  
+**运行耗时**：~48 分钟（基准编译 312s + 测试 55s，后续 98 个变异体 2 并行）
+
+### 汇总
+
+| 指标 | 数值 |
+|------|------|
+| 总变异体 | 98 |
+| **已捕获（Caught）** | **70** |
+| **未捕获（Missed）** | **18** |
+| 不可行（Unviable） | 10 |
+| 超时（Timeout） | 0 |
+| **Mutation Score** | **79.5%**（70/88，不含 Unviable） |
+
+### 未捕获变异体（18 个）❌ 及修复状态
+
+**`src/hub/health.rs`（1 个）— 暂缓**
+
+| 位置 | 变异 | 状态 |
+|------|------|------|
+| 15:5 | `spawn_health_checker` → `()` | ⏳ 后台 task，需集成测试覆盖 |
+
+**`src/hub/queue.rs`（2 个）— 暂缓**
+
+| 位置 | 变异 | 状态 |
+|------|------|------|
+| 81:9 | `MessageQueue::push_shared` → `Ok(true/false)` | ⏳ Trait 默认实现，无具体实现类覆盖 |
+
+**`src/hub/registry.rs`（8 个）— 已修复** ✅
+
+| 位置 | 变异 | 修复方式 |
+|------|------|---------|
+| 261:9 | `update_metadata` → `()` | 新增 `update_metadata_persists_all_fields` 测试 |
+| 286:9 | `set_persona` → `()` | 新增 `set_persona_persists_persona_fields` 测试 |
+| 291:9 | `set_description` → `()` | 新增 `set_description_persists_description` 测试 |
+| 316:9 | `online_clients` → `vec![]` | 新增 `online_clients_returns_only_online` 测试 |
+| 370:9 | `pick_default_after_remove` → `None/Some(...)` ×3 | 新增 4 个 `pick_default_after_remove_*` 测试 |
+| 372:32, 377:40 | `!=` → `==` ×2 | 同上，边界条件用例覆盖 |
+
+**`src/hub/router.rs`（7 个）— 已修复** ✅
+
+| 位置 | 变异 | 修复方式 |
+|------|------|---------|
+| 35:45 | `/status` `\|\|` `/s` → `&&` | 新增 `parse_status_short_alias` 测试 |
+| 39:9, 40:9 | `/help` OR 链 → `&&` | 新增 `parse_help_short_aliases` 测试 |
+| 200:9 | `remove_routes_for_vtoken` → `()` | 新增 `remove_routes_for_vtoken_*` 3 个测试 |
+| 200:43, 203:46 | `==`/`!=` 反转 | 同上 |
+
+---
+
 ## 历史记录
 
-| 日期 | Phase | 模块数 | 总变异体 | 捕获 | 未捕获 | 分数 |
-|------|-------|--------|----------|------|--------|------|
-| 2026-07-05 | Phase 1 | 3 | 57 | 51 | 6 | **89.5%** |
+| 日期 | Phase | 模块数 | 总变异体 | 捕获 | 未捕获 | 分数 | 事后修复 |
+|------|-------|--------|----------|------|--------|------|---------|
+| 2026-07-05 | Phase 1 | 3 | 57 | 51 | 6 | **89.5%** | ✅ 全部修复 |
+| 2026-07-05 | Phase 2 | 4 | 98 | 70 | 18 | **79.5%** | ✅ 15/18 修复，3 暂缓 |

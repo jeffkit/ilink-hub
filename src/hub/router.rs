@@ -506,4 +506,82 @@ mod tests {
         let redacted = guard.as_ref().expect("expected vtoken to be logged");
         assert_eq!(redacted, "very_lon…");
     }
+
+    // ── parse_hub_command short-alias coverage ─────────────────────────
+
+    #[test]
+    fn parse_status_short_alias() {
+        // /s is an alias for /status; the || branch must not be collapsed to &&.
+        assert_eq!(parse_hub_command("/status"), Some(HubCommand::Status));
+        assert_eq!(
+            parse_hub_command("/s"),
+            Some(HubCommand::Status),
+            "/s short alias must also parse"
+        );
+    }
+
+    #[test]
+    fn parse_help_short_aliases() {
+        // /? and /h are aliases for /help; each branch is pinned individually.
+        assert_eq!(parse_hub_command("/help"), Some(HubCommand::Help));
+        assert_eq!(
+            parse_hub_command("/?"),
+            Some(HubCommand::Help),
+            "/? alias must parse"
+        );
+        assert_eq!(
+            parse_hub_command("/h"),
+            Some(HubCommand::Help),
+            "/h alias must parse"
+        );
+    }
+
+    // ── Router::remove_routes_for_vtoken ───────────────────────────────
+
+    #[test]
+    fn remove_routes_for_vtoken_clears_per_user_routes() {
+        let mut r = Router::new(Some("vt-a".into()));
+        r.set_route("user1", "vt-a".into());
+        r.set_route("user2", "vt-b".into());
+
+        // Remove vt-a; user1's route should be cleared and fall through to new default.
+        r.remove_routes_for_vtoken("vt-a", Some("vt-b".into()));
+
+        assert_eq!(
+            r.get_route("user1"),
+            Some("vt-b"),
+            "user1 falls through to new default after their route is cleared"
+        );
+        assert_eq!(
+            r.get_route("user2"),
+            Some("vt-b"),
+            "user2's own route is unaffected"
+        );
+    }
+
+    #[test]
+    fn remove_routes_for_vtoken_updates_default_client() {
+        let mut r = Router::new(Some("vt-a".into()));
+
+        // Removing the default with a replacement must update default_client.
+        r.remove_routes_for_vtoken("vt-a", Some("vt-b".into()));
+        assert_eq!(r.default_client.as_deref(), Some("vt-b"));
+
+        // Removing the current default with None must clear default_client.
+        r.remove_routes_for_vtoken("vt-b", None);
+        assert_eq!(r.default_client, None);
+    }
+
+    #[test]
+    fn remove_routes_for_vtoken_leaves_other_default_intact() {
+        let mut r = Router::new(Some("vt-x".into()));
+
+        // Removing a vtoken that is NOT the default must not change the default.
+        r.remove_routes_for_vtoken("vt-y", Some("vt-z".into()));
+        assert_eq!(
+            r.default_client.as_deref(),
+            Some("vt-x"),
+            "default must stay vt-x when a different token vt-y is removed"
+        );
+    }
 }
