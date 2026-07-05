@@ -155,4 +155,72 @@ mod tests {
         let _r: &tokio::sync::RwLock<ClientRegistry> = &state.registry;
         let _l: &Arc<dashmap::DashMap<String, std::sync::atomic::AtomicU64>> = &state.last_seen;
     }
+
+    /// M1: `spawn_health_checker` must mark clients whose `last_seen` exceeds
+    /// the offline threshold as offline. Catches the mutant that replaces the
+    /// entire function with a no-op.
+    #[tokio::test]
+    async fn health_checker_marks_stale_client_offline() {
+        use std::sync::Arc;
+
+        // Connect the store with real time — the SQLite pool's internal
+        // acquire timeout fires under a paused clock if we pause before
+        // connecting. We pause below, after all async init is done.
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let upstream: Arc<dyn crate::ilink::UpstreamSink> = Arc::new(
+            crate::ilink::UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"),
+        );
+        let queue: Arc<dyn crate::MessageQueue> = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = crate::hub::HubState::new(
+            upstream,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            crate::hub::AdminConfig::from_env(),
+        );
+
+        let (_, hashed_vtoken, _) =
+            state
+                .clients
+                .registry
+                .write()
+                .await
+                .register("test-backend".to_string(), None, None);
+
+        {
+            let mut registry = state.clients.registry.write().await;
+            registry.mark_online(&hashed_vtoken);
+        }
+
+        state
+            .clients
+            .last_seen
+            .entry(hashed_vtoken.clone())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .store(0, Ordering::Relaxed);
+
+        // Pause tokio time only after all async setup is complete.
+        tokio::time::pause();
+
+        spawn_health_checker(Arc::clone(&state));
+
+        // The spawned task hasn't run yet at this point.  First advance gives
+        // it a chance to start and register its sleep(CHECK_INTERVAL_SECS).
+        // Second advance fires that sleep.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_secs(CHECK_INTERVAL_SECS + 1)).await;
+        // Extra yields to let the task complete the registry write and read.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let registry = state.clients.registry.read().await;
+        assert!(
+            registry.online_clients().is_empty(),
+            "stale client must be marked offline"
+        );
+    }
 }
