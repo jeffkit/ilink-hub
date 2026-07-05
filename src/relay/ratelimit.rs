@@ -132,4 +132,60 @@ mod tests {
             "limiter must work correctly after evicting stale keys"
         );
     }
+
+    /// M2: eviction must trigger only when len is strictly > 10_000.
+    #[test]
+    fn eviction_threshold_is_strict_greater_than_10000() {
+        // window=0 → each bucket immediately expires
+        let limiter = RateLimiter::new(1_000_000, 0);
+
+        // Insert exactly 10_000 distinct keys
+        for i in 0..10_000usize {
+            limiter.allow(&i.to_string());
+        }
+
+        // Assert: 10_000 buckets exist (eviction threshold is > 10_000, not >=)
+        let inner = limiter.inner.lock().unwrap();
+        assert_eq!(
+            inner.buckets.len(),
+            10_000,
+            "eviction must not trigger at exactly 10,000 buckets (threshold is strictly > 10_000)"
+        );
+    }
+
+    /// M2: retain predicate must keep fresh buckets and evict stale ones.
+    #[test]
+    fn retain_keeps_fresh_buckets_and_evicts_stale_ones() {
+        // window = 60s: buckets older than 60s are stale
+        let limiter = RateLimiter::new(1_000_000, 60);
+        let now = Instant::now();
+        let stale_start = now - Duration::from_secs(120);
+
+        {
+            let mut inner = limiter.inner.lock().unwrap();
+            for i in 0..10_000usize {
+                inner.buckets.insert(
+                    format!("stale_{i}"),
+                    Bucket {
+                        count: 1,
+                        window_start: stale_start,
+                    },
+                );
+            }
+        }
+
+        // allow("fresh_key"): triggers eviction (10_001 > 10_000)
+        limiter.allow("fresh_key");
+
+        let inner = limiter.inner.lock().unwrap();
+        assert_eq!(
+            inner.buckets.len(),
+            1,
+            "after eviction, only the fresh key must remain"
+        );
+        assert!(
+            inner.buckets.contains_key("fresh_key"),
+            "the fresh key (within window) must be retained after eviction"
+        );
+    }
 }

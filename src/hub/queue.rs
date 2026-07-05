@@ -234,6 +234,7 @@ impl MessageQueue for InMemoryQueue {
 #[cfg(test)]
 mod queue_config_tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_in_memory_queue_with_limit() {
@@ -379,5 +380,95 @@ mod queue_config_tests {
         for h in slot_handles {
             h.join().unwrap();
         }
+    }
+
+    struct AlwaysFalseQueue;
+
+    #[async_trait::async_trait]
+    impl crate::MessageQueue for AlwaysFalseQueue {
+        async fn push(
+            &self,
+            _vtoken: &str,
+            _msg: crate::ilink::types::WeixinMessage,
+        ) -> Result<bool, crate::error::HubError> {
+            Ok(false)
+        }
+        async fn drain(
+            &self,
+            _vtoken: &str,
+        ) -> Result<Vec<crate::ilink::types::WeixinMessage>, crate::error::HubError> {
+            Ok(vec![])
+        }
+        async fn wait_notify(
+            &self,
+            _vtoken: &str,
+            _timeout_secs: u64,
+        ) -> Result<bool, crate::error::HubError> {
+            Ok(false)
+        }
+        async fn remove_client(&self, _vtoken: &str) -> Result<(), crate::error::HubError> {
+            Ok(())
+        }
+        async fn queue_sizes(
+            &self,
+        ) -> Result<std::collections::HashMap<String, usize>, crate::error::HubError> {
+            Ok(std::collections::HashMap::new())
+        }
+    }
+
+    struct AlwaysTrueQueue;
+
+    #[async_trait::async_trait]
+    impl crate::MessageQueue for AlwaysTrueQueue {
+        async fn push(
+            &self,
+            _vtoken: &str,
+            _msg: crate::ilink::types::WeixinMessage,
+        ) -> Result<bool, crate::error::HubError> {
+            Ok(true)
+        }
+        async fn drain(
+            &self,
+            _vtoken: &str,
+        ) -> Result<Vec<crate::ilink::types::WeixinMessage>, crate::error::HubError> {
+            Ok(vec![])
+        }
+        async fn wait_notify(
+            &self,
+            _vtoken: &str,
+            _timeout_secs: u64,
+        ) -> Result<bool, crate::error::HubError> {
+            Ok(false)
+        }
+        async fn remove_client(&self, _vtoken: &str) -> Result<(), crate::error::HubError> {
+            Ok(())
+        }
+        async fn queue_sizes(
+            &self,
+        ) -> Result<std::collections::HashMap<String, usize>, crate::error::HubError> {
+            Ok(std::collections::HashMap::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn push_shared_default_propagates_false_from_push() {
+        let queue = AlwaysFalseQueue;
+        let base = Arc::new(WeixinMessage::default());
+        let result = queue.push_shared("v1", base, None, None).await.unwrap();
+        assert!(
+            !result,
+            "push_shared default impl must propagate Ok(false) from push()"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_shared_default_propagates_true_from_push() {
+        let queue = AlwaysTrueQueue;
+        let base = Arc::new(WeixinMessage::default());
+        let result = queue.push_shared("v1", base, None, None).await.unwrap();
+        assert!(
+            result,
+            "push_shared default impl must propagate Ok(true) from push()"
+        );
     }
 }
