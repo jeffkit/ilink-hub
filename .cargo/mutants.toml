@@ -1,0 +1,65 @@
+# cargo-mutants 配置文件
+# https://mutants.rs/config-file.html
+#
+# 变异测试策略：聚焦在纯函数、逻辑密集且测试覆盖较好的模块，
+# 排除 I/O 绑定、bin 入口及集成测试文件。
+#
+# 运行方式（必须加 RUST_TEST_THREADS=1 避免集成测试并发竞争）：
+#   RUST_TEST_THREADS=1 cargo mutants -j 2           # 本机全量扫描（含 examine_globs 中的文件）
+#   RUST_TEST_THREADS=1 cargo mutants -j 4 \
+#     --file src/hub/vtoken_hash.rs                  # 单文件快速检查
+
+# ── 测试超时 ──────────────────────────────────────────────────────────
+# 以基准测试时间的 4 倍为超时上限，防止耗时变异体拖垮 CI
+timeout_multiplier = 4.0
+# 最短超时 60s，确保初始化较重的 tokio 异步测试有足够时间
+minimum_test_timeout = 60
+
+# ── 构建超时倍数 ───────────────────────────────────────────────────────
+build_timeout_multiplier = 3.0
+
+# ── 重点覆盖文件（变异测试目标范围）──────────────────────────────────
+# 只检查核心业务逻辑文件：纯函数、状态管理、安全关键路径
+examine_globs = [
+    # 安全关键：vtoken SHA-256 哈希
+    "src/hub/vtoken_hash.rs",
+    # 出站消息格式化（纯函数，分支丰富）
+    "src/hub/outbound_label.rs",
+    # 限流窗口逻辑
+    "src/relay/ratelimit.rs",
+    # Hub 路由表
+    "src/hub/router.rs",
+    # 客户端注册表
+    "src/hub/registry.rs",
+    # 消息队列实现
+    "src/hub/queue.rs",
+    # 健康检查逻辑
+    "src/hub/health.rs",
+]
+
+# ── 排除文件（覆盖范围之外）──────────────────────────────────────────
+# 通过 examine_globs 白名单控制，exclude_globs 作为额外防护
+exclude_globs = [
+    "src/main.rs",
+    "src/bin/*.rs",
+    "src/server/**",
+    "src/bridge/**",
+    "src/client/**",
+    "src/mcp/**",
+    "tests/**",
+    "src/store/**",
+    "src/paths.rs",
+    "src/metrics.rs",
+    "src/runtime/**",
+    "src/breaking_changes.rs",
+]
+
+# ── 排除特定变异模式（减少噪音）──────────────────────────────────────
+# 日志调用的变异不影响业务语义
+exclude_re = [
+    "tracing::",
+    "warn!",
+    "info!",
+    "debug!",
+    "error!",
+]

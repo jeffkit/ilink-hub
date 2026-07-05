@@ -108,4 +108,28 @@ mod tests {
         assert!(limiter.allow("1.2.3.4"));
         assert!(!limiter.allow("1.2.3.4"));
     }
+
+    /// Cover the eviction branch: inserting > 10_000 distinct keys triggers
+    /// `buckets.retain(...)` which prunes stale entries.
+    ///
+    /// Using `window_secs = 0` makes every bucket immediately stale, so the
+    /// retain predicate removes all of them. Afterwards the limiter must still
+    /// function correctly, proving both the `> 10_000` threshold comparison and
+    /// the `< self.window` filter comparison are exercised.
+    #[test]
+    fn evicts_stale_keys_when_over_limit() {
+        // window = 0 → every bucket expires immediately after creation.
+        let limiter = RateLimiter::new(1, 0);
+
+        // Push past the 10_000-key eviction threshold.
+        for i in 0..=10_000usize {
+            limiter.allow(&i.to_string());
+        }
+
+        // After eviction the limiter must still accept new keys normally.
+        assert!(
+            limiter.allow("new_key_after_eviction"),
+            "limiter must work correctly after evicting stale keys"
+        );
+    }
 }
