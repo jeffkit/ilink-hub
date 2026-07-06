@@ -119,6 +119,15 @@ impl LoginClient {
         Ok(resp)
     }
 
+    #[cfg(test)]
+    fn with_base_url(base_url: String) -> Result<Self> {
+        let client = Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("failed to build HTTP client")?;
+        Ok(Self { client, base_url })
+    }
+
     async fn poll_qrcode_status(
         &self,
         key: &str,
@@ -195,5 +204,169 @@ impl LoginClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    fn make_client(base_url: String) -> LoginClient {
+        LoginClient::with_base_url(base_url).expect("test client")
+    }
+
+    /// M8-login-1: upstream_parse_err 必须将错误包装为 HubError::UpstreamParse。
+    /// 捕捉 `anyhow::Error::new(HubError::UpstreamParse(...))` → 其他错误类型的变异。
+    #[test]
+    fn upstream_parse_err_wraps_as_hub_error_upstream_parse() {
+        let err = upstream_parse_err("json parse failed");
+        let hub_err = err
+            .downcast::<HubError>()
+            .expect("must downcast to HubError");
+        assert!(
+            matches!(hub_err, HubError::UpstreamParse(_)),
+            "must be HubError::UpstreamParse, got: {hub_err:?}"
+        );
+    }
+
+    /// M8-login-2: get_qrcode 当 ret != 0 时必须返回 Err。
+    /// 捕捉 `resp.ret != 0` → `resp.ret == 0` 的变异——若取反则成功路径变成失败路径。
+    #[tokio::test]
+    async fn get_qrcode_non_zero_ret_returns_err() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":1,"errmsg":"auth failed","qrcode":null,"qrcode_img_content":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.get_qrcode().await;
+        assert!(result.is_err(), "non-zero ret must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("get_bot_qrcode failed"),
+            "error message must mention get_bot_qrcode, got: {msg}"
+        );
+    }
+
+    /// M8-login-3: get_qrcode 当 ret == 0 时必须返回 Ok，并包含 qrcode 字段。
+    #[tokio::test]
+    async fn get_qrcode_zero_ret_returns_ok() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"qrcode":"test-key-123","qrcode_img_content":"https://example.com/qr.png"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.get_qrcode().await;
+        assert!(result.is_ok(), "zero ret must return Ok, got: {result:?}");
+        let resp = result.unwrap();
+        assert_eq!(resp.qrcode.as_deref(), Some("test-key-123"));
+    }
+
+    /// M8-login-4: poll_qrcode_status 当响应状态为 "confirmed" 且含 bot_token 时必须返回 Ok(token)。
+    /// 捕捉 `Some("confirmed")` 分支被替换或 bot_token 检查被 no-op 的变异。
+    #[tokio::test]
+    async fn poll_qrcode_status_confirmed_with_token_returns_ok() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=test-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":"my-bot-token-xyz","baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.poll_qrcode_status("test-key", None).await;
+        assert!(
+            result.is_ok(),
+            "confirmed status must return Ok, got: {result:?}"
+        );
+        assert_eq!(result.unwrap(), "my-bot-token-xyz");
+    }
+
+    /// M8-login-5: poll_qrcode_status 当 "confirmed" 但无 bot_token 时必须返回 Err。
+    #[tokio::test]
+    async fn poll_qrcode_status_confirmed_without_token_returns_err() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=no-token-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":null,"baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.poll_qrcode_status("no-token-key", None).await;
+        assert!(
+            result.is_err(),
+            "confirmed without bot_token must return Err"
+        );
+    }
+
+    /// M8-login-6: poll_qrcode_status 当状态为 "expired" 时必须返回 Err。
+    /// 捕捉 `Some("expired")` 分支被跳过或 Err 变成 Ok 的变异。
+    #[tokio::test]
+    async fn poll_qrcode_status_expired_returns_err() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=expired-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"expired","bot_token":null,"baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.poll_qrcode_status("expired-key", None).await;
+        assert!(result.is_err(), "expired status must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("expired"),
+            "error must mention 'expired', got: {msg}"
+        );
+    }
+
+    /// M8-login-7: poll_qrcode_status 当 ret != 0 且状态未知时必须返回 Err。
+    /// 捕捉 `if resp.ret != 0` → `if resp.ret == 0` 的变异。
+    #[tokio::test]
+    async fn poll_qrcode_status_unknown_status_nonzero_ret_returns_err() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=err-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":5,"status":"unknown_status","errmsg":"something went wrong","bot_token":null,"baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.poll_qrcode_status("err-key", None).await;
+        assert!(
+            result.is_err(),
+            "non-zero ret with unknown status must return Err"
+        );
     }
 }
