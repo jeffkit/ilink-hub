@@ -1642,4 +1642,87 @@ mod admin_auth_tests {
         );
         assert!(extract_vtoken(&headers).is_none());
     }
+
+    // ── render_counter ────────────────────────────────────────────────────────
+
+    /// `_total` suffix must be stripped from the base name so Prometheus can
+    /// synthesise `_created` from the same base rather than creating
+    /// `messages_dispatched_total_created`.
+    #[test]
+    fn render_counter_strips_total_suffix_from_base_name() {
+        let mut out = String::new();
+        render_counter(&mut out, "messages_dispatched_total", "help text", 42, 1.0);
+        assert!(
+            out.contains("# HELP messages_dispatched help text\n"),
+            "HELP must use base name without _total: {out}"
+        );
+        assert!(
+            out.contains("# TYPE messages_dispatched counter\n"),
+            "TYPE must use base name without _total: {out}"
+        );
+        assert!(
+            out.contains("messages_dispatched_total 42\n"),
+            "value line must keep _total suffix: {out}"
+        );
+        assert!(
+            out.contains("messages_dispatched_created 1\n"),
+            "_created must use base name: {out}"
+        );
+    }
+
+    #[test]
+    fn render_counter_passthrough_when_no_total_suffix() {
+        let mut out = String::new();
+        render_counter(&mut out, "my_counter", "desc", 7, 2.0);
+        assert!(out.contains("# HELP my_counter desc\n"));
+        assert!(out.contains("my_counter 7\n"));
+        assert!(out.contains("my_counter_created 2\n"));
+    }
+
+    // ── render_histogram ──────────────────────────────────────────────────────
+
+    /// Histogram buckets must be **cumulative** (each bucket includes all
+    /// lower-boundary observations). This is the load-bearing invariant for
+    /// correct Prometheus rate/quantile calculations.
+    #[test]
+    fn render_histogram_produces_cumulative_bucket_counts() {
+        use crate::hub::LatencyHistogram;
+        use std::sync::atomic::Ordering;
+
+        let h = LatencyHistogram::new();
+        // Bucket layout: [1, 5, 25, 100, 500, 2500, 10000]
+        // Observe one event in bucket[0] (≤ 1ms) and one in bucket[1] (≤ 5ms).
+        h.buckets[0].store(3, Ordering::Relaxed);
+        h.buckets[1].store(2, Ordering::Relaxed);
+        h.count.store(5, Ordering::Relaxed);
+
+        let mut out = String::new();
+        render_histogram(&mut out, "test_latency", "desc", &h, 0.0);
+
+        // bucket le="1" must be 3 (not cumulative yet, first bucket)
+        assert!(
+            out.contains("test_latency_bucket{le=\"1\"} 3\n"),
+            "first bucket must equal bucket[0] count: {out}"
+        );
+        // bucket le="5" must be 5 (3 from bucket[0] + 2 from bucket[1]) — cumulative!
+        assert!(
+            out.contains("test_latency_bucket{le=\"5\"} 5\n"),
+            "second bucket must be cumulative (3+2=5): {out}"
+        );
+        // +Inf must include all counts
+        assert!(
+            out.contains("test_latency_bucket{le=\"+Inf\"} 5\n"),
+            "+Inf bucket must equal total count: {out}"
+        );
+    }
+
+    #[test]
+    fn render_histogram_includes_help_and_type_lines() {
+        use crate::hub::LatencyHistogram;
+        let h = LatencyHistogram::new();
+        let mut out = String::new();
+        render_histogram(&mut out, "my_latency", "my help", &h, 0.0);
+        assert!(out.contains("# HELP my_latency my help\n"));
+        assert!(out.contains("# TYPE my_latency histogram\n"));
+    }
 }

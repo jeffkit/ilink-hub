@@ -114,6 +114,15 @@ examine_globs = [
     # Bridge 内置 profile 共享辅助（Phase I 新增）
     # StreamMessage::text + ensure_success 新增测试；async I/O 预期 timeout
     "src/bridge/builtin/common.rs",
+    # Bridge executor 纯函数（Phase J 新增）
+    # split_cli_session_from_stdout / split_into_parts / validate_safe_value 已有 18 个测试
+    "src/bridge/executor.rs",
+    # Bridge manager 纯函数（Phase J 新增）
+    # restart_delay / sanitize_profile_id / next_restart_attempts 已有 12 个测试
+    "src/bridge/manager.rs",
+    # Server routes 纯函数（Phase J 新增）
+    # render_histogram（累积桶）+ render_counter（_total 剥离）新增测试；已有 11 个测试
+    "src/server/routes.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
