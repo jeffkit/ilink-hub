@@ -98,6 +98,22 @@ examine_globs = [
     # MCP 协议 JSON 构造（Phase H 新增）
     # list_agents_def / call_agent_def / server_info 已有 13 个测试
     "src/mcp/protocol.rs",
+    # SSE 票据存储（Phase I 新增）
+    # issue / consume 已有 4 个测试，单次消费 + 过期 + 高熵
+    "src/server/sse_ticket.rs",
+    # Bridge 可执行文件路径解析（Phase I 新增）
+    # is_bridge_executable / sibling / resolve_spawn_command 已有 4 个测试
+    "src/bridge/paths.rs",
+    # Bridge 消息分发器纯函数（Phase I 新增）
+    # backoff_for_with / sanitize_field / classify_sendoutcome / parse_sendoutcome /
+    # session_dispatch_key 已有 43 个测试（含 adversarial）
+    "src/bridge/dispatcher.rs",
+    # Bridge 配置解析（Phase I 新增）
+    # expand_env_var / expand_env_var_named / validate_env_ident 已有 22 个测试
+    "src/bridge/config.rs",
+    # Bridge 内置 profile 共享辅助（Phase I 新增）
+    # StreamMessage::text + ensure_success 新增测试；async I/O 预期 timeout
+    "src/bridge/builtin/common.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
