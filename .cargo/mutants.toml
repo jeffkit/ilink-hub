@@ -65,6 +65,21 @@ examine_globs = [
     # 仅 is_blocked_forward_header / unix_now 为纯函数；
     # async I/O 函数 (run_relay_loop / run_session 等) 预期会 timeout，不影响分数
     "src/relay/client.rs",
+    # Hub 指标与并发追踪（Phase G1 新增）
+    # LatencyHistogram::observe 桶分配逻辑 + PollTracker::enter 并发门控
+    "src/hub/state.rs",
+    # iLink 消息类型纯函数（Phase G2 新增）
+    # text() / first_item_type() / reply_text / SendMessageResponse::ok/err
+    "src/ilink/types.rs",
+    # Relay 协议 JSON 序列化（Phase G3 新增）
+    # 所有变体 roundtrip 测试已覆盖
+    "src/relay/protocol.rs",
+    # 错误类型 + From 转换（Phase G4 新增）
+    # 6 个现有测试覆盖 Display 格式 + downcast 链
+    "src/error.rs",
+    # iLink upstream 纯函数（Phase G4 新增）
+    # is_well_formed_bot_token + bot_id；async I/O 预期 timeout
+    "src/ilink/upstream.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
