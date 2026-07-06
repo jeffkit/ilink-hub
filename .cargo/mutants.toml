@@ -43,6 +43,18 @@ examine_globs = [
     "src/store/context.rs",
     "src/store/clients.rs",
     "src/store/sessions.rs",
+    # Hub 命令 / 分发 / 配对（Phase 5 新增测试后加入，E1 优化）
+    # 已知良性 missed mutants 通过 exclude_re 过滤（见下方注释）
+    "src/hub/commands.rs",
+    "src/hub/dispatch.rs",
+    "src/hub/pairing.rs",
+    # 消息格式函数（Phase 6-D 新增测试后加入）
+    "src/hub/messages.rs",
+    # 设备标识（Phase 6-C 新增测试后加入）
+    "src/relay/device.rs",
+    # iLink 登录流程（Phase B mockito 接入后加入）
+    # 注意：scan 依赖网络 mock，每次扫描约 5-10 分钟
+    "src/ilink/login.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
