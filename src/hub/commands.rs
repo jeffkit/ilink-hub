@@ -474,12 +474,15 @@ mod tests {
     use std::sync::Arc;
 
     async fn make_hub_state() -> Arc<HubState> {
+        make_hub_state_with_upstream(crate::hub::tests::MockUpstream::returning_ok()).await
+    }
+
+    async fn make_hub_state_with_upstream(
+        upstream: Arc<dyn crate::ilink::UpstreamSink>,
+    ) -> Arc<HubState> {
         let store = crate::store::Store::connect("sqlite::memory:")
             .await
             .expect("in-memory store");
-        let upstream: Arc<dyn crate::ilink::UpstreamSink> = Arc::new(
-            crate::ilink::UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"),
-        );
         let queue: Arc<dyn crate::MessageQueue> = Arc::new(InMemoryQueue::new());
         let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         HubState::new(
@@ -545,5 +548,48 @@ mod tests {
         };
         // Must not panic; logs a warning and returns without sending a reply.
         handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+    }
+
+    /// M1-5: handle_hub_command with a valid context_token must call send_message
+    /// exactly once via MockUpstream. Verifies the upstream is called regardless of
+    /// whether resp.ret is zero or non-zero.
+    #[tokio::test]
+    async fn handle_hub_command_calls_send_message_once() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: Some("ctx-valid-123".to_string()),
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            1,
+            "send_message must be called exactly once for a valid context"
+        );
+    }
+
+    /// M1-6: handle_hub_command with a valid context_token and MockUpstream
+    /// returning non-zero ret must still complete without panicking.
+    /// Catches the send_message → Ok(()) no-op mutant.
+    #[tokio::test]
+    async fn handle_hub_command_completes_when_upstream_returns_err_ret() {
+        let mock = crate::hub::tests::MockUpstream::returning_err(1, "mock rejected");
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: Some("ctx-err-test".to_string()),
+            from_user_id: Some("user-err".to_string()),
+            ..Default::default()
+        };
+        // Even with a non-zero ret from upstream, must not panic.
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Status).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            1,
+            "send_message must still be called once even when upstream returns error"
+        );
     }
 }
