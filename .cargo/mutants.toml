@@ -123,6 +123,18 @@ examine_globs = [
     # Server routes 纯函数（Phase J 新增）
     # render_histogram（累积桶）+ render_counter（_total 剥离）新增测试；已有 11 个测试
     "src/server/routes.rs",
+    # Bridge probe 纯函数（Phase K 新增）
+    # check_command_exists（empty/path/command 三路分支）+ ProbeError::error_type（match 字符串）
+    # 新增 6 个测试；dry_run_profile / find_in_path_robust 为 I/O 密集型，预期 timeout
+    "src/bridge/probe.rs",
+    # Bridge builtin 处理器（Phase K 新增）
+    # 各文件已有 2–15 个测试覆盖 text()/serde 反序列化/去重逻辑；
+    # async run() / stream_* / invoke_* 等 I/O 路径预期 timeout，属良性 missed
+    "src/bridge/builtin/claude_code.rs",
+    "src/bridge/builtin/cursor.rs",
+    "src/bridge/builtin/codebuddy_code.rs",
+    "src/bridge/builtin/recursive.rs",
+    "src/bridge/builtin/agy.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
