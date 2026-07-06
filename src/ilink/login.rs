@@ -369,4 +369,106 @@ mod tests {
             "non-zero ret with unknown status must return Err"
         );
     }
+
+    // ── login_with_qr_ui 端到端（捕捉顶层函数被替换为 Ok(String::new()) 的变异）─────
+
+    /// M8-login-8: login_with_qr_ui 必须经过完整的 QR 获取 + 状态轮询流程，
+    /// 最终返回后端提供的真实 bot_token。
+    ///
+    /// 捕捉两类变异：
+    ///   - `replace LoginClient::login_with_qr_ui -> Result<String> with Ok(String::new())`
+    ///   - `replace LoginClient::login_with_qr_ui -> Result<String> with Ok("xyzzy".into())`
+    #[tokio::test]
+    async fn login_with_qr_ui_returns_the_confirmed_bot_token() {
+        let mut server = Server::new_async().await;
+
+        // 1. QR 码获取端点
+        let _m_qr = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"qrcode":"qr-key-test","qrcode_img_content":"https://wx.qq.com/qr.png"}"#,
+            )
+            .create_async()
+            .await;
+
+        // 2. 状态轮询端点：一次调用即返回 "confirmed" + bot_token
+        let _m_status = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=qr-key-test")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":"token-from-qr-login","baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<QrLoginUiEvent>();
+
+        let result = client.login_with_qr_ui(Some(tx)).await;
+        assert!(result.is_ok(), "expected Ok but got: {result:?}");
+        let token = result.unwrap();
+        assert_eq!(
+            token, "token-from-qr-login",
+            "login_with_qr_ui must return the confirmed bot_token, got: {token:?}"
+        );
+    }
+
+    /// M8-login-9: get_qrcode 当 ret == 0 时必须返回含 qrcode 字段的 Ok。
+    /// 补充针对 `ret != 0` → `ret == 0` 变异的强化覆盖：验证成功路径的返回值非空。
+    #[tokio::test]
+    async fn get_qrcode_zero_ret_returns_non_empty_qrcode_key() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"qrcode":"my-qr-key-9999","qrcode_img_content":"https://example.com/qr.png"}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.get_qrcode().await;
+        assert!(result.is_ok(), "zero ret must be Ok, got: {result:?}");
+        let resp = result.unwrap();
+        let qrcode = resp.qrcode.as_deref().unwrap_or("");
+        assert_eq!(
+            qrcode, "my-qr-key-9999",
+            "qrcode must match the mocked value"
+        );
+    }
+
+    /// M8-login-10: poll_qrcode_status 返回值必须是真实 token，而非空字符串或占位符。
+    /// 补充强化：assert_eq 使用与 M8-login-4 不同的 token 值以交叉验证。
+    #[tokio::test]
+    async fn poll_qrcode_status_returns_exact_token_not_placeholder() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock(
+                "GET",
+                "/ilink/bot/get_qrcode_status?qrcode=exact-token-key",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":"precise-bot-token-xyz","baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.poll_qrcode_status("exact-token-key", None).await;
+        assert!(result.is_ok(), "expected Ok, got: {result:?}");
+        let token = result.unwrap();
+        // Must be neither empty nor the cargo-mutants placeholder "xyzzy".
+        assert!(
+            !token.is_empty() && token != "xyzzy",
+            "token must be non-empty and non-xyzzy, got: {token:?}"
+        );
+        assert_eq!(token, "precise-bot-token-xyz");
+    }
 }
