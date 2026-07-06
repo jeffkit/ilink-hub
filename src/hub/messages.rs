@@ -338,4 +338,99 @@ mod tests {
         assert!(parse_elapsed_secs("not-a-date").is_none());
         assert!(parse_elapsed_secs("").is_none());
     }
+
+    // ─── session 消息函数覆盖（捕捉 → String::new() / → "xyzzy" 变异） ───────────
+
+    /// M7-msg-1: session_new_created_switch_failed 必须包含 name 和错误信息。
+    #[test]
+    fn session_new_created_switch_failed_contains_name_and_error() {
+        let out = session_new_created_switch_failed("work", &"db error");
+        assert!(out.contains("work"), "must contain session name");
+        assert!(out.contains("db error"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-2: session_new_failed 必须包含错误信息。
+    #[test]
+    fn session_new_failed_contains_error() {
+        let out = session_new_failed(&"network timeout");
+        assert!(
+            out.contains("network timeout"),
+            "must contain error message"
+        );
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-3: session_use_failed 必须包含错误信息。
+    #[test]
+    fn session_use_failed_contains_error() {
+        let out = session_use_failed(&"not found");
+        assert!(out.contains("not found"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-4: session_use_slot_create_failed 必须包含错误信息。
+    #[test]
+    fn session_use_slot_create_failed_contains_error() {
+        let out = session_use_slot_create_failed(&"slot full");
+        assert!(out.contains("slot full"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-5: session_use_query_failed 必须包含错误信息。
+    #[test]
+    fn session_use_query_failed_contains_error() {
+        let out = session_use_query_failed(&"sql error");
+        assert!(out.contains("sql error"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-6: session_delete_failed 必须包含错误信息。
+    #[test]
+    fn session_delete_failed_contains_error() {
+        let out = session_delete_failed(&"io error");
+        assert!(out.contains("io error"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-7: session_list_failed 必须包含错误信息。
+    #[test]
+    fn session_list_failed_contains_error() {
+        let out = session_list_failed(&"timeout");
+        assert!(out.contains("timeout"), "must contain error message");
+        assert!(!out.is_empty() && out != "xyzzy");
+    }
+
+    /// M7-msg-8: hub_status 截断逻辑 — snippet.chars().count() > 30 的边界。
+    /// 捕捉 `> 30` → `>= 30` 的变异：当 content 恰好 30 个字符时不应被截断。
+    #[test]
+    fn hub_status_truncation_boundary_exactly_30_chars_not_truncated() {
+        // 恰好 30 个字符，不应截断
+        let msg_30 = "A".repeat(30);
+        let client_sessions = vec![(
+            "claude".to_string(),
+            vec![entry("s1", Some(&msg_30), false, None)],
+        )];
+        let out = hub_status(1, 1, &client_sessions);
+        assert!(
+            !out.contains('…'),
+            "30-char message must NOT be truncated, output: {out}"
+        );
+    }
+
+    /// M7-msg-9: hub_status 截断逻辑 — 31 字符的消息必须被截断。
+    #[test]
+    fn hub_status_truncation_boundary_31_chars_is_truncated() {
+        // 31 个字符，必须被截断
+        let msg_31 = "B".repeat(31);
+        let client_sessions = vec![(
+            "claude".to_string(),
+            vec![entry("s1", Some(&msg_31), false, None)],
+        )];
+        let out = hub_status(1, 1, &client_sessions);
+        assert!(
+            out.contains('…'),
+            "31-char message MUST be truncated, output: {out}"
+        );
+    }
 }

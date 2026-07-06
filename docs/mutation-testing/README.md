@@ -28,6 +28,7 @@ RUST_TEST_THREADS=1 cargo mutants -j 2 --output mutants-output/full
 | 文件 | 说明 | 优先级 |
 |------|------|--------|
 | `src/hub/vtoken_hash.rs` | 安全关键：vtoken SHA-256 哈希 | P0 |
+| `src/relay/auth.rs` | 安全关键：Ed25519 配对注册签名验证 | P0 |
 | `src/hub/outbound_label.rs` | 出站消息格式化（纯函数，分支密集） | P1 |
 | `src/relay/ratelimit.rs` | 固定窗口限流逻辑 | P1 |
 | `src/hub/router.rs` | Hub 路由表 | P1 |

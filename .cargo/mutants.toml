@@ -35,6 +35,8 @@ examine_globs = [
     "src/hub/queue.rs",
     # 健康检查逻辑
     "src/hub/health.rs",
+    # 安全关键：Ed25519 配对注册签名验证（Phase 4 新增）
+    "src/relay/auth.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────

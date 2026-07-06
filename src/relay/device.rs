@@ -236,4 +236,110 @@ mod tests {
         // Double-slash variant after decoding.
         assert!(!is_allowed_relay_path("/hub/pair/%2e%2e/%2e%2e/etc/passwd"));
     }
+
+    /// M6-device-1: validate_device_id boundary — minimum length is 8 (strict >).
+    /// Catches the `< 8` → `<= 8` mutant (141:17): if <= is used, a string of
+    /// exactly 8 chars would be rejected; if < is used (correct), it is accepted.
+    #[test]
+    fn validate_device_id_length_boundaries() {
+        // Exactly 7 characters → too short, must be rejected.
+        let too_short = "abcdefg"; // 7 chars
+        assert!(!validate_device_id(too_short), "7-char id must be rejected");
+
+        // Exactly 8 characters → minimum valid length.
+        let min_valid = "abcdefgh"; // 8 chars
+        assert!(validate_device_id(min_valid), "8-char id must be accepted");
+
+        // Exactly 64 characters → maximum valid length.
+        let max_valid = "a".repeat(64);
+        assert!(
+            validate_device_id(&max_valid),
+            "64-char id must be accepted"
+        );
+
+        // Exactly 65 characters → too long, must be rejected.
+        let too_long = "a".repeat(65);
+        assert!(
+            !validate_device_id(&too_long),
+            "65-char id must be rejected"
+        );
+    }
+
+    /// M6-device-2: DeviceIdentity::device_id() getter must return the actual id.
+    /// Catches the `→ ""` and `→ "xyzzy"` mutants (83:9).
+    #[test]
+    fn device_identity_device_id_getter_returns_actual_id() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let signing_key_b64 = base64::engine::general_purpose::STANDARD.encode(sk.to_bytes());
+        let expected_id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+
+        let identity = DeviceIdentity::for_testing(expected_id.clone(), signing_key_b64);
+        assert_eq!(
+            identity.device_id(),
+            expected_id,
+            "device_id() must return the stored id"
+        );
+    }
+
+    /// M6-device-3: DeviceIdentity::verifying_key() must return the actual key.
+    /// Catches the `→ Ok(Default::default())` mutant (99:9) — Default::default()
+    /// for VerifyingKey is all-zeros, which would always differ from the real key.
+    #[test]
+    fn device_identity_verifying_key_matches_signing_key() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let expected_vk = sk.verifying_key();
+        let signing_key_b64 = B64.encode(sk.to_bytes());
+
+        let identity = DeviceIdentity::for_testing("test-device-id".to_string(), signing_key_b64);
+        let vk = identity
+            .verifying_key()
+            .expect("verifying_key must succeed");
+        assert_eq!(
+            vk.to_bytes(),
+            expected_vk.to_bytes(),
+            "verifying_key() must match the stored signing key"
+        );
+    }
+
+    /// M6-device-4: public_key_b64 and sign_register must produce non-trivial results.
+    /// Catches the `→ Ok(String::new())` / `→ Ok("xyzzy")` mutants (103:9, 107:9).
+    #[test]
+    fn device_identity_public_key_and_sign_register_are_non_trivial() {
+        use ed25519_dalek::SigningKey;
+        use rand_core::OsRng;
+        let sk = SigningKey::generate(&mut OsRng);
+        let signing_key_b64 = B64.encode(sk.to_bytes());
+        let identity = DeviceIdentity::for_testing("test-device-abc".to_string(), signing_key_b64);
+
+        let pk = identity
+            .public_key_b64()
+            .expect("public_key_b64 must succeed");
+        assert!(
+            !pk.is_empty() && pk != "xyzzy",
+            "public_key_b64 must be a real base64 string"
+        );
+
+        let sig = identity
+            .sign_register(1_700_000_000)
+            .expect("sign_register must succeed");
+        assert!(
+            !sig.is_empty() && sig != "xyzzy",
+            "sign_register must produce a real signature string"
+        );
+
+        // Verify the signature is valid using the auth module's verify_register.
+        use super::super::auth::verify_register;
+        verify_register(
+            &identity.verifying_key().unwrap(),
+            &identity.device_id,
+            1_700_000_000,
+            &sig,
+            1_700_000_000,
+        )
+        .expect("produced signature must be verifiable");
+    }
 }

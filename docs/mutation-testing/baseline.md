@@ -183,9 +183,44 @@ fn evicts_stale_keys_when_over_limit() {
 
 ---
 
+## Phase 4：安全关键签名验证模块
+
+**范围**：`src/relay/auth.rs`（Ed25519 配对注册签名）  
+**运行耗时**：~10 分钟（基准编译 83s + 测试 44s，13 个变异体 2 并行）
+
+### 汇总
+
+|| 指标 | 数值 |
+||------|------|
+|| 总变异体 | 13 |
+|| **已捕获（Caught）** | **7** |
+|| **未捕获（Missed）** | **6** |
+|| 不可行（Unviable） | 0 |
+|| 超时（Timeout） | 0 |
+|| **初始 Mutation Score** | **53.8%** |
+
+### 未捕获变异体（6 个）❌ 及修复状态
+
+**`src/relay/auth.rs`（全部 6 个）— 已修复** ✅
+
+|| 位置 | 变异 | 修复方式 |
+||------|------|---------|
+|| 26:37 | `>` → `==` (skew check) | 新增 `verify_register_accepts_timestamp_within_skew_window` |
+|| 26:37 | `>` → `>=` (skew check) | 同上 |
+|| 26:18 | `-` → `/` (time-diff calc) | 新增 `verify_register_rejects_timestamp_outside_skew_window` |
+|| 42:5 | `verifying_key_from_b64` → `Ok(Default::default())` | 新增 `public_key_b64_and_verifying_key_from_b64_round_trip` |
+|| 55:5 | `public_key_b64` → `String::new()` | 同上（非空断言 + round-trip 验证） |
+|| 55:5 | `public_key_b64` → `"xyzzy".into()` | 同上 |
+
+---
+
 ## 历史记录
 
 | 日期 | Phase | 模块数 | 总变异体 | 捕获 | 未捕获 | 分数 | 事后修复 |
 |------|-------|--------|----------|------|--------|------|---------|
 | 2026-07-05 | Phase 1 | 3 | 57 | 51 | 6 | **89.5%** | ✅ 全部修复 |
 | 2026-07-05 | Phase 2 | 4 | 98 | 70 | 18 | **79.5%** | ✅ 15/18 修复，3 暂缓 |
+| 2026-07-05 | Phase 3 | 暂缓项 | — | — | 3 | — | ✅ 全部补测完成（main 分支） |
+| 2026-07-06 | Phase 4 | 1 | 13 | 7 | 6 | **53.8% → 100%** | ✅ 全部修复（补测 3 个用例） |
+| 2026-07-06 | Phase 5 | 3 | 156 | 116 | 40 | **74.4%** | ✅ 补测 16 个用例，~14 暂缓（需 mock upstream） |
+| 2026-07-06 | Phase 6 | 5 | — | — | — | protocol/quote_route 初扫即 100% | ✅ device.rs+messages.rs 新增 13 测试（login.rs 暂缓） |

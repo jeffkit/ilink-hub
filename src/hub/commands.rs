@@ -465,3 +465,85 @@ fn build_help_text() -> String {
      4. AI 服务调用 /ilink/bot/getupdates 接收消息，并通过 /ilink/bot/sendmessage 回复"
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{AdminConfig, HubState, InMemoryQueue};
+    use crate::ilink::types::WeixinMessage;
+    use std::sync::Arc;
+
+    async fn make_hub_state() -> Arc<HubState> {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let upstream: Arc<dyn crate::ilink::UpstreamSink> = Arc::new(
+            crate::ilink::UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"),
+        );
+        let queue: Arc<dyn crate::MessageQueue> = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        HubState::new(
+            upstream,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
+    }
+
+    /// M1-1: handle_cmd_broadcast with no online clients must return the correct
+    /// count string. Catches the mutant that replaces the whole function body
+    /// with String::new() or "xyzzy".
+    #[tokio::test]
+    async fn broadcast_to_no_online_clients_returns_zero_count() {
+        let state = make_hub_state().await;
+        let msg = WeixinMessage::default();
+        let result = handle_cmd_broadcast(&state, "user1", "ctx-abc", &msg, "hello").await;
+        assert_eq!(
+            result, "📡 Broadcast to 0 client(s)",
+            "broadcast with no online clients must report 0"
+        );
+    }
+
+    /// M1-2: handle_cmd_status with no clients must return a non-empty hub
+    /// status string. Catches the mutant that replaces the function with String::new().
+    #[tokio::test]
+    async fn status_with_no_clients_returns_hub_status_string() {
+        let state = make_hub_state().await;
+        let result = handle_cmd_status(&state).await;
+        assert!(
+            result.contains("iLink Hub 状态：0/0"),
+            "status with no clients must contain '0/0', got: {result:?}"
+        );
+    }
+
+    /// M1-3: handle_cmd_session_list with no backend selected (no routing
+    /// entry for the user) must return the NO_BACKEND message.
+    /// Catches the == → != mutant on vtoken match and sessions.is_empty() → false.
+    #[tokio::test]
+    async fn session_list_with_no_backend_returns_no_backend_message() {
+        let state = make_hub_state().await;
+        let result = handle_cmd_session_list(&state, "user-no-backend", "ctx-xyz", None).await;
+        assert_eq!(
+            result,
+            messages::NO_BACKEND,
+            "session list with no backend must return NO_BACKEND message"
+        );
+    }
+
+    /// M1-4: handle_hub_command with an empty context_token must return early
+    /// without panicking. Catches the !ctx.is_empty() → true mutant which
+    /// would allow routing without a valid context.
+    #[tokio::test]
+    async fn handle_hub_command_with_empty_context_token_returns_early() {
+        let state = make_hub_state().await;
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        // Must not panic; logs a warning and returns without sending a reply.
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+    }
+}
