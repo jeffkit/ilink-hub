@@ -367,3 +367,431 @@ impl Store {
         Ok(map)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::store::Store;
+
+    async fn make_store() -> Store {
+        Store::connect("sqlite::memory:").await.expect("connect")
+    }
+
+    #[tokio::test]
+    async fn save_message_and_list_messages_returns_saved_row() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "default",
+                "user-1",
+                "user",
+                "hello",
+            )
+            .await
+            .expect("save");
+        let rows = store.list_messages("vctx-1", 10).await.expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].content, "hello");
+        assert_eq!(rows[0].role, "user");
+        assert_eq!(rows[0].vtoken, Some("vtok-A".to_string()));
+    }
+
+    #[tokio::test]
+    async fn list_messages_filters_by_vctx_and_respects_limit() {
+        let store = make_store().await;
+        store
+            .save_message("vctx-1", None, "default", "u1", "user", "in-vctx-1-a")
+            .await
+            .expect("save a");
+        store
+            .save_message("vctx-1", None, "default", "u1", "assistant", "in-vctx-1-b")
+            .await
+            .expect("save b");
+        store
+            .save_message("vctx-2", None, "default", "u1", "user", "in-vctx-2")
+            .await
+            .expect("save other vctx");
+        // limit=1 must only return the one latest row for vctx-1
+        let rows = store
+            .list_messages("vctx-1", 1)
+            .await
+            .expect("list with limit");
+        assert_eq!(rows.len(), 1, "limit=1 must return exactly 1 row");
+        // Without limit restriction, both vctx-1 rows but not vctx-2 row
+        let all = store.list_messages("vctx-1", 10).await.expect("list all");
+        assert_eq!(all.len(), 2, "must return only rows for vctx-1");
+        let contents: Vec<&str> = all.iter().map(|r| r.content.as_str()).collect();
+        assert!(contents.contains(&"in-vctx-1-a"));
+        assert!(contents.contains(&"in-vctx-1-b"));
+        assert!(
+            !contents.contains(&"in-vctx-2"),
+            "vctx-2 row must not appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_content_finds_matching_row() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "Hello World",
+            )
+            .await
+            .expect("save");
+        let result = store
+            .find_assistant_message_by_content("user-1", "Hello")
+            .await
+            .expect("find");
+        assert!(result.is_some());
+        let (vtoken, session) = result.unwrap();
+        assert_eq!(vtoken, "vtok-A");
+        assert_eq!(session, Some("sess-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_content_returns_none_when_no_match() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "Hello World",
+            )
+            .await
+            .expect("save");
+        let result = store
+            .find_assistant_message_by_content("user-1", "Goodbye")
+            .await
+            .expect("find");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_content_does_not_match_user_role() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "user",
+                "Hello from user",
+            )
+            .await
+            .expect("save");
+        let result = store
+            .find_assistant_message_by_content("user-1", "Hello from user")
+            .await
+            .expect("find");
+        assert!(result.is_none(), "must not match user-role messages");
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_content_escapes_percent_wildcard() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "50%_off sale",
+            )
+            .await
+            .expect("save target");
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-B"),
+                "sess-2",
+                "user-1",
+                "assistant",
+                "50 anything sale",
+            )
+            .await
+            .expect("save decoy");
+        // Prefix "50%_off" must be escaped so % and _ are treated as literals
+        let result = store
+            .find_assistant_message_by_content("user-1", "50%_off")
+            .await
+            .expect("find");
+        let (vtoken, _) = result.expect("must match the exact row");
+        assert_eq!(
+            vtoken, "vtok-A",
+            "escaped prefix must match only the literal row"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_timestamp_returns_match_within_window() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "Timed msg",
+            )
+            .await
+            .expect("save");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let result = store
+            .find_assistant_message_by_timestamp("user-1", now, 10)
+            .await
+            .expect("find");
+        let (vtoken, session) = result.expect("must find message within ±10s window");
+        assert_eq!(vtoken, "vtok-A");
+        assert_eq!(session, Some("sess-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_timestamp_returns_none_outside_window() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "Old msg",
+            )
+            .await
+            .expect("save");
+        // Target timestamp 1 hour in the past with a 5s window — must not match
+        let past_ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - 3600;
+        let result = store
+            .find_assistant_message_by_timestamp("user-1", past_ts, 5)
+            .await
+            .expect("find");
+        assert!(result.is_none(), "timestamp outside window must not match");
+    }
+
+    #[tokio::test]
+    async fn list_messages_for_session_clamps_limit_min_to_one() {
+        let store = make_store().await;
+        store
+            .save_message("vctx-1", Some("vtok-A"), "sess-1", "user-1", "user", "msg1")
+            .await
+            .expect("save");
+        // limit=0 must be clamped to 1
+        let rows = store
+            .list_messages_for_session("vtok-A", "sess-1", 0)
+            .await
+            .expect("list");
+        assert_eq!(rows.len(), 1, "limit=0 clamped to 1 must return 1 row");
+    }
+
+    #[tokio::test]
+    async fn list_messages_for_session_clamps_limit_max_to_500() {
+        let store = make_store().await;
+        for i in 0..5 {
+            store
+                .save_message(
+                    "vctx-1",
+                    Some("vtok-A"),
+                    "sess-1",
+                    "user-1",
+                    "user",
+                    &format!("msg{i}"),
+                )
+                .await
+                .expect("save");
+        }
+        // limit=600 clamped to 500; only 5 messages exist, so all 5 returned
+        let rows = store
+            .list_messages_for_session("vtok-A", "sess-1", 600)
+            .await
+            .expect("list");
+        assert_eq!(
+            rows.len(),
+            5,
+            "limit=600 clamped to 500 must still return all 5 rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_status_per_vtoken_empty_input_returns_empty_map() {
+        let store = make_store().await;
+        let result = store.get_session_status_per_vtoken(&[]).await.expect("get");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_session_status_per_vtoken_waiting_true_when_last_role_is_user() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "AI reply",
+            )
+            .await
+            .expect("save assistant");
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "user",
+                "User followup",
+            )
+            .await
+            .expect("save user");
+        let result = store
+            .get_session_status_per_vtoken(&["vtok-A".to_string()])
+            .await
+            .expect("get");
+        let entry = result.get("vtok-A").expect("must have vtok-A");
+        assert!(
+            entry.waiting_for_reply,
+            "last role=user → waiting_for_reply must be true"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_session_status_per_vtoken_waiting_false_when_last_role_is_assistant() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "user",
+                "User question",
+            )
+            .await
+            .expect("save user");
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "AI reply",
+            )
+            .await
+            .expect("save assistant");
+        let result = store
+            .get_session_status_per_vtoken(&["vtok-A".to_string()])
+            .await
+            .expect("get");
+        let entry = result.get("vtok-A").expect("must have vtok-A");
+        assert!(
+            !entry.waiting_for_reply,
+            "last role=assistant → waiting_for_reply must be false"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_all_session_entries_per_vtoken_empty_input_returns_empty_map() {
+        let store = make_store().await;
+        let result = store
+            .get_all_session_entries_per_vtoken(&[])
+            .await
+            .expect("get");
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_all_session_entries_per_vtoken_groups_by_session() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "user",
+                "Q in sess1",
+            )
+            .await
+            .expect("save sess1");
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-2",
+                "user-1",
+                "assistant",
+                "A in sess2",
+            )
+            .await
+            .expect("save sess2");
+        let result = store
+            .get_all_session_entries_per_vtoken(&["vtok-A".to_string()])
+            .await
+            .expect("get");
+        let entries = result.get("vtok-A").expect("must have vtok-A");
+        assert_eq!(entries.len(), 2, "two sessions must produce two entries");
+        let names: Vec<&str> = entries.iter().map(|e| e.session_name.as_str()).collect();
+        assert!(names.contains(&"sess-1"));
+        assert!(names.contains(&"sess-2"));
+    }
+
+    #[tokio::test]
+    async fn get_all_session_entries_per_vtoken_waiting_true_when_last_role_is_user() {
+        let store = make_store().await;
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "assistant",
+                "AI reply",
+            )
+            .await
+            .expect("save assistant");
+        store
+            .save_message(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-1",
+                "user-1",
+                "user",
+                "User followup",
+            )
+            .await
+            .expect("save user");
+        let result = store
+            .get_all_session_entries_per_vtoken(&["vtok-A".to_string()])
+            .await
+            .expect("get");
+        let entries = result.get("vtok-A").expect("vtok-A");
+        let sess1 = entries
+            .iter()
+            .find(|e| e.session_name == "sess-1")
+            .expect("sess-1");
+        assert!(
+            sess1.waiting_for_reply,
+            "last role=user → waiting_for_reply must be true"
+        );
+    }
+}

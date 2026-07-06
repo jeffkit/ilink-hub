@@ -55,6 +55,16 @@ examine_globs = [
     # iLink 登录流程（Phase B mockito 接入后加入）
     # 注意：scan 依赖网络 mock，每次扫描约 5-10 分钟
     "src/ilink/login.rs",
+    # Quote-aware routing（纯函数，Phase F1 新增）
+    # 已有 11 个单元测试，所有函数均无 I/O 依赖
+    "src/hub/quote_route.rs",
+    # 消息历史持久化（SQLite，Phase F2 新增）
+    # 注意：store 层依赖 sqlite::memory:，扫描时间较长
+    "src/store/messages.rs",
+    # Relay 客户端纯函数（Phase F3 新增）
+    # 仅 is_blocked_forward_header / unix_now 为纯函数；
+    # async I/O 函数 (run_relay_loop / run_session 等) 预期会 timeout，不影响分数
+    "src/relay/client.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
