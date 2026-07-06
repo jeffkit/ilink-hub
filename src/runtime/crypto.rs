@@ -98,17 +98,96 @@ fn decode_hex(s: &str) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn make_key(raw: [u8; 32]) -> Key {
+        let unbound = UnboundKey::new(&AES_256_GCM, &raw).unwrap();
+        LessSafeKey::new(unbound)
+    }
+
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
-        let raw_key = [0u8; 32];
-        let unbound_key = UnboundKey::new(&AES_256_GCM, &raw_key).unwrap();
-        let key = LessSafeKey::new(unbound_key);
-
+        let key = make_key([0u8; 32]);
         let token = "my-secret-bot-token-12345";
         let encrypted = encrypt_token(token, &key).unwrap();
         assert_ne!(token, encrypted);
-
         let decrypted = decrypt_token(&encrypted, &key).unwrap();
         assert_eq!(token, decrypted);
+    }
+
+    #[test]
+    fn decrypt_token_too_short_blob_returns_error() {
+        let key = make_key([0u8; 32]);
+        // 20 bytes is < 12 (nonce) + 16 (tag) = 28 minimum
+        let short_blob = B64.encode([0u8; 20]);
+        let result = decrypt_token(&short_blob, &key);
+        assert!(result.is_err(), "blob shorter than 28 bytes must fail");
+    }
+
+    #[test]
+    fn decrypt_token_invalid_base64_returns_error() {
+        let key = make_key([0u8; 32]);
+        let result = decrypt_token("not-valid-base64!!", &key);
+        assert!(result.is_err(), "invalid base64 must fail");
+    }
+
+    // ── decode_hex ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_hex_valid_even_length_input() {
+        let bytes = decode_hex("0102ff").unwrap();
+        assert_eq!(bytes, vec![0x01, 0x02, 0xff]);
+    }
+
+    /// Odd number of hex characters must be rejected.
+    #[test]
+    fn decode_hex_odd_length_returns_error() {
+        let result = decode_hex("abc"); // 3 chars = odd
+        assert!(result.is_err(), "odd-length hex must fail");
+    }
+
+    #[test]
+    fn decode_hex_invalid_char_returns_error() {
+        let result = decode_hex("zz");
+        assert!(result.is_err(), "non-hex characters must fail");
+    }
+
+    #[test]
+    fn decode_hex_empty_string_returns_empty_vec() {
+        let bytes = decode_hex("").unwrap();
+        assert!(
+            bytes.is_empty(),
+            "empty hex string must decode to empty vec"
+        );
+    }
+
+    // ── decode_key ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_key_accepts_32_byte_base64() {
+        let b64_key = B64.encode([42u8; 32]);
+        let bytes = decode_key(&b64_key).unwrap();
+        assert_eq!(bytes, vec![42u8; 32]);
+    }
+
+    #[test]
+    fn decode_key_accepts_64_char_hex() {
+        let hex_key = "00".repeat(32); // 32 bytes as hex = 64 chars
+        let bytes = decode_key(&hex_key).unwrap();
+        assert_eq!(bytes, vec![0u8; 32]);
+    }
+
+    #[test]
+    fn decode_key_rejects_wrong_length_base64() {
+        let b64_key = B64.encode([0u8; 16]); // only 16 bytes
+        let result = decode_key(&b64_key);
+        assert!(result.is_err(), "16-byte key must be rejected");
+    }
+
+    #[test]
+    fn decode_key_strips_surrounding_quotes() {
+        // Admins sometimes quote the env var value
+        let raw = B64.encode([7u8; 32]);
+        let quoted = format!("\"{raw}\"");
+        let bytes = decode_key(&quoted).unwrap();
+        assert_eq!(bytes, vec![7u8; 32]);
     }
 }

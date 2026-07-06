@@ -80,6 +80,24 @@ examine_globs = [
     # iLink upstream 纯函数（Phase G4 新增）
     # is_well_formed_bot_token + bot_id；async I/O 预期 timeout
     "src/ilink/upstream.rs",
+    # 顶层工具函数（Phase H 新增）
+    # redact_token 已有 1 个综合测试
+    "src/lib.rs",
+    # Relay server 纯函数（Phase H 新增）
+    # relay_response_to_http + unix_now；async 路由处理器预期 timeout
+    "src/relay/server.rs",
+    # AES-256-GCM 加密工具（Phase H 新增，安全关键）
+    # encrypt_token / decrypt_token / decode_hex / decode_key
+    "src/runtime/crypto.rs",
+    # MCP 工具纯函数（Phase H 新增）
+    # persona_handle / build_display_text 已有完整测试；async I/O 预期 timeout
+    "src/mcp/tools.rs",
+    # A2A reply waiter（Phase H 新增）
+    # register / resolve / cancel 已有 7 个测试
+    "src/mcp/waiter.rs",
+    # MCP 协议 JSON 构造（Phase H 新增）
+    # list_agents_def / call_agent_def / server_info 已有 13 个测试
+    "src/mcp/protocol.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
