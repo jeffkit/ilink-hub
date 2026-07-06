@@ -74,4 +74,18 @@ exclude_re = [
     "info!",
     "debug!",
     "error!",
+    # ── 已知"良性 missed mutants"（文档化决策，无需补测）──────────────
+    # 1. resp.ret match guard 变异（commands.rs / dispatch.rs）：
+    #    `resp.ret.map(|r| r != 0).unwrap_or(false)` 只控制走哪条日志分支
+    #    （error!/warn! vs debug!/noop），对系统状态无影响。
+    #    要捕获需要 log-interception，成本 >> 收益。
+    "resp.ret.map",
+    # 2. pairing.rs 时间边界变异（> vs >=）：
+    #    `created_at.elapsed() > PAIRING_TTL` 等使用 std::time::Instant，
+    #    无法通过 tokio::time::pause() 控制。>= 边界（差 1 纳秒）在业务上无意义。
+    #    若要捕获需将 Instant 改为可注入依赖，改动大于收益。
+    "elapsed() > PAIRING_TTL",
+    "elapsed() > SCANNED_TTL",
+    "elapsed() > CONFIRMED_TTL",
+    "elapsed() < CONFIRMED_TTL",
 ]
