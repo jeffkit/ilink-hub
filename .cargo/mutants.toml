@@ -37,6 +37,12 @@ examine_globs = [
     "src/hub/health.rs",
     # 安全关键：Ed25519 配对注册签名验证（Phase 4 新增）
     "src/relay/auth.rs",
+    # Store 层业务逻辑（Phase C 新增）
+    # 注意：store 层函数依赖 SQLite，扫描时间较长，建议单独运行：
+    #   cargo mutants --file src/store/context.rs -j 1
+    "src/store/context.rs",
+    "src/store/clients.rs",
+    "src/store/sessions.rs",
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
@@ -49,7 +55,11 @@ exclude_globs = [
     "src/client/**",
     "src/mcp/**",
     "tests/**",
-    "src/store/**",
+    # store/migrations.rs 纯 DDL，无业务逻辑
+    "src/store/migrations.rs",
+    "src/store/credentials.rs",
+    "src/store/store_tests.rs",
+    "src/store/mod.rs",
     "src/paths.rs",
     "src/metrics.rs",
     "src/runtime/**",

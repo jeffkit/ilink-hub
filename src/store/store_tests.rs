@@ -3258,3 +3258,72 @@ async fn find_vtoken_for_session_resolves_persona_footer_fallback() {
         .unwrap();
     assert!(not_found.is_none());
 }
+
+// ─── Store layer mutation-catching tests (Phase C) ────────────────────────────
+
+/// M9-store-1: find_or_create_vctx with a non-empty group_id must use the
+/// "group:<id>" conv_key prefix.
+/// Catches the `!s.is_empty()` → `s.is_empty()` mutant in the group_id filter
+/// (context.rs:56), and the `format!("group:{g}")` → other format mutants.
+#[tokio::test]
+async fn find_or_create_vctx_group_id_uses_group_prefix() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let vctx = store
+        .find_or_create_vctx("peer-x", Some("group-abc"), "real-ctx")
+        .await
+        .expect("must succeed");
+    assert!(!vctx.is_empty(), "vctx must be non-empty for group message");
+
+    // Same group_id must return same vctx (stable key).
+    let vctx2 = store
+        .find_or_create_vctx("peer-y", Some("group-abc"), "real-ctx-2")
+        .await
+        .expect("must succeed");
+    assert_eq!(
+        vctx, vctx2,
+        "same group_id must always resolve to the same vctx regardless of peer_user_id"
+    );
+}
+
+/// M9-store-2: find_or_create_vctx with an empty group_id must fall through to
+/// the peer_user_id path.
+/// Catches `group_id.filter(|s| !s.is_empty())` → always-Some mutant.
+#[tokio::test]
+async fn find_or_create_vctx_empty_group_id_falls_through_to_peer() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+
+    let vctx_with_empty_group = store
+        .find_or_create_vctx("peer-unique-1", Some(""), "real-ctx")
+        .await
+        .expect("must succeed");
+    let vctx_with_no_group = store
+        .find_or_create_vctx("peer-unique-1", None, "real-ctx")
+        .await
+        .expect("must succeed");
+    assert_eq!(
+        vctx_with_empty_group, vctx_with_no_group,
+        "empty group_id must be treated same as None (peer path)"
+    );
+}
+
+/// M9-store-3: find_or_create_vctx with empty peer_user_id and no group_id
+/// must still succeed (creates an anonymous context).
+/// Catches the `!peer_user_id.is_empty()` → always-true mutant (context.rs:58).
+#[tokio::test]
+async fn find_or_create_vctx_empty_peer_and_no_group_returns_vctx() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let vctx = store
+        .find_or_create_vctx("", None, "real-ctx-anon")
+        .await
+        .expect("empty peer must still create a vctx");
+    assert!(
+        !vctx.is_empty(),
+        "vctx must be non-empty even for anonymous context"
+    );
+}
