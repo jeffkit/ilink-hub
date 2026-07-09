@@ -21,3 +21,19 @@
 - Replaced single-take with `VTOKEN_CLAIM_WINDOW = 120s`
 - Tests: reclaimable within window; cleared after window (backdated `confirmed_at`); wait/scanned still return None token
 - Findings: f1 `fixed`; f2 `accepted`; f4 `partial` (sequential double-claim)
+
+## M2: shell 硬拒绝 + 日志脱敏 + 桌面 loopback
+
+### Decisions
+- Replaced `warn_shell_injection_risk` with `reject_shell_injection_risk` → `Result`: only the dangerous combo (shell interpreter + `-c` + `{{MESSAGE}}` in args) fails load via `bail!`. Shell + `-c` without MESSAGE, and `stdin: message` profiles, still load.
+- Added `redact_database_url` next to `redact_token` in `src/lib.rs`; startup log and `ServeOptions` Debug use the redacted form (password → `***`).
+- Desktop `resolve_initial_listen_addr` validates `ILINK_HUB_ADDR` via `ensure_loopback_listen_addr` — only `127.0.0.1` / `localhost` / `::1` / bare port; `0.0.0.0` and LAN IPs Err.
+- Desktop `hub_update_client` updated to new `update_client_in_hub` signature: read existing persona from registry and pass through (None would clear DB persona).
+
+### Problems & Solutions
+- Problem: desktop crate failed to compile against hub's 6-arg `update_client_in_hub` → Solution: preserve persona by reading registry before update (not pass None).
+- Problem: `url::Url::parse` fails on some SQLite DSNs → Solution: fallback string mask for `user:pass@` authority; `sqlite::memory:` returned unchanged.
+
+### Outcome
+- Verification passed: `cargo fmt --all`, `cargo clippy -- -D warnings`, new unit tests (shell reject / redact / loopback), full `cargo test -- --test-threads=1`, `cargo build`, desktop `cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` (loopback filters)
+- Commit: (pending)

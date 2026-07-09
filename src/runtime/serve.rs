@@ -149,7 +149,10 @@ impl fmt::Debug for ServeOptions {
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .field("addr", &self.addr)
             .field("ilink_base_url", &self.ilink_base_url)
-            .field("database_url", &self.database_url)
+            .field(
+                "database_url",
+                &crate::redact_database_url(&self.database_url),
+            )
             .field("on_listening", &self.on_listening.is_some())
             .field("qr_login_ui", &self.qr_login_ui.is_some())
             .field("on_hub_state", &self.on_hub_state.is_some())
@@ -177,7 +180,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     let runtime_cfg = RuntimeConfig::from_env()?;
     // Queue backend validation also happens eagerly (it calls build_queue_backend below).
 
-    info!(%addr, %database_url, "iLink Hub starting");
+    info!(%addr, database_url = %crate::redact_database_url(&database_url), "iLink Hub starting");
 
     // Bind the listen socket FIRST — before token resolution / QR login,
     // store connection, or any background WeChat polling. An invalid listen

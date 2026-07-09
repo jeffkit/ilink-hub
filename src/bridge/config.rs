@@ -261,7 +261,7 @@ impl BridgeApp {
             streaming: c.streaming,
             description: c.description,
         };
-        warn_shell_injection_risk(&profile, "default");
+        reject_shell_injection_risk(&profile, "default")?;
         let mut profiles = HashMap::new();
         profiles.insert("default".to_string(), profile);
         Ok(Self {
@@ -296,7 +296,7 @@ impl BridgeApp {
                      (set `command`, `script`, or use a recognized `type`)"
                 );
             }
-            warn_shell_injection_risk(p, name);
+            reject_shell_injection_risk(p, name)?;
         }
 
         // Resolve routing: if omitted, auto-detect fixed routing using a sensible default.
@@ -534,34 +534,37 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
     }
 }
 
-/// Warn when a profile has a dangerous shell-injection pattern:
-/// a shell interpreter (bash/sh/zsh) as the command with `-c` as an arg AND
-/// `{{MESSAGE}}` somewhere in the args — user input would be interpolated into
-/// a shell command string, enabling arbitrary command execution.
+/// Reject profiles with a dangerous shell-injection pattern:
+/// a shell interpreter (bash/sh/zsh/fish/dash) as the command with `-c` as an
+/// arg AND `{{MESSAGE}}` somewhere in the args — user input would be
+/// interpolated into a shell command string, enabling arbitrary command
+/// execution.
 ///
 /// `tokio::process::Command` does NOT invoke a shell automatically, so this is
 /// only dangerous when the user explicitly invokes a shell with `-c`.
-/// Recommendation: use `stdin: message` instead.
-fn warn_shell_injection_risk(p: &BridgeProfile, name: &str) {
+/// Safe alternatives: use `stdin: message`, or a non-shell command.
+///
+/// Only the dangerous combo is rejected; shell + `-c` without `{{MESSAGE}}`,
+/// or shell with `stdin: message` and no placeholder in args, still loads.
+fn reject_shell_injection_risk(p: &BridgeProfile, name: &str) -> Result<()> {
     const SHELL_CMDS: &[&str] = &["bash", "sh", "zsh", "fish", "dash"];
     let cmd = std::path::Path::new(&p.command)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(&p.command);
     if !SHELL_CMDS.contains(&cmd) {
-        return;
+        return Ok(());
     }
     let has_dash_c = p.args.iter().any(|a| a == "-c");
     let has_message_placeholder = p.args.iter().any(|a| a.contains("{{MESSAGE}}"));
     if has_dash_c && has_message_placeholder {
-        tracing::warn!(
-            profile = name,
-            command = %p.command,
-            "SECURITY: profile uses a shell with `-c` and `{{{{MESSAGE}}}}` in args — \
-             user input will be interpolated into a shell command string. \
+        anyhow::bail!(
+            "profile `{name}`: SECURITY: shell command with `-c` and `{{{{MESSAGE}}}}` in args \
+             is rejected — user input would be interpolated into a shell command string. \
              Use `stdin: message` to pass the message safely via stdin instead."
         );
     }
+    Ok(())
 }
 
 /// Expand `${VAR}` placeholders in `template` using values from `env`.
@@ -860,6 +863,62 @@ routing:
   default_profile: x
 "#;
         assert!(BridgeApp::parse_yaml(y).is_err());
+    }
+
+    #[test]
+    fn shell_c_with_message_placeholder_rejected() {
+        let y = r#"
+command: bash
+args: ["-c", "echo {{MESSAGE}}"]
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SECURITY") && msg.contains("MESSAGE"),
+            "expected shell-injection reject, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_c_with_message_placeholder_rejected_multi_profile() {
+        let y = r#"
+profiles:
+  bot:
+    command: /bin/zsh
+    args: ["-c", "printf '%s' '{{MESSAGE}}'"]
+routing:
+  strategy: fixed
+  default_profile: bot
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SECURITY") && msg.contains("bot"),
+            "expected named-profile reject, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_with_stdin_message_still_loads() {
+        let y = r#"
+command: bash
+args: ["./run.sh"]
+stdin: message
+"#;
+        let app = BridgeApp::parse_yaml(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "bash");
+        assert_eq!(p.stdin, StdinMode::Message);
+    }
+
+    #[test]
+    fn shell_c_without_message_placeholder_still_loads() {
+        // Only the dangerous combo (shell + -c + {{MESSAGE}}) is rejected.
+        let y = r#"
+command: bash
+args: ["-c", "echo hello"]
+"#;
+        assert!(BridgeApp::parse_yaml(y).is_ok());
     }
 
     #[test]

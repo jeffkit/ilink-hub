@@ -119,10 +119,71 @@ fn save_desktop_port_override(port: u16) -> Result<(), String> {
 /// `127.0.0.1:8765`. The port override only overrides the port; the host
 /// stays loopback so the saved choice cannot accidentally rebind on a
 /// non-loopback interface.
+///
+/// When falling back to `ILINK_HUB_ADDR`, only loopback hosts are accepted
+/// (`127.0.0.1`, `localhost`, `::1`, or a bare port which implies loopback).
+/// Non-loopback values such as `0.0.0.0` or LAN IPs are rejected.
 fn resolve_initial_listen_addr() -> Result<String, String> {
     match load_desktop_port_override()? {
         Some(port) => Ok(loopback_listen_addr_for_port(port)),
-        None => Ok(std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".into())),
+        None => match std::env::var("ILINK_HUB_ADDR") {
+            Ok(addr) => {
+                ensure_loopback_listen_addr(&addr)?;
+                Ok(addr)
+            }
+            Err(_) => Ok("127.0.0.1:8765".into()),
+        },
+    }
+}
+
+/// Return `Ok(())` when `addr` binds only on a loopback host; otherwise Err.
+///
+/// Accepted forms:
+/// - `127.0.0.1:<port>`
+/// - `localhost:<port>`
+/// - `[::1]:<port>` / `::1:<port>`
+/// - bare `<port>` (treated as loopback by the rest of the desktop stack)
+fn ensure_loopback_listen_addr(addr: &str) -> Result<(), String> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() {
+        return Err("ILINK_HUB_ADDR is empty".into());
+    }
+
+    // Bare port → loopback implied.
+    if !trimmed.contains(':') {
+        return trimmed
+            .parse::<u16>()
+            .ok()
+            .filter(|p| *p > 0)
+            .map(|_| ())
+            .ok_or_else(|| format!("ILINK_HUB_ADDR `{trimmed}` is not a valid port"));
+    }
+
+    // Strip optional scheme so `http://127.0.0.1:8765` still works if pasted.
+    let s = trimmed
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+
+    let host = if let Some(rest) = s.strip_prefix('[') {
+        // IPv6 bracket form: [::1]:port
+        let end = rest
+            .find(']')
+            .ok_or_else(|| format!("ILINK_HUB_ADDR `{trimmed}` has invalid IPv6 brackets"))?;
+        &rest[..end]
+    } else {
+        s.rsplit_once(':')
+            .map(|(h, _)| h)
+            .ok_or_else(|| format!("ILINK_HUB_ADDR `{trimmed}` is missing a port"))?
+    };
+
+    let host_ok = matches!(host, "127.0.0.1" | "localhost" | "::1");
+    if host_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "ILINK_HUB_ADDR `{trimmed}` must use a loopback host \
+             (127.0.0.1, localhost, or ::1); got host `{host}`"
+        ))
     }
 }
 
@@ -670,7 +731,28 @@ async fn hub_update_client(
         }
     };
 
-    match update_client_in_hub(state.as_ref(), &old_name, &name, label).await {
+    let (persona_name, persona_emoji) = {
+        let registry = state.clients.registry.read().await;
+        match registry.get_by_name(&old_name) {
+            Some(info) => (info.persona_name.clone(), info.persona_emoji.clone()),
+            None => {
+                return update_client_err(false, format!("未找到后端「{old_name}」"));
+            }
+        }
+    };
+
+    // Preserve existing persona fields — the desktop UI does not edit them yet,
+    // and update_client_in_hub writes persona to DB unconditionally (None clears).
+    match update_client_in_hub(
+        state.as_ref(),
+        &old_name,
+        &name,
+        label,
+        persona_name,
+        persona_emoji,
+    )
+    .await
+    {
         Ok(_) => UpdateClientResult {
             ok: true,
             name: Some(name),
@@ -2166,6 +2248,41 @@ mod tests {
             Some(v) => std::env::set_var("ILINK_HUB_ADDR", v),
             None => std::env::remove_var("ILINK_HUB_ADDR"),
         }
+    }
+
+    #[test]
+    fn resolve_initial_listen_addr_rejects_non_loopback_env() {
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        let prev_addr = std::env::var("ILINK_HUB_ADDR").ok();
+        std::env::set_var("ILINK_HUB_ADDR", "0.0.0.0:8765");
+        let err = resolve_initial_listen_addr().expect_err("non-loopback must fail");
+        assert!(
+            err.contains("loopback") || err.contains("0.0.0.0"),
+            "expected loopback rejection, got: {err}"
+        );
+
+        std::env::set_var("ILINK_HUB_ADDR", "127.0.0.1:8765");
+        let ok = resolve_initial_listen_addr().expect("loopback must succeed");
+        assert_eq!(ok, "127.0.0.1:8765");
+
+        match prev_addr {
+            Some(v) => std::env::set_var("ILINK_HUB_ADDR", v),
+            None => std::env::remove_var("ILINK_HUB_ADDR"),
+        }
+    }
+
+    #[test]
+    fn ensure_loopback_listen_addr_accepts_loopback_hosts() {
+        assert!(ensure_loopback_listen_addr("127.0.0.1:8765").is_ok());
+        assert!(ensure_loopback_listen_addr("localhost:9000").is_ok());
+        assert!(ensure_loopback_listen_addr("[::1]:8765").is_ok());
+        assert!(ensure_loopback_listen_addr("::1:8765").is_ok());
+        assert!(ensure_loopback_listen_addr("9123").is_ok());
+        assert!(ensure_loopback_listen_addr("0.0.0.0:8765").is_err());
+        assert!(ensure_loopback_listen_addr("192.168.1.10:8765").is_err());
     }
 
     #[test]
