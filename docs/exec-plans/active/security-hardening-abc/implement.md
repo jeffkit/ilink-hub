@@ -11,4 +11,4 @@
 
 ### Outcome
 - Verification passed: `cargo fmt --all`, `cargo clippy -- -D warnings`, `cargo test --test cors_tests`, `cargo test pairing`, full `cargo test -- --test-threads=1` (pending/recorded in review-request), `cargo build`
-- Commit: (filled after commit)
+- Commit: b859975
