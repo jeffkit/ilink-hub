@@ -1,60 +1,78 @@
 milestone: "M2: shell 硬拒绝 + 日志脱敏 + 桌面 loopback"
-requested_at: "2026-07-09 15:23"
+requested_at: "2026-07-09 15:35"
 requestor: "implement-agent"
+round: fix
 
 scope:
   changed_files:
-    - path: "src/bridge/config.rs"
-      change_type: modified
-      summary: "reject_shell_injection_risk hard-fails shell+-c+{{MESSAGE}}; unit tests"
-    - path: "src/lib.rs"
-      change_type: modified
-      summary: "Add redact_database_url + unit tests (password masked)"
-    - path: "src/runtime/serve.rs"
-      change_type: modified
-      summary: "Startup info! and ServeOptions Debug log redacted DATABASE_URL"
     - path: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs"
       change_type: modified
-      summary: "Force loopback for ILINK_HUB_ADDR; hub_update_client persona preserve; tests"
-    - path: "desktop/ilink-hub-desktop/src-tauri/Cargo.lock"
+      summary: >-
+        f1: setup fallback via safe_listen_addr_on_resolve_error — hardcoded
+        127.0.0.1:8765 only, never re-read ILINK_HUB_ADDR; unit test
+    - path: "src/main.rs"
       change_type: modified
-      summary: "Lockfile path version bump from desktop build against hub 0.2.11"
+      summary: "f2: login success println uses redact_database_url"
+    - path: "src/bridge/config.rs"
+      change_type: modified
+      summary: >-
+        f3/f4: -lc short clusters; MESSAGE in env; shell list +ksh/mksh/ash/busybox;
+        unit tests for -lc and env MSG
+    - path: "src/lib.rs"
+      change_type: modified
+      summary: "f5: redact query password/key/secret/token params; unit tests"
     - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
       change_type: modified
-      summary: "M2 decisions / outcome"
-    - path: "docs/exec-plans/active/security-hardening-abc/status.md"
+      summary: "M2 fix-round notes"
+    - path: "docs/exec-plans/active/security-hardening-abc/reviews/m2/review-findings.yaml"
       change_type: modified
-      summary: "M2 pending adversarial review"
+      summary: "Mark f1/f2/f3/f5 fixed; f4 partial"
     - path: "docs/exec-plans/active/security-hardening-abc/reviews/m2/review-request.yaml"
-      change_type: added
-      summary: "This review request"
-
-  diff_stats:
-    files_changed: 8
-    insertions: 367
-    deletions: 23
+      change_type: modified
+      summary: "This re-review request"
 
 change_summary: |
-  Three High security hardenings without touching dangerous CLI flags:
+  Close M2 adversarial CRITICAL/HIGH bypasses without touching dangerous CLI flags:
 
-  1) Bridge profile load now errors (bail!) when command is a shell interpreter
-  (bash/sh/zsh/fish/dash) AND args contain both `-c` and `{{MESSAGE}}`. Safe
-  patterns (stdin: message; shell -c without MESSAGE) still load.
+  1) Desktop setup no longer re-reads rejected ILINK_HUB_ADDR on resolve Err;
+     fallback is always hardcoded 127.0.0.1:8765 (f1 CRITICAL).
+  2) CLI login success path redacts DATABASE_URL before println (f2 HIGH).
+  3) Shell reject: combined short opts (-lc/-ic/-xc), MESSAGE in env values,
+     expanded shell list ksh/mksh/ash/busybox (f3 HIGH; f4 partial).
+  4) redact_database_url also masks query credential params (f5 MEDIUM).
 
-  2) Startup log and ServeOptions Debug redact DATABASE_URL passwords via
-  redact_database_url (scheme/host/db/user kept, password → ***).
-
-  3) Desktop resolve_initial_listen_addr rejects non-loopback ILINK_HUB_ADDR
-  (0.0.0.0, LAN IPs). Also fixed compile break: hub_update_client now passes
-  existing persona through to 6-arg update_client_in_hub.
+prior_findings_addressed:
+  - id: f1
+    resolution: fixed
+    note: "safe_listen_addr_on_resolve_error; test setup_fallback_never_reuses_rejected_non_loopback_env"
+  - id: f2
+    resolution: fixed
+    note: "redact_database_url in login println"
+  - id: f3
+    resolution: fixed
+    note: "arg_enables_shell_command_string + env MESSAGE scan + tests"
+  - id: f4
+    resolution: partial
+    note: "shell list expanded; python/node/wrappers deferred"
+  - id: f5
+    resolution: fixed
+    note: "query param redaction + tests"
+  - id: f6
+    resolution: deferred
+    note: "LOW bare-port normalize — not in must-fix"
+  - id: f7
+    resolution: deferred
+    note: "LOW persona TOCTOU — not in must-fix"
 
 acceptance_criteria:
-  - "shell + -c + {{MESSAGE}} profile fails BridgeApp::parse_yaml / load"
-  - "stdin: message (and shell -c without MESSAGE) still loads"
-  - "startup / Debug path does not log raw DB password; redact_database_url unit-tested"
-  - "ILINK_HUB_ADDR=0.0.0.0:8765 → Err; 127.0.0.1:8765 → Ok"
+  - "ILINK_HUB_ADDR=0.0.0.0:8765 → resolve Err; setup fallback is 127.0.0.1:8765 (not 0.0.0.0)"
+  - "login println does not contain raw DB password"
+  - "bash -lc '...{{MESSAGE}}...' rejected"
+  - "bash -c $MSG with env MSG={{MESSAGE}} rejected"
+  - "--color + {{MESSAGE}} still loads (no false positive)"
+  - "redact_database_url masks ?password= and ?key="
   - "dangerous CLI flags unchanged"
-  - "cargo fmt, clippy -D warnings, cargo test, cargo build, desktop tests pass"
+  - "cargo fmt, clippy -D warnings, cargo test, cargo build, desktop loopback tests pass"
 
 verification_results:
   lint: pass
@@ -62,17 +80,17 @@ verification_results:
   test: pass
   build: pass
   notes: >-
-    cargo fmt --all; cargo clippy -- -D warnings; cargo build;
+    cargo fmt --all -- --check; cargo clippy -- -D warnings; cargo build;
     cargo test -- --test-threads=1 (all ok);
     cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
-    -- --test-threads=1 resolve_initial_listen_addr ensure_loopback (4 ok)
+    -- --test-threads=1 resolve_initial_listen_addr ensure_loopback setup_fallback (5 ok)
 
 e2e_cases: []
 e2e_verification: not-needed
 
 focus_areas:
-  - "Only the dangerous shell combo is rejected; no false positives on stdin:message"
-  - "redact_database_url covers mysql user:pass@host and does not panic on sqlite::memory:"
-  - "ensure_loopback_listen_addr covers ::1 / localhost / bare port; rejects 0.0.0.0 and LAN"
-  - "hub_update_client persona preserve does not clear DB persona on rename"
+  - "setup fallback must never bind 0.0.0.0 when env is non-loopback"
+  - "shell -lc and env MESSAGE bypasses closed; --color not false-positive"
+  - "query-param password redaction"
   - "Do not change --dangerously-skip-permissions / --yolo / similar flags"
+  - "f4 residual (python -c / env wrapper) acceptable as partial this round"

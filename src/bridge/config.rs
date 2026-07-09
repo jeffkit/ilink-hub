@@ -545,9 +545,13 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
 /// Safe alternatives: use `stdin: message`, or a non-shell command.
 ///
 /// Only the dangerous combo is rejected; shell + `-c` without `{{MESSAGE}}`,
-/// or shell with `stdin: message` and no placeholder in args, still loads.
+/// or shell with `stdin: message` and no placeholder in args/env, still loads.
 fn reject_shell_injection_risk(p: &BridgeProfile, name: &str) -> Result<()> {
-    const SHELL_CMDS: &[&str] = &["bash", "sh", "zsh", "fish", "dash"];
+    // Include common POSIX / busybox shells. Interpreters (python -c, etc.)
+    // and wrapper cmds (env/nice) are out of this round's scope.
+    const SHELL_CMDS: &[&str] = &[
+        "bash", "sh", "zsh", "fish", "dash", "ksh", "mksh", "ash", "busybox",
+    ];
     let cmd = std::path::Path::new(&p.command)
         .file_name()
         .and_then(|s| s.to_str())
@@ -555,16 +559,38 @@ fn reject_shell_injection_risk(p: &BridgeProfile, name: &str) -> Result<()> {
     if !SHELL_CMDS.contains(&cmd) {
         return Ok(());
     }
-    let has_dash_c = p.args.iter().any(|a| a == "-c");
-    let has_message_placeholder = p.args.iter().any(|a| a.contains("{{MESSAGE}}"));
+    let has_dash_c = p.args.iter().any(|a| arg_enables_shell_command_string(a));
+    // MESSAGE in args OR env values is the same RCE class when paired with shell -c
+    // (e.g. `bash -c "$MSG"` with `env: {MSG: "{{MESSAGE}}"}`).
+    let has_message_placeholder = p.args.iter().any(|a| a.contains("{{MESSAGE}}"))
+        || p.env.values().any(|v| v.contains("{{MESSAGE}}"));
     if has_dash_c && has_message_placeholder {
         anyhow::bail!(
             "profile `{name}`: SECURITY: shell command with `-c` and `{{{{MESSAGE}}}}` in args \
-             is rejected — user input would be interpolated into a shell command string. \
+             or env is rejected — user input would be interpolated into a shell command string. \
              Use `stdin: message` to pass the message safely via stdin instead."
         );
     }
     Ok(())
+}
+
+/// True when `arg` enables shell's "run command string" mode (`-c`).
+///
+/// Matches exact `-c` and combined short options that include `c` after a
+/// single leading `-` (e.g. `-lc`, `-ic`, `-xc`, `-cl`). Does **not** match
+/// long options like `--color` (double-dash).
+fn arg_enables_shell_command_string(arg: &str) -> bool {
+    if arg == "-c" {
+        return true;
+    }
+    // Single-dash short cluster only: `-` + one or more flag letters.
+    if arg.starts_with('-') && !arg.starts_with("--") {
+        return arg
+            .as_bytes()
+            .get(1..)
+            .is_some_and(|flags| flags.contains(&b'c'));
+    }
+    false
 }
 
 /// Expand `${VAR}` placeholders in `template` using values from `env`.
@@ -919,6 +945,64 @@ command: bash
 args: ["-c", "echo hello"]
 "#;
         assert!(BridgeApp::parse_yaml(y).is_ok());
+    }
+
+    #[test]
+    fn shell_lc_with_message_placeholder_rejected() {
+        // Combined short options (-lc / -ic / -xc) must count as -c.
+        let y = r#"
+command: bash
+args: ["-lc", "echo {{MESSAGE}}"]
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SECURITY") && msg.contains("MESSAGE"),
+            "expected -lc shell-injection reject, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_c_with_message_in_env_rejected() {
+        // MESSAGE via env + bash -c $MSG is the same RCE class as args.
+        let y = r#"
+command: bash
+args: ["-c", "$MSG"]
+env:
+  MSG: "{{MESSAGE}}"
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SECURITY") && msg.contains("MESSAGE"),
+            "expected env-based shell-injection reject, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn shell_long_option_color_not_treated_as_dash_c() {
+        // `--color` must not false-positive as enabling -c.
+        let y = r#"
+command: bash
+args: ["--color", "echo {{MESSAGE}}"]
+"#;
+        assert!(
+            BridgeApp::parse_yaml(y).is_ok(),
+            "long option --color must not trigger -c reject"
+        );
+    }
+
+    #[test]
+    fn ksh_c_with_message_placeholder_rejected() {
+        let y = r#"
+command: ksh
+args: ["-c", "echo {{MESSAGE}}"]
+"#;
+        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        assert!(
+            err.to_string().contains("SECURITY"),
+            "ksh -c + MESSAGE must be rejected"
+        );
     }
 
     #[test]

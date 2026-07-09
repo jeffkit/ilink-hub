@@ -113,6 +113,12 @@ fn save_desktop_port_override(port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// Hardcoded safe default listen address. Used whenever resolve fails.
+///
+/// CRITICAL: setup must never re-read `ILINK_HUB_ADDR` on Err — that env value
+/// may be the non-loopback address that caused the rejection (e.g. `0.0.0.0:8765`).
+const SAFE_LOOPBACK_LISTEN_ADDR: &str = "127.0.0.1:8765";
+
 /// Resolve the listen address the desktop shell should use on first start.
 ///
 /// Priority: persisted port override → `ILINK_HUB_ADDR` env var → default
@@ -131,9 +137,23 @@ fn resolve_initial_listen_addr() -> Result<String, String> {
                 ensure_loopback_listen_addr(&addr)?;
                 Ok(addr)
             }
-            Err(_) => Ok("127.0.0.1:8765".into()),
+            Err(_) => Ok(SAFE_LOOPBACK_LISTEN_ADDR.into()),
         },
     }
+}
+
+/// Fallback used by `setup()` when [`resolve_initial_listen_addr`] returns Err.
+///
+/// Always returns the hardcoded loopback default. Never re-reads
+/// `ILINK_HUB_ADDR` — that would undo the loopback check (M2 f1).
+fn safe_listen_addr_on_resolve_error(err: impl std::fmt::Display) -> String {
+    tracing::warn!(
+        error = %err,
+        fallback = SAFE_LOOPBACK_LISTEN_ADDR,
+        "resolve_initial_listen_addr failed; using hardcoded loopback default \
+         (never re-read ILINK_HUB_ADDR)"
+    );
+    SAFE_LOOPBACK_LISTEN_ADDR.into()
 }
 
 /// Return `Ok(())` when `addr` binds only on a loopback host; otherwise Err.
@@ -2275,6 +2295,39 @@ mod tests {
     }
 
     #[test]
+    fn setup_fallback_never_reuses_rejected_non_loopback_env() {
+        // M2 f1: when resolve fails because ILINK_HUB_ADDR is non-loopback,
+        // setup must use the hardcoded safe default — NOT re-read the env.
+        let _guard = PORT_OVERRIDE_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = ScopedHome::set(tmp.path());
+
+        let prev_addr = std::env::var("ILINK_HUB_ADDR").ok();
+        std::env::set_var("ILINK_HUB_ADDR", "0.0.0.0:8765");
+
+        let err = resolve_initial_listen_addr().expect_err("non-loopback must fail");
+        let fallback = safe_listen_addr_on_resolve_error(err);
+        assert_eq!(
+            fallback, SAFE_LOOPBACK_LISTEN_ADDR,
+            "fallback must be hardcoded loopback, never the rejected env value"
+        );
+        assert!(
+            !fallback.starts_with("0.0.0.0"),
+            "must not bind all interfaces: {fallback}"
+        );
+        // Env is still the rejected value — proving fallback did not re-read it.
+        assert_eq!(
+            std::env::var("ILINK_HUB_ADDR").as_deref(),
+            Ok("0.0.0.0:8765")
+        );
+
+        match prev_addr {
+            Some(v) => std::env::set_var("ILINK_HUB_ADDR", v),
+            None => std::env::remove_var("ILINK_HUB_ADDR"),
+        }
+    }
+
+    #[test]
     fn ensure_loopback_listen_addr_accepts_loopback_hosts() {
         assert!(ensure_loopback_listen_addr("127.0.0.1:8765").is_ok());
         assert!(ensure_loopback_listen_addr("localhost:9000").is_ok());
@@ -2845,13 +2898,11 @@ pub fn run() {
             let db_path = data_dir.join("ilink-hub.db");
 
             // Resolve the listen address with this priority: persisted GUI
-            // port override → `ILINK_HUB_ADDR` env var → default. A bad /
-            // unreadable override file falls back to the env default so the
-            // desktop app keeps working rather than refusing to launch.
-            let requested_addr = resolve_initial_listen_addr().unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "failed to read persisted port override; falling back to env/default");
-                std::env::var("ILINK_HUB_ADDR").unwrap_or_else(|_| "127.0.0.1:8765".to_string())
-            });
+            // port override → `ILINK_HUB_ADDR` env var → default. On any Err
+            // (bad override file OR rejected non-loopback env), fall back ONLY
+            // to hardcoded 127.0.0.1:8765 — never re-read ILINK_HUB_ADDR.
+            let requested_addr =
+                resolve_initial_listen_addr().unwrap_or_else(safe_listen_addr_on_resolve_error);
 
             // Capture env-driven config ONCE so subsequent start_hub / restart_hub
             // calls cannot silently swap token / base_url if the process env is

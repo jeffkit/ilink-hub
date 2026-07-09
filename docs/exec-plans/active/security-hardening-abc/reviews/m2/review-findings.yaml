@@ -1,0 +1,185 @@
+milestone: "M2: shell 硬拒绝 + 日志脱敏 + 桌面 loopback"
+reviewed_at: "2026-07-09 15:24"
+reviewer: "adversarial-reviewer"
+
+verdict: NEEDS_FIX
+
+findings:
+  - id: "f1"
+    severity: CRITICAL
+    category: security
+    description: >-
+      桌面 loopback 强制在启动路径被彻底绕过。setup() 里
+      `resolve_initial_listen_addr().unwrap_or_else(|err| ... std::env::var("ILINK_HUB_ADDR") ...)`
+      的兜底分支在 resolve 因非 loopback 而返回 Err 时，直接再次读取同一个被拒绝的
+      ILINK_HUB_ADDR 原样使用。因此设置 ILINK_HUB_ADDR=0.0.0.0:8765：resolve →
+      ensure_loopback_listen_addr → Err → 兜底重新读回 "0.0.0.0:8765" →
+      requested_addr="0.0.0.0:8765" → spawn_hub_task → TcpListener::bind("0.0.0.0:8765")
+      绑定到所有网卡。新增的 ensure_loopback_listen_addr 校验形同虚设，M2 目标 #3
+      （桌面禁止非 loopback）在真实绑定路径上未达成。单测
+      resolve_initial_listen_addr_rejects_non_loopback_env 只断言函数返回 Err，
+      没有覆盖 setup() 吞掉 Err 后的实际绑定地址，属于测试盲区。
+    suggestion: >-
+      兜底分支不能无脑回退到原始 ILINK_HUB_ADDR。区分错误来源：仅当错误来自
+      "override 文件读取失败" 时才回退到默认 127.0.0.1:8765；当错误来自非 loopback 校验
+      时应直接 panic/拒绝启动或强制降级为 127.0.0.1:<同端口>。最简做法：
+      `resolve_initial_listen_addr().unwrap_or_else(|err| { warn!; "127.0.0.1:8765".into() })`
+      —— 兜底恒为 loopback，绝不再读回 env 原值。并补一个断言 setup 后
+      requested_addr 主机为 loopback 的测试。
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:2851"
+    status: fixed
+
+  - id: "f2"
+    severity: HIGH
+    category: security
+    description: >-
+      DATABASE_URL 脱敏不完整：CLI 登录成功路径 `println!("✅ Login successful!
+      Token saved to {}", database_url)` 把原始 database_url（含
+      mysql://user:password@host/db 明文口令）直接打到 stdout，未经过
+      redact_database_url。这与 M2「不记录原始 DB 口令」的目标直接冲突，且 stdout
+      常被 CI/日志/终端历史采集。焦点 #2 的答案是「脱敏不完整」。
+    suggestion: >-
+      改为 `println!("... Token saved to {}", crate::redact_database_url(&database_url))`；
+      更合理的做法是这条提示根本不该回显数据库连接串（文案是"Token saved"，暴露 DB URL
+      毫无必要），可直接去掉 database_url 或替换为 db 名称。
+    location: "src/main.rs:180"
+    status: fixed
+
+  - id: "f3"
+    severity: HIGH
+    category: security
+    description: >-
+      reject_shell_injection_risk 可被多条常见路径绕过，未真正堵住焦点 #1 的注入面：
+      (1) 组合短选项：`has_dash_c` 用 `a == "-c"` 精确匹配，`bash -lc "echo {{MESSAGE}}"`
+      / `-ic` / `-xc` 的组合参数不等于 "-c"，直接放行 → RCE（同一个 shell、同一个意图，
+      只是加了登录/交互位）。
+      (2) MESSAGE 走 env 不走 args：cfg.env 的值同样会做 {{MESSAGE}} 替换
+      （executor.rs:259-270，仅校验 NUL/换行），而 reject 只扫描 p.args。profile
+      `command: bash, args: ["-c", "$MSG"], env: {MSG: "{{MESSAGE}}"}` 不含 args 里的
+      占位符 → 放行；运行时 bash -c '$MSG' 会把消息内容当命令执行 → RCE。这正是焦点
+      "MESSAGE in env not args"。
+      shell 元字符（`;` `$(...)` 反引号）无换行即可通过 validate_safe_value，故上述两条
+      都是可远程触发的真实注入。
+    suggestion: >-
+      (a) `-c` 检测改为「任一 arg 以 `-` 开头且去掉前导 `-` 后包含字符 `c`」的宽松匹配
+      （覆盖 -c/-lc/-ic/-xc/-cl 等），或直接在 shell 命令下禁止任何以 -c 结尾的组合选项；
+      (b) 把 {{MESSAGE}} 占位符检查从「仅 args」扩展到「args + env 值 + cwd」，当命令是
+      shell 且带 -c 时，只要 env 值里出现 {{MESSAGE}} 就一并拒绝；或从根上禁止 env 值
+      承载 {{MESSAGE}} 供 shell -c 引用。补齐对应单测。
+    location: "src/bridge/config.rs:558-560"
+    status: fixed
+
+  - id: "f4"
+    severity: MEDIUM
+    category: security
+    description: >-
+      SHELL_CMDS 白名单只有 bash/sh/zsh/fish/dash，遗漏常见交互式/兼容 shell
+      （ksh、mksh、csh、tcsh、ash、busybox）以及等价的代码注入解释器
+      （`python3 -c`、`node -e`、`perl -e`、`ruby -e`）。`ksh -c "echo {{MESSAGE}}"`
+      或 `python3 -c "print('{{MESSAGE}}')"`（消息内闭合引号后注入代码）均可绕过，
+      注入效果与 bash -c 等价。此外 `command: env, args: ["bash","-c","...{{MESSAGE}}..."]`
+      用 env/nice/stdbuf 包装器时，file_name 是 env 而非 shell，也被放行。
+    suggestion: >-
+      扩充 shell 列表（至少加 ksh/mksh/csh/tcsh/ash/busybox）；对已知解释器
+      python/python3/node/perl/ruby 的 -c/-e 也做同源检测；识别 env/nice/stdbuf/timeout
+      等包装器命令并对其后续 argv 递归判定被包装的真实命令。
+    location: "src/bridge/config.rs:550-555"
+    status: partial
+
+  - id: "f5"
+    severity: MEDIUM
+    category: security
+    description: >-
+      redact_database_url 只脱敏 URL authority 里的 userinfo 口令
+      （url.password()），不处理 query 参数中的凭据。形如
+      `mysql://user@host/db?password=secret&sslkey=...` 或
+      `postgres://host/db?password=...` 解析成功后走主分支，直接
+      parsed.to_string() 原样保留 query，口令仍会随日志泄露（焦点 #2 明确点名
+      "query params with password"）。同理 SQLCipher 的 `?key=...` 也不脱敏。
+    suggestion: >-
+      在主分支对解析后的 query pairs 做遍历，将键名匹配
+      (password|passwd|pwd|sslpassword|key|secret|token) 的值替换为 ***；
+      用 parsed.query_pairs_mut() 重写后再 to_string()。补充带 query 口令的单测。
+    location: "src/lib.rs:38-48"
+    status: fixed
+
+  - id: "f6"
+    severity: LOW
+    category: boundary
+    description: >-
+      ensure_loopback_listen_addr 的裸端口分支接受 "8765" 并返回 Ok，
+      resolve 于是把裸端口字符串原样交给 spawn_hub_task；但 run_serve 最终
+      TcpListener::bind("8765") 会因无法解析为 SocketAddr 而失败，桌面走 env=裸端口
+      时会启动即崩（而非绑定 loopback）。注释声称"被 desktop 栈其余部分当作 loopback
+      处理"，实际链路没有把裸端口补成 127.0.0.1:8765。
+    suggestion: >-
+      裸端口分支不要返回原字符串，直接返回规范化后的 loopback_listen_addr_for_port(port)
+      给 resolve 使用（即 resolve 对裸端口也拼成 127.0.0.1:<port>），保证可绑定。
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:153-159"
+    status: open
+
+  - id: "f7"
+    severity: LOW
+    category: maintainability
+    description: >-
+      hub_update_client 先用 read 锁 get_by_name 取 persona，随后
+      update_client_in_hub 内再取 write 锁重新查一次（executor 之外的双查）。两次查找
+      之间存在 TOCTOU 窗口：期间后端若被摘除/改名，persona 可能对不上；且 persona 以
+      内存 registry 的 ClientInfo 为准，若重连后 ClientInfo 未回填 DB 里的 persona，
+      改名会用（可能为空的）内存值 update_client_persona 覆盖 DB persona。属行为正确性
+      隐患而非明确 bug。
+    suggestion: >-
+      让 update_client_in_hub 在持写锁时"读改一体"地保留原 persona（例如新增一个
+      "keep existing persona" 语义或在同一把锁内读取旧 persona），避免调用方跨锁预读；
+      或明确 persona 的单一真相源（DB）并据此回填。
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:734-742"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: e2e
+    description: >-
+      桌面以 ILINK_HUB_ADDR=0.0.0.0:8765 且无 desktop-port 覆盖文件启动，
+      检查 HubController.requested_addr / 实际 TcpListener 绑定地址。
+    expected_behavior: >-
+      绑定主机必须是 loopback（127.0.0.1），或启动被明确拒绝；绝不能绑定
+      0.0.0.0/LAN 网卡。当前实现会绑定 0.0.0.0（f1）。
+    added_to_suite: true
+
+  - id: "at2"
+    type: unit
+    description: >-
+      parse_yaml 加载 `command: bash, args: ["-lc", "echo {{MESSAGE}}"]`
+      以及 `command: bash, args: ["-c", "$MSG"], env: {MSG: "{{MESSAGE}}"}`。
+    expected_behavior: >-
+      两者都应被 reject_shell_injection_risk 拒绝（SECURITY bail）；当前均被放行
+      （f3）。
+    added_to_suite: true
+
+  - id: "at3"
+    type: unit
+    description: >-
+      redact_database_url("mysql://user@host/db?password=secret&sslkey=abc")
+      与 redact_database_url("postgres://host/db?password=secret")。
+    expected_behavior: >-
+      返回值不得包含 "secret"/"abc"，query 中的凭据应被替换为 ***；当前口令原样保留
+      （f5）。
+    added_to_suite: true
+
+  - id: "at4"
+    type: unit
+    description: >-
+      parse_yaml 加载 `command: ksh, args: ["-c", "echo {{MESSAGE}}"]` 与
+      `command: python3, args: ["-c", "print('{{MESSAGE}}')"]`。
+    expected_behavior: >-
+      应被拒绝（等价注入面）；当前 ksh/python3 不在白名单被放行（f4）。
+    added_to_suite: partial
+
+summary: |
+  M2 三项加固均存在可绕过缺口，未通过。最严重：桌面启动兜底在 loopback 校验失败后
+  又原样读回 ILINK_HUB_ADDR，使 0.0.0.0 仍会真实绑定所有网卡，彻底架空目标 #3
+  （CRITICAL/f1）。其次 main.rs 登录路径仍向 stdout 打印含明文口令的 database_url，
+  脱敏不完整（HIGH/f2）；reject_shell_injection_risk 可经组合短选项(-lc)、env 承载
+  {{MESSAGE}}、以及白名单外 shell/解释器绕过 → 远程可触发 RCE（HIGH/f3、MEDIUM/f4）；
+  redact_database_url 不处理 query 参数口令（MEDIUM/f5）。存在 CRITICAL+HIGH，
+  verdict = NEEDS_FIX。

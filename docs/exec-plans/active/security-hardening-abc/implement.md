@@ -37,3 +37,20 @@
 ### Outcome
 - Verification passed: `cargo fmt --all`, `cargo clippy -- -D warnings`, new unit tests (shell reject / redact / loopback), full `cargo test -- --test-threads=1`, `cargo build`, desktop `cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` (loopback filters)
 - Commit: `af15970`
+
+### M2 fix round (post adversarial NEEDS_FIX)
+
+#### Decisions
+- **f1:** `setup()` fallback extracted to `safe_listen_addr_on_resolve_error` — on any resolve Err, always use hardcoded `127.0.0.1:8765`; never re-read `ILINK_HUB_ADDR` (that undid the loopback check).
+- **f2:** login success `println!` now uses `redact_database_url`.
+- **f3:** `-c` detection via `arg_enables_shell_command_string` (covers `-lc`/`-ic`/`-xc`); MESSAGE placeholder scanned in args **and** env values; shell list +ksh/mksh/ash/busybox.
+- **f5 (cheap):** `redact_database_url` also masks query keys password/passwd/pwd/sslpassword/key/secret/token → `***`.
+- **f4 partial:** shell list expanded; python/node wrappers deferred (out of must-fix).
+
+#### Problems & Solutions
+- Problem: setup `unwrap_or_else` re-read rejected env → Solution: hardcoded safe default helper + unit test proving env stays `0.0.0.0` while fallback is loopback.
+
+#### Outcome
+- Findings: f1/f2/f3/f5 `fixed`; f4 `partial` (shell list only); f6/f7 left open (LOW).
+- Verification: `cargo fmt --all -- --check`, `cargo clippy -- -D warnings`, full `cargo test -- --test-threads=1`, `cargo build`, desktop loopback/fallback tests (5 ok).
+- Re-review: `reviews/m2/review-request.yaml` (fix round).

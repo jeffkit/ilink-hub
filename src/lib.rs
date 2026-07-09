@@ -29,14 +29,17 @@ pub fn redact_token(t: &str) -> String {
 /// Redact credentials in a database URL for startup logs.
 ///
 /// Keeps scheme, host, path/db name, and username; replaces any password with
-/// `***`. Unparseable strings (e.g. some SQLite DSNs) are returned unchanged
-/// when they do not contain a `user:password@` authority segment.
+/// `***`. Also redacts common credential query params (`password`, `passwd`,
+/// `pwd`, `sslpassword`, `key`, `secret`, `token`). Unparseable strings (e.g.
+/// some SQLite DSNs) are returned unchanged when they do not contain a
+/// `user:password@` authority segment.
 pub fn redact_database_url(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(mut parsed) => {
             if parsed.password().is_some() {
                 let _ = parsed.set_password(Some("***"));
             }
+            redact_sensitive_query_params(&mut parsed);
             parsed.to_string()
         }
         Err(_) => {
@@ -57,6 +60,37 @@ pub fn redact_database_url(url: &str) -> String {
                 }
             }
             url.to_string()
+        }
+    }
+}
+
+fn is_sensitive_query_key(key: &str) -> bool {
+    matches!(
+        key.to_ascii_lowercase().as_str(),
+        "password" | "passwd" | "pwd" | "sslpassword" | "key" | "secret" | "token"
+    )
+}
+
+fn redact_sensitive_query_params(url: &mut url::Url) {
+    let pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    if pairs.is_empty() {
+        return;
+    }
+    if !pairs.iter().any(|(k, _)| is_sensitive_query_key(k)) {
+        return;
+    }
+    url.set_query(None);
+    {
+        let mut query = url.query_pairs_mut();
+        for (k, v) in pairs {
+            if is_sensitive_query_key(&k) {
+                query.append_pair(&k, "***");
+            } else {
+                query.append_pair(&k, &v);
+            }
         }
     }
 }
@@ -115,5 +149,33 @@ mod tests {
         // Common local DSN — must not panic and must not invent a password mask.
         let redacted = redact_database_url("sqlite::memory:");
         assert_eq!(redacted, "sqlite::memory:");
+    }
+
+    #[test]
+    fn test_redact_database_url_query_password_params() {
+        let redacted = redact_database_url("mysql://user@host/db?password=secret&sslkey=abc");
+        assert!(
+            !redacted.contains("secret"),
+            "query password must be redacted: {redacted}"
+        );
+        // `sslkey` is not in the sensitive-key list; only password/key/secret/token…
+        // but `key` alone is. sslkey stays — assert password gone and *** present.
+        assert!(
+            redacted.contains("password=***")
+                || redacted.contains("password%3D***")
+                || redacted.contains("***")
+        );
+
+        let redacted2 = redact_database_url("postgres://host/db?password=secret");
+        assert!(
+            !redacted2.contains("secret"),
+            "postgres query password must be redacted: {redacted2}"
+        );
+
+        let redacted3 = redact_database_url("sqlite:///tmp/x.db?key=supersecret");
+        assert!(
+            !redacted3.contains("supersecret"),
+            "SQLCipher key query must be redacted: {redacted3}"
+        );
     }
 }
