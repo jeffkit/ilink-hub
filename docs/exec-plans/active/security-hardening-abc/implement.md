@@ -36,4 +36,4 @@
 
 ### Outcome
 - Verification passed: `cargo fmt --all`, `cargo clippy -- -D warnings`, new unit tests (shell reject / redact / loopback), full `cargo test -- --test-threads=1`, `cargo build`, desktop `cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml` (loopback filters)
-- Commit: (pending)
+- Commit: `af15970`
