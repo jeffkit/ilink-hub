@@ -1,0 +1,93 @@
+milestone: "M4: 文档债 + 队列易失说明 + 归档过期 plans"
+reviewed_at: "2026-07-09 16:05"
+reviewer: "adversarial-reviewer (light, docs-only)"
+commit_reviewed: "6b538d4 docs: fix knowledge drift, queue volatility note, archive stale plans"
+
+verdict: PASS
+summary: |
+  文档债清理准确、无 CRITICAL/HIGH 事实错误。默认监听、队列易失性、归档状态均与代码/仓库
+  现状一致；M4 提交为纯重命名 + 5 个文档修改，未误删任何活跃 plan。放行。
+
+checks:
+  - id: C1
+    name: "overview.md 模块树与 src/ 一致"
+    result: PASS_WITH_NOTE
+    evidence: |
+      overview.md 列出的 server/ store/ hub/ bridge/ ilink/ relay/ runtime/ mcp/ 均真实存在，
+      描述准确，不再以 api/db/auth 为主叙事；锁叙事已改为 tokio::sync/std::sync/DashMap/arc_swap，
+      parking_lot 标注为传递依赖。符合验收标准。
+    note: |
+      src/ 实际还含 bin/（ilink-hub-bridge.rs / ilink-relay.rs 入口）与 client/（mod.rs / pairing.rs），
+      模块树未列出。属示意性列表的非穷尽遗漏，非事实错误。
+
+  - id: C2
+    name: "configuration.md 默认监听 127.0.0.1:8765 与 main.rs 对齐"
+    result: PASS
+    evidence: |
+      src/main.rs:259-283 get_addr_default() 在 WEIXIN_BASE_URL 未设置时返回 "127.0.0.1:8765"；
+      env = "WEIXIN_BASE_URL"（main.rs:31）。configuration.md 第 19/29 行描述一致，并正确说明
+      env 可为 URL、ILINK_HUB_ADDR/ILINK_HUB_URL 已废弃（main.rs:93-108 打印废弃告警，语义相符）。
+
+  - id: C3
+    name: "deployment-hardening 提及内存队列易失性"
+    result: PASS
+    evidence: |
+      §6 第 73 行明确「队列仅为内存实现…Hub 重启会丢失未投递消息，不要当作持久化/可靠队列」，
+      §2 loopback 默认与 configuration.md 一致。醒目度足够，不会被误当持久队列。
+
+  - id: C4
+    name: "过期 plan 已归档、security-hardening-abc 仍活跃"
+    result: PASS
+    evidence: |
+      completed/ 含 mutation-test-coverage、mutation-test-coverage-p2、desktop-bridge-profiles、
+      arch-cleanup-p1；security-hardening-abc 仍在 active/。M4 提交对应 R100 纯重命名。
+
+  - id: C5
+    name: "无误删活跃 plan（todo-* / db-migration / sendtyping）"
+    result: PASS
+    evidence: |
+      active/ 仍含 todo-hub、todo-hub-2、todo-misc、todo-server-1、todo-server-2、
+      db-migration-version-tracking、sendtyping-error-fix。M4 提交 name-status 未触及这些目录，
+      无 D（删除）条目（唯一的 arch-cleanup-p1/status.md「删除」实为移动+改写，新副本已在 completed/）。
+
+  - id: C6
+    name: "arch-cleanup-p1 归档措辞是否误导为需重做"
+    result: PASS
+    evidence: |
+      completed/arch-cleanup-p1/status.md 标注 superseded/completed-by-main，明确
+      「不要再按本 plan 重新实现 N-01..N-07」，措辞正确无误导。
+
+findings: []
+
+observations:
+  - severity: LOW
+    scope: out-of-milestone
+    text: |
+      db-migration-version-tracking 与 todo-misc 同时存在于 active/ 与 completed/。经核实 M4 提交
+      未触及二者，属预先存在的重复，非本里程碑引入。建议后续单独澄清各自 scope，本次不阻断。
+  - severity: LOW
+    scope: doc-completeness
+    text: |
+      overview.md 模块树未列 src/bin/ 与 src/client/。示意性遗漏，可在下次文档维护时补齐。
+
+acceptance_criteria_status:
+  - criterion: "overview.md 模块列表与 src/ 一致，不以 api/db/auth 为主叙事"
+    met: true
+  - criterion: "overview.md 锁描述不以 parking_lot::Mutex 为主"
+    met: true
+  - criterion: "configuration.md 默认监听为 127.0.0.1:8765，并说明 env 可为 URL"
+    met: true
+  - criterion: "configuration.md 明确 memory 队列重启丢 pending、redis 未实现"
+    met: true
+  - criterion: "deployment-hardening.md §2 默认 loopback，并警告勿裸绑 0.0.0.0"
+    met: true
+  - criterion: "deployment-hardening.md 资源边界含队列非持久化说明"
+    met: true
+  - criterion: "mutation-test-coverage / -p2 / desktop-bridge-profiles / arch-cleanup-p1 已在 completed/"
+    met: true
+  - criterion: "security-hardening-abc 仍在 active/"
+    met: true
+  - criterion: "无 .rs 行为变更"
+    met: true
+
+next_action: "M4 可标记对抗审查通过，进入归档/合并流程。"
