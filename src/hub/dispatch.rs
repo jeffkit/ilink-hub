@@ -796,15 +796,21 @@ mod tests {
     use super::*;
     use crate::hub::{AdminConfig, InMemoryQueue};
     use crate::ilink::types::{MessageItem, TextItem, WeixinMessage};
-    use crate::ilink::UpstreamClient;
     use crate::store::Store;
 
     async fn make_state_with_client() -> (Arc<HubState>, String) {
+        let (state, vtoken, _mock) =
+            make_state_with_client_and_mock(crate::hub::tests::MockUpstream::returning_ok()).await;
+        (state, vtoken)
+    }
+
+    async fn make_state_with_client_and_mock(
+        upstream: Arc<dyn crate::ilink::UpstreamSink>,
+    ) -> (Arc<HubState>, String, Arc<dyn crate::ilink::UpstreamSink>) {
         let store = Store::connect("sqlite::memory:")
             .await
             .expect("in-memory store");
-        let upstream =
-            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream"));
+        let mock_ref = Arc::clone(&upstream);
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let state = HubState::new(
@@ -822,7 +828,7 @@ mod tests {
                 .write()
                 .await
                 .register("test-backend".to_string(), None, None);
-        (state, vtoken)
+        (state, vtoken, mock_ref)
     }
 
     /// Build a WeixinMessage that carries a quote-reply ref_msg with the given
@@ -1378,6 +1384,86 @@ mod tests {
             ext.session_id.as_deref(),
             Some(session_value),
             "session_id must equal the stored session value (not-empty guard must work)"
+        );
+    }
+
+    /// Empty context_token on ForwardTo must skip upstream send and queue push.
+    /// Catches `!ctx.is_empty()` match guard → true at the ForwardTo arm.
+    #[tokio::test]
+    async fn dispatch_message_empty_context_skips_forward() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let (state, vtoken, mock_ref) = make_state_with_client_and_mock(mock).await;
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_route("user-empty-ctx", vtoken);
+        }
+        let before_dropped = state.metrics.messages_dropped.load(Ordering::Relaxed);
+        let before_dispatched = state.metrics.messages_dispatched.load(Ordering::Relaxed);
+
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user-empty-ctx".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        dispatch_message(Arc::clone(&state), msg).await;
+
+        assert_eq!(
+            mock_ref.polls_ok(),
+            0,
+            "empty context must not call upstream send_message"
+        );
+        assert_eq!(
+            state.metrics.messages_dispatched.load(Ordering::Relaxed),
+            before_dispatched,
+            "empty context must not push to queue"
+        );
+        let _ = before_dropped;
+    }
+
+    /// Broadcast with no online clients and empty context must not call upstream.
+    /// Catches the Broadcast-arm `!c.is_empty()` filter mutant.
+    #[tokio::test]
+    async fn dispatch_broadcast_empty_context_skips_no_backend_reply() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let store = Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let mock_ref = Arc::clone(&mock);
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = HubState::new(
+            mock,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        );
+        // No clients registered → Broadcast / no-backend path when no default route.
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user-bcast".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello world".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        dispatch_message(Arc::clone(&state), msg).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            0,
+            "empty context on no-backend path must not send reply"
         );
     }
 }

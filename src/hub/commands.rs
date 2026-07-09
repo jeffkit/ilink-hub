@@ -536,18 +536,38 @@ mod tests {
     }
 
     /// M1-4: handle_hub_command with an empty context_token must return early
-    /// without panicking. Catches the !ctx.is_empty() → true mutant which
-    /// would allow routing without a valid context.
+    /// without calling upstream. Catches `!ctx.is_empty()` → true (would send).
     #[tokio::test]
     async fn handle_hub_command_with_empty_context_token_returns_early() {
-        let state = make_hub_state().await;
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
         let msg = WeixinMessage {
             context_token: Some(String::new()),
             from_user_id: Some("user1".to_string()),
             ..Default::default()
         };
-        // Must not panic; logs a warning and returns without sending a reply.
         handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            0,
+            "empty context_token must not call send_message"
+        );
+    }
+
+    /// M1-4b: missing context_token (None) must also skip upstream send.
+    #[tokio::test]
+    async fn handle_hub_command_with_none_context_token_skips_send() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: None,
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(mock_ref.polls_ok(), 0);
     }
 
     /// M1-5: handle_hub_command with a valid context_token must call send_message
@@ -590,6 +610,61 @@ mod tests {
             mock_ref.polls_ok(),
             1,
             "send_message must still be called once even when upstream returns error"
+        );
+    }
+
+    /// M1-7: session list with a routed backend but zero sessions must use the
+    /// empty-sessions message (not the non-empty list formatter).
+    /// Catches `sessions.is_empty()` match guard → false.
+    #[tokio::test]
+    async fn session_list_with_backend_but_no_sessions_uses_empty_message() {
+        let state = make_hub_state().await;
+        let hashed = {
+            let mut registry = state.clients.registry.write().await;
+            let (_plain, hashed, _) = registry.register("backend-a".into(), None, None);
+            hashed
+        };
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_route("user-sess", hashed);
+        }
+
+        let result = handle_cmd_session_list(&state, "user-sess", "ctx-sess", None).await;
+        assert_eq!(
+            result,
+            format!(
+                "当前后端 `backend-a` {}",
+                messages::SESSION_LIST_NO_SESSIONS
+            ),
+            "empty session list must use empty-sessions template, got: {result:?}"
+        );
+    }
+
+    /// M1-8: when a matching client exists, session list must use the client name
+    /// (not redact_token). Catches `c.vtoken == vtoken` → `!=`.
+    #[tokio::test]
+    async fn session_list_uses_client_name_not_redacted_token() {
+        let state = make_hub_state().await;
+        let hashed = {
+            let mut registry = state.clients.registry.write().await;
+            let (_plain, hashed, _) = registry.register("pretty-name".into(), None, None);
+            hashed
+        };
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_route("user-named", hashed);
+        }
+
+        let result = handle_cmd_session_list(&state, "user-named", "ctx-named", None).await;
+        assert!(
+            result.contains("pretty-name"),
+            "must display registered client name, got: {result:?}"
+        );
+        // redact_token shortens hashes; the display name path must win.
+        assert!(
+            result.starts_with("当前后端 `pretty-name`")
+                || result.contains("**后端 `pretty-name` 的 sessions：**"),
+            "must use client name in header, got: {result:?}"
         );
     }
 }
