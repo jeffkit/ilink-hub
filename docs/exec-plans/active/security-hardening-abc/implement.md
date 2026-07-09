@@ -73,3 +73,20 @@
 - Line counts: dispatcher 2515 → dir (mod 157 / send 509 / handle 283 / session 265 / backoff 73 / tests 1289); desktop lib 3062 → 1131 (−1931) + listen_addr 470 + hub_commands 528 + bridge_profiles 946.
 - Verification: `cargo fmt --all`, `cargo clippy -- -D warnings`, `cargo test -- --test-threads=1`, `cargo build`, desktop `cargo test` + clippy `-D warnings`.
 - Commits: `d372eab` (dispatcher), `8cf7bb5` (desktop)
+
+## M4: 文档债 + 队列易失说明 + 归档过期 plans
+
+### Decisions
+- `overview.md`：仓库模块改为 `server/` `store/` `hub/` `bridge/` `ilink/` `relay/` `runtime/` `mcp/`；锁叙事改为 `tokio::sync` / `std::sync` / `DashMap` / `arc_swap`。
+- `configuration.md`：`WEIXIN_BASE_URL` 默认监听澄清为 `127.0.0.1:8765`（env 可为 URL）；`ILINK_QUEUE_BACKEND=memory` 强调重启丢 pending、redis 未实现。
+- `deployment-hardening.md`：§2 默认 loopback；§6 增加内存队列非持久化 bullet。
+- `bridges/overview.md`：模块结构仍准确，未改。
+- 归档：`mutation-test-coverage`、`mutation-test-coverage-p2`、`desktop-bridge-profiles`、`arch-cleanup-p1`（后者 status 标 superseded/completed-by-main，不重做）。
+- `sendtyping-error-fix`：M5 仍 TODO，留 active；`todo-*` / `db-migration-version-tracking` 不动。
+
+### Problems & Solutions
+- Problem: `arch-cleanup-p1` status 全 pending 但 main 已有 N-01..N-07 → Solution: 更新 status 为 superseded，`git mv` 到 completed，明确勿重实现。
+
+### Outcome
+- Docs-only；无 `.rs` 变更，未跑 cargo 全量。
+- Review: `reviews/m4/review-request.yaml`

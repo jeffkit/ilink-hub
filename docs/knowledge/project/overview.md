@@ -3,7 +3,7 @@ type: Project Overview
 title: ilink-hub 项目概览
 description: iLink 多端 Hub 服务，让一个微信账号同时接入多个 AI 客户端。
 tags: [project, architecture, rust]
-timestamp: 2026-06-18T10:00:00+08:00
+timestamp: 2026-07-09T16:00:00+08:00
 ---
 
 # ilink-hub 项目概览
@@ -16,21 +16,25 @@ ilink-hub 是一个 Rust 实现的反向代理 Hub，让单个微信账号同时
 |----|------|
 | 核心服务 | Rust + Tokio（异步） |
 | HTTP/WS | Axum |
-| 数据库 | SQLite（默认）/ MySQL / PostgreSQL，通过 sqlx |
+| 数据库 | SQLite（默认）/ PostgreSQL，通过 sqlx |
 | 桌面应用 | Tauri + Vite + TypeScript |
 | 错误处理 | thiserror |
-| 锁 | parking_lot::Mutex |
+| 锁 / 并发 | `tokio::sync`、`std::sync`、`DashMap`、`arc_swap`（`parking_lot` 仅作传递依赖，非主路径） |
 
 ## 仓库结构
 
 ```
 src/                Rust 核心服务
-  bridge/           Bridge 实现（WebSocket 转发、内置 Bridge）
-  api/              HTTP API 处理器
-  db/               数据库层
-  auth/             认证与 Token 管理
+  server/           HTTP 路由与处理器（Axum）
+  store/            数据库访问与迁移辅助
+  hub/              Hub 状态、路由、队列、命令、配对
+  bridge/           Bridge 实现（WebSocket 转发、内置 Bridge、dispatcher）
+  ilink/            上游 iLink 协议客户端
+  relay/            公网配对中继
+  runtime/          进程启动与 serve 编排
+  mcp/              MCP 相关适配
 desktop/            Tauri 桌面应用（ilink-hub-desktop）
-migrations/         SQLite/MySQL 数据库迁移文件
+migrations/         SQLite/PostgreSQL 数据库迁移文件
 tests/              集成测试
 docs/               文档（本知识库也在这里）
 docs/exec-plans/    四件套执行计划（active/进行中，completed/已归档）

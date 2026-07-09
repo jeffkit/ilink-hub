@@ -4,7 +4,7 @@ title: 部署安全加固
 description: 将 iLink Hub 安全地部署到生产环境的加固清单——鉴权、网络暴露、配对/中继安全、资源边界与上线前检查。
 resource: docs/knowledge/ops/deployment-hardening.md
 tags: [ops, security, deployment, hardening]
-timestamp: 2026-06-18T16:30:00+08:00
+timestamp: 2026-07-09T16:00:00+08:00
 ---
 
 # 部署安全加固
@@ -24,10 +24,11 @@ iLink Hub 有三条需要分别加固的暴露面：
 
 ## 2. 网络暴露与 TLS
 
-- Hub 默认监听 `WEIXIN_BASE_URL`（`http://0.0.0.0:8765`），**明文 HTTP**。生产环境务必置于反向代理（Nginx / Caddy / 云 LB）之后，由代理终止 TLS。
-- Hub 自身不做 TLS；不要把 `0.0.0.0:8765` 直接暴露到公网。
+- Hub **默认监听 `127.0.0.1:8765`**（loopback，相对安全的默认值；见 `get_addr_default`）。`WEIXIN_BASE_URL` 可填 URL，serve 从中解析 host:port；未设置时不会绑定 `0.0.0.0`。
+- 协议仍是**明文 HTTP**。生产环境务必置于反向代理（Nginx / Caddy / 云 LB）之后，由代理终止 TLS。
+- Hub 自身不做 TLS；**切勿在无反向代理的情况下绑定 `0.0.0.0:8765` 并直接暴露公网**。
 - 反向代理需正确透传 `Authorization` 头与 `Origin` / `Referer` 头（配对的跨站防护依赖它们）。
-- 若仅本机调试，将监听地址收敛到 `127.0.0.1` 可直接消除大部分暴露面。
+- 本机调试保持默认 loopback 即可消除大部分暴露面；仅在确需局域网/公网访问时再显式改绑定地址。
 
 ## 3. 管理端点鉴权（强制）
 
@@ -68,6 +69,8 @@ iLink Hub 有三条需要分别加固的暴露面：
 | 中继转发响应体 | 8 MiB 流式上限 | 防超大响应体 OOM |
 | Bridge CLI 输出捕获 | 64 MiB（stdout/stderr，全路径含流式） | 防失控 CLI 无界增长内存 |
 | 优雅关闭排空 | `ILINK_SHUTDOWN_DRAIN_SECS=30` | 关闭时等待队列排空上限 |
+
+- **队列仅为内存实现**（`ILINK_QUEUE_BACKEND=memory`；`redis` 未实现）：Hub **重启会丢失未投递消息**，不要当作持久化/可靠队列做容量规划或 SLA。
 
 ## 7. Bridge 执行面隔离
 

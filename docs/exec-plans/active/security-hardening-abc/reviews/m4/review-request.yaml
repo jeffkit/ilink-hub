@@ -1,0 +1,74 @@
+milestone: "M4: 文档债 + 队列易失说明 + 归档过期 plans"
+requested_at: "2026-07-09 16:00"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "docs/knowledge/project/overview.md"
+      change_type: modified
+      summary: "修正模块树与锁叙事；timestamp 2026-07-09"
+    - path: "docs/knowledge/api/configuration.md"
+      change_type: modified
+      summary: "WEIXIN_BASE_URL 默认监听 127.0.0.1:8765；memory 队列重启丢消息"
+    - path: "docs/knowledge/ops/deployment-hardening.md"
+      change_type: modified
+      summary: "§2 默认 loopback；§6 队列非持久化 bullet；timestamp"
+    - path: "docs/exec-plans/completed/mutation-test-coverage/"
+      change_type: moved
+      summary: "active → completed（status ✅ complete）"
+    - path: "docs/exec-plans/completed/mutation-test-coverage-p2/"
+      change_type: moved
+      summary: "active → completed（status ✅ complete）"
+    - path: "docs/exec-plans/completed/desktop-bridge-profiles/"
+      change_type: moved
+      summary: "active → completed（全部里程碑已完成）"
+    - path: "docs/exec-plans/completed/arch-cleanup-p1/"
+      change_type: moved
+      summary: "status 标 superseded/completed-by-main 后归档；不重做 N-01..N-07"
+    - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
+      change_type: modified
+      summary: "记录 M4 决策与归档清单"
+    - path: "docs/exec-plans/active/security-hardening-abc/status.md"
+      change_type: modified
+      summary: "M4 实现完成，待对抗审查"
+  diff_stats:
+    files_changed: "docs-only (knowledge + exec-plans)"
+    insertions: "n/a"
+    deletions: "n/a"
+
+change_summary: |
+  修正知识库与代码漂移：仓库模块、锁原语、默认监听 loopback、内存队列易失性。
+  将已完成/被 main 取代的 active exec-plans 归档到 completed/。
+  bridges/overview 结构仍准确未改；sendtyping-error-fix（M5 TODO）与 todo-* /
+  db-migration-version-tracking 保留 active。无 Rust 代码变更。
+
+acceptance_criteria:
+  - "overview.md 模块列表与 src/ 一致，不以 api/db/auth 为主叙事"
+  - "overview.md 锁描述不以 parking_lot::Mutex 为主"
+  - "configuration.md 默认监听为 127.0.0.1:8765，并说明 env 可为 URL"
+  - "configuration.md 明确 memory 队列重启丢 pending、redis 未实现"
+  - "deployment-hardening.md §2 默认 loopback，并警告勿裸绑 0.0.0.0"
+  - "deployment-hardening.md 资源边界含队列非持久化说明"
+  - "mutation-test-coverage、mutation-test-coverage-p2、desktop-bridge-profiles、arch-cleanup-p1 已在 completed/"
+  - "security-hardening-abc 仍在 active/"
+  - "无 .rs 行为变更"
+
+verification_results:
+  lint: n/a
+  typecheck: n/a
+  test: n/a
+  build: n/a
+  e2e: skipped
+  notes: "Docs-only milestone; no cargo required"
+
+focus_areas:
+  - "WEIXIN_BASE_URL / get_addr_default 语义是否与 src/main.rs 一致"
+  - "队列易失说明是否足够醒目，避免运维误当持久队列"
+  - "arch-cleanup-p1 归档是否误导为「需重做」"
+  - "是否误归档仍活跃的 sendtyping / todo / db-migration plans"
+
+e2e_verification:
+  applicable: false
+  platform: "argusai"
+  run_result: skipped
+  run_id: ""
