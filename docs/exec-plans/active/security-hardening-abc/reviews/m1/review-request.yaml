@@ -1,61 +1,65 @@
-milestone: "M1: CORS wiring + single-claim pairing vtoken"
-requested_at: "2026-07-09 15:02"
+milestone: "M1 fix: pairing vtoken claim-window (post adversarial)"
+requested_at: "2026-07-09 15:20"
 requestor: "implement-agent"
+round: "fix"
+prior_verdict: "NEEDS_FIX"
+prior_findings: "reviews/m1/review-findings.yaml"
 
 scope:
   changed_files:
-    - path: "src/server/mod.rs"
-      change_type: modified
-      summary: "Wire build_router bot CORS to build_cors_layer() instead of CorsLayer::permissive()"
     - path: "src/hub/pairing.rs"
       change_type: modified
-      summary: "Add PairingRegistry::claim_confirmed_vtoken for single-claim confirmed vtoken"
+      summary: "Replace single-take claim with VTOKEN_CLAIM_WINDOW (120s) reclaim semantics + unit tests"
     - path: "src/server/pairing.rs"
       change_type: modified
-      summary: "qrcode_status_json uses write lock + claim_confirmed_vtoken"
-    - path: "tests/cors_tests.rs"
-      change_type: modified
-      summary: "Add build_router + HubState integration tests for whitelist vs evil Origin"
+      summary: "qrcode_status_json comments describe claim-window not single-take"
     - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
       change_type: modified
-      summary: "Record M1 decisions/problems/outcome"
-    - path: "docs/exec-plans/active/security-hardening-abc/status.md"
+      summary: "Record claim-window decision; f2 accepted residual; f3 out of scope"
+    - path: "docs/exec-plans/active/security-hardening-abc/reviews/m1/review-findings.yaml"
       change_type: modified
-      summary: "Mark M1 implemented pending adversarial review"
+      summary: "f1 fixed; f2 accepted; f4 partial"
     - path: "docs/exec-plans/active/security-hardening-abc/reviews/m1/review-request.yaml"
-      change_type: added
-      summary: "M1 adversarial review request"
-  diff_stats:
-    files_changed: 7
-    insertions: 220
-    deletions: 7
+      change_type: modified
+      summary: "Re-review request for M1 fix round"
 
 change_summary: |
-  Wired production bot API CORS through build_cors_layer() so ILINK_CORS_ORIGINS
-  whitelist is enforced on build_router (not only on an isolated toy router).
-  Added PairingRegistry::claim_confirmed_vtoken that takes the confirmed vtoken
-  once while retaining the confirmed stub for status/baseurl; qrcode_status_json
-  now uses a write lock + claim so re-polling a pair code cannot steal the bearer
-  token during CONFIRMED_TTL. Legitimate first poll after confirm still receives
-  bot_token; subsequent polls return confirmed without token.
+  Adversarial f1 (HIGH): pure single-take cleared vtoken on first get_qrcode_status
+  poll. Lost response left the CLI without credentials while register_confirmed_client
+  had already inserted a registry row → NameCollision on retry.
+
+  Fix: claim-window semantics. Within 120s of confirm, claim_confirmed_vtoken returns
+  the same token without clearing (idempotent retry). After the window, the next claim
+  permanently clears vtoken (still closes the 24h re-poll steal hole). Wait/scanned
+  paths still return None token. CORS wiring unchanged.
+
+  f2 (MEDIUM): accepted residual — pair code is the capability; client-binding secret
+  deferred. f3: default CORS permissive kept (OpenClaw). f4: sequential double-claim
+  within window covered; multi-thread race deferred.
 
 acceptance_criteria:
-  - "build_router uses build_cors_layer(); whitelist rejects evil Origin (router-level test)"
-  - "Confirmed pairing vtoken is single-claim; second status poll has bot_token=None"
-  - "cargo test --test cors_tests + pairing unit tests pass"
-  - "Do not change dangerous CLI flags; do not implement M2/M3/M4"
+  - "Within VTOKEN_CLAIM_WINDOW, sequential claims all get Some(same token); stored vtoken uncleared"
+  - "After window (backdated confirmed_at), claim returns None and vtoken stays cleared"
+  - "Wait/scanned claim returns (session, None); unknown code returns None"
+  - "CORS default / build_cors_layer wiring unchanged"
+  - "cargo fmt, clippy -D warnings, hub::pairing + cors_tests + build pass"
 
 verification_results:
   lint: pass
   typecheck: n/a
   test: pass
   build: pass
+  notes: >-
+    cargo fmt --all; cargo clippy -- -D warnings; cargo test hub::pairing
+    (19 ok); cargo test --test cors_tests (13 ok); cargo build; full cargo
+    test -- --test-threads=1 (see commit)
 
 e2e_cases: []
 e2e_verification: not-needed
 
 focus_areas:
-  - "Confirm build_router CORS regression cannot be bypassed by testing only build_cors_layer"
-  - "Race: concurrent get_qrcode_status after confirm — only one claim gets the token"
-  - "Long-poll loop calling claim on wait/scanned must not invent or clear tokens incorrectly"
-  - "Client pairing path (src/client/pairing.rs) still gets bot_token on first confirmed response"
+  - "Claim-window closes 24h steal hole without orphan/NameCollision wedge on lost first response"
+  - "After-window clear is permanent (second post-window claim still None)"
+  - "Long-poll on wait/scanned must not invent or clear tokens"
+  - "f2 residual (unauthenticated claim during window) is documented accepted, not silently 'fixed'"
+  - "Do not regress CORS whitelist wiring; do not flip default to deny"

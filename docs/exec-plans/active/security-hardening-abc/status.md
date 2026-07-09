@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-**进度：** M1 已实现，待对抗审查  
+**进度：** M1 对抗审查 NEEDS_FIX → claim-window 修复已实现，待再审  
 **分支：** `fix/security-hardening-abc`  
 **Worktree：** `/Users/kongjie/projects/ilink-hub/.worktrees/fix/security-hardening-abc/`
 
@@ -12,7 +12,7 @@
 
 | 里程碑 | 状态 | 说明 |
 |--------|------|------|
-| M1 CORS + vtoken 单次领取 | ✅ 实现完成 | Critical；见 reviews/m1/ |
+| M1 CORS + vtoken claim-window | 🔄 修复待再审 | f1 fixed；f2 accepted residual；见 reviews/m1/ |
 | M2 shell/log/loopback | ⏳ | High（保留 dangerous flag） |
 | M3 God 模块拆分 ≥2 | ⏳ | C=3 |
 | M4 文档 + 归档 | ⏳ | |

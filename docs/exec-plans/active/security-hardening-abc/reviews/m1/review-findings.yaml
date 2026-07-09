@@ -1,0 +1,210 @@
+milestone: "M1: CORS wiring + single-claim pairing vtoken"
+reviewed_at: "2026-07-09 15:12"
+reviewer: "adversarial-reviewer"
+
+verdict: NEEDS_FIX
+
+findings:
+  - id: "f1"
+    severity: HIGH
+    category: boundary
+    description: >-
+      Single-claim makes vtoken delivery fragile with no recovery path.
+      get_qrcode_status is the ONLY channel that delivers the vtoken to the
+      polling CLI client (src/client/pairing.rs:249-253 reads body.bot_token;
+      the confirm POST response that also carries the token is consumed by the
+      phone/browser, not the CLI). claim_confirmed_vtoken() calls
+      session.vtoken.take() (src/hub/pairing.rs:167) on the first claim, so if
+      that HTTP response is lost — network reset, client crash mid-response,
+      reverse-proxy/LB idle timeout, or a concurrent racer winning the claim —
+      the token is gone forever. The next poll returns status=confirmed with
+      bot_token=None, and the client aborts with "confirmed but bot_token
+      missing" (src/client/pairing.rs:253). Worse, register_confirmed_client_in_hub
+      has already inserted a registry+store row at confirm time
+      (src/server/pairing.rs:957-965), so retrying pairing with the same name
+      returns NameCollision/409 (src/server/pairing.rs:340-350). The user is
+      wedged: an orphan client exists that nobody holds credentials for, and
+      the same name can no longer be re-paired.
+    suggestion: >-
+      Bind the claim to the client that initiated get_bot_qrcode instead of
+      "first poller wins". E.g. return a per-session client secret/nonce from
+      get_bot_qrcode and require it on get_qrcode_status; only clear the vtoken
+      after the matching client re-polls (idempotent for that client, single-use
+      to others). Alternatively keep a short re-claim grace window, and on
+      pairing abandonment roll back the register_confirmed_client_in_hub row so
+      the name can be reused.
+    location: "src/hub/pairing.rs:161-173, src/server/pairing.rs:577-613, src/client/pairing.rs:249-253"
+    status: fixed
+    fix_note: >-
+      Replaced single-take with VTOKEN_CLAIM_WINDOW (120s): within window
+      claims re-return the same token without clearing; after window the next
+      claim permanently clears vtoken. Closes 24h steal hole while allowing
+      lost-response recovery. See implement.md M1 fix round.
+
+  - id: "f2"
+    severity: MEDIUM
+    category: security
+    description: >-
+      Residual token-theft race: the token consumer is unauthenticated, so
+      single-claim only narrows (does not close) the theft window. An attacker
+      who knows the pair code and concurrently long-polls get_qrcode_status will,
+      when pair_confirm fires pairing_notify.notify_waiters()
+      (src/server/pairing.rs:967), wake alongside the legit client. Both call
+      claim_confirmed_vtoken under the pairing write lock; whoever tokio's
+      RwLock schedules first takes the token. If the attacker wins, the attacker
+      receives bot_token AND the legit client receives bot_token=None (theft +
+      DoS in one shot). The write lock guarantees at-most-one winner but not
+      that the winner is the legitimate client.
+    suggestion: >-
+      Same root fix as f1: require a client-bound secret (issued at
+      get_bot_qrcode) on get_qrcode_status so only the initiating client can
+      claim the token, making a code leak insufficient to steal or race for it.
+    location: "src/server/pairing.rs:577-613, src/server/pairing.rs:966-967"
+    status: accepted
+    fix_note: >-
+      Accepted residual risk for this round: pair code remains the capability;
+      unauthenticated claim during the 120s window is documented in implement.md.
+      Client-binding secret deferred (not trivial / needs plan approval).
+
+  - id: "f3"
+    severity: MEDIUM
+    category: security
+    description: >-
+      CORS defaults to fully permissive (Access-Control-Allow-Origin: *) when
+      ILINK_CORS_ORIGINS is unset/empty (src/server/mod.rs:52-53), and this
+      permissive layer is applied to the bot API which includes
+      get_qrcode_status — the endpoint that returns bot_token. On a
+      security-hardening milestone, the default posture leaves the token-bearing
+      route readable cross-origin by any site (ACAO:* + no credentials means JS
+      can read the body). Combined with f1/f2, a malicious page that learns a
+      pair code could read/steal the token from a victim's browser context. The
+      whitelist path itself is correctly wired (tests confirm evil Origin is
+      rejected); the gap is the insecure default.
+    suggestion: >-
+      Default to deny/same-origin for token-bearing routes, or fail startup in
+      production unless ILINK_CORS_ORIGINS is explicitly set; at minimum exclude
+      get_qrcode_status from the permissive fallback layer.
+    location: "src/server/mod.rs:48-62, src/server/mod.rs:99-119"
+    status: open
+
+  - id: "f4"
+    severity: MEDIUM
+    category: testing
+    description: >-
+      No concurrency test for the single-claim guarantee (explicit focus area).
+      claim_confirmed_vtoken_is_single_use (src/hub/pairing.rs:615-642) only
+      exercises two SEQUENTIAL claims. A regression that changed .write() to
+      .read() in qrcode_status_json, or moved the claim outside the lock, would
+      not be caught. The whole security property ("only one claim gets the
+      token") is asserted only in the single-threaded case.
+    suggestion: >-
+      Add a tokio multi-thread test that shares Arc<HubState> (or Arc<RwLock<
+      PairingRegistry>>), confirms one code, then spawns N tasks each racing
+      claim_confirmed_vtoken/get_qrcode_status, and asserts exactly one observes
+      Some(token) and the rest observe None.
+    location: "src/hub/pairing.rs:613-642"
+    status: partial
+    fix_note: >-
+      Sequential double-claim within window now asserts both get Some(token).
+      Full multi-thread race test deferred; write-lock serialization documented
+      on claim_confirmed_vtoken.
+
+  - id: "f5"
+    severity: MEDIUM
+    category: testing
+    description: >-
+      The milestone changes the get_qrcode_status API response behavior
+      (single-claim), but there is no HTTP-level/integration test of the
+      handler. Coverage stops at the registry unit method and the CORS layer.
+      Nothing drives build_router + oneshot through the confirm -> poll(token
+      once) -> poll(bot_token=None) sequence, so the wiring of write-lock +
+      claim inside qrcode_status_json and the baseurl-only-when-confirmed
+      branch (src/server/pairing.rs:604-608) are untested end to end.
+    suggestion: >-
+      Add an integration test (tests/) that builds the router, creates a QR,
+      marks it scanned via GET /hub/pair/{code}, POSTs confirm with the CSRF +
+      allowed Origin, then GETs /ilink/bot/get_qrcode_status twice, asserting
+      bot_token is Some on the first and None (status still confirmed) on the
+      second.
+    location: "src/server/pairing.rs:577-647, tests/cors_tests.rs"
+    status: open
+
+  - id: "f6"
+    severity: LOW
+    category: maintainability
+    description: >-
+      pair_page fires pairing_notify.notify_waiters() on EVERY load of an
+      existing code, even when mark_scanned was a no-op (already scanned, or the
+      code lives in confirmed_sessions where mark_scanned returns false). The
+      `changed` flag ignores mark_scanned's return value and is set to true
+      whenever get(&code).is_some() (src/server/pairing.rs:656-662). Each
+      spurious wake makes every long-poll re-acquire the write lock and run
+      purge_expired (O(n) retain), needless work under many concurrent pollers.
+    suggestion: >-
+      Set `changed` to the boolean actually returned by mark_scanned so
+      notify_waiters only fires on a real Wait->Scanned transition.
+    location: "src/server/pairing.rs:654-664"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: >-
+      Concurrent single-claim: confirm one code, then spawn 50 tokio tasks
+      sharing the same RwLock<PairingRegistry>, each calling
+      claim_confirmed_vtoken(code) once, and collect the returned tokens.
+    expected_behavior: >-
+      Exactly one task receives Some(vtoken); all 49 others receive None. The
+      stored session keeps status=confirmed and vtoken=None afterwards.
+    added_to_suite: false
+
+  - id: "at2"
+    type: e2e
+    description: >-
+      HTTP single-claim through build_router: create QR (GET
+      /ilink/bot/get_bot_qrcode), scan it (GET /hub/pair/{code}), confirm (POST
+      /hub/pair/{code}/confirm with X-Pair-CSRF + allowed Origin), then GET
+      /ilink/bot/get_qrcode_status twice.
+    expected_behavior: >-
+      First status poll returns 200 with status=confirmed and a non-empty
+      bot_token; second poll returns status=confirmed with bot_token=None (and
+      baseurl still present). Proves the API-level single-claim behavior.
+    added_to_suite: false
+
+  - id: "at3"
+    type: e2e
+    description: >-
+      Token-loss wedge: confirm a pairing under a chosen name, consume the
+      token via one get_qrcode_status poll (simulating a lost response by
+      discarding it), then (a) poll get_qrcode_status again and (b) attempt to
+      re-pair/register a confirmed client with the SAME name.
+    expected_behavior: >-
+      Documents the current failure: (a) second poll yields bot_token=None so a
+      client would abort with "confirmed but bot_token missing", and (b)
+      re-registering the same name returns NameCollision/409 — demonstrating the
+      orphan-client wedge f1 describes. After the fix, either the token remains
+      claimable by the same client or the name is reusable.
+    added_to_suite: false
+
+  - id: "at4"
+    type: e2e
+    description: >-
+      CORS default exposure: with ILINK_CORS_ORIGINS UNSET, build_router and
+      send GET /ilink/bot/get_qrcode_status?qrcode=... with
+      Origin: https://evil.example.com.
+    expected_behavior: >-
+      Current code returns Access-Control-Allow-Origin: * on the token-bearing
+      endpoint (documents f3). After hardening, the token-bearing route must not
+      advertise ACAO:* to an arbitrary Origin by default.
+    added_to_suite: false
+
+summary: |
+  CORS whitelist wiring on build_router is correct and tested, but the
+  single-claim redesign trades a 24h re-poll theft window for a fragile,
+  unauthenticated at-most-once token delivery: if the first get_qrcode_status
+  response is lost or a concurrent racer wins, the legitimate client can never
+  recover the token and is wedged behind an orphan registry row + NameCollision
+  (f1 HIGH). The token consumer remains unauthenticated so a code leak still
+  permits a confirm-instant theft/DoS race (f2), and CORS still defaults to
+  permissive on the token-bearing bot API (f3). Concurrency and HTTP-level
+  single-claim behavior are untested (f4/f5). Verdict NEEDS_FIX.

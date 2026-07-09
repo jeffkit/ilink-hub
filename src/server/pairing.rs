@@ -575,8 +575,9 @@ pub async fn get_bot_qrcode_post(
 }
 
 async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusResponse {
-    // Write lock + single-claim: confirmed vtoken is returned at most once so a
-    // leaked pair code cannot be re-polled for 24h to steal the bearer token.
+    // Write lock + claim-window: within VTOKEN_CLAIM_WINDOW after confirm the
+    // same vtoken may be re-read (lost-response recovery); after the window the
+    // token is cleared so a leaked pair code cannot be re-polled for CONFIRMED_TTL.
     let claimed = {
         let mut pairing = state.clients.pairing.write().await;
         pairing.claim_confirmed_vtoken(qrcode)
