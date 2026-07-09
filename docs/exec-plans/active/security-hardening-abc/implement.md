@@ -53,4 +53,5 @@
 #### Outcome
 - Findings: f1/f2/f3/f5 `fixed`; f4 `partial` (shell list only); f6/f7 left open (LOW).
 - Verification: `cargo fmt --all -- --check`, `cargo clippy -- -D warnings`, full `cargo test -- --test-threads=1`, `cargo build`, desktop loopback/fallback tests (5 ok).
+- Commit: `d662bde`
 - Re-review: `reviews/m2/review-request.yaml` (fix round).
