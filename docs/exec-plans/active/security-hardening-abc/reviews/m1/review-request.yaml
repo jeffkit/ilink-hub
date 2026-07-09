@@ -1,0 +1,61 @@
+milestone: "M1: CORS wiring + single-claim pairing vtoken"
+requested_at: "2026-07-09 15:02"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "src/server/mod.rs"
+      change_type: modified
+      summary: "Wire build_router bot CORS to build_cors_layer() instead of CorsLayer::permissive()"
+    - path: "src/hub/pairing.rs"
+      change_type: modified
+      summary: "Add PairingRegistry::claim_confirmed_vtoken for single-claim confirmed vtoken"
+    - path: "src/server/pairing.rs"
+      change_type: modified
+      summary: "qrcode_status_json uses write lock + claim_confirmed_vtoken"
+    - path: "tests/cors_tests.rs"
+      change_type: modified
+      summary: "Add build_router + HubState integration tests for whitelist vs evil Origin"
+    - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
+      change_type: modified
+      summary: "Record M1 decisions/problems/outcome"
+    - path: "docs/exec-plans/active/security-hardening-abc/status.md"
+      change_type: modified
+      summary: "Mark M1 implemented pending adversarial review"
+    - path: "docs/exec-plans/active/security-hardening-abc/reviews/m1/review-request.yaml"
+      change_type: added
+      summary: "M1 adversarial review request"
+  diff_stats:
+    files_changed: 7
+    insertions: 220
+    deletions: 7
+
+change_summary: |
+  Wired production bot API CORS through build_cors_layer() so ILINK_CORS_ORIGINS
+  whitelist is enforced on build_router (not only on an isolated toy router).
+  Added PairingRegistry::claim_confirmed_vtoken that takes the confirmed vtoken
+  once while retaining the confirmed stub for status/baseurl; qrcode_status_json
+  now uses a write lock + claim so re-polling a pair code cannot steal the bearer
+  token during CONFIRMED_TTL. Legitimate first poll after confirm still receives
+  bot_token; subsequent polls return confirmed without token.
+
+acceptance_criteria:
+  - "build_router uses build_cors_layer(); whitelist rejects evil Origin (router-level test)"
+  - "Confirmed pairing vtoken is single-claim; second status poll has bot_token=None"
+  - "cargo test --test cors_tests + pairing unit tests pass"
+  - "Do not change dangerous CLI flags; do not implement M2/M3/M4"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+
+e2e_cases: []
+e2e_verification: not-needed
+
+focus_areas:
+  - "Confirm build_router CORS regression cannot be bypassed by testing only build_cors_layer"
+  - "Race: concurrent get_qrcode_status after confirm — only one claim gets the token"
+  - "Long-poll loop calling claim on wait/scanned must not invent or clear tokens incorrectly"
+  - "Client pairing path (src/client/pairing.rs) still gets bot_token on first confirmed response"

@@ -575,12 +575,14 @@ pub async fn get_bot_qrcode_post(
 }
 
 async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusResponse {
-    let session = {
-        let pairing = state.clients.pairing.read().await;
-        pairing.get(qrcode)
+    // Write lock + single-claim: confirmed vtoken is returned at most once so a
+    // leaked pair code cannot be re-polled for 24h to steal the bearer token.
+    let claimed = {
+        let mut pairing = state.clients.pairing.write().await;
+        pairing.claim_confirmed_vtoken(qrcode)
     };
 
-    let Some(session) = session else {
+    let Some((session, bot_token)) = claimed else {
         return QrcodeStatusResponse {
             ret: -1,
             status: Some("expired".to_string()),
@@ -594,7 +596,6 @@ async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusRespo
 
     let client_base = client_base_url();
     let status = session.status_str().to_string();
-    let bot_token = session.vtoken.clone();
 
     QrcodeStatusResponse {
         ret: 0,

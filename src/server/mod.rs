@@ -96,7 +96,7 @@ pub fn build_router(state: Arc<HubState>) -> Router {
     // SDK clients (e.g. OpenClaw) can call it from any origin.
     // Hub management and admin routes deliberately do NOT get CORS headers — they
     // should only be called server-side or via same-origin UI.
-    let bot_cors = CorsLayer::permissive();
+    let bot_cors = build_cors_layer();
 
     let bot_api = Router::new()
         .route(
