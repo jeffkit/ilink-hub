@@ -55,3 +55,21 @@
 - Verification: `cargo fmt --all -- --check`, `cargo clippy -- -D warnings`, full `cargo test -- --test-threads=1`, `cargo build`, desktop loopback/fallback tests (5 ok).
 - Commit: `d662bde`
 - Re-review: `reviews/m2/review-request.yaml` (fix round).
+
+## M3: God 模块拆分（dispatcher + desktop lib）
+
+### Decisions
+- Split `src/bridge/dispatcher.rs` into `dispatcher/{mod,backoff,send,session,handle,tests}.rs` with mechanical moves; `pub(super)` for cross-submodule items; public API unchanged (`run_bridge`, `run_bridge_with_shutdown`, `BridgeStop`).
+- Moved colocated tests to `dispatcher/tests.rs` so production `mod.rs` stays small (~157 lines); largest production file is `send.rs` (~509).
+- Split desktop `lib.rs` into `listen_addr.rs`, `hub_commands.rs`, `bridge_profiles.rs`; `lib.rs` keeps HubController/spawn/run + invoke wiring via `pub(crate) use`.
+- Extracted `test_support.rs` (`ScopedHome`, `PORT_OVERRIDE_LOCK`) so listen_addr and lib tests share HOME/port-override isolation.
+
+### Problems & Solutions
+- Problem: nested `mod tests` lost private parent imports after file split → Solution: explicit `use super::{...}` of `pub(super)`-visible items in `tests.rs`.
+- Problem: sibling modules cannot see parent glob re-exports → Solution: explicit `use crate::listen_addr::…` / `Manager` imports in each submodule.
+- Problem: listen_addr tests needed `ScopedHome` defined in lib tests → Solution: shared `test_support` module.
+
+### Outcome
+- Line counts: dispatcher 2515 → dir (mod 157 / send 509 / handle 283 / session 265 / backoff 73 / tests 1289); desktop lib 3062 → 1131 (−1931) + listen_addr 470 + hub_commands 528 + bridge_profiles 946.
+- Verification: `cargo fmt --all`, `cargo clippy -- -D warnings`, `cargo test -- --test-threads=1`, `cargo build`, desktop `cargo test` + clippy `-D warnings`.
+- Commits: `d372eab` (dispatcher), `8cf7bb5` (desktop)

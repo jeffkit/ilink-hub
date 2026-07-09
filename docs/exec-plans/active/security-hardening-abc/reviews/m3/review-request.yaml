@@ -1,0 +1,86 @@
+milestone: "M3: God 模块拆分（dispatcher + desktop lib）"
+requested_at: "2026-07-09 15:52"
+requestor: "implement-agent"
+
+scope:
+  changed_files:
+    - path: "src/bridge/dispatcher.rs"
+      change_type: deleted
+      summary: "Replaced by dispatcher/ module directory"
+    - path: "src/bridge/dispatcher/mod.rs"
+      change_type: added
+      summary: "Re-exports BridgeStop/run_bridge*; owns long-poll loop"
+    - path: "src/bridge/dispatcher/backoff.rs"
+      change_type: added
+      summary: "retry_budget + exponential backoff helpers"
+    - path: "src/bridge/dispatcher/send.rs"
+      change_type: added
+      summary: "HubClient, SendOutcome, sanitize/parse, partial/final retry"
+    - path: "src/bridge/dispatcher/session.rs"
+      change_type: added
+      summary: "SessionDispatcher + session worker"
+    - path: "src/bridge/dispatcher/handle.rs"
+      change_type: added
+      summary: "handle_one_message + outbound hub_ext attach"
+    - path: "src/bridge/dispatcher/tests.rs"
+      change_type: added
+      summary: "Former colocated dispatcher unit tests"
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs"
+      change_type: modified
+      summary: "HubController/spawn/run + invoke_handler; re-exports modules"
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/listen_addr.rs"
+      change_type: added
+      summary: "Loopback helpers, port override, settings commands + tests"
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/hub_commands.rs"
+      change_type: added
+      summary: "hub_clients/stats/register/delete/update commands"
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/bridge_profiles.rs"
+      change_type: added
+      summary: "YAML builders + bridge_* profile/lifecycle commands + tests"
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/test_support.rs"
+      change_type: added
+      summary: "Shared ScopedHome / PORT_OVERRIDE_LOCK for tests"
+    - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
+      change_type: modified
+      summary: "M3 decisions/outcome"
+    - path: "docs/exec-plans/active/security-hardening-abc/status.md"
+      change_type: modified
+      summary: "M3 awaiting adversarial review"
+  diff_stats:
+    files_changed: 12
+    insertions: 4598
+    deletions: 4483
+  commits:
+    - "d372eab"
+    - "8cf7bb5"
+
+change_summary: |
+  Pure structural refactor with no intentional behavior change from M1/M2.
+  dispatcher.rs (2515) → dispatcher/ submodules; largest production file
+  send.rs ~509 lines. Desktop lib.rs (3062) → 1131 lines after extracting
+  listen_addr, hub_commands, bridge_profiles. Public bridge API and Tauri
+  invoke_handler command set preserved via re-exports.
+
+acceptance_criteria:
+  - "dispatcher.rs single file gone; production files in dispatcher/ ideally < ~1200 lines"
+  - "lib.rs line count drops substantially (aim < ~1800 or at least -800)"
+  - "src/bridge/mod.rs still pub use dispatcher::{run_bridge, run_bridge_with_shutdown, BridgeStop}"
+  - "All existing dispatcher tests pass"
+  - "Desktop cargo test / check pass; #[tauri::command] still registered"
+  - "No security behavior change from M1/M2"
+  - "cargo fmt, clippy -D warnings, cargo test, cargo build pass"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+  desktop_test: pass
+  desktop_clippy: pass
+
+focus_areas:
+  - "Visibility/pub(super) mistakes that could change which code paths compile in release vs test"
+  - "Missed invoke_handler registrations or renamed Tauri commands"
+  - "Accidental behavior drift in send/partial retry or session dispatch during the move"
+  - "Desktop loopback / port-override helpers still enforce M2 security invariants"
+  - "Circular module deps or dead re-exports"
