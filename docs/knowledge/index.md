@@ -25,6 +25,7 @@
 
 * [force-dev 工作流](dev-workflow/force-dev.md) — 用 force-dev 启动/续跑 feature 分支
 * [常用命令速查](dev-workflow/common-commands.md) — cargo test/clippy/fmt/build 等
+* [变异测试](../mutation-testing/README.md) — cargo-mutants 基建、基准与持续推进节奏
 
 ## 运维与安全
 

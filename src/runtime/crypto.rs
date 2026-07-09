@@ -122,6 +122,21 @@ mod tests {
         assert!(result.is_err(), "blob shorter than 28 bytes must fail");
     }
 
+    /// Exactly 28 bytes must pass the length gate (`len < 28`), then fail at AEAD open.
+    /// Catches ` < ` → ` <= ` (which would wrongly reject the minimum-length blob).
+    #[test]
+    fn decrypt_token_exactly_28_bytes_passes_length_check() {
+        let key = make_key([0u8; 32]);
+        let blob = B64.encode([0u8; 28]);
+        let err = decrypt_token(&blob, &key)
+            .expect_err("garbage 28-byte blob must still fail AEAD")
+            .to_string();
+        assert!(
+            !err.contains("data too short"),
+            "exactly 28 bytes must not trip the length check; got: {err}"
+        );
+    }
+
     #[test]
     fn decrypt_token_invalid_base64_returns_error() {
         let key = make_key([0u8; 32]);
