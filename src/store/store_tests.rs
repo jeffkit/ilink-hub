@@ -3522,3 +3522,100 @@ async fn update_client_persona_persists() {
     assert_eq!(row.persona_name.as_deref(), Some("Ada"));
     assert_eq!(row.persona_emoji.as_deref(), Some("🤖"));
 }
+
+// ─── context.rs mutation catch-up (2026-07-10) ───────────────────────────────
+
+/// Pre-v7 schema lacks the partial unique index; upsert must fall back to the
+/// two-step path and still return a stable vctx for the same peer.
+#[tokio::test]
+async fn find_or_create_vctx_pre_v7_fallback_is_stable() {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .expect("schema_version");
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS context_token_map (
+                vctx TEXT PRIMARY KEY,
+                real_ctx TEXT NOT NULL,
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT
+            )",
+        )
+        .await
+        .expect("context_token_map");
+    for v in 1..=12 {
+        store.record_migration_run(v).await.expect("mark migrated");
+    }
+
+    let v1 = store
+        .find_or_create_vctx("peer-pre-v7", None, "real-1")
+        .await
+        .expect("first create");
+    let v2 = store
+        .find_or_create_vctx("peer-pre-v7", None, "real-2")
+        .await
+        .expect("second create must fall back, not fail");
+    assert_eq!(
+        v1, v2,
+        "same peer must keep stable vctx via two-step fallback"
+    );
+    assert_eq!(
+        store
+            .resolve_context_token(&v1)
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some("real-2"),
+        "fallback path must update real_ctx"
+    );
+}
+
+/// Anonymous contexts must resolve by freshly minted vctx, not the first empty
+/// `peer_user_id` row left in the table (context.rs:135 `!conv_key.is_empty()`).
+#[tokio::test]
+async fn find_or_create_vctx_anonymous_resolve_uses_minted_vctx() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let anon1 = store
+        .find_or_create_vctx("", None, "anon-one")
+        .await
+        .expect("anon1");
+    store
+        .find_or_create_vctx("peer-between", None, "peer-ctx")
+        .await
+        .expect("peer");
+    let anon2 = store
+        .find_or_create_vctx("", None, "anon-two")
+        .await
+        .expect("anon2");
+    assert_ne!(
+        anon1, anon2,
+        "each anonymous call must mint a distinct vctx"
+    );
+    assert_eq!(
+        store
+            .resolve_context_token(&anon2)
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some("anon-two"),
+        "second anonymous context must not alias the first empty-scope row"
+    );
+}
