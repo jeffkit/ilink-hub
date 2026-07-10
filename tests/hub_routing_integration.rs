@@ -951,7 +951,12 @@ fn pair_url_is_not_logged_at_info_level() {
     let audited_files = [
         include_str!("../src/server/pairing.rs"),
         include_str!("../src/server/mod.rs"),
-        include_str!("../src/server/routes.rs"),
+        include_str!("../src/server/routes/mod.rs"),
+        include_str!("../src/server/routes/auth.rs"),
+        include_str!("../src/server/routes/bot.rs"),
+        include_str!("../src/server/routes/admin.rs"),
+        include_str!("../src/server/routes/metrics.rs"),
+        include_str!("../src/server/routes/wait.rs"),
         include_str!("../src/hub/mod.rs"),
         include_str!("../src/hub/pairing.rs"),
         include_str!("../src/ilink/mod.rs"),
