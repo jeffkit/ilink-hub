@@ -9,4 +9,4 @@
 | M2 server/routes 拆分 | done |
 | M3 hub/dispatch 拆分 | done |
 | M4 质量门 | done |
-| M5 合 main + 推送 | in progress |
+| M5 合 main + 推送 | done |
