@@ -4,7 +4,8 @@ use tokio::sync::watch;
 use tracing::info;
 
 use ilink_hub::{
-    ilink::LoginClient, paths::default_database_url, run_serve, store::Store, ServeOptions,
+    ilink::LoginClient, paths::default_database_url, redact_database_url, run_serve, store::Store,
+    ServeOptions,
 };
 
 #[derive(Parser)]
@@ -177,7 +178,10 @@ async fn run_login(database_url: String, ilink_base_url: Option<String>) -> Resu
     let token = login_client.login_with_qr().await?;
     let base = ilink_base_url.unwrap_or_else(|| "https://ilinkai.weixin.qq.com".to_string());
     store.save_credentials(&token, &base).await?;
-    println!("✅ Login successful! Token saved to {}", database_url);
+    println!(
+        "✅ Login successful! Token saved to {}",
+        redact_database_url(&database_url)
+    );
     Ok(())
 }
 

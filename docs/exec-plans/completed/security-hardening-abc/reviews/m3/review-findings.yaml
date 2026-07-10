@@ -1,0 +1,131 @@
+milestone: "M3: God 模块拆分（dispatcher + desktop lib）"
+reviewed_at: "2026-07-09 15:58"
+reviewer: "adversarial-reviewer"
+
+verdict: PASS
+
+# Review method
+# -------------
+# Adversarial goal: prove this "pure refactor" DID change behavior. It did not.
+#
+# 1. Dispatcher split (d372eab):
+#    - Extracted old `src/bridge/dispatcher.rs` (2515 lines, pre-split HEAD) and
+#      normalized both sides (stripped comments / blank lines / `use` stmts /
+#      `mod x;` decls / `pub`+`pub(super)` visibility keywords), then compared the
+#      multiset of production code lines against mod.rs+backoff.rs+send.rs+
+#      session.rs+handle.rs.
+#    - Result: ZERO production logic lines differ. Only deltas are import-list
+#      re-wrapping and the extra `#[cfg(test)]` gates needed to re-import
+#      test-only symbols through mod.rs. => no behavior drift.
+#    - Test parity: extracted 61 `fn` names from old inline `mod tests` vs new
+#      dispatcher/tests.rs => identical set, none dropped/skipped.
+#    - Re-exports: src/bridge/mod.rs:22 still
+#      `pub use dispatcher::{run_bridge, run_bridge_with_shutdown, BridgeStop};` (intact).
+#    - Circular deps: mod->{backoff,handle,send,session}; session->{handle,send,super};
+#      handle->{backoff,send,session,super}. Rust permits mutual module refs; build passes.
+#
+# 2. Desktop lib.rs split (8cf7bb5):
+#    - Same normalized multiset diff of old lib.rs (3062 lines) vs
+#      lib.rs+listen_addr.rs+hub_commands.rs+bridge_profiles.rs+test_support.rs.
+#    - Result: 0 old production lines missing; new-only lines are exclusively
+#      test-module scaffolding (`#[cfg(test)] mod tests {`, `#![cfg(test)]`).
+#    - invoke_handler: old and new command lists are byte-identical (22 commands,
+#      same order). `#[tauri::command]` count 22 == 22 (lib 4 + hub_commands 5 +
+#      bridge_profiles 11 + listen_addr 2), pulled into scope via
+#      `pub(crate) use <mod>::*;`.
+#    - Test parity: 97 `fn` names in old vs 97 across new files, none dropped.
+#    - M2 security invariants physically present in listen_addr.rs
+#      (ensure_loopback_listen_addr host allowlist 127.0.0.1/localhost/::1,
+#      port range 1..=65535, hardcoded loopback fallback default) and byte-identical
+#      to pre-split source per the multiset diff.
+
+findings:
+  - id: "f1"
+    severity: LOW
+    category: testing
+    description: >
+      The Tauri `invoke_handler` command set is asserted only implicitly (compile
+      + manual list). There is no regression guard, so a future extraction that
+      forgets to add a moved `#[tauri::command]` to `generate_handler![]` would
+      compile cleanly and silently drop a frontend-callable command. This M3 diff
+      is correct (22==22, identical order), but the class of bug this milestone
+      most risks has no automated tripwire.
+    suggestion: >
+      Add a test that pins the expected command name list (e.g. a const
+      `EXPECTED_COMMANDS: &[&str]` compared against a hand-maintained list, or a
+      doc-comment + CI grep) so dropping/renaming a command in a later split fails CI.
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:1073"
+    status: open
+
+  - id: "f2"
+    severity: LOW
+    category: maintainability
+    description: >
+      Desktop modules are re-exported into lib.rs with glob `pub(crate) use
+      bridge_profiles::*; use hub_commands::*; use listen_addr::*;`. Globs widen
+      the crate-internal namespace and make accidental name collisions or
+      unintended symbol exposure between the three modules easy to introduce in a
+      future split (the compiler only errors on an actual clash, not on
+      over-broad exposure). Not a defect today.
+    suggestion: >
+      Prefer explicit re-export lists (`pub(crate) use hub_commands::{hub_info,
+      hub_clients, ...};`) for the command surface, or keep globs but add a brief
+      comment noting the intent, so the public-to-frontend surface stays auditable.
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:17"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: >
+      Encapsulation regression guard for the bridge public API. Assert (via a
+      compile-only test / trybuild or a small module that only imports the public
+      path) that `crate::bridge::{run_bridge, run_bridge_with_shutdown, BridgeStop}`
+      resolve, while dispatcher internals `HubClient`, `SendOutcome`,
+      `SessionDispatcher` are NOT reachable from `crate::bridge` (only from within
+      dispatcher). Probes the `pub(super)` narrowing introduced by the module split.
+    expected_behavior: >
+      The three public items compile; referencing any `pub(super)` internal from
+      outside `dispatcher` fails to compile. This locks the intended API surface
+      so a future `pub` typo can't silently leak internals.
+    added_to_suite: false
+
+  - id: "at2"
+    type: unit
+    description: >
+      M2 loopback invariant, re-pinned after the move into listen_addr.rs. Feed
+      `ensure_loopback_listen_addr` and `resolve_listen_addr`-style helpers hostile
+      inputs: `0.0.0.0:8765`, a LAN IP `192.168.1.10:8765`, `http://evil.com:8765`,
+      port `0`, and port `65536`/overflow, plus the accepted forms
+      (`127.0.0.1:9000`, `localhost:9000`, `::1`, bare `9000`).
+    expected_behavior: >
+      Non-loopback hosts and out-of-range ports are rejected with an error; only
+      loopback hosts and 1..=65535 ports are accepted; fallback default remains the
+      hardcoded `127.0.0.1:8765`. Confirms the security check survived extraction.
+    added_to_suite: false
+
+  - id: "at3"
+    type: e2e
+    description: >
+      Desktop command round-trip after extraction: invoke `set_listen_port` with a
+      valid port then an invalid port (0) through the Tauri command boundary, and
+      invoke one `hub_*` and one `bridge_*` command, asserting each is still
+      registered and returns its documented shape.
+    expected_behavior: >
+      Every command moved out of lib.rs is still callable via the invoke bridge;
+      `set_listen_port(0)` returns the port-range error rather than a
+      "command not found" error (which would indicate a missing generate_handler entry).
+    added_to_suite: false
+
+summary: |
+  Verified pure structural refactor. Normalized multiset diffs of both the
+  dispatcher (2515-line file -> 5 submodules) and desktop lib.rs (3062 lines ->
+  listen_addr/hub_commands/bridge_profiles) show ZERO production-logic changes;
+  new lines are exclusively import re-wrapping and test-module scaffolding. All
+  61 dispatcher tests and all 97 desktop test fns are preserved, the bridge
+  re-export (run_bridge/run_bridge_with_shutdown/BridgeStop) is intact, the
+  Tauri invoke_handler command set is byte-identical (22 commands, same order,
+  all 22 #[tauri::command] defs accounted for), and the M2 loopback/port-override
+  security invariants remain byte-identical in listen_addr.rs. No CRITICAL/HIGH
+  behavior regressions found; two LOW maintainability notes (missing command-set
+  regression guard, glob re-exports) do not block the milestone.

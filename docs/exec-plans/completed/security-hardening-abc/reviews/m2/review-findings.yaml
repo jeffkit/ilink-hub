@@ -1,0 +1,153 @@
+milestone: "M2: shell 硬拒绝 + 日志脱敏 + 桌面 loopback"
+reviewed_at: "2026-07-09 15:42"
+reviewer: "adversarial-reviewer"
+round: fix-rereview
+
+verdict: PASS
+
+findings:
+  - id: "f1"
+    severity: CRITICAL
+    category: security
+    description: >-
+      [已修复·已复核] 桌面启动兜底不再回读被拒绝的 ILINK_HUB_ADDR。
+      resolve_initial_listen_addr 仅在 env 通过 ensure_loopback_listen_addr 时返回原值，
+      非 loopback 直接返回 Err；setup() 的兜底改为
+      `resolve_initial_listen_addr().unwrap_or_else(safe_listen_addr_on_resolve_error)`
+      （lib.rs:2905），safe_listen_addr_on_resolve_error 恒返回硬编码
+      SAFE_LOOPBACK_LISTEN_ADDR="127.0.0.1:8765"，注释明确"never re-read ILINK_HUB_ADDR"。
+      因此 ILINK_HUB_ADDR=0.0.0.0:8765 → resolve Err → 兜底 127.0.0.1:8765，
+      不再绑定 0.0.0.0。单测 setup_fallback_never_reuses_rejected_non_loopback_env
+      断言 fallback==127.0.0.1:8765 且不以 0.0.0.0 开头，并验证 env 未被回读。
+    suggestion: "已按建议实现，无进一步动作。"
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:149,2905"
+    status: fixed
+
+  - id: "f2"
+    severity: HIGH
+    category: security
+    description: >-
+      [已修复·已复核] CLI 登录成功路径改为
+      `println!("✅ Login successful! Token saved to {}", redact_database_url(&database_url))`
+      （main.rs:181-184），stdout 不再回显明文 DB 口令。
+    suggestion: "已按建议实现。可选后续：文案与 DB URL 无关，未来可考虑完全去除该 URL 回显。"
+    location: "src/main.rs:181"
+    status: fixed
+
+  - id: "f3"
+    severity: HIGH
+    category: security
+    description: >-
+      [已修复·已复核] reject_shell_injection_risk 两条主绕过均已封堵：
+      (1) 组合短选项：arg_enables_shell_command_string 精确匹配 `-c`，并对单破折号短簇
+      （`-lc`/`-ic`/`-xc`/`-cl` 等，去掉前导单 `-` 后 flags 含 `c`）返回 true，
+      同时排除 `--` 长选项（`--color` 不误报）。
+      (2) env 承载 {{MESSAGE}}：has_message_placeholder 现同时扫描 p.args 与 p.env.values()，
+      `command: bash, args: ["-c","$MSG"], env: {MSG: "{{MESSAGE}}"}` 被 SECURITY bail。
+      单测覆盖：shell_lc_with_message_placeholder_rejected、
+      shell_c_with_message_in_env_rejected、shell_long_option_color_not_treated_as_dash_c。
+    suggestion: "已按建议实现（宽松 -c 匹配 + env 值扫描），无进一步动作。"
+    location: "src/bridge/config.rs:562-573,582-594"
+    status: fixed
+
+  - id: "f4"
+    severity: MEDIUM
+    category: security
+    description: >-
+      [部分修复·可接受残留] SHELL_CMDS 已扩充为
+      bash/sh/zsh/fish/dash/ksh/mksh/ash/busybox。仍有等价注入面未覆盖，
+      按本轮范围作为 MEDIUM 残留接受：
+      (a) csh/tcsh 支持 `-c` 但未加入白名单，`csh -c "echo {{MESSAGE}}"` 可绕过；
+      (b) 代码注入解释器 python/python3/node/perl/ruby 的 `-c`/`-e` 未做同源检测；
+      (c) env/nice/stdbuf/timeout 等包装器命令的 file_name 非 shell，被放行。
+      三者均需运营者主动编写恶意 profile（同 python -c 信任模型），非远程无条件触发。
+    suggestion: >-
+      后续轮次：将 csh/tcsh 并入 shell 列表；对 python/node/perl/ruby 的 -c/-e 同源检测；
+      识别 env/nice/stdbuf/timeout 包装器并对其后续 argv 递归判定被包装的真实命令。
+    location: "src/bridge/config.rs:552-554"
+    status: partial
+
+  - id: "f5"
+    severity: MEDIUM
+    category: security
+    description: >-
+      [已修复·已复核] redact_database_url 除脱敏 authority userinfo 口令外，
+      新增 redact_sensitive_query_params：对 query 键
+      (password|passwd|pwd|sslpassword|key|secret|token) 的值经 query_pairs_mut 重写为 ***。
+      `mysql://user@host/db?password=secret&sslkey=...`、SQLCipher `?key=...` 均被脱敏。
+    suggestion: >-
+      已按建议实现。可选后续：sslkey 属文件路径而非口令，当前也被 key 命中脱敏，
+      如需保留路径可细化键名匹配，非阻塞。
+    location: "src/lib.rs:36-96"
+    status: fixed
+
+  - id: "f6"
+    severity: LOW
+    category: boundary
+    description: >-
+      [接受残留·LOW] ensure_loopback_listen_addr 裸端口分支仍返回原始裸端口字符串，
+      resolve 直接交给 spawn_hub_task，最终 TcpListener::bind("8765") 可能启动即崩
+      （而非规范化为 127.0.0.1:8765）。按 must-fix 范围外接受为 LOW。
+    suggestion: "后续：裸端口分支返回 loopback_listen_addr_for_port(port) 规范化地址。"
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:172-180"
+    status: open
+
+  - id: "f7"
+    severity: LOW
+    category: maintainability
+    description: >-
+      [接受残留·LOW] hub_update_client 读锁预取 persona 后，update_client_in_hub
+      再持写锁重查，存在 TOCTOU 窗口与 persona 真相源歧义。行为正确性隐患，非明确 bug。
+    suggestion: "后续：update_client_in_hub 在同一把写锁内'读改一体'保留原 persona；明确 DB 为单一真相源。"
+    location: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs:734-742"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: e2e
+    description: >-
+      桌面以 ILINK_HUB_ADDR=0.0.0.0:8765 且无 desktop-port 覆盖文件启动，
+      检查 HubController.requested_addr / 实际 TcpListener 绑定地址。
+    expected_behavior: >-
+      绑定主机必须为 loopback（127.0.0.1）。当前实现兜底恒为 127.0.0.1:8765，
+      已由单测 setup_fallback_never_reuses_rejected_non_loopback_env 覆盖等价断言。
+    added_to_suite: true
+
+  - id: "at2"
+    type: unit
+    description: >-
+      parse_yaml 加载 `bash -lc "echo {{MESSAGE}}"` 与
+      `bash -c "$MSG" env:{MSG:"{{MESSAGE}}"}`。
+    expected_behavior: >-
+      两者均被 reject_shell_injection_risk 拒绝（SECURITY bail）。已由
+      shell_lc_with_message_placeholder_rejected / shell_c_with_message_in_env_rejected 覆盖。
+    added_to_suite: true
+
+  - id: "at3"
+    type: unit
+    description: >-
+      新增回归：`command: csh, args: ["-c","echo {{MESSAGE}}"]` 与
+      `command: python3, args: ["-c","print('{{MESSAGE}}')"]` 加载。
+    expected_behavior: >-
+      当前会被放行（f4 已知残留，csh/tcsh + 解释器不在白名单）。此测试应在后续轮次
+      转为断言拒绝，作为残留收口的守门测试。
+    added_to_suite: false
+
+  - id: "at4"
+    type: unit
+    description: >-
+      redact_database_url("mysql://user@host/db?password=secret&sslkey=abc") 与
+      redact_database_url("postgres://host/db?password=secret") 及 SQLCipher `?key=...`。
+    expected_behavior: >-
+      返回值不得包含 secret/abc，query 凭据被替换为 ***。当前实现已满足
+      （redact_sensitive_query_params）。
+    added_to_suite: true
+
+summary: |
+  复核确认 M2 三项 CRITICAL/HIGH 修复均已落地并配套单测：桌面启动兜底
+  (safe_listen_addr_on_resolve_error) 恒为硬编码 loopback，绝不回读被拒绝的
+  ILINK_HUB_ADDR（f1 CRITICAL→fixed）；CLI 登录 println 经 redact_database_url 脱敏
+  （f2 HIGH→fixed）；shell 硬拒绝覆盖 -lc/-ic/-xc 组合短选项与 env 承载的 {{MESSAGE}}，
+  且 --color 不误报（f3 HIGH→fixed）；query 参数口令脱敏补齐（f5 MEDIUM→fixed）。
+  残留均为 MEDIUM/LOW 且已接受：f4（csh/tcsh、python/node -c、env 包装器）、
+  f6（裸端口）、f7（persona TOCTOU）。无新增 CRITICAL/HIGH，verdict = PASS。

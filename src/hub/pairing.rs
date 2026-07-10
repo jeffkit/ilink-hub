@@ -17,6 +17,15 @@ const SCANNED_TTL: Duration = Duration::from_secs(60);
 /// are immortal and `MAX_PAIRING_SESSIONS` is effectively neutered once
 /// the live set has cycled through `create` + `confirm`.
 const CONFIRMED_TTL: Duration = Duration::from_secs(86_400);
+/// How long after confirm a polling client may re-read the same `vtoken`.
+///
+/// Claim-window (not single-take): the first `get_qrcode_status` response can be
+/// lost (network reset, proxy idle timeout, client crash mid-body). Keeping the
+/// token reclaimable for this short window lets the legitimate CLI retry without
+/// wedging behind an orphan registry row + NameCollision. After the window,
+/// the next claim permanently clears the token so a leaked pair code cannot be
+/// re-polled for the remaining `CONFIRMED_TTL` (24h) steal hole.
+const VTOKEN_CLAIM_WINDOW: Duration = Duration::from_secs(120);
 /// Hard cap on simultaneously-live pairing sessions. Prevents a `GET /ilink/bot/get_bot_qrcode`
 /// flood from growing `state.pairing.sessions` unboundedly. Each entry is a `PairingSession` plus
 /// optional CSRF string; 1024 is generous and the cap is checked at `create()`.
@@ -146,6 +155,43 @@ impl PairingRegistry {
             return Some(session.clone());
         }
         None
+    }
+
+    /// Claim (or re-claim within `VTOKEN_CLAIM_WINDOW`) a confirmed session's vtoken.
+    ///
+    /// Semantics (claim-window, not single-take):
+    /// - Unknown code → `None`
+    /// - Wait/scanned in `sessions` → `(session, None)` unchanged (never invents a token)
+    /// - Confirmed, `vtoken: Some`, and `confirmed_at.elapsed() < VTOKEN_CLAIM_WINDOW`
+    ///   → `(session, Some(token))` **without clearing** so a lost status response
+    ///   can be retried by the legitimate client
+    /// - Confirmed and `confirmed_at.elapsed() >= VTOKEN_CLAIM_WINDOW`
+    ///   → clear `vtoken` and return `(session, None)` (closes the 24h re-poll steal hole)
+    /// - Confirmed with `vtoken` already `None` → `(session, None)`
+    ///
+    /// Callers hold the pairing write lock around this method; concurrent claims
+    /// within the window are serialized and each observes the same token.
+    pub fn claim_confirmed_vtoken(
+        &mut self,
+        code: &str,
+    ) -> Option<(PairingSession, Option<String>)> {
+        self.purge_expired();
+        if let Some((session, confirmed_at)) = self.confirmed_sessions.get_mut(code) {
+            if session.vtoken.is_none() {
+                return Some((session.clone(), None));
+            }
+            if confirmed_at.elapsed() < VTOKEN_CLAIM_WINDOW {
+                let token = session.vtoken.clone();
+                return Some((session.clone(), token));
+            }
+            // Window elapsed: permanently clear so a leaked pair code cannot
+            // re-poll for the bearer token during the remaining CONFIRMED_TTL.
+            let _ = session.vtoken.take();
+            return Some((session.clone(), None));
+        }
+        self.sessions
+            .get(code)
+            .map(|session| (session.clone(), None))
     }
 
     pub fn mark_scanned(&mut self, code: &str) -> bool {
@@ -584,5 +630,93 @@ mod tests {
             PairingError::TooManySessions,
             "cap must account for both pending and confirmed sessions"
         );
+    }
+
+    /// Within the claim window, sequential claims all receive the same token
+    /// and the stored vtoken is not cleared (lost-response recovery).
+    #[test]
+    fn claim_confirmed_vtoken_reclaimable_within_window() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.confirm(&code, "client".into(), None, "vhub_once".into(), &csrf)
+            .unwrap();
+
+        let (session1, token1) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(session1.status_str(), "confirmed");
+        assert_eq!(token1.as_deref(), Some("vhub_once"));
+
+        let (session2, token2) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(
+            session2.status_str(),
+            "confirmed",
+            "confirmed stub must remain after claim"
+        );
+        assert_eq!(
+            token2.as_deref(),
+            Some("vhub_once"),
+            "second claim within window must re-issue the same vtoken"
+        );
+        assert_eq!(
+            reg.get(&code).unwrap().vtoken.as_deref(),
+            Some("vhub_once"),
+            "stored session must keep vtoken during claim window"
+        );
+    }
+
+    /// After the claim window, the next claim clears the token permanently.
+    #[test]
+    fn claim_confirmed_vtoken_clears_after_claim_window() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.confirm(&code, "client".into(), None, "vhub_window".into(), &csrf)
+            .unwrap();
+
+        let (_, token_fresh) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(token_fresh.as_deref(), Some("vhub_window"));
+
+        reg.confirmed_sessions.get_mut(&code).unwrap().1 =
+            Instant::now() - VTOKEN_CLAIM_WINDOW - Duration::from_secs(1);
+
+        let (session, token) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(session.status_str(), "confirmed");
+        assert!(
+            token.is_none(),
+            "claim after window must not return the vtoken"
+        );
+        assert!(
+            reg.get(&code).unwrap().vtoken.is_none(),
+            "stored session must keep vtoken cleared after window"
+        );
+
+        let (_, token_again) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert!(
+            token_again.is_none(),
+            "subsequent claims must keep seeing None after clear"
+        );
+    }
+
+    /// Wait/scanned sessions are readable via claim without inventing a token.
+    #[test]
+    fn claim_confirmed_vtoken_on_wait_returns_none_token() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        let (session, token) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(session.status_str(), "wait");
+        assert!(token.is_none());
+
+        reg.mark_scanned(&code);
+        let (session, token) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(session.status_str(), "scaned");
+        assert!(token.is_none());
+    }
+
+    #[test]
+    fn claim_confirmed_vtoken_unknown_code_returns_none() {
+        let mut reg = PairingRegistry::new();
+        assert!(reg.claim_confirmed_vtoken("pair_missing").is_none());
     }
 }

@@ -1,0 +1,96 @@
+milestone: "M2: shell 硬拒绝 + 日志脱敏 + 桌面 loopback"
+requested_at: "2026-07-09 15:35"
+requestor: "implement-agent"
+round: fix
+
+scope:
+  changed_files:
+    - path: "desktop/ilink-hub-desktop/src-tauri/src/lib.rs"
+      change_type: modified
+      summary: >-
+        f1: setup fallback via safe_listen_addr_on_resolve_error — hardcoded
+        127.0.0.1:8765 only, never re-read ILINK_HUB_ADDR; unit test
+    - path: "src/main.rs"
+      change_type: modified
+      summary: "f2: login success println uses redact_database_url"
+    - path: "src/bridge/config.rs"
+      change_type: modified
+      summary: >-
+        f3/f4: -lc short clusters; MESSAGE in env; shell list +ksh/mksh/ash/busybox;
+        unit tests for -lc and env MSG
+    - path: "src/lib.rs"
+      change_type: modified
+      summary: "f5: redact query password/key/secret/token params; unit tests"
+    - path: "docs/exec-plans/active/security-hardening-abc/implement.md"
+      change_type: modified
+      summary: "M2 fix-round notes"
+    - path: "docs/exec-plans/active/security-hardening-abc/reviews/m2/review-findings.yaml"
+      change_type: modified
+      summary: "Mark f1/f2/f3/f5 fixed; f4 partial"
+    - path: "docs/exec-plans/active/security-hardening-abc/reviews/m2/review-request.yaml"
+      change_type: modified
+      summary: "This re-review request"
+
+change_summary: |
+  Close M2 adversarial CRITICAL/HIGH bypasses without touching dangerous CLI flags:
+
+  1) Desktop setup no longer re-reads rejected ILINK_HUB_ADDR on resolve Err;
+     fallback is always hardcoded 127.0.0.1:8765 (f1 CRITICAL).
+  2) CLI login success path redacts DATABASE_URL before println (f2 HIGH).
+  3) Shell reject: combined short opts (-lc/-ic/-xc), MESSAGE in env values,
+     expanded shell list ksh/mksh/ash/busybox (f3 HIGH; f4 partial).
+  4) redact_database_url also masks query credential params (f5 MEDIUM).
+
+prior_findings_addressed:
+  - id: f1
+    resolution: fixed
+    note: "safe_listen_addr_on_resolve_error; test setup_fallback_never_reuses_rejected_non_loopback_env"
+  - id: f2
+    resolution: fixed
+    note: "redact_database_url in login println"
+  - id: f3
+    resolution: fixed
+    note: "arg_enables_shell_command_string + env MESSAGE scan + tests"
+  - id: f4
+    resolution: partial
+    note: "shell list expanded; python/node/wrappers deferred"
+  - id: f5
+    resolution: fixed
+    note: "query param redaction + tests"
+  - id: f6
+    resolution: deferred
+    note: "LOW bare-port normalize — not in must-fix"
+  - id: f7
+    resolution: deferred
+    note: "LOW persona TOCTOU — not in must-fix"
+
+acceptance_criteria:
+  - "ILINK_HUB_ADDR=0.0.0.0:8765 → resolve Err; setup fallback is 127.0.0.1:8765 (not 0.0.0.0)"
+  - "login println does not contain raw DB password"
+  - "bash -lc '...{{MESSAGE}}...' rejected"
+  - "bash -c $MSG with env MSG={{MESSAGE}} rejected"
+  - "--color + {{MESSAGE}} still loads (no false positive)"
+  - "redact_database_url masks ?password= and ?key="
+  - "dangerous CLI flags unchanged"
+  - "cargo fmt, clippy -D warnings, cargo test, cargo build, desktop loopback tests pass"
+
+verification_results:
+  lint: pass
+  typecheck: n/a
+  test: pass
+  build: pass
+  notes: >-
+    cargo fmt --all -- --check; cargo clippy -- -D warnings; cargo build;
+    cargo test -- --test-threads=1 (all ok);
+    cargo test --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml
+    -- --test-threads=1 resolve_initial_listen_addr ensure_loopback setup_fallback (5 ok)
+
+e2e_cases: []
+e2e_verification: not-needed
+
+focus_areas:
+  - "setup fallback must never bind 0.0.0.0 when env is non-loopback"
+  - "shell -lc and env MESSAGE bypasses closed; --color not false-positive"
+  - "query-param password redaction"
+  - "Do not change --dangerously-skip-permissions / --yolo / similar flags"
+  - "f4 residual (python -c / env wrapper) acceptable as partial this round"

@@ -1,0 +1,215 @@
+milestone: "M1 fix: pairing vtoken claim-window (post adversarial re-review)"
+reviewed_at: "2026-07-09 15:38"
+reviewer: "adversarial-reviewer"
+round: "fix"
+prior_verdict: "NEEDS_FIX"
+
+verdict: PASS
+
+findings:
+  - id: "f1"
+    severity: HIGH
+    category: boundary
+    description: >-
+      ORIGINAL: single-take cleared the vtoken on the first get_qrcode_status
+      poll, so a lost first response (network reset / proxy idle timeout /
+      client crash mid-body) wedged the client permanently — the next poll
+      returned confirmed+bot_token=None and the CLI hard-aborts at
+      src/client/pairing.rs:253 ("confirmed but bot_token missing"), while
+      register_confirmed_client_in_hub had already inserted a registry row →
+      NameCollision/409 on any re-pair with the same name.
+    suggestion: >-
+      (Applied) Claim-window reclaim semantics.
+    location: "src/hub/pairing.rs:160-195, src/server/pairing.rs:577-614"
+    status: fixed
+    fix_note: >-
+      VERIFIED FIXED. claim_confirmed_vtoken now returns the same token WITHOUT
+      clearing while confirmed_at.elapsed() < VTOKEN_CLAIM_WINDOW (120s), and
+      only clears after the window (src/hub/pairing.rs:179-191). The fix closes
+      the wedge for its stated scenario: the client's poll loop treats a lost
+      response as a transport error, warns, sleeps 1s and re-polls
+      (src/client/pairing.rs:230-236); the retry lands inside the 120s window
+      and re-reads the identical token, so no confirmed+None hard-abort occurs.
+      Client polls every 500ms with a 25s long-poll, so 120s is ample headroom.
+      The 24h re-poll steal hole is still closed because the first post-window
+      claim permanently clears the token. Covered by
+      claim_confirmed_vtoken_reclaimable_within_window and
+      claim_confirmed_vtoken_clears_after_claim_window (both pass). Adequate.
+
+  - id: "f2"
+    severity: MEDIUM
+    category: security
+    description: >-
+      Residual token-theft: get_qrcode_status remains unauthenticated, so any
+      party holding the pair code can claim the vtoken. The claim-window changes
+      the shape of this residual: the readable window widened from an
+      instant-of-confirm race to a full 120s during which the token is returned
+      on EVERY poll (not consumed). An attacker who knows the code has 120s of
+      repeated readability.
+    suggestion: >-
+      Client-bound secret issued at get_bot_qrcode and required on
+      get_qrcode_status (deferred, needs plan approval).
+    location: "src/server/pairing.rs:577-614, src/hub/pairing.rs:174-195"
+    status: accepted
+    fix_note: >-
+      ACCEPTED RESIDUAL (per review request: pair code is the capability).
+      Fair-but-adversarial note in BOTH directions: (a) the theft READ window
+      grew to 120s vs single-take's instant race — worse for confidentiality;
+      (b) but the coupled theft+DoS is GONE — because within-window claims no
+      longer clear the token, an attacker who reads it does NOT starve the legit
+      client, so a code leak no longer causes the "attacker gets token AND legit
+      client gets None" one-shot from the prior f2. Net posture is a bounded
+      120s exposure gated on knowing the code, materially better than the
+      original 24h hole. Not reopened as HIGH.
+
+  - id: "f3"
+    severity: MEDIUM
+    category: security
+    description: >-
+      CORS defaults to permissive (ACAO:*) when ILINK_CORS_ORIGINS is unset, and
+      the layer covers the token-bearing get_qrcode_status route. Whitelist
+      wiring itself is correct and tested (evil Origin rejected); the gap is the
+      insecure default combined with an unauthenticated token route.
+    suggestion: >-
+      Default deny/same-origin for token-bearing routes, or fail startup in prod
+      unless ILINK_CORS_ORIGINS is set.
+    location: "src/server/mod.rs:48-62"
+    status: accepted
+    fix_note: >-
+      OUT OF SCOPE this milestone (OpenClaw default kept, per review request).
+      Not reopened as HIGH. Flagged for a follow-up hardening milestone: the
+      permissive default is what makes f2's 120s window reachable cross-origin
+      from a victim browser context, so f2 and f3 should be closed together.
+
+  - id: "f4"
+    severity: LOW
+    category: testing
+    description: >-
+      The prior "exactly one claimer wins" single-use property is intentionally
+      GONE — the claim-window makes within-window claims idempotent (all get the
+      same token). The new invariants (all claims within window → same token;
+      first claim after window → None + permanent clear; wait/scanned → None;
+      unknown → None) are covered only by sequential single-threaded tests.
+      No multi-thread test asserts the write-lock actually serializes concurrent
+      claimers so none observes a torn/half-cleared state.
+    suggestion: >-
+      Add a tokio multi-thread test sharing Arc<RwLock<PairingRegistry>>: confirm
+      a code, backdate confirmed_at past the window, spawn N tasks racing
+      claim_confirmed_vtoken, assert exactly one observes Some(token) (the
+      clearing claim) and the rest observe None — pinning the after-window clear
+      under contention.
+    location: "src/hub/pairing.rs:635-721"
+    status: partial
+    fix_note: >-
+      Downgraded HIGH→LOW: the security-critical assertion (no token leak after
+      window) is covered sequentially and the method is documented as
+      write-lock-serialized. Concurrency test is a nice-to-have, not blocking.
+
+  - id: "f5"
+    severity: MEDIUM
+    category: testing
+    description: >-
+      Still no HTTP-level integration test driving build_router through
+      confirm → poll(token, lost/retry) → poll(token again within window) →
+      backdated poll(None after window). The write-lock + claim wiring inside
+      qrcode_status_json and the baseurl-only-when-confirmed branch
+      (src/server/pairing.rs:601-609) remain untested end-to-end; only the
+      registry unit method and the CORS layer are exercised.
+    suggestion: >-
+      Add a tests/ integration test: build router, create QR, GET /hub/pair/{code}
+      to scan, POST confirm with X-Pair-CSRF + allowed Origin, then GET
+      /ilink/bot/get_qrcode_status twice within the window (assert same non-empty
+      bot_token both times, baseurl present).
+    location: "src/server/pairing.rs:577-648, tests/cors_tests.rs"
+    status: open
+
+  - id: "f6"
+    severity: LOW
+    category: maintainability
+    description: >-
+      pair_page still fires pairing_notify.notify_waiters() on every load of an
+      existing code, ignoring mark_scanned's return value: `changed` is set to
+      true whenever get(&code).is_some() (src/server/pairing.rs:657-663). Each
+      spurious wake makes every long-poll re-acquire the write lock and re-run
+      purge_expired (O(n) retain) plus a claim_confirmed_vtoken.
+    suggestion: >-
+      Set `changed` to the boolean returned by mark_scanned so notify_waiters
+      only fires on a real Wait→Scanned transition.
+    location: "src/server/pairing.rs:654-665"
+    status: open
+
+  - id: "f7"
+    severity: MEDIUM
+    category: boundary
+    description: >-
+      Residual of f1 not covered by the claim-window: the register/store row is
+      inserted at confirm time and is never rolled back on pairing abandonment.
+      If the legitimate client never claims the token within 120s (client
+      suspended/backgrounded, process restarted into a fresh pairing flow, or a
+      >120s connectivity gap), the token is permanently cleared after the window
+      yet the confirmed registry row persists → the same name still returns
+      NameCollision/409, and a poll after the window returns confirmed+None so
+      the CLI hard-aborts. The claim-window shrinks the probability of the wedge
+      but does not eliminate the underlying orphan-row problem for the
+      abandonment case.
+    suggestion: >-
+      Either (a) roll back register_confirmed_client_in_hub when a confirmed
+      pairing's token is cleared unclaimed after the window (so the name frees
+      up), or (b) make the CLI treat confirmed+bot_token=None as retryable/
+      re-pairable rather than a hard abort, or (c) document this as an explicit
+      accepted operational edge in implement.md so it is a decision, not a gap.
+    location: "src/hub/pairing.rs:187-190, src/server/pairing.rs (register_confirmed_client_in_hub), src/client/pairing.rs:249-253"
+    status: open
+
+adversarial_tests:
+  - id: "at1"
+    type: unit
+    description: >-
+      After-window clear under contention: confirm a code, backdate confirmed_at
+      to VTOKEN_CLAIM_WINDOW+1s, then spawn N tokio tasks sharing
+      Arc<RwLock<PairingRegistry>> each calling claim_confirmed_vtoken once.
+    expected_behavior: >-
+      Exactly one task observes Some(token) (the clearing claim) and all others
+      observe None; the stored session ends with vtoken=None and
+      status=confirmed. Proves the write-lock serializes the post-window clear so
+      no second claimer can re-read a not-yet-cleared token.
+    added_to_suite: false
+
+  - id: "at2"
+    type: e2e
+    description: >-
+      Lost-first-response recovery through build_router: create QR, scan via
+      GET /hub/pair/{code}, POST confirm with X-Pair-CSRF + allowed Origin, then
+      GET /ilink/bot/get_qrcode_status TWICE within the window (simulating a
+      first response that the client discarded).
+    expected_behavior: >-
+      Both polls return 200 with status=confirmed and the SAME non-empty
+      bot_token (baseurl present). Proves the claim-window makes delivery
+      idempotent at the HTTP layer and the f1 wedge is closed.
+    added_to_suite: false
+
+  - id: "at3"
+    type: e2e
+    description: >-
+      Abandonment wedge (f7): confirm a pairing under a chosen name, do NOT poll,
+      backdate confirmed_at past the window, then (a) GET get_qrcode_status once
+      and (b) attempt to re-pair/register a confirmed client with the SAME name.
+    expected_behavior: >-
+      Documents the residual: (a) poll yields status=confirmed with
+      bot_token=None (CLI would hard-abort), and (b) re-register returns
+      NameCollision/409. Confirms whether the team accepts the abandonment edge
+      or adds registry rollback / retryable client handling.
+    added_to_suite: false
+
+summary: |
+  The 120s VTOKEN_CLAIM_WINDOW adequately fixes f1 HIGH: because within-window
+  claims re-return the vtoken without clearing, a lost first get_qrcode_status
+  response is recovered by the client's existing error-retry loop, and the 24h
+  re-poll steal hole stays closed by the permanent after-window clear. Unit
+  coverage (reclaim-within-window, clear-after-window, wait/scanned/unknown)
+  passes (19/19). Accepted residuals hold up under adversarial scrutiny: f2's
+  read window widened to 120s but its coupled theft+DoS is gone, and f3 is a
+  deferred CORS default. One MEDIUM residual of f1 remains (f7: unclaimed-after
+  -window abandonment still orphans the registry row + NameCollision), plus
+  MEDIUM/LOW testing and maintainability gaps (f4/f5/f6) — none are new
+  CRITICAL/HIGH. Verdict PASS.
