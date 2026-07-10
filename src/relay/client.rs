@@ -682,4 +682,20 @@ mod tests {
         let _ = mock_ws.await;
         let _ = mock_hub.await;
     }
+
+    /// `unix_now()` must return a positive Unix timestamp in a plausible range.
+    /// This pins the `as_secs() as i64` conversion so a mutant swapping the cast
+    /// type (e.g. `as u64`) or changing the epoch origin is immediately caught.
+    #[test]
+    fn unix_now_returns_positive_timestamp_in_plausible_range() {
+        let ts = unix_now();
+        // 2020-01-01 00:00:00 UTC in Unix seconds
+        let year_2020: i64 = 1_577_836_800;
+        // 2100-01-01 00:00:00 UTC in Unix seconds
+        let year_2100: i64 = 4_102_444_800;
+        assert!(
+            ts > year_2020 && ts < year_2100,
+            "unix_now() = {ts} is outside the expected [2020, 2100) range"
+        );
+    }
 }

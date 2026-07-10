@@ -462,4 +462,127 @@ mod tests {
             "create must succeed once the immortal Confirmed entry is evicted"
         );
     }
+
+    /// M2-1: pre_check_confirm with a wrong CSRF token must return CsrfMismatch.
+    /// Catches the `constant_time_eq(...) → true` mutant (195:28) which would
+    /// bypass the CSRF guard and allow any token to confirm a scanned session.
+    #[test]
+    fn pre_check_confirm_rejects_wrong_csrf() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        // correct csrf is stored in the session; pass a different string.
+        let err = reg
+            .pre_check_confirm(&code, "definitely-wrong-csrf")
+            .unwrap_err();
+        assert_eq!(
+            err,
+            PairingError::CsrfMismatch,
+            "wrong CSRF must be rejected with CsrfMismatch"
+        );
+    }
+
+    /// M2-2: pre_check_confirm with the correct CSRF token must return Ok.
+    /// Together with M2-1, this creates a passing/failing pair that catches
+    /// both directions of the constant_time_eq mutant.
+    #[test]
+    fn pre_check_confirm_accepts_correct_csrf() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.pre_check_confirm(&code, &csrf)
+            .expect("correct CSRF must be accepted");
+    }
+
+    /// M2-3: A freshly Confirmed session must not be considered expired even
+    /// after PAIRING_TTL. Catches the `delete match arm PairingStatus::Confirmed`
+    /// mutant (52:13) in `is_expired` which would make Confirmed sessions
+    /// expire after PAIRING_TTL using the catch-all branch.
+    #[test]
+    fn confirmed_session_is_not_expired_after_pairing_ttl() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.confirm(&code, "client".into(), None, "vhub_ok".into(), &csrf)
+            .unwrap();
+
+        // Backdate created_at past PAIRING_TTL to exercise the TTL branch.
+        // A Confirmed session should still report "confirmed", not "expired".
+        reg.confirmed_sessions.get_mut(&code).unwrap().0.created_at =
+            Instant::now() - Duration::from_secs(PAIRING_TTL.as_secs() + 5);
+
+        assert_eq!(
+            reg.get(&code).unwrap().status_str(),
+            "confirmed",
+            "Confirmed session must not appear expired after PAIRING_TTL"
+        );
+    }
+
+    /// M2-4: A Wait-status session past PAIRING_TTL must be evicted by
+    /// purge_expired. Catches the `should_evict → false` mutant (70:9) and the
+    /// `purge_expired < → <=` mutant (116:67) — if should_evict always returns
+    /// false, expired sessions never disappear and the cap becomes ineffective.
+    #[test]
+    fn purge_expired_removes_stale_wait_sessions() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        // Backdate past PAIRING_TTL so should_evict returns true.
+        reg.sessions.get_mut(&code).unwrap().created_at =
+            Instant::now() - Duration::from_secs(PAIRING_TTL.as_secs() + 5);
+
+        reg.purge_expired();
+
+        assert!(
+            reg.get(&code).is_none(),
+            "stale Wait session must be removed by purge_expired"
+        );
+    }
+
+    /// M2-5: A Scanned-status session past SCANNED_TTL must be evicted by
+    /// purge_expired. Catches should_evict comparison mutants for Scanned branch.
+    #[test]
+    fn purge_expired_removes_stale_scanned_sessions() {
+        let mut reg = PairingRegistry::new();
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        // Backdate scanned_at well past SCANNED_TTL.
+        let session = reg.sessions.get_mut(&code).unwrap();
+        session.scanned_at = Some(Instant::now() - Duration::from_secs(SCANNED_TTL.as_secs() + 5));
+
+        reg.purge_expired();
+
+        assert!(
+            reg.get(&code).is_none(),
+            "stale Scanned session must be removed by purge_expired"
+        );
+    }
+
+    /// M2-6: confirmed_sessions count toward the session cap.
+    /// Catches the `sessions.len() + confirmed.len()` → `sessions.len() - confirmed.len()`
+    /// mutant (121:32): if subtraction is used, having confirmed sessions would
+    /// *lower* the effective count, allowing more sessions than the cap allows.
+    #[test]
+    fn session_cap_includes_confirmed_sessions() {
+        let mut reg = PairingRegistry::new();
+        // Fill up to (MAX - 1) with normal sessions.
+        for _ in 0..(MAX_PAIRING_SESSIONS - 1) {
+            reg.create().unwrap();
+        }
+        // Create and confirm one more session (moves to confirmed_sessions).
+        let code = reg.create().unwrap();
+        reg.mark_scanned(&code);
+        let csrf = reg.get(&code).unwrap().csrf.clone().unwrap();
+        reg.confirm(&code, "c".into(), None, "vhub_cap".into(), &csrf)
+            .unwrap();
+        // sessions has MAX-1 entries, confirmed_sessions has 1 → total == MAX.
+        // create() must fail regardless of whether we use + or -.
+        let err = reg.create().unwrap_err();
+        assert_eq!(
+            err,
+            PairingError::TooManySessions,
+            "cap must account for both pending and confirmed sessions"
+        );
+    }
 }

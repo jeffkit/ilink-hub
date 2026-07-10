@@ -1,0 +1,94 @@
+name: Mutation Testing
+
+on:
+  # 每周一凌晨 3 点（UTC）自动运行全量扫描
+  schedule:
+    - cron: '0 3 * * 1'
+  # 手动触发，可选指定单文件
+  workflow_dispatch:
+    inputs:
+      file:
+        description: |
+          单文件扫描路径（可选）。
+          留空 = 扫描 mutants.toml examine_globs 全部文件。
+          示例: src/hub/commands.rs
+        required: false
+        default: ''
+      parallelism:
+        description: '并发 job 数 (-j)'
+        required: false
+        default: '2'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # 防止集成测试并发竞争
+  RUST_TEST_THREADS: 1
+
+jobs:
+  mutants:
+    name: cargo-mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 全量扫描最多 6 小时
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+
+      - name: Run mutation tests (single file)
+        if: ${{ inputs.file != '' }}
+        run: |
+          echo "### Mutation Testing: \`${{ inputs.file }}\`" >> $GITHUB_STEP_SUMMARY
+          cargo mutants \
+            --file "${{ inputs.file }}" \
+            -j "${{ inputs.parallelism || 2 }}" \
+            --annotations=github \
+            2>&1 | tee /tmp/mutants-output.txt
+        env:
+          DATABASE_URL: "sqlite::memory:"
+
+      - name: Run mutation tests (full scan)
+        if: ${{ inputs.file == '' }}
+        run: |
+          echo "### Mutation Testing: Full Scan" >> $GITHUB_STEP_SUMMARY
+          cargo mutants \
+            -j "${{ inputs.parallelism || 2 }}" \
+            --annotations=github \
+            2>&1 | tee /tmp/mutants-output.txt
+        env:
+          DATABASE_URL: "sqlite::memory:"
+
+      - name: Generate summary
+        if: always()
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Results" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Show last 50 lines (summary section)
+          tail -50 /tmp/mutants-output.txt >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+          # Show missed mutants if any
+          if [ -f mutants.out/missed.txt ] && [ -s mutants.out/missed.txt ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "#### ⚠️ Missed Mutants" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat mutants.out/missed.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload mutants output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-out-${{ github.run_id }}
+          path: mutants.out/
+          retention-days: 30

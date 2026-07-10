@@ -267,6 +267,80 @@ mod tests {
     use super::*;
     use crate::bridge::config::BridgeProfile;
 
+    // ── ProbeError::error_type ────────────────────────────────────────────────
+
+    /// M9-probe-1: error_type 必须为每个变体返回其对应的静态字符串。
+    /// 捕捉 match 分支被替换为 "" 或 "xyzzy" 的变异。
+    #[test]
+    fn probe_error_type_returns_correct_string_for_all_variants() {
+        assert_eq!(ProbeError::NotFound("cmd".into()).error_type(), "NotFound");
+        assert_eq!(
+            ProbeError::ConfigError("dir".into()).error_type(),
+            "ConfigError"
+        );
+        assert_eq!(
+            ProbeError::Unauthenticated("hint".into()).error_type(),
+            "Unauthenticated"
+        );
+        assert_eq!(
+            ProbeError::ExecutionError("msg".into()).error_type(),
+            "ExecutionError"
+        );
+    }
+
+    // ── check_command_exists ──────────────────────────────────────────────────
+
+    /// M9-probe-2: 空命令名必须直接返回 false。
+    /// 捕捉 `if command.is_empty() { return false }` → `return true` 的变异。
+    #[test]
+    fn check_command_exists_empty_string_returns_false() {
+        assert!(!check_command_exists(""), "empty command must return false");
+    }
+
+    /// M9-probe-3: 含路径分隔符的参数走文件存在性检查；不存在的绝对路径必须返回 false。
+    /// 捕捉 `command.contains('/')` → `!command.contains('/')` 的变异，
+    /// 以及 `path.exists() && path.is_file()` → `path.exists() || path.is_file()` 的变异。
+    #[test]
+    fn check_command_exists_absolute_nonexistent_path_returns_false() {
+        assert!(
+            !check_command_exists("/nonexistent-path-ilink-test/cmd"),
+            "nonexistent absolute path must return false"
+        );
+    }
+
+    /// M9-probe-4: 含路径分隔符的参数走文件存在性检查；已知存在的可执行文件必须返回 true。
+    /// 捕捉 `path.exists() && path.is_file()` 整体被替换为 `true` 或 `false` 的变异。
+    #[cfg(unix)]
+    #[test]
+    fn check_command_exists_absolute_path_to_real_executable_returns_true() {
+        // /bin/sh 在所有 POSIX 系统都存在
+        assert!(
+            check_command_exists("/bin/sh"),
+            "/bin/sh must exist as a file"
+        );
+    }
+
+    /// M9-probe-5: 不含路径分隔符的命令名走 find_in_path_robust；
+    /// 系统中肯定存在 `sh`，必须返回 true。
+    #[test]
+    fn check_command_exists_command_name_in_path_returns_true() {
+        // `sh` 必然在 PATH 中
+        assert!(
+            check_command_exists("sh"),
+            "sh must be found in PATH on any POSIX system"
+        );
+    }
+
+    /// M9-probe-6: 不在 PATH 中的随机名字必须返回 false。
+    /// 捕捉 `find_in_path_robust(command).is_some()` → `true` 的变异。
+    #[test]
+    fn check_command_exists_unknown_command_returns_false() {
+        assert!(
+            !check_command_exists("nonexistent-cmd-ilink-test-99"),
+            "random command must not be found"
+        );
+    }
+
     #[tokio::test]
     async fn test_probe_profile_light_and_dry_run() {
         let profile_missing_cwd = BridgeProfile {

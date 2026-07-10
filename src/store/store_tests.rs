@@ -3258,3 +3258,364 @@ async fn find_vtoken_for_session_resolves_persona_footer_fallback() {
         .unwrap();
     assert!(not_found.is_none());
 }
+
+// ─── Store layer mutation-catching tests (Phase C) ────────────────────────────
+
+/// M9-store-1: find_or_create_vctx with a non-empty group_id must use the
+/// "group:<id>" conv_key prefix.
+/// Catches the `!s.is_empty()` → `s.is_empty()` mutant in the group_id filter
+/// (context.rs:56), and the `format!("group:{g}")` → other format mutants.
+#[tokio::test]
+async fn find_or_create_vctx_group_id_uses_group_prefix() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let vctx = store
+        .find_or_create_vctx("peer-x", Some("group-abc"), "real-ctx")
+        .await
+        .expect("must succeed");
+    assert!(!vctx.is_empty(), "vctx must be non-empty for group message");
+
+    // Same group_id must return same vctx (stable key).
+    let vctx2 = store
+        .find_or_create_vctx("peer-y", Some("group-abc"), "real-ctx-2")
+        .await
+        .expect("must succeed");
+    assert_eq!(
+        vctx, vctx2,
+        "same group_id must always resolve to the same vctx regardless of peer_user_id"
+    );
+}
+
+/// M9-store-2: find_or_create_vctx with an empty group_id must fall through to
+/// the peer_user_id path.
+/// Catches `group_id.filter(|s| !s.is_empty())` → always-Some mutant.
+#[tokio::test]
+async fn find_or_create_vctx_empty_group_id_falls_through_to_peer() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+
+    let vctx_with_empty_group = store
+        .find_or_create_vctx("peer-unique-1", Some(""), "real-ctx")
+        .await
+        .expect("must succeed");
+    let vctx_with_no_group = store
+        .find_or_create_vctx("peer-unique-1", None, "real-ctx")
+        .await
+        .expect("must succeed");
+    assert_eq!(
+        vctx_with_empty_group, vctx_with_no_group,
+        "empty group_id must be treated same as None (peer path)"
+    );
+}
+
+/// M9-store-3: find_or_create_vctx with empty peer_user_id and no group_id
+/// must still succeed (creates an anonymous context).
+/// Catches the `!peer_user_id.is_empty()` → always-true mutant (context.rs:58).
+#[tokio::test]
+async fn find_or_create_vctx_empty_peer_and_no_group_returns_vctx() {
+    let store = crate::store::Store::connect("sqlite::memory:")
+        .await
+        .expect("connect");
+    let vctx = store
+        .find_or_create_vctx("", None, "real-ctx-anon")
+        .await
+        .expect("empty peer must still create a vctx");
+    assert!(
+        !vctx.is_empty(),
+        "vctx must be non-empty even for anonymous context"
+    );
+}
+
+// ─── clients.rs mutation catch-up (2026-07-10) ───────────────────────────────
+
+/// Catches `touch_client → Ok(())` no-op: last_seen must be set after touch.
+#[tokio::test]
+async fn touch_client_advances_last_seen() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_touch-client-aaaaaaaaaaaaaaa");
+    store
+        .upsert_client(&hashed, "touch-me", None)
+        .await
+        .expect("upsert");
+
+    // Fresh INSERT does not set last_seen (only ON CONFLICT UPDATE does).
+    let before = store
+        .get_client_by_name("touch-me")
+        .await
+        .expect("get")
+        .expect("row")
+        .last_seen;
+
+    store.touch_client(&hashed).await.expect("touch");
+
+    let after = store
+        .get_client_by_name("touch-me")
+        .await
+        .expect("get")
+        .expect("row")
+        .last_seen;
+    assert!(
+        after.is_some(),
+        "touch_client must populate last_seen, got None"
+    );
+    assert_ne!(
+        before, after,
+        "touch_client must change last_seen (before={before:?}, after={after:?})"
+    );
+}
+
+/// Catches `get_client_by_name → Ok(None)`: existing name must return Some with fields.
+#[tokio::test]
+async fn get_client_by_name_returns_existing_row() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_get-by-name-bbbbbbbbbbbbbbb");
+    store
+        .upsert_client(&hashed, "named-client", Some("lbl"))
+        .await
+        .expect("upsert");
+
+    let row = store
+        .get_client_by_name("named-client")
+        .await
+        .expect("get")
+        .expect("must find named-client");
+    assert_eq!(row.vtoken, hashed);
+    assert_eq!(row.name, "named-client");
+    assert_eq!(row.label.as_deref(), Some("lbl"));
+
+    let missing = store
+        .get_client_by_name("no-such-client")
+        .await
+        .expect("get missing");
+    assert!(missing.is_none(), "unknown name must return None");
+}
+
+/// Catches `update_client_description → Ok(())` no-op.
+/// Column is `NOT NULL DEFAULT ''`; empty string maps to `None` in ClientRow.
+#[tokio::test]
+async fn update_client_description_persists() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_desc-client-cccccccccccccccc");
+    store
+        .upsert_client(&hashed, "desc-client", None)
+        .await
+        .expect("upsert");
+
+    store
+        .update_client_description(&hashed, Some("hello desc"))
+        .await
+        .expect("update description");
+
+    let row = store
+        .get_client_by_name("desc-client")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.description.as_deref(), Some("hello desc"));
+
+    // Clear via empty string (column is NOT NULL).
+    store
+        .update_client_description(&hashed, Some(""))
+        .await
+        .expect("clear description");
+    let row = store
+        .get_client_by_name("desc-client")
+        .await
+        .expect("get")
+        .expect("row");
+    assert!(
+        row.description.is_none(),
+        "empty description must map to None, got {:?}",
+        row.description
+    );
+}
+
+/// Catches `delete_client_by_name → Ok(true/false)` and `rows_affected > 0`
+/// comparison mutants (`>` → `==` / `<` / `>=`).
+#[tokio::test]
+async fn delete_client_by_name_reports_whether_row_existed() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_del-client-dddddddddddddddd");
+    store
+        .upsert_client(&hashed, "del-me", None)
+        .await
+        .expect("upsert");
+
+    let deleted = store
+        .delete_client_by_name("del-me")
+        .await
+        .expect("delete existing");
+    assert!(deleted, "deleting an existing client must return true");
+    assert!(
+        store
+            .get_client_by_name("del-me")
+            .await
+            .expect("get")
+            .is_none(),
+        "row must be gone after delete"
+    );
+
+    let deleted_again = store
+        .delete_client_by_name("del-me")
+        .await
+        .expect("delete missing");
+    assert!(
+        !deleted_again,
+        "deleting a missing client must return false (catches >= 0)"
+    );
+}
+
+/// Catches `update_client_by_vtoken → Ok(())` no-op.
+#[tokio::test]
+async fn update_client_by_vtoken_persists_name_and_label() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_upd-by-vt-eeeeeeeeeeeeeeee");
+    store
+        .upsert_client(&hashed, "old-name", Some("old-label"))
+        .await
+        .expect("upsert");
+
+    store
+        .update_client_by_vtoken(&hashed, "new-name", Some("new-label"))
+        .await
+        .expect("update by vtoken");
+
+    assert!(
+        store
+            .get_client_by_name("old-name")
+            .await
+            .expect("get")
+            .is_none(),
+        "old name must no longer resolve"
+    );
+    let row = store
+        .get_client_by_name("new-name")
+        .await
+        .expect("get")
+        .expect("new name must resolve");
+    assert_eq!(row.vtoken, hashed);
+    assert_eq!(row.label.as_deref(), Some("new-label"));
+}
+
+/// Catches `update_client_persona → Ok(())` no-op.
+#[tokio::test]
+async fn update_client_persona_persists() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let hashed = hash_vtoken("vhub_persona-client-ffffffffffff");
+    store
+        .upsert_client(&hashed, "persona-client", None)
+        .await
+        .expect("upsert");
+
+    store
+        .update_client_persona(&hashed, Some("Ada"), Some("🤖"))
+        .await
+        .expect("update persona");
+
+    let row = store
+        .get_client_by_name("persona-client")
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(row.persona_name.as_deref(), Some("Ada"));
+    assert_eq!(row.persona_emoji.as_deref(), Some("🤖"));
+}
+
+// ─── context.rs mutation catch-up (2026-07-10) ───────────────────────────────
+
+/// Pre-v7 schema lacks the partial unique index; upsert must fall back to the
+/// two-step path and still return a stable vctx for the same peer.
+#[tokio::test]
+async fn find_or_create_vctx_pre_v7_fallback_is_stable() {
+    sqlx::any::install_default_drivers();
+    let pool = sqlx::pool::PoolOptions::<sqlx::Any>::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .expect("pool");
+    let store = Store {
+        rpool: pool.clone(),
+        pool,
+        kind: DatabaseKind::Sqlite,
+        master_key: std::sync::OnceLock::new(),
+    };
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                migrated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP)
+            )",
+        )
+        .await
+        .expect("schema_version");
+    store
+        .ddl(
+            "CREATE TABLE IF NOT EXISTS context_token_map (
+                vctx TEXT PRIMARY KEY,
+                real_ctx TEXT NOT NULL,
+                peer_user_id TEXT NOT NULL DEFAULT '',
+                created_at TEXT
+            )",
+        )
+        .await
+        .expect("context_token_map");
+    for v in 1..=12 {
+        store.record_migration_run(v).await.expect("mark migrated");
+    }
+
+    let v1 = store
+        .find_or_create_vctx("peer-pre-v7", None, "real-1")
+        .await
+        .expect("first create");
+    let v2 = store
+        .find_or_create_vctx("peer-pre-v7", None, "real-2")
+        .await
+        .expect("second create must fall back, not fail");
+    assert_eq!(
+        v1, v2,
+        "same peer must keep stable vctx via two-step fallback"
+    );
+    assert_eq!(
+        store
+            .resolve_context_token(&v1)
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some("real-2"),
+        "fallback path must update real_ctx"
+    );
+}
+
+/// Anonymous contexts must resolve by freshly minted vctx, not the first empty
+/// `peer_user_id` row left in the table (context.rs:135 `!conv_key.is_empty()`).
+#[tokio::test]
+async fn find_or_create_vctx_anonymous_resolve_uses_minted_vctx() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let anon1 = store
+        .find_or_create_vctx("", None, "anon-one")
+        .await
+        .expect("anon1");
+    store
+        .find_or_create_vctx("peer-between", None, "peer-ctx")
+        .await
+        .expect("peer");
+    let anon2 = store
+        .find_or_create_vctx("", None, "anon-two")
+        .await
+        .expect("anon2");
+    assert_ne!(
+        anon1, anon2,
+        "each anonymous call must mint a distinct vctx"
+    );
+    assert_eq!(
+        store
+            .resolve_context_token(&anon2)
+            .await
+            .expect("resolve")
+            .as_deref(),
+        Some("anon-two"),
+        "second anonymous context must not alias the first empty-scope row"
+    );
+}

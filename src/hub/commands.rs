@@ -465,3 +465,206 @@ fn build_help_text() -> String {
      4. AI 服务调用 /ilink/bot/getupdates 接收消息，并通过 /ilink/bot/sendmessage 回复"
         .to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::{AdminConfig, HubState, InMemoryQueue};
+    use crate::ilink::types::WeixinMessage;
+    use std::sync::Arc;
+
+    async fn make_hub_state() -> Arc<HubState> {
+        make_hub_state_with_upstream(crate::hub::tests::MockUpstream::returning_ok()).await
+    }
+
+    async fn make_hub_state_with_upstream(
+        upstream: Arc<dyn crate::ilink::UpstreamSink>,
+    ) -> Arc<HubState> {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let queue: Arc<dyn crate::MessageQueue> = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        HubState::new(
+            upstream,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
+    }
+
+    /// M1-1: handle_cmd_broadcast with no online clients must return the correct
+    /// count string. Catches the mutant that replaces the whole function body
+    /// with String::new() or "xyzzy".
+    #[tokio::test]
+    async fn broadcast_to_no_online_clients_returns_zero_count() {
+        let state = make_hub_state().await;
+        let msg = WeixinMessage::default();
+        let result = handle_cmd_broadcast(&state, "user1", "ctx-abc", &msg, "hello").await;
+        assert_eq!(
+            result, "📡 Broadcast to 0 client(s)",
+            "broadcast with no online clients must report 0"
+        );
+    }
+
+    /// M1-2: handle_cmd_status with no clients must return a non-empty hub
+    /// status string. Catches the mutant that replaces the function with String::new().
+    #[tokio::test]
+    async fn status_with_no_clients_returns_hub_status_string() {
+        let state = make_hub_state().await;
+        let result = handle_cmd_status(&state).await;
+        assert!(
+            result.contains("iLink Hub 状态：0/0"),
+            "status with no clients must contain '0/0', got: {result:?}"
+        );
+    }
+
+    /// M1-3: handle_cmd_session_list with no backend selected (no routing
+    /// entry for the user) must return the NO_BACKEND message.
+    /// Catches the == → != mutant on vtoken match and sessions.is_empty() → false.
+    #[tokio::test]
+    async fn session_list_with_no_backend_returns_no_backend_message() {
+        let state = make_hub_state().await;
+        let result = handle_cmd_session_list(&state, "user-no-backend", "ctx-xyz", None).await;
+        assert_eq!(
+            result,
+            messages::NO_BACKEND,
+            "session list with no backend must return NO_BACKEND message"
+        );
+    }
+
+    /// M1-4: handle_hub_command with an empty context_token must return early
+    /// without calling upstream. Catches `!ctx.is_empty()` → true (would send).
+    #[tokio::test]
+    async fn handle_hub_command_with_empty_context_token_returns_early() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            0,
+            "empty context_token must not call send_message"
+        );
+    }
+
+    /// M1-4b: missing context_token (None) must also skip upstream send.
+    #[tokio::test]
+    async fn handle_hub_command_with_none_context_token_skips_send() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: None,
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(mock_ref.polls_ok(), 0);
+    }
+
+    /// M1-5: handle_hub_command with a valid context_token must call send_message
+    /// exactly once via MockUpstream. Verifies the upstream is called regardless of
+    /// whether resp.ret is zero or non-zero.
+    #[tokio::test]
+    async fn handle_hub_command_calls_send_message_once() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: Some("ctx-valid-123".to_string()),
+            from_user_id: Some("user1".to_string()),
+            ..Default::default()
+        };
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Help).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            1,
+            "send_message must be called exactly once for a valid context"
+        );
+    }
+
+    /// M1-6: handle_hub_command with a valid context_token and MockUpstream
+    /// returning non-zero ret must still complete without panicking.
+    /// Catches the send_message → Ok(()) no-op mutant.
+    #[tokio::test]
+    async fn handle_hub_command_completes_when_upstream_returns_err_ret() {
+        let mock = crate::hub::tests::MockUpstream::returning_err(1, "mock rejected");
+        let mock_ref = Arc::clone(&mock);
+        let state = make_hub_state_with_upstream(mock).await;
+        let msg = WeixinMessage {
+            context_token: Some("ctx-err-test".to_string()),
+            from_user_id: Some("user-err".to_string()),
+            ..Default::default()
+        };
+        // Even with a non-zero ret from upstream, must not panic.
+        handle_hub_command(Arc::clone(&state), msg, HubCommand::Status).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            1,
+            "send_message must still be called once even when upstream returns error"
+        );
+    }
+
+    /// M1-7: session list with a routed backend but zero sessions must use the
+    /// empty-sessions message (not the non-empty list formatter).
+    /// Catches `sessions.is_empty()` match guard → false.
+    #[tokio::test]
+    async fn session_list_with_backend_but_no_sessions_uses_empty_message() {
+        let state = make_hub_state().await;
+        let hashed = {
+            let mut registry = state.clients.registry.write().await;
+            let (_plain, hashed, _) = registry.register("backend-a".into(), None, None);
+            hashed
+        };
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_route("user-sess", hashed);
+        }
+
+        let result = handle_cmd_session_list(&state, "user-sess", "ctx-sess", None).await;
+        assert_eq!(
+            result,
+            format!(
+                "当前后端 `backend-a` {}",
+                messages::SESSION_LIST_NO_SESSIONS
+            ),
+            "empty session list must use empty-sessions template, got: {result:?}"
+        );
+    }
+
+    /// M1-8: when a matching client exists, session list must use the client name
+    /// (not redact_token). Catches `c.vtoken == vtoken` → `!=`.
+    #[tokio::test]
+    async fn session_list_uses_client_name_not_redacted_token() {
+        let state = make_hub_state().await;
+        let hashed = {
+            let mut registry = state.clients.registry.write().await;
+            let (_plain, hashed, _) = registry.register("pretty-name".into(), None, None);
+            hashed
+        };
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_route("user-named", hashed);
+        }
+
+        let result = handle_cmd_session_list(&state, "user-named", "ctx-named", None).await;
+        assert!(
+            result.contains("pretty-name"),
+            "must display registered client name, got: {result:?}"
+        );
+        // redact_token shortens hashes; the display name path must win.
+        assert!(
+            result.starts_with("当前后端 `pretty-name`")
+                || result.contains("**后端 `pretty-name` 的 sessions：**"),
+            "must use client name in header, got: {result:?}"
+        );
+    }
+}

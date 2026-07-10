@@ -6,6 +6,101 @@ use crate::store::Store;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+// ─── MockUpstream ─────────────────────────────────────────────────────────────
+//
+// Minimal UpstreamSink implementation for unit tests.
+// Controls what send_message returns so tests can observe whether the
+// Hub correctly gates on a non-zero ret code.
+//
+// Usage (in any hub::* test module):
+//   use crate::hub::tests::MockUpstream;
+//   let upstream = MockUpstream::returning_ok();
+//   // or
+//   let upstream = MockUpstream::returning_err(1, "mock error");
+
+pub(crate) struct MockUpstream {
+    send_ret: i32,
+    send_msg: &'static str,
+    send_calls: std::sync::atomic::AtomicU64,
+}
+
+impl MockUpstream {
+    /// Build an Arc<dyn UpstreamSink> whose send_message always returns ret=0.
+    pub(crate) fn returning_ok() -> Arc<dyn crate::ilink::UpstreamSink> {
+        Arc::new(Self {
+            send_ret: 0,
+            send_msg: "",
+            send_calls: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Build an Arc<dyn UpstreamSink> whose send_message returns a non-zero ret.
+    pub(crate) fn returning_err(
+        ret: i32,
+        msg: &'static str,
+    ) -> Arc<dyn crate::ilink::UpstreamSink> {
+        Arc::new(Self {
+            send_ret: ret,
+            send_msg: msg,
+            send_calls: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::ilink::UpstreamSink for MockUpstream {
+    async fn notify_start(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn send_message(
+        &self,
+        _req: crate::ilink::types::SendMessageRequest,
+    ) -> anyhow::Result<crate::ilink::types::SendMessageResponse> {
+        self.send_calls.fetch_add(1, Ordering::Relaxed);
+        if self.send_ret == 0 {
+            Ok(crate::ilink::types::SendMessageResponse::ok())
+        } else {
+            Ok(crate::ilink::types::SendMessageResponse::err(
+                self.send_ret,
+                self.send_msg,
+            ))
+        }
+    }
+    async fn send_typing(
+        &self,
+        _req: crate::ilink::types::SendTypingRequest,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn get_config(
+        &self,
+        _req: crate::ilink::types::GetConfigRequest,
+    ) -> anyhow::Result<crate::ilink::types::GetConfigResponse> {
+        Ok(crate::ilink::types::GetConfigResponse::default())
+    }
+    async fn get_upload_url(
+        &self,
+        _req: crate::ilink::types::GetUploadUrlRequest,
+    ) -> anyhow::Result<crate::ilink::types::GetUploadUrlResponse> {
+        Ok(crate::ilink::types::GetUploadUrlResponse {
+            ret: 0,
+            upload_url: None,
+            media_id: None,
+            errmsg: None,
+        })
+    }
+    /// Reused as a send_message call counter for observability in tests.
+    fn polls_ok(&self) -> u64 {
+        self.send_calls.load(Ordering::Relaxed)
+    }
+    fn polls_err(&self) -> u64 {
+        0
+    }
+    fn relogin_attempts(&self) -> u64 {
+        0
+    }
+}
+
 /// Helper: extract `(per_vtoken, guard)` from a fresh `EnterOutcome`.
 /// Test code paths only deal with the `Ok` variant; the test helper
 /// makes the call sites match the production handler's destructure.

@@ -9,14 +9,18 @@ ilink-hub 使用 [`cargo-mutants`](https://mutants.rs/) 对核心业务逻辑进
 # 安装工具
 cargo install cargo-mutants
 
-# 针对 Phase 1 核心模块快速检查（约 48 分钟）
+# 预览当前配置会扫描哪些文件 / 变异体
+cargo mutants --list-files
+cargo mutants --list | wc -l
+
+# 单文件快速检查（推荐日常使用）
+# 注意：cargo-mutants ≥27 会把 CLI --file 与配置 examine_globs **合并**，
+# 单文件扫描请加 --no-config，否则会扫到全部白名单文件。
 RUST_TEST_THREADS=1 cargo mutants --no-config -j 2 \
   --file src/hub/vtoken_hash.rs \
-  --file src/hub/outbound_label.rs \
-  --file src/relay/ratelimit.rs \
-  --output mutants-output/phase1
+  --output mutants-output/vtoken_hash
 
-# 针对所有配置的目标文件运行（含 router、registry、queue 等）
+# 全量扫描（读取 .cargo/mutants.toml，约数小时）
 RUST_TEST_THREADS=1 cargo mutants -j 2 --output mutants-output/full
 ```
 
@@ -25,19 +29,25 @@ RUST_TEST_THREADS=1 cargo mutants -j 2 --output mutants-output/full
 
 ## 目标文件范围（.cargo/mutants.toml）
 
-| 文件 | 说明 | 优先级 |
+`examine_globs` 是白名单；`exclude_globs` 在 examine **之后**再过滤。
+**禁止**把已列入 examine 的目录整树写进 exclude（2026-07-09 已修复该冲突）。
+
+| 类别 | 文件 | 优先级 |
 |------|------|--------|
-| `src/hub/vtoken_hash.rs` | 安全关键：vtoken SHA-256 哈希 | P0 |
-| `src/hub/outbound_label.rs` | 出站消息格式化（纯函数，分支密集） | P1 |
-| `src/relay/ratelimit.rs` | 固定窗口限流逻辑 | P1 |
-| `src/hub/router.rs` | Hub 路由表 | P1 |
-| `src/hub/registry.rs` | 客户端注册表 | P1 |
-| `src/hub/queue.rs` | 消息队列实现 | P1 |
-| `src/hub/health.rs` | 健康检查逻辑 | P2 |
+| 安全关键 | `vtoken_hash` / `relay/auth` / `runtime/crypto` | P0 |
+| Hub 核心 | `router` / `registry` / `queue` / `commands` / `dispatch` / `pairing` | P0–P1 |
+| 纯函数 | `outbound_label` / `messages` / `quote_route` / `ratelimit` | P1 |
+| Store | `context` / `clients` / `sessions` / `messages` | P1 |
+| Bridge / MCP / Server | paths / dispatcher / config / executor / manager / probe / builtin / mcp/* / sse_ticket / routes | P2 |
+| I/O 密集 | `ilink/login` / `relay/client` / `ilink/upstream` | P2（async 路径可 timeout） |
+
+完整列表见 [`.cargo/mutants.toml`](../../.cargo/mutants.toml)。
 
 ## 基准结果
 
 详见 [baseline.md](baseline.md)。
+
+**目标 Mutation Score**：关键路径 ≥ **80%**；全量扫描低于该线时在 CI summary 告警（不做 PR 硬门禁）。
 
 ## 术语说明
 
@@ -49,8 +59,27 @@ RUST_TEST_THREADS=1 cargo mutants -j 2 --output mutants-output/full
 | **Timeout** | 测试超时（视为未捕获） |
 | **Mutation Score** | `caught / (caught + missed + timeout)` |
 
-## CI 集成（规划）
+## CI 集成
 
-目前变异测试仅在本地按需运行，不纳入 PR CI（耗时 ~1h）。
-未来计划：每周定时跑完整扫描，结果上传为 CI artifact，并在
-mutation score 低于基准线 80% 时告警。
+Workflow：[`.github/workflows/mutation-testing.yml`](../../.github/workflows/mutation-testing.yml)
+
+| 触发 | 行为 |
+|------|------|
+| 每周一 03:00 UTC | 全量扫描 `examine_globs` |
+| `workflow_dispatch` | 可指定单文件 + 并行度 |
+
+结果写入 Job Summary，并上传 `mutants.out/` artifact（保留 30 天）。
+**不**纳入 PR 必过质量门（全量耗时过长）。
+
+## 持续推进节奏
+
+1. **改关键路径后**：`cargo mutants --no-config -j 2 --file <path>`
+2. **每周**：依赖 CI 全量扫描，对照 baseline，处理新增 missed
+3. **扩 examine 前**：先补针对性单测 → 单文件扫到 ≥80% → 再写入 `examine_globs`
+4. **良性 missed**：写入 `exclude_re` 并在配置注释中说明理由（勿静默忽略）
+5. **暂缓项**：需 mock upstream / 可注入时钟的，记入 exec-plan，勿无限扩白名单
+
+## 相关文档
+
+- [baseline.md](baseline.md) — 分阶段基准与历史
+- Exec-plan：`docs/exec-plans/active/mutation-test-coverage/`、`mutation-test-coverage-p2/`

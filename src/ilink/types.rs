@@ -440,6 +440,125 @@ mod outbound_tests {
             "has_content() 对含空 TextItem 的 item_list 应返回 true（记录现有行为）"
         );
     }
+
+    // ── WeixinMessage::text() ────────────────────────────────────────────────
+
+    #[test]
+    fn text_returns_text_item_content() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), "hello".to_string());
+        assert_eq!(msg.text(), Some("hello"));
+    }
+
+    #[test]
+    fn text_falls_back_to_voice_item_asr_transcript() {
+        let msg = WeixinMessage {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(msg_type::VOICE),
+                voice_item: Some(VoiceItem {
+                    text: Some("voice asr text".to_string()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        assert_eq!(
+            msg.text(),
+            Some("voice asr text"),
+            "text() must fall back to voice_item ASR transcript"
+        );
+    }
+
+    #[test]
+    fn text_returns_none_when_no_item_list() {
+        let msg = WeixinMessage::default();
+        assert!(msg.text().is_none());
+    }
+
+    #[test]
+    fn text_returns_none_when_text_item_has_no_text_field_and_no_voice_fallback() {
+        let msg = WeixinMessage {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(msg_type::IMAGE),
+                image_item: Some(crate::ilink::types::ImageItem {
+                    cdn_url: Some("https://cdn.example.com/img.jpg".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        assert!(
+            msg.text().is_none(),
+            "image-only message must return None from text()"
+        );
+    }
+
+    // ── WeixinMessage::first_item_type() ─────────────────────────────────────
+
+    #[test]
+    fn first_item_type_returns_type_of_first_item() {
+        let msg = WeixinMessage::build_text_reply("ctx".to_string(), "hi".to_string());
+        assert_eq!(msg.first_item_type(), Some(msg_type::TEXT));
+    }
+
+    #[test]
+    fn first_item_type_returns_none_when_no_item_list() {
+        let msg = WeixinMessage::default();
+        assert!(msg.first_item_type().is_none());
+    }
+
+    // ── SendMessageRequest::reply_text() ─────────────────────────────────────
+
+    #[test]
+    fn reply_text_sets_to_user_id_when_non_empty() {
+        let req =
+            SendMessageRequest::reply_text("ctx".to_string(), "hi".to_string(), "user-123", None);
+        let to_user = req.msg.as_ref().unwrap().to_user_id.as_deref();
+        assert_eq!(
+            to_user,
+            Some("user-123"),
+            "non-empty to_user_id must be set on msg"
+        );
+    }
+
+    #[test]
+    fn reply_text_does_not_set_to_user_id_when_empty() {
+        let req = SendMessageRequest::reply_text("ctx".to_string(), "hi".to_string(), "", None);
+        let to_user = req.msg.as_ref().unwrap().to_user_id.as_deref();
+        assert!(to_user.is_none(), "empty to_user_id must NOT be set on msg");
+    }
+
+    #[test]
+    fn reply_text_sets_ilink_hub_ext_when_cli_session_id_provided() {
+        let req = SendMessageRequest::reply_text(
+            "ctx".to_string(),
+            "hi".to_string(),
+            "",
+            Some("session-uuid-abc".to_string()),
+        );
+        let ext = req.msg.as_ref().unwrap().ilink_hub_ext.as_ref();
+        assert!(ext.is_some(), "cli_session_id must set ilink_hub_ext");
+        assert_eq!(
+            ext.unwrap().cli_session_id.as_deref(),
+            Some("session-uuid-abc")
+        );
+    }
+
+    // ── SendMessageResponse::ok() / err() ────────────────────────────────────
+
+    #[test]
+    fn send_message_response_ok_has_ret_zero_and_no_errmsg() {
+        let r = SendMessageResponse::ok();
+        assert_eq!(r.ret, Some(0));
+        assert!(r.errmsg.is_none());
+    }
+
+    #[test]
+    fn send_message_response_err_has_non_zero_ret_and_errmsg() {
+        let r = SendMessageResponse::err(-1, "bad request");
+        assert_eq!(r.ret, Some(-1));
+        assert_eq!(r.errmsg.as_deref(), Some("bad request"));
+    }
 }
 
 // ─── GetUpdates (getupdates endpoint) ────────────────────────────────────────

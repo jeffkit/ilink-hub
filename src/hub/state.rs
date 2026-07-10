@@ -603,3 +603,178 @@ impl HubState {
         Some(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    // ─── LatencyHistogram::observe ───────────────────────────────────────────
+
+    #[test]
+    fn observe_increments_count_and_sum_us() {
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_millis(10));
+        assert_eq!(h.count.load(Ordering::Relaxed), 1);
+        // 10ms = 10_000 µs
+        assert_eq!(h.sum_us.load(Ordering::Relaxed), 10_000);
+    }
+
+    /// N-02 regression: sub-millisecond observations must contribute a
+    /// non-zero value to `sum_us` so rate calculations are meaningful.
+    #[test]
+    fn observe_sub_ms_contributes_non_zero_to_sum_us() {
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_micros(500)); // 0.5 ms = 500 µs
+        assert_eq!(
+            h.sum_us.load(Ordering::Relaxed),
+            500,
+            "500µs observation must add 500 to sum_us, not 0"
+        );
+    }
+
+    /// 1 ms sits exactly on the first boundary — must land in bucket[0] (≤ 1ms).
+    #[test]
+    fn observe_exactly_at_boundary_lands_in_lower_bucket() {
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_millis(1));
+        assert_eq!(
+            h.buckets[0].load(Ordering::Relaxed),
+            1,
+            "1ms (= boundary) must land in bucket[0] (≤ 1ms)"
+        );
+        assert_eq!(
+            h.buckets[1].load(Ordering::Relaxed),
+            0,
+            "bucket[1] must be empty"
+        );
+    }
+
+    /// 2 ms is above the 1 ms boundary — must NOT land in bucket[0].
+    #[test]
+    fn observe_just_above_boundary_lands_in_next_bucket() {
+        // HISTOGRAM_BUCKETS_MS = [1, 5, 25, 100, 500, 2500, 10000]
+        // 2ms > 1ms → not bucket[0]; 2ms ≤ 5ms → bucket[1]
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_millis(2));
+        assert_eq!(
+            h.buckets[0].load(Ordering::Relaxed),
+            0,
+            "2ms must NOT land in bucket[0] (> 1ms boundary)"
+        );
+        assert_eq!(
+            h.buckets[1].load(Ordering::Relaxed),
+            1,
+            "2ms must land in bucket[1] (≤ 5ms)"
+        );
+    }
+
+    /// Values above all boundaries must land in the overflow (+Inf) bucket.
+    #[test]
+    fn observe_above_all_boundaries_lands_in_overflow_bucket() {
+        let h = LatencyHistogram::new();
+        h.observe(Duration::from_millis(11_000)); // > 10_000ms — overflow
+        let overflow_idx = HISTOGRAM_BUCKETS_MS.len();
+        assert_eq!(
+            h.buckets[overflow_idx].load(Ordering::Relaxed),
+            1,
+            "11s must land in overflow bucket"
+        );
+        for i in 0..HISTOGRAM_BUCKETS_MS.len() {
+            assert_eq!(
+                h.buckets[i].load(Ordering::Relaxed),
+                0,
+                "bucket[{i}] must be empty"
+            );
+        }
+    }
+
+    // ─── PollTracker::enter ──────────────────────────────────────────────────
+
+    fn make_tracker(cap: usize) -> Arc<PollTracker> {
+        let t = Arc::new(PollTracker::default());
+        t.set_hub_cap(cap);
+        t
+    }
+
+    #[test]
+    fn enter_first_poll_returns_ok_with_per_vtoken_count_one() {
+        let t = make_tracker(10);
+        let outcome = t.enter("vtok-A");
+        assert!(
+            matches!(outcome, EnterOutcome::Ok { per_vtoken: 1, .. }),
+            "first enter must be Ok with per_vtoken=1"
+        );
+        assert_eq!(t.total_polls(), 1);
+    }
+
+    #[test]
+    fn enter_second_poll_same_vtoken_returns_count_two() {
+        let t = make_tracker(10);
+        let _g1 = t.enter("vtok-A");
+        let outcome = t.enter("vtok-A");
+        assert!(
+            matches!(outcome, EnterOutcome::Ok { per_vtoken: 2, .. }),
+            "second enter on same vtoken must be Ok with per_vtoken=2"
+        );
+    }
+
+    #[test]
+    fn enter_hub_cap_exceeded_returns_hub_limit_reached() {
+        let t = make_tracker(1);
+        let _g1 = t.enter("vtok-A"); // fills the cap
+        let outcome = t.enter("vtok-B");
+        assert!(
+            matches!(outcome, EnterOutcome::HubLimitReached { .. }),
+            "cap=1 with 1 active poll must reject next enter"
+        );
+    }
+
+    #[test]
+    fn enter_hub_limit_reached_rolls_back_total_counter() {
+        let t = make_tracker(1);
+        let _g1 = t.enter("vtok-A"); // fills cap
+        let _rejected = t.enter("vtok-B"); // triggers rollback
+                                           // total must be 1 (not 2) because the increment was rolled back
+        assert_eq!(
+            t.total_polls(),
+            1,
+            "rejected enter must roll back Hub-wide total"
+        );
+    }
+
+    #[test]
+    fn poll_guard_drop_decrements_total_and_removes_vtoken_entry() {
+        let t = make_tracker(10);
+        {
+            let outcome = t.enter("vtok-A");
+            assert_eq!(t.total_polls(), 1);
+            drop(outcome); // drops EnterOutcome → drops PollGuard → runs Drop impl
+        }
+        assert_eq!(
+            t.total_polls(),
+            0,
+            "PollGuard drop must decrement Hub-wide total to zero"
+        );
+        let counts = t.counts.lock().unwrap();
+        assert!(
+            !counts.contains_key("vtok-A"),
+            "zero-count vtoken entry must be removed from map"
+        );
+    }
+
+    #[test]
+    fn enter_outcome_guard_some_for_ok_none_for_hub_limit_reached() {
+        let t = make_tracker(10);
+        let ok = t.enter("vtok-A");
+        assert!(ok.guard().is_some(), "Ok variant must return Some(guard)");
+
+        let t2 = make_tracker(0);
+        let rejected = t2.enter("vtok-X");
+        assert!(
+            rejected.guard().is_none(),
+            "HubLimitReached must return None from guard()"
+        );
+    }
+}

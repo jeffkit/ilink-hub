@@ -154,3 +154,118 @@ pub struct StreamContentBlock {
     pub block_type: Option<String>,
     pub text: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── StreamMessage::text() ─────────────────────────────────────────────────
+
+    #[test]
+    fn stream_message_text_concatenates_text_blocks() {
+        let msg = StreamMessage {
+            content: Some(vec![
+                StreamContentBlock {
+                    block_type: Some("text".into()),
+                    text: Some("Hello".into()),
+                },
+                StreamContentBlock {
+                    block_type: Some("tool_use".into()),
+                    text: Some("ignored".into()),
+                },
+                StreamContentBlock {
+                    block_type: Some("text".into()),
+                    text: Some(" World".into()),
+                },
+            ]),
+        };
+        assert_eq!(msg.text(), "Hello World");
+    }
+
+    #[test]
+    fn stream_message_text_ignores_non_text_block_types() {
+        let msg = StreamMessage {
+            content: Some(vec![
+                StreamContentBlock {
+                    block_type: Some("image".into()),
+                    text: Some("should be ignored".into()),
+                },
+                StreamContentBlock {
+                    block_type: Some("tool_use".into()),
+                    text: Some("also ignored".into()),
+                },
+            ]),
+        };
+        assert_eq!(
+            msg.text(),
+            "",
+            "non-text blocks must not contribute to output"
+        );
+    }
+
+    #[test]
+    fn stream_message_text_empty_when_no_content() {
+        let msg = StreamMessage { content: None };
+        assert_eq!(msg.text(), "");
+    }
+
+    #[test]
+    fn stream_message_text_skips_text_block_with_none_text_field() {
+        let msg = StreamMessage {
+            content: Some(vec![StreamContentBlock {
+                block_type: Some("text".into()),
+                text: None,
+            }]),
+        };
+        assert_eq!(
+            msg.text(),
+            "",
+            "None text field in text block must produce empty output"
+        );
+    }
+
+    // ── ensure_success ────────────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    mod unix_tests {
+        use super::*;
+        use std::os::unix::process::ExitStatusExt;
+
+        fn exit(code: i32) -> std::process::ExitStatus {
+            // On UNIX the raw status is encoded as (exit_code << 8).
+            std::process::ExitStatus::from_raw(code << 8)
+        }
+
+        #[test]
+        fn ensure_success_ok_for_status_zero() {
+            assert!(ensure_success("tool", exit(0), "", false).is_ok());
+        }
+
+        #[test]
+        fn ensure_success_err_when_nonzero_and_not_recovered() {
+            let result = ensure_success("tool", exit(1), "stderr output", false);
+            assert!(
+                result.is_err(),
+                "non-zero exit without recovery must be Err"
+            );
+        }
+
+        #[test]
+        fn ensure_success_ok_when_nonzero_but_recovered() {
+            // A non-zero exit is tolerated when a usable session/response was obtained.
+            assert!(
+                ensure_success("tool", exit(1), "stderr", true).is_ok(),
+                "recovered=true must suppress non-zero exit error"
+            );
+        }
+
+        #[test]
+        fn ensure_success_err_message_includes_tool_name() {
+            let err = ensure_success("my-tool", exit(2), "", false).unwrap_err();
+            assert!(
+                err.to_string().contains("my-tool"),
+                "error must include tool name"
+            );
+        }
+    }
+}

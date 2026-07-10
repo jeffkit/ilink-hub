@@ -741,4 +741,83 @@ mod tests {
             "conn_id of remaining entry must be the new connection's"
         );
     }
+
+    // ─── relay_response_to_http ───────────────────────────────────────────────
+
+    /// Non-Response RelayMessage variants (e.g. Ping) must map to BAD_GATEWAY.
+    #[test]
+    fn relay_response_to_http_non_response_returns_bad_gateway() {
+        let resp = relay_response_to_http(RelayMessage::Ping);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn relay_response_to_http_maps_status_and_body() {
+        let msg = RelayMessage::Response {
+            id: "r1".into(),
+            status: 200,
+            headers: HashMap::new(),
+            body: Some("hello".into()),
+        };
+        let resp = relay_response_to_http(msg);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"hello");
+    }
+
+    /// `transfer-encoding` must be stripped to avoid confusing the upstream
+    /// HTTP client; other headers must pass through unchanged.
+    #[tokio::test]
+    async fn relay_response_to_http_strips_transfer_encoding_header() {
+        let mut headers = HashMap::new();
+        headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        headers.insert("x-custom".to_string(), "value".to_string());
+        let msg = RelayMessage::Response {
+            id: "r1".into(),
+            status: 200,
+            headers,
+            body: None,
+        };
+        let resp = relay_response_to_http(msg);
+        assert!(
+            resp.headers().get("transfer-encoding").is_none(),
+            "transfer-encoding must be stripped"
+        );
+        assert!(
+            resp.headers().get("x-custom").is_some(),
+            "x-custom must pass through"
+        );
+    }
+
+    /// Empty body (None) must result in an empty response body rather than panicking.
+    #[tokio::test]
+    async fn relay_response_to_http_empty_body_returns_empty_bytes() {
+        let msg = RelayMessage::Response {
+            id: "r1".into(),
+            status: 204,
+            headers: HashMap::new(),
+            body: None,
+        };
+        let resp = relay_response_to_http(msg);
+        assert_eq!(resp.status(), 204);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(bytes.is_empty(), "None body must produce empty bytes");
+    }
+
+    // ─── unix_now ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn unix_now_returns_plausible_timestamp() {
+        let ts = unix_now();
+        let year_2020: i64 = 1_577_836_800;
+        let year_2100: i64 = 4_102_444_800;
+        assert!(
+            ts > year_2020 && ts < year_2100,
+            "unix_now() = {ts} outside plausible range"
+        );
+    }
 }

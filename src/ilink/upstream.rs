@@ -604,6 +604,34 @@ mod tests {
         assert!(!UpstreamClient::is_well_formed_bot_token("no-colon"));
     }
 
+    /// Explicitly pin the `&&` semantics: a non-empty token without `:` must
+    /// return false (catches `&&` → `||` mutations).
+    #[test]
+    fn is_well_formed_bot_token_requires_both_non_empty_and_colon() {
+        // Non-empty but no colon → false (catches && → ||)
+        assert!(!UpstreamClient::is_well_formed_bot_token("justasecret"));
+        // Empty with colon → false (catches !empty → empty, trivially impossible)
+        // Note: "" contains no ':' so this also hits the contains(':') branch
+        assert!(!UpstreamClient::is_well_formed_bot_token(""));
+        // Minimal valid: single colon
+        assert!(UpstreamClient::is_well_formed_bot_token(":"));
+    }
+
+    /// `bot_id()` extracts the part before `:` in the token.
+    #[test]
+    fn bot_id_returns_prefix_before_colon() {
+        let client =
+            UpstreamClient::new("botid@im.bot:secretkey".to_string(), None).expect("test client");
+        assert_eq!(client.bot_id(), "botid@im.bot");
+    }
+
+    /// When token has no `:`, `split(':').next()` returns the whole string.
+    #[test]
+    fn bot_id_returns_whole_token_when_no_colon() {
+        let client = UpstreamClient::new("nocolon".to_string(), None).expect("test client");
+        assert_eq!(client.bot_id(), "nocolon");
+    }
+
     #[test]
     fn headers_fail_with_invalid_token() {
         let client = UpstreamClient::new("invalid\nkey".to_string(), None).expect("test client");
