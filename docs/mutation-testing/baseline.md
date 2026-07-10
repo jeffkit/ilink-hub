@@ -224,3 +224,51 @@ fn evicts_stale_keys_when_over_limit() {
 | 2026-07-06 | Phase 4 | 1 | 13 | 7 | 6 | **53.8% → 100%** | ✅ 全部修复（补测 3 个用例） |
 | 2026-07-06 | Phase 5 | 3 | 156 | 116 | 40 | **74.4%** | ✅ 补测 16 个用例，~14 暂缓（需 mock upstream） |
 | 2026-07-06 | Phase 6 | 5 | — | — | — | protocol/quote_route 初扫即 100% | ✅ device.rs+messages.rs 新增 13 测试（login.rs 暂缓） |
+| 2026-07-06 | Phase C | store 层 | — | — | — | 纳入 examine | context/clients/sessions |
+| 2026-07-06 | Phase F–K | bridge/mcp/server 等 | — | — | — | 扩展 examine_globs | 见下方「配置修复」 |
+| 2026-07-09 | 基建修复 | — | — | — | — | — | 修复 examine/exclude 冲突；login mockito 后重扫 |
+
+---
+
+## 配置修复（2026-07-09）
+
+### 问题
+
+`examine_globs` 已纳入 Phase H–K 的 bridge / mcp / server / `runtime/crypto`，
+但 `exclude_globs` 仍整树排除 `src/bridge/**`、`src/mcp/**`、`src/server/**`、`src/runtime/**`。
+cargo-mutants 规则为「先 examine，再 exclude」，导致 **18 个文件名义纳入、实际永不扫描**。
+
+### 修复
+
+- 从 `exclude_globs` 移除上述整树排除；仅保留真正不需要变异的入口/DDL/测试辅助文件。
+- `.gitignore` 增加 `mutants.out/`、`mutants.out.old/`。
+- 修复后 `cargo mutants --list-files` = **45** 文件，`--list` ≈ **1570** 变异体。
+
+### 刷新扫描（2026-07-09，补测后 / 配置修复后）
+
+| 模块 | Caught | Missed | Timeout | Unviable | Score | 备注 |
+|------|--------|--------|---------|----------|-------|------|
+| `ilink/login.rs` | 10 | 1→0* | 0 | 2 | **90.9% → ~100%*** | 0%→90.9%；补 `login_with_qr` + ret 文案；`+=`→`*=` 已 exclude_re |
+| `runtime/crypto.rs` | 25 | 0 | 0 | 2 | **100%** | 补 `exactly_28_bytes` 后满捕 |
+| `server/sse_ticket.rs` | 7 | 4→0* | 0 | 1 | **63.6% → ~100%*** | Instant `>` 边界已 exclude_re（良性） |
+| `mcp/protocol.rs` | 1 | 0 | 0 | 4 | **100%** | 此前被 exclude 挡掉 |
+| `mcp/waiter.rs` | 2 | 0 | 1 | 7 | **66.7%** | 1 timeout（async 等待路径） |
+| `bridge/paths.rs` | 12 | 0 | 0 | 0 | **100%** | 33.3%→100%；补 env override / is_bridge / sibling / find_in_path |
+| `hub/commands.rs` | 37 | 1→0* | 0 | 0 | **97.4% → ~100%*** | 75%→97.4%；空 ctx + session_list；`!=` ret 已 exclude_re |
+| `hub/dispatch.rs` | 44 | 3→0* | 0 | 3 | **93.6% → ~100%*** | 77.3%→93.6%；抽 `handle_broadcast` 补测 + @mention/quote/footer；`resp.ret` 已 exclude_re |
+| `store/context.rs` | 33 | 2 | 0 | 0 | **94.3%** | 72.7%→94.3%；补 is_missing_constraint_error 单测 + pre-v7 fallback + 匿名 vctx 解析；余 2 missed（空 conv_key upsert 守卫，SQLite 行为等价） |
+| `store/clients.rs` | 22 | 0 | 0 | 2 | **100%** | 40%→100%；补 touch/get/desc/delete/update/persona |
+| `store/sessions.rs` | 29 | 5 | 0 | 52 | **85.3%** | 达标；大量 unviable（HashMap 返回值爆炸） |
+| `store/messages.rs` | 22 | 1 | 0 | 10 | **95.7%** | 仅 1 missed（时间窗 `-`→`/`） |
+| `error.rs` | 0 | 0 | 0 | 1 | n/a | 仅 unviable |
+| `lib.rs` | 2 | 0 | 0 | 0 | **100%** | `redact_token` |
+
+\* 应用 `exclude_re` 后，对应良性 missed 不再计入分母。
+
+### 仍待处理
+
+| 项 | 说明 |
+|----|------|
+| `store/context.rs` 余下 2 missed | 空 conv_key upsert 守卫（`!conv_key.is_empty()` / `&&`），SQLite 上与跳过 upsert 行为等价 |
+| 全量 CI 基线 | PR #20 已合并；等首次周跑 |
+| 集成测试隔离 | 去掉对 `RUST_TEST_THREADS=1` 的依赖 |

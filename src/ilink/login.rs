@@ -471,4 +471,63 @@ mod tests {
         );
         assert_eq!(token, "precise-bot-token-xyz");
     }
+
+    /// M8-login-11: `login_with_qr` 是 `login_with_qr_ui(None)` 的薄包装，
+    /// 必须返回真实 bot_token（不能被替换为 Ok("") / Ok("xyzzy")）。
+    #[tokio::test]
+    async fn login_with_qr_returns_the_confirmed_bot_token() {
+        let mut server = Server::new_async().await;
+
+        let _m_qr = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"qrcode":"qr-key-wrapper","qrcode_img_content":"https://wx.qq.com/qr.png"}"#,
+            )
+            .create_async()
+            .await;
+
+        let _m_status = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=qr-key-wrapper")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":"token-via-login-with-qr","baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let result = client.login_with_qr().await;
+        assert!(result.is_ok(), "expected Ok but got: {result:?}");
+        assert_eq!(result.unwrap(), "token-via-login-with-qr");
+    }
+
+    /// M8-login-12: 未知 status + 非零 ret 的错误信息必须包含业务文案，
+    /// 不能仅靠后续超时/网络错误碰巧变成 Err（否则 `ret != 0` → `==` 会漏网）。
+    #[tokio::test]
+    async fn poll_qrcode_status_unknown_status_nonzero_ret_message() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=err-msg-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":5,"status":"unknown_status","errmsg":"something went wrong","bot_token":null,"baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let client = make_client(server.url());
+        let err = client
+            .poll_qrcode_status("err-msg-key", None)
+            .await
+            .expect_err("non-zero ret with unknown status must return Err");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("qrcode status error") && msg.contains("something went wrong"),
+            "must fail on ret check with errmsg, not via timeout/network; got: {msg}"
+        );
+    }
 }

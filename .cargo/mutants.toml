@@ -138,23 +138,24 @@ examine_globs = [
 ]
 
 # ── 排除文件（覆盖范围之外）──────────────────────────────────────────
-# 通过 examine_globs 白名单控制，exclude_globs 作为额外防护
+# examine_globs 是白名单；exclude_globs 在 examine 之后再过滤。
+# 注意：不要把已列入 examine_globs 的目录整树排除（曾导致 Phase H–K
+# 的 bridge/mcp/server/runtime 文件名义纳入、实际永不扫描）。
 exclude_globs = [
     "src/main.rs",
     "src/bin/*.rs",
-    "src/server/**",
-    "src/bridge/**",
     "src/client/**",
-    "src/mcp/**",
     "tests/**",
-    # store/migrations.rs 纯 DDL，无业务逻辑
+    # store：只排除无业务逻辑 / 测试辅助文件（业务文件在 examine_globs）
     "src/store/migrations.rs",
     "src/store/credentials.rs",
     "src/store/store_tests.rs",
     "src/store/mod.rs",
     "src/paths.rs",
     "src/metrics.rs",
-    "src/runtime/**",
+    # runtime：只排除非 crypto 的入口/编排（crypto.rs 在 examine_globs）
+    "src/runtime/mod.rs",
+    "src/runtime/serve.rs",
     "src/breaking_changes.rs",
 ]
 
@@ -167,11 +168,15 @@ exclude_re = [
     "debug!",
     "error!",
     # ── 已知"良性 missed mutants"（文档化决策，无需补测）──────────────
-    # 1. resp.ret match guard 变异（commands.rs / dispatch.rs）：
+    # 1. resp.ret match guard / 比较变异（commands.rs / dispatch.rs）：
     #    `resp.ret.map(|r| r != 0).unwrap_or(false)` 只控制走哪条日志分支
     #    （error!/warn! vs debug!/noop），对系统状态无影响。
     #    要捕获需要 log-interception，成本 >> 收益。
     "resp.ret.map",
+    # 同路径上的 `r != 0` → `r == 0`（变异体名不含 map，需单独排除）
+    "replace != with == in handle_hub_command",
+    "replace != with == in dispatch_message",
+    "replace != with == in handle_broadcast",
     # 2. pairing.rs 时间边界变异（> vs >=）：
     #    `created_at.elapsed() > PAIRING_TTL` 等使用 std::time::Instant，
     #    无法通过 tokio::time::pause() 控制。>= 边界（差 1 纳秒）在业务上无意义。
@@ -180,4 +185,14 @@ exclude_re = [
     "elapsed() > SCANNED_TTL",
     "elapsed() > CONFIRMED_TTL",
     "elapsed() < CONFIRMED_TTL",
+    # 3. login.rs poll 计数 `attempts += 1`：
+    #    现有成功路径只轮询 1 次；`+=` → `*=` 在 attempts=0 时仍为 0，但单次成功路径
+    #    观察不到差异。要捕获需 mock 60 次 wait + 驱动 tokio 时钟，成本 >> 收益。
+    #    exclude_re 匹配的是变异体名称（如 "replace += with *="），不是源码文本。
+    "replace \\+= with \\*=",
+    # 4. sse_ticket.rs Instant 过期比较（> vs >= / == / <）：
+    #    `*exp > now` 使用 std::time::Instant，无法用 tokio::time::pause 控制。
+    #    纳秒级边界在业务上无意义；已有「强制改写 Instant 到过去」的过期测试覆盖语义。
+    #    匹配变异体名：replace > with {==,<,>=} in SseTicketStore::{issue,consume}
+    "replace > with (==|<|>=) in SseTicketStore::",
 ]

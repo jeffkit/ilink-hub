@@ -65,11 +65,10 @@ pub fn parse_footer_from_quoted_text(text: &str) -> Option<(String, Option<Strin
     } else if let Some(pos) = text.rfind("\n— ") {
         // Old format: line starting with em-dash.
         text[pos + 4..].trim()
-    } else if let Some(stripped) = text.trim().strip_prefix("— ") {
-        // Edge case: the whole quoted text is just a footer line.
-        stripped.trim()
     } else {
-        return None;
+        // Edge case: the whole quoted text is just a footer line.
+        let stripped = text.trim().strip_prefix("— ")?;
+        stripped.trim()
     };
 
     if footer_line.is_empty() {

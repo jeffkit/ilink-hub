@@ -231,3 +231,88 @@ impl Store {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_missing_constraint_error;
+    use sqlx::error::{DatabaseError, ErrorKind};
+    use std::borrow::Cow;
+    use std::error::Error;
+
+    #[derive(Debug, Clone, Copy)]
+    struct StubDbErr {
+        code: Option<&'static str>,
+        message: &'static str,
+    }
+
+    impl std::fmt::Display for StubDbErr {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl Error for StubDbErr {}
+
+    impl DatabaseError for StubDbErr {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn code(&self) -> Option<Cow<'_, str>> {
+            self.code.map(Cow::Borrowed)
+        }
+
+        fn kind(&self) -> ErrorKind {
+            ErrorKind::Other
+        }
+
+        fn as_error(&self) -> &(dyn Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    fn db_err(code: Option<&'static str>, message: &'static str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(StubDbErr { code, message }))
+    }
+
+    #[test]
+    fn is_missing_constraint_error_recognizes_postgres_codes() {
+        assert!(is_missing_constraint_error(&db_err(
+            Some("42P10"),
+            "invalid_column_reference",
+        )));
+        assert!(is_missing_constraint_error(&db_err(
+            Some("42704"),
+            "undefined_object",
+        )));
+    }
+
+    #[test]
+    fn is_missing_constraint_error_recognizes_sqlite_conflict_clause_phrase() {
+        assert!(is_missing_constraint_error(&db_err(
+            None,
+            "ON CONFLICT clause does not match any UNIQUE or PRIMARY KEY constraint",
+        )));
+    }
+
+    #[test]
+    fn is_missing_constraint_error_rejects_unrelated_database_errors() {
+        assert!(!is_missing_constraint_error(&db_err(
+            Some("2067"),
+            "UNIQUE constraint failed: context_token_map.real_ctx",
+        )));
+    }
+
+    #[test]
+    fn is_missing_constraint_error_rejects_non_database_errors() {
+        assert!(!is_missing_constraint_error(&sqlx::Error::RowNotFound));
+    }
+}
