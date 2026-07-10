@@ -16,23 +16,24 @@
 //! ## Lock acquisition order (read this before adding cross-cutting changes)
 //!
 //! `HubState` holds two primary locks that may be acquired in the same
-//! request path. Deadlock is avoided by acquiring them in a **strict total
-//! order** and **never holding more than one at a time**:
+//! request path. Deadlock is avoided by a **strict total order** and by
+//! **preferring never to hold more than one at a time**:
 //!
 //! 1. `state.routing.router` (`tokio::sync::Mutex<Router>`)
 //! 2. `state.clients.registry` (`tokio::sync::RwLock<ClientRegistry>`)
 //!
 //! Rules:
 //!
-//! - Acquire in the order above when you need more than one in a single
-//!   flow. Acquiring them in a different order across two concurrent tasks
-//!   is a deadlock waiting to happen.
+//! - **Preferred pattern:** take one lock, clone/copy what you need, drop the
+//!   guard, then take the other (see `handle_cmd_list` / `handle_cmd_use` /
+//!   `register_client_in_hub` / `load_clients_from_db`). This eliminates
+//!   AB-BA risk entirely.
+//! - When a single critical section truly needs both, acquire in the order
+//!   above (`router` then `registry`) via [`HubState::with_router_and_registry`].
+//!   Do not invent a new call-site order.
 //! - **Drop the guard before any `.await` that may schedule other tasks.**
-//!   The current code does this by assigning to a binding in an inner block
-//!   and letting it go out of scope before the next lock or await point.
-//! - Do not hold any of these locks across network I/O, DB queries, or
-//!   child-process spawns. Copy the data you need (`clone()` on the relevant
-//!   `Arc`/`String`/`ClientInfo`) and release the guard before the work.
+//!   Never hold either lock across network I/O, DB queries, or child-process
+//!   spawns.
 //! - If you find yourself wanting a "transactional" view across two of these
 //!   locks, add a facade method on `HubState` instead of letting callers
 //!   reach in. The point of the order rule is that the *set* of call sites

@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::auth::{check_admin_auth, extract_vtoken, UNKNOWN_VTOKEN_MSG};
+use super::auth::{extract_vtoken, AdminGuard, UNKNOWN_VTOKEN_MSG};
 use super::wait::wait_notify_or_shutdown;
 use crate::hub::{HubState, MAX_CONCURRENT_POLLS_PER_VTOKEN};
 use crate::ilink::types::*;
@@ -49,22 +49,10 @@ pub struct RegisterResponse {
 const MAX_CLIENT_NAME_LEN: usize = 64;
 
 pub async fn register(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> (StatusCode, Json<RegisterResponse>) {
-    if !check_admin_auth(&state.admin, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(RegisterResponse {
-                ret: 401,
-                vtoken: String::new(),
-                base_url: String::new(),
-                errmsg: Some("Unauthorized".to_string()),
-            }),
-        );
-    }
-
     let name = req.name.trim();
     if name.is_empty() || name.len() > MAX_CLIENT_NAME_LEN {
         return (
@@ -429,8 +417,15 @@ pub async fn sendmessage(
     {
         Ok(Some(triple)) => triple,
         Ok(None) => {
-            warn!(vctx = %vctx, "no mapping for virtual context token");
-            return Json(SendMessageResponse::err(400, "Unknown context_token"));
+            warn!(
+                vctx = %vctx,
+                vtoken = %redact_token(&vtoken),
+                "no mapping for virtual context token, or vtoken does not own vctx"
+            );
+            return Json(SendMessageResponse::err(
+                403,
+                "Unknown context_token or not authorized for this context",
+            ));
         }
         Err(e) => {
             warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
@@ -673,10 +668,44 @@ pub async fn getconfig(
         }
     }
 
-    // Translate virtual context token if present
-    if let Some(vctx) = &req.context_token.clone() {
-        if let Ok(Some(real)) = state.store.resolve_context_token(vctx).await {
-            req.context_token = Some(real);
+    // Translate virtual context token if present — only when this vtoken owns it.
+    // Unknown / non-virtual tokens are left unchanged (upstream may accept a real_ctx).
+    if let Some(token) = &req.context_token.clone() {
+        match state.store.resolve_context_token(token).await {
+            Ok(Some(real)) => match state.store.vtoken_owns_vctx(token, &vtoken).await {
+                Ok(true) => {
+                    req.context_token = Some(real);
+                }
+                Ok(false) => {
+                    warn!(
+                        vtoken = %redact_token(&vtoken),
+                        vctx = %token,
+                        "getconfig rejected: vtoken does not own vctx"
+                    );
+                    return Json(GetConfigResponse {
+                        ret: Some(403),
+                        typing_ticket: None,
+                        errmsg: Some("context_token not authorized for this client".to_string()),
+                    });
+                }
+                Err(e) => {
+                    warn!(error = %e, "getconfig ownership check failed");
+                    return Json(GetConfigResponse {
+                        ret: Some(500),
+                        typing_ticket: None,
+                        errmsg: Some("context ownership check error".to_string()),
+                    });
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "getconfig context resolve failed");
+                return Json(GetConfigResponse {
+                    ret: Some(500),
+                    typing_ticket: None,
+                    errmsg: Some("context_token resolution error".to_string()),
+                });
+            }
         }
     }
 

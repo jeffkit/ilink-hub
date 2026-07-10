@@ -4,7 +4,7 @@ title: 部署安全加固
 description: 将 iLink Hub 安全地部署到生产环境的加固清单——鉴权、网络暴露、配对/中继安全、资源边界与上线前检查。
 resource: docs/knowledge/ops/deployment-hardening.md
 tags: [ops, security, deployment, hardening]
-timestamp: 2026-07-09T16:00:00+08:00
+timestamp: 2026-07-10T18:30:00+08:00
 ---
 
 # 部署安全加固
@@ -44,13 +44,24 @@ iLink Hub 有三条需要分别加固的暴露面：
 
 - **Origin/Referer 白名单**：配对确认类 POST 会校验 `Origin`（缺失时回退 `Referer`）必须匹配设备基址，拒绝跨站 drive-by 请求。代理改写 Host 时要保证该头一致。
 - **CSRF**：配对会话绑定一次性 CSRF token，确认时用常量时间比较，用后即焚（防重放）。
-- **中继密钥**：出站到 `ILINKHUB_RELAY_URL` 的请求用 Ed25519 / 共享密钥认证，校验同样是常量时间比较。
-- **限流**：中继侧用固定窗口计数器（`relay::ratelimit`）对每个 key 限速，缓解暴力配对/枚举。
+- **中继密钥**：出站到 `ILINKHUB_RELAY_URL` 的请求用 Ed25519 / 共享密钥认证，校验同样是常量时间比较。非 loopback 的 `http://` 中继 URL 会自动升级为 `wss://`。
+- **限流**：
+  - `get_bot_qrcode`：按 IP 滑动窗口限流（默认 60s 内最多 20 次），防配对会话耗尽。
+  - 配对确认：按 `(code, ip)` 限流。
+  - 中继侧：固定窗口计数器（`relay::ratelimit`）对每个 key 限速。
+- **vtoken claim-window 下发**：`get_qrcode_status` 在 `confirmed` 后的短窗口内可重取明文 `bot_token`（防丢包重试）；窗口结束后清除，缩小长期 qrcode 泄露窗口。
 - 不需要公网配对时，设 `ILINKHUB_RELAY=0` 关闭出站中继，进一步缩小暴露面。
+- **CORS**：生产若有浏览器客户端，设置 `ILINK_CORS_ORIGINS` 为显式白名单；未设置时 bot API 仍为 permissive 并打 warn。`ILINK_ADMIN_INSECURE_NO_AUTH` + 绑定 `0.0.0.0`/`::` 会**拒绝启动**。
 
 ## 5. 凭证与日志
 
 - **静态加密**：必须设置 `ILINK_HUB_MASTER_KEY`（32 字节 Base64/Hex），用于对 `bot_credentials.token` 等落盘敏感数据进行 AES-256-GCM 加密，严防数据库泄露导致明文 Token 曝光。若未设置，Hub 拒绝启动。
+- **Master key 轮转 SOP**（当前无双 key API，需停机操作）：
+  1. 停 Hub；备份数据库。
+  2. 用**旧** `ILINK_HUB_MASTER_KEY` 启动一次性工具或临时进程，解密 `bot_credentials.token`（或直接重新扫码登录）。
+  3. 设置**新** `ILINK_HUB_MASTER_KEY`，写入新密文（或完成 QR 登录后由 Hub 自动加密保存）。
+  4. 确认 `ilink-hub serve` 能正常拉消息后，销毁旧 key。
+  5. 切勿在未解密/未重登的情况下直接替换 key——已加密的 bot_token 将无法解密。
 - **哈希存储**：客户端的虚拟 Token (`vtoken`) 在内存和数据库中均采用 SHA-256 进行哈希后存储。接口（如 `/hub/clients`）或数据库里均无法获取明文 `vtoken`，明文仅在注册时返回一次。
 - 日志中的 vtoken / token 一律经 `redact_token` 脱敏（例如路由加载告警、`/session list` 回包的 backend 名回退）。新增日志涉及凭证时务必沿用脱敏。
 - 不要把 token 放进 URL query；用 `Authorization` 头或一次性 ticket。

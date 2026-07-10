@@ -356,6 +356,13 @@ mod tests {
         assert_eq!(session.status_str(), "confirmed");
         assert_eq!(session.vtoken.as_deref(), Some("vhub_abc"));
         assert!(session.csrf.is_none(), "csrf must be consumed on confirm");
+
+        // Claim-window: within VTOKEN_CLAIM_WINDOW the token remains reclaimable.
+        let (_snap, first) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(first.as_deref(), Some("vhub_abc"));
+        let (_snap, second) = reg.claim_confirmed_vtoken(&code).unwrap();
+        assert_eq!(second.as_deref(), Some("vhub_abc"));
+        assert_eq!(reg.get(&code).unwrap().status_str(), "confirmed");
     }
 
     #[test]

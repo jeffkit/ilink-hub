@@ -78,22 +78,11 @@ pub struct AdminDeleteClientQuery {
 }
 
 pub async fn admin_delete_client(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
     axum::extract::Path(name): axum::extract::Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminDeleteClientQuery>,
 ) -> (StatusCode, Json<AdminDeleteClientResponse>) {
-    if !check_admin_auth(&state.admin, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(AdminDeleteClientResponse {
-                ret: 401,
-                errmsg: Some("Unauthorized".to_string()),
-                name: None,
-            }),
-        );
-    }
-
     let name = name.trim();
     if name.is_empty() {
         return (
@@ -149,22 +138,11 @@ pub async fn admin_delete_client(
 }
 
 pub async fn admin_update_client(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
     axum::extract::Path(old_name): axum::extract::Path<String>,
     Json(req): Json<AdminUpdateClientRequest>,
 ) -> (StatusCode, Json<AdminClientMutationResponse>) {
-    if !check_admin_auth(&state.admin, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(AdminClientMutationResponse {
-                ret: 401,
-                errmsg: Some("Unauthorized".to_string()),
-                name: None,
-            }),
-        );
-    }
-
     let old_name = old_name.trim();
     if old_name.is_empty() {
         return (
@@ -245,18 +223,9 @@ pub struct IlinkStatusResponse {
 }
 
 pub async fn admin_ilink_status(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
 ) -> (StatusCode, Json<IlinkStatusResponse>) {
-    if !check_admin_auth(&state.admin, &headers) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(IlinkStatusResponse {
-                status: "unauthorized",
-                code: 0,
-            }),
-        );
-    }
     let code = state.ilink.ilink_status.load(Ordering::Relaxed);
     let status = crate::hub::ilink_status::as_str(code);
     (StatusCode::OK, Json(IlinkStatusResponse { status, code }))

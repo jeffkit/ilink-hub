@@ -300,10 +300,14 @@ impl UpstreamClient {
     }
 
     /// Continuous polling loop — sends received messages to `tx`.
+    ///
+    /// Responds promptly to `shutdown`: both the long-poll HTTP call and
+    /// backoff sleeps are raced against `shutdown.changed()` so SIGTERM does
+    /// not wait out a full upstream timeout or a 30s renewal backoff.
     pub async fn run_polling_loop(
         self: Arc<Self>,
         tx: mpsc::Sender<WeixinMessage>,
-        shutdown: tokio::sync::watch::Receiver<bool>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
         mut renewal: Option<SessionRenewal>,
     ) {
         let mut get_updates_buf = String::new();
@@ -389,7 +393,19 @@ impl UpstreamClient {
                 continue;
             }
 
-            let result = self.get_updates(get_updates_buf.clone(), None).await;
+            // Race the long-poll against shutdown so SIGTERM is not blocked on
+            // the upstream HTTP timeout.
+            let result = tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("iLink upstream polling shutting down");
+                        return;
+                    }
+                    continue;
+                }
+                result = self.get_updates(get_updates_buf.clone(), None) => result,
+            };
 
             match result {
                 Ok(resp) if resp.ret == Some(0) || resp.errcode.is_none() => {
@@ -452,24 +468,43 @@ impl UpstreamClient {
                                         error!(error = %e, "iLink session renewal failed; waiting 30s before retry");
                                         // Fixed wait after renewal failure — prevents tight loop
                                         // hammering the QR endpoint when credentials are broken.
-                                        tokio::time::sleep(Duration::from_secs(30)).await;
+                                        if sleep_or_shutdown(&mut shutdown, 30).await {
+                                            info!("iLink upstream polling shutting down");
+                                            renewing.store(false, Ordering::SeqCst);
+                                            return;
+                                        }
                                         renewing.store(false, Ordering::SeqCst);
                                     }
                                 }
                             }
                         }
                     }
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    if sleep_or_shutdown(&mut shutdown, backoff_secs).await {
+                        info!("iLink upstream polling shutting down");
+                        return;
+                    }
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
                 Err(e) => {
                     self.polls_err.fetch_add(1, Ordering::Relaxed);
                     error!(error = %e, "iLink upstream request failed");
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                    if sleep_or_shutdown(&mut shutdown, backoff_secs).await {
+                        info!("iLink upstream polling shutting down");
+                        return;
+                    }
                     backoff_secs = (backoff_secs * 2).min(30);
                 }
             }
         }
+    }
+}
+
+/// Sleep for `secs`, but return `true` immediately if `shutdown` becomes `true`.
+async fn sleep_or_shutdown(shutdown: &mut tokio::sync::watch::Receiver<bool>, secs: u64) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => *shutdown.borrow(),
+        _ = tokio::time::sleep(Duration::from_secs(secs)) => false,
     }
 }
 

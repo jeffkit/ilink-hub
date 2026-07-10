@@ -413,7 +413,13 @@ pub(super) async fn run_cli(
         }
     }
 
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = match stderr_task.await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "CLI stderr task joined with error");
+            String::new()
+        }
+    };
     if !stderr.is_empty() {
         tracing::debug!(stderr = %stderr, "CLI stderr");
     }

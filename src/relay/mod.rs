@@ -61,7 +61,21 @@ pub fn relay_ws_url() -> String {
     if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}/ws/pairing")
     } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}/ws/pairing")
+        let host = rest.split('/').next().unwrap_or(rest);
+        let is_loopback = host.starts_with("127.0.0.1")
+            || host.starts_with("localhost")
+            || host.starts_with("[::1]");
+        if is_loopback {
+            format!("ws://{rest}/ws/pairing")
+        } else {
+            // Refuse cleartext relay to non-loopback hosts — MITM can forge pairing.
+            tracing::error!(
+                url = %base,
+                "ILINKHUB_RELAY_URL uses http:// to a non-loopback host; \
+                 upgrading to wss://. Set https:// explicitly."
+            );
+            format!("wss://{rest}/ws/pairing")
+        }
     } else {
         format!("wss://{base}/ws/pairing")
     }
@@ -110,6 +124,14 @@ mod tests {
         assert_eq!(
             relay_ws_url_from("http://localhost:9000"),
             "ws://localhost:9000/ws/pairing"
+        );
+    }
+
+    #[test]
+    fn ws_url_upgrades_non_loopback_http_to_wss() {
+        assert_eq!(
+            relay_ws_url_from("http://relay.example.com"),
+            "wss://relay.example.com/ws/pairing"
         );
     }
 
@@ -223,7 +245,15 @@ mod tests {
         if let Some(rest) = base.strip_prefix("https://") {
             format!("wss://{rest}/ws/pairing")
         } else if let Some(rest) = base.strip_prefix("http://") {
-            format!("ws://{rest}/ws/pairing")
+            let host = rest.split('/').next().unwrap_or(rest);
+            let is_loopback = host.starts_with("127.0.0.1")
+                || host.starts_with("localhost")
+                || host.starts_with("[::1]");
+            if is_loopback {
+                format!("ws://{rest}/ws/pairing")
+            } else {
+                format!("wss://{rest}/ws/pairing")
+            }
         } else {
             format!("wss://{base}/ws/pairing")
         }

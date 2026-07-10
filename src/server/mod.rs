@@ -23,40 +23,49 @@ use tower_http::trace::TraceLayer;
 /// Parse a comma-separated list of allowed origins from a string.
 ///
 /// Each entry must include a scheme (`https://` or `http://`).
-/// Panics with a descriptive message if any entry is missing a scheme,
-/// so misconfiguration surfaces immediately at startup rather than silently
-/// allowing unintended origins.
-pub fn parse_origins(s: &str) -> Vec<HeaderValue> {
+/// Returns `Err` with a descriptive message if any entry is missing a scheme
+/// or is not a valid header value, so misconfiguration surfaces at startup
+/// via `Result` rather than a panic.
+pub fn parse_origins(s: &str) -> Result<Vec<HeaderValue>, String> {
     s.split(',')
         .map(|o| o.trim())
         .filter(|o| !o.is_empty())
         .map(|o| {
-            assert!(
-                o.starts_with("http://") || o.starts_with("https://"),
-                "CORS origin {o:?} is invalid: must start with http:// or https:// (without scheme)"
-            );
+            if !(o.starts_with("http://") || o.starts_with("https://")) {
+                return Err(format!(
+                    "CORS origin {o:?} is invalid: must start with http:// or https://"
+                ));
+            }
             HeaderValue::from_str(o)
-                .unwrap_or_else(|_| panic!("CORS origin {o:?} is not a valid header value"))
+                .map_err(|_| format!("CORS origin {o:?} is not a valid header value"))
         })
         .collect()
 }
 
 /// Build a `CorsLayer` from the `ILINK_CORS_ORIGINS` environment variable.
 ///
-/// - If the variable is unset or empty, returns a permissive layer (`*`).
+/// - If the variable is unset or empty, returns a permissive layer (`*`) and
+///   logs a warn — production should set an explicit allowlist.
 /// - If set, returns a restrictive layer that only allows the listed origins.
-pub fn build_cors_layer() -> CorsLayer {
+/// - Invalid entries cause a panic-free `Err` so callers can fail startup cleanly.
+pub fn build_cors_layer() -> Result<CorsLayer, String> {
     match std::env::var("ILINK_CORS_ORIGINS")
         .ok()
         .filter(|v| !v.trim().is_empty())
     {
-        None => CorsLayer::permissive(),
+        None => {
+            tracing::warn!(
+                "ILINK_CORS_ORIGINS unset — bot API CORS is permissive (*). \
+                 Set an explicit allowlist in production if browser clients are used."
+            );
+            Ok(CorsLayer::permissive())
+        }
         Some(origins_str) => {
-            let origins = parse_origins(&origins_str);
-            CorsLayer::new()
+            let origins = parse_origins(&origins_str)?;
+            Ok(CorsLayer::new()
                 .allow_origin(origins)
                 .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any))
         }
     }
 }
@@ -96,7 +105,11 @@ pub fn build_router(state: Arc<HubState>) -> Router {
     // SDK clients (e.g. OpenClaw) can call it from any origin.
     // Hub management and admin routes deliberately do NOT get CORS headers — they
     // should only be called server-side or via same-origin UI.
-    let bot_cors = build_cors_layer();
+    let bot_cors = build_cors_layer().unwrap_or_else(|e| {
+        // Invalid allowlist must not silently become permissive.
+        tracing::error!(error = %e, "invalid ILINK_CORS_ORIGINS; denying all browser origins");
+        CorsLayer::new()
+    });
 
     let bot_api = Router::new()
         .route(

@@ -16,14 +16,26 @@ use super::quote::{
 
 pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: mpsc::Receiver<WeixinMessage>) {
     tokio::spawn(async move {
+        let mut shutdown = state.ilink.shutdown.clone();
         loop {
-            match rx.recv().await {
-                Some(msg) => {
-                    dispatch_message(state.clone(), msg).await;
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("dispatcher shutting down");
+                        return;
+                    }
                 }
-                None => {
-                    info!("upstream channel closed, dispatcher exiting");
-                    return;
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            dispatch_message(state.clone(), msg).await;
+                        }
+                        None => {
+                            info!("upstream channel closed, dispatcher exiting");
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -141,30 +153,20 @@ pub(super) async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessag
             let hub_ext =
                 build_hub_ext_for_vctx(&state.store, &vctx, &vtoken, session_override).await;
 
-            // Fire-and-forget: reset a2a_depth to 0 for this (vctx, vtoken) pair so
-            // that subsequent `call_agent` calls start from depth 0.  Uses the active
-            // session name if available; falls back to "default".
+            // Grant (vctx, vtoken) ownership BEFORE pushing to the queue so the
+            // bridge's first sendmessage cannot race ahead of the grant row.
+            // Also resets a2a_depth to 0 for subsequent `call_agent` calls.
+            let session_name_for_depth = hub_ext
+                .as_ref()
+                .and_then(|e| e.session_name.as_deref())
+                .unwrap_or("default")
+                .to_string();
+            if let Err(e) = state
+                .store
+                .set_active_session_with_depth(&vctx, &vtoken, &session_name_for_depth, 0)
+                .await
             {
-                let session_name_for_depth = hub_ext
-                    .as_ref()
-                    .and_then(|e| e.session_name.as_deref())
-                    .unwrap_or("default")
-                    .to_string();
-                let store_d = state.store.clone();
-                let (vctx_d, vtoken_d) = (vctx.clone(), vtoken.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = store_d
-                        .set_active_session_with_depth(
-                            &vctx_d,
-                            &vtoken_d,
-                            &session_name_for_depth,
-                            0,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to reset a2a_depth on user message dispatch");
-                    }
-                });
+                warn!(error = %e, "failed to grant vctx ownership / reset a2a_depth on dispatch");
             }
 
             // Fire-and-forget: record user message to history.
@@ -303,6 +305,18 @@ pub(super) async fn handle_broadcast(state: Arc<HubState>, msg: WeixinMessage) {
                     a2a_call_id: None,
                     a2a_depth: None,
                 });
+        // Grant ownership before the bridge can reply (same as ForwardTo path).
+        let session_name = hub_ext
+            .as_ref()
+            .and_then(|e| e.session_name.as_deref())
+            .unwrap_or("default");
+        if let Err(e) = state
+            .store
+            .set_active_session_with_depth(&vctx, &vtoken, session_name, 0)
+            .await
+        {
+            warn!(error = %e, "failed to grant vctx ownership on broadcast dispatch");
+        }
         push_shared_to_queue(
             &state.clients.queue,
             &state.metrics,

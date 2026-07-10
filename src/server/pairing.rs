@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -279,16 +280,88 @@ fn pair_confirm_rate_limiter() -> &'static PairConfirmRateLimiter {
     PAIR_CONFIRM_RATE_LIMITER.get_or_init(PairConfirmRateLimiter::default)
 }
 
+/// Max `get_bot_qrcode` creations per IP inside [`QR_CREATE_RATE_LIMIT_WINDOW`].
+const QR_CREATE_RATE_LIMIT_MAX: usize = 20;
+const QR_CREATE_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const QR_CREATE_RATE_LIMIT_MAX_ENTRIES: usize = 4096;
+
+/// Sliding-window rate limiter for pairing QR creation (DoS / session exhaustion).
+#[derive(Default)]
+struct QrCreateRateLimiter {
+    /// ip → timestamps of recent creates
+    attempts: StdMutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl QrCreateRateLimiter {
+    fn check_and_record(&self, ip: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.attempts.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, times| {
+            times.retain(|t| now.duration_since(*t) < QR_CREATE_RATE_LIMIT_WINDOW);
+            !times.is_empty()
+        });
+
+        let current = map.get(ip).map(|v| v.len()).unwrap_or(0);
+        if current >= QR_CREATE_RATE_LIMIT_MAX {
+            return false;
+        }
+
+        if map.len() >= QR_CREATE_RATE_LIMIT_MAX_ENTRIES && !map.contains_key(ip) {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, times)| times.first().copied().unwrap_or(now))
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+
+        map.entry(ip.to_string()).or_default().push(now);
+        true
+    }
+}
+
+static QR_CREATE_RATE_LIMITER: std::sync::OnceLock<QrCreateRateLimiter> =
+    std::sync::OnceLock::new();
+
+fn qr_create_rate_limiter() -> &'static QrCreateRateLimiter {
+    QR_CREATE_RATE_LIMITER.get_or_init(QrCreateRateLimiter::default)
+}
+
+/// Optional client IP for rate limiting. Missing `ConnectInfo` (e.g. oneshot
+/// tests) falls back to `"unknown"` instead of rejecting the request.
+pub struct ClientIp(pub String);
+
+impl<S> axum::extract::FromRequestParts<S> for ClientIp
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<axum::extract::ConnectInfo<SocketAddr>>()
+            .map(|ci| ci.0.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        Ok(ClientIp(ip))
+    }
+}
+
 pub async fn register_client_in_hub(
     state: &HubState,
     name: String,
     label: Option<String>,
     description: Option<String>,
 ) -> RegisterClientOutcome {
-    // Lock order: registry → router (always). MUST NOT be called while
-    // `state.clients.pairing.write()` is held; doing so would introduce a new
-    // `pairing → registry → router` lock order that deadlocks against any
-    // future code path that takes registry+router and then pairing. (F-M1-1)
+    // Lock order (see hub/mod.rs): never hold registry and router at the same time.
+    // Registry write is released before any router lock or DB await.
+    // MUST NOT be called while `state.clients.pairing.write()` is held; doing so
+    // would introduce a `pairing → registry` order that deadlocks against any
+    // future path that takes registry then pairing. (F-M1-1)
     let (plaintext, hashed, is_new, is_first) = {
         let mut registry = state.clients.registry.write().await;
         let (plaintext, hashed, is_new) =
@@ -298,9 +371,11 @@ pub async fn register_client_in_hub(
     };
 
     if is_first {
-        let mut router = state.routing.router.lock().await;
-        router.set_default(hashed.clone());
-        // Persist the default so it survives hub restarts (HUB_DEFAULT_SENTINEL row).
+        {
+            let mut router = state.routing.router.lock().await;
+            router.set_default(hashed.clone());
+        }
+        // Persist after releasing the router lock — never await DB while holding it.
         if let Err(e) = state
             .store
             .set_route(crate::store::HUB_DEFAULT_SENTINEL, &hashed)
@@ -554,24 +629,54 @@ async fn create_pairing_qr(state: &HubState) -> GetQrcodeResponse {
 /// `GET /ilink/bot/get_bot_qrcode` — start a Hub pairing session (not WeChat login).
 pub async fn get_bot_qrcode(
     State(state): State<Arc<HubState>>,
+    ClientIp(ip): ClientIp,
     Query(_query): Query<BotQrcodeQuery>,
-) -> Json<GetQrcodeResponse> {
-    Json(create_pairing_qr(state.as_ref()).await)
+) -> (StatusCode, Json<GetQrcodeResponse>) {
+    if !qr_create_rate_limiter().check_and_record(&ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetQrcodeResponse {
+                ret: -1,
+                qrcode: None,
+                qrcode_img_content: None,
+                errmsg: Some("too many pairing QR requests; retry shortly".to_string()),
+            }),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(create_pairing_qr(state.as_ref()).await),
+    )
 }
 
 /// `POST /ilink/bot/get_bot_qrcode` — OpenClaw sends `local_token_list` in the body.
 pub async fn get_bot_qrcode_post(
     State(state): State<Arc<HubState>>,
+    ClientIp(ip): ClientIp,
     Query(_query): Query<BotQrcodeQuery>,
     Json(body): Json<BotQrcodeBody>,
-) -> Json<GetQrcodeResponse> {
+) -> (StatusCode, Json<GetQrcodeResponse>) {
+    if !qr_create_rate_limiter().check_and_record(&ip) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetQrcodeResponse {
+                ret: -1,
+                qrcode: None,
+                qrcode_img_content: None,
+                errmsg: Some("too many pairing QR requests; retry shortly".to_string()),
+            }),
+        );
+    }
     if !body.local_token_list.is_empty() {
         debug!(
             count = body.local_token_list.len(),
             "get_bot_qrcode POST (local_token_list ignored for hub pairing)"
         );
     }
-    Json(create_pairing_qr(state.as_ref()).await)
+    (
+        StatusCode::OK,
+        Json(create_pairing_qr(state.as_ref()).await),
+    )
 }
 
 async fn qrcode_status_json(state: &HubState, qrcode: &str) -> QrcodeStatusResponse {

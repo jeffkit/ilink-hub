@@ -1,25 +1,18 @@
 //! Prometheus `/metrics` endpoint.
-use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-};
+use axum::{extract::State, http::StatusCode};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::error;
 
-use super::auth::check_admin_auth;
+use super::auth::AdminGuard;
 use crate::hub::HubState;
 
 // ─── Metrics (Prometheus text format) ────────────────────────────────────────
 
 pub async fn metrics(
+    _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
-    headers: HeaderMap,
 ) -> (StatusCode, String) {
-    if !check_admin_auth(&state.admin, &headers) {
-        return (StatusCode::UNAUTHORIZED, "Unauthorized".into());
-    }
-
     let _hub_name = std::env::var("HUB_NAME").unwrap_or_else(|_| "default".to_string());
 
     let (online, total, client_names_by_vtoken) = {

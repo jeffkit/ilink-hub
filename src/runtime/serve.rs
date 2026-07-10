@@ -83,26 +83,32 @@ impl RuntimeConfig {
 
     /// Emit a startup warning if admin auth is disabled, scaled to the actual risk level.
     /// Called after the listen address is known so the message can be actionable.
-    pub fn warn_if_insecure(&self, bind_addr: &str) {
+    ///
+    /// Returns `Err` when insecure mode is combined with a public bind address
+    /// (`0.0.0.0` / `[::]` / `::`) — fail-closed so a misconfigured production
+    /// deploy cannot silently expose unauthenticated admin endpoints.
+    pub fn warn_if_insecure(&self, bind_addr: &str) -> Result<()> {
         if !self.admin.insecure_no_auth {
-            return;
+            return Ok(());
         }
-        let is_public = bind_addr.starts_with("0.0.0.0");
+        let host = bind_addr
+            .rsplit_once(':')
+            .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']'))
+            .unwrap_or(bind_addr);
+        let is_public = host == "0.0.0.0" || host == "::" || host.eq_ignore_ascii_case("::0");
         if is_public {
-            tracing::error!(
-                addr = %bind_addr,
-                is_public = true,
-                "SECURITY RISK: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
-                 0.0.0.0 (all interfaces). Admin endpoints are accessible with NO authentication. \
-                 Set ILINK_ADMIN_TOKEN or restrict the listen address to 127.0.0.1."
-            );
-        } else {
-            tracing::warn!(
-                addr = %bind_addr,
-                "ILINK_ADMIN_INSECURE_NO_AUTH is set — admin endpoints have no authentication. \
-                 Acceptable only on loopback; never expose this port externally."
+            anyhow::bail!(
+                "refusing to start: ILINK_ADMIN_INSECURE_NO_AUTH is set and Hub is bound to \
+                 {bind_addr} (all interfaces). Admin endpoints would be accessible with NO \
+                 authentication. Set ILINK_ADMIN_TOKEN or bind to 127.0.0.1 / ::1."
             );
         }
+        tracing::warn!(
+            addr = %bind_addr,
+            "ILINK_ADMIN_INSECURE_NO_AUTH is set — admin endpoints have no authentication. \
+             Acceptable only on loopback; never expose this port externally."
+        );
+        Ok(())
     }
 }
 
@@ -218,7 +224,7 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
         let _ = tx.send(local_display);
     }
     info!(%addr, "iLink Hub listening");
-    runtime_cfg.warn_if_insecure(&addr);
+    runtime_cfg.warn_if_insecure(&addr)?;
 
     // Eagerly check and load the master key after bind succeeds.
     let master_key = match crate::runtime::crypto::load_or_derive_master_key() {
@@ -506,9 +512,11 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                 }
             };
             if let Some(vtoken) = &default_vtoken {
-                let mut router = state.routing.router.lock().await;
-                router.set_default(vtoken.clone());
-                // Persist the resolved default so the next restart can restore it.
+                {
+                    let mut router = state.routing.router.lock().await;
+                    router.set_default(vtoken.clone());
+                }
+                // Persist after releasing the router lock — never await DB while holding it.
                 if let Err(e) = store.set_route(HUB_DEFAULT_SENTINEL, vtoken).await {
                     tracing::warn!(error = %e, "failed to persist resolved default client");
                 }
@@ -527,17 +535,28 @@ async fn load_clients_from_db(state: Arc<HubState>, store: Arc<Store>) {
                 .iter()
                 .filter(|(from_user, _)| from_user != HUB_DEFAULT_SENTINEL)
                 .count();
-            let mut router = state.routing.router.lock().await;
-            let registry = state.clients.registry.read().await;
-            for (from_user, vtoken) in routes {
-                // Skip the sentinel — it is handled above as the global default, not a per-user route.
-                if from_user == HUB_DEFAULT_SENTINEL {
-                    continue;
-                }
-                if registry.get_by_vtoken(&vtoken).is_some() {
-                    router.set_route(&from_user, vtoken);
-                } else {
-                    tracing::warn!(vtoken = %crate::redact_token(&vtoken), from_user = %from_user, "skipping route loading for non-existent vtoken");
+            // Never hold registry + router together. Snapshot known vtokens first,
+            // then apply routes under the router lock alone (lock order: router only).
+            let known_vtokens: std::collections::HashSet<String> = {
+                let registry = state.clients.registry.read().await;
+                registry
+                    .all_clients()
+                    .into_iter()
+                    .map(|c| c.vtoken.clone())
+                    .collect()
+            };
+            {
+                let mut router = state.routing.router.lock().await;
+                for (from_user, vtoken) in routes {
+                    // Skip the sentinel — it is handled above as the global default, not a per-user route.
+                    if from_user == HUB_DEFAULT_SENTINEL {
+                        continue;
+                    }
+                    if known_vtokens.contains(&vtoken) {
+                        router.set_route(&from_user, vtoken);
+                    } else {
+                        tracing::warn!(vtoken = %crate::redact_token(&vtoken), from_user = %from_user, "skipping route loading for non-existent vtoken");
+                    }
                 }
             }
             info!(count, "loaded routing state from database");
@@ -869,6 +888,38 @@ mod tests {
             .await
             .unwrap();
         assert!(dropped);
+    }
+
+    #[test]
+    fn warn_if_insecure_ok_when_auth_configured() {
+        let cfg = RuntimeConfig {
+            dispatch_channel_size: 1024,
+            shutdown_drain_secs: 30,
+            admin: AdminConfig {
+                token: Some("secret".into()),
+                insecure_no_auth: false,
+                outbound_origin_label: None,
+            },
+            max_hub_polls: 8192,
+        };
+        assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_ok());
+    }
+
+    #[test]
+    fn warn_if_insecure_rejects_public_bind_without_auth() {
+        let cfg = RuntimeConfig {
+            dispatch_channel_size: 1024,
+            shutdown_drain_secs: 30,
+            admin: AdminConfig {
+                token: None,
+                insecure_no_auth: true,
+                outbound_origin_label: None,
+            },
+            max_hub_polls: 8192,
+        };
+        assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_err());
+        assert!(cfg.warn_if_insecure("[::]:8765").is_err());
+        assert!(cfg.warn_if_insecure("127.0.0.1:8765").is_ok());
     }
 
     #[test]

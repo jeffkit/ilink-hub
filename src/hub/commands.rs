@@ -104,10 +104,17 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
 }
 
 pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> String {
-    let registry = state.clients.registry.read().await;
-    let mut clients = registry.all_clients();
-    // Sort by name so the 1-based index shown here matches `get_by_alias`.
-    clients.sort_by(|a, b| a.name.cmp(&b.name));
+    // Lock order: never hold registry and router at the same time.
+    // Clone client list under the read lock, then release before taking router
+    // (same pattern as `handle_cmd_use`). Holding both in opposite order from
+    // `load_clients_from_db` (router → registry) would AB-BA deadlock.
+    let clients = {
+        let registry = state.clients.registry.read().await;
+        let mut clients: Vec<_> = registry.all_clients().into_iter().cloned().collect();
+        // Sort by name so the 1-based index shown here matches `get_by_alias`.
+        clients.sort_by(|a, b| a.name.cmp(&b.name));
+        clients
+    };
     if clients.is_empty() {
         "尚未注册任何后端客户端。".to_string()
     } else {

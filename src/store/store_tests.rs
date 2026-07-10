@@ -3619,3 +3619,70 @@ async fn find_or_create_vctx_anonymous_resolve_uses_minted_vctx() {
         "second anonymous context must not alias the first empty-scope row"
     );
 }
+
+// ─── vctx ownership (arch-p0-hardening) ──────────────────────────────────────
+
+/// `resolve_send_context` must return None when the vtoken was never granted
+/// the vctx — even if the vctx itself exists in `context_token_map`.
+#[tokio::test]
+async fn resolve_send_context_rejects_unowned_vtoken() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-owner-check", None, "real-ctx-owner")
+        .await
+        .expect("create vctx");
+
+    // No grant yet → None.
+    let unowned = store
+        .resolve_send_context(&vctx, "vtoken-stranger")
+        .await
+        .expect("query");
+    assert!(
+        unowned.is_none(),
+        "unowned vtoken must not resolve send context"
+    );
+
+    assert!(
+        !store
+            .vtoken_owns_vctx(&vctx, "vtoken-stranger")
+            .await
+            .expect("owns"),
+        "stranger must not own vctx"
+    );
+
+    // Grant via active_sessions → Some.
+    store
+        .set_active_session_name(&vctx, "vtoken-owner", "default")
+        .await
+        .expect("grant");
+    let owned = store
+        .resolve_send_context(&vctx, "vtoken-owner")
+        .await
+        .expect("query")
+        .expect("owner must resolve");
+    assert_eq!(owned.0, "real-ctx-owner");
+    assert!(store
+        .vtoken_owns_vctx(&vctx, "vtoken-owner")
+        .await
+        .expect("owns"));
+}
+
+/// Ownership via `backend_sessions_v2` alone (no active_sessions row) is enough.
+#[tokio::test]
+async fn resolve_send_context_accepts_backend_session_grant() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-bsess", None, "real-bsess")
+        .await
+        .expect("create vctx");
+    store
+        .set_backend_session(&vctx, "vtoken-bsess", "default", "sid-1")
+        .await
+        .expect("session");
+    let owned = store
+        .resolve_send_context(&vctx, "vtoken-bsess")
+        .await
+        .expect("query")
+        .expect("backend_sessions grant must suffice");
+    assert_eq!(owned.0, "real-bsess");
+}

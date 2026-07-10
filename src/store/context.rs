@@ -201,7 +201,14 @@ impl Store {
         Ok(row.map(|r| r.get("vtoken")))
     }
 
-    /// when the vctx is unknown (caller should 400).
+    /// Resolve everything `sendmessage` needs in a single DB round-trip:
+    /// `(real_ctx, peer_user_id, session_name)`.
+    ///
+    /// Combines context lookup with an **ownership check**: the calling
+    /// `vtoken` must already have been granted this `vctx` by Hub dispatch
+    /// (row in `active_sessions`, `backend_sessions_v2`, or `messages`).
+    /// Returns `None` when the vctx is unknown **or** the vtoken does not
+    /// own it (caller should 400 / 403).
     pub async fn resolve_send_context(
         &self,
         vctx: &str,
@@ -216,7 +223,15 @@ impl Store {
                       'default' \
                     ) AS session_name \
              FROM context_token_map c \
-             WHERE c.vctx = $1",
+             WHERE c.vctx = $1 \
+               AND ( \
+                 EXISTS (SELECT 1 FROM active_sessions a \
+                         WHERE a.vctx = $1 AND a.vtoken = $2) \
+                 OR EXISTS (SELECT 1 FROM backend_sessions_v2 b \
+                            WHERE b.vctx = $1 AND b.vtoken = $2) \
+                 OR EXISTS (SELECT 1 FROM messages m \
+                            WHERE m.vctx = $1 AND m.vtoken = $2 LIMIT 1) \
+               )",
         )
         .bind(vctx)
         .bind(vtoken)
@@ -229,6 +244,25 @@ impl Store {
                 r.get("session_name"),
             )
         }))
+    }
+
+    /// Return `true` when `vtoken` has been granted access to `vctx`
+    /// (same ownership predicate as [`Self::resolve_send_context`]).
+    pub async fn vtoken_owns_vctx(&self, vctx: &str, vtoken: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 AS ok WHERE \
+               EXISTS (SELECT 1 FROM active_sessions a \
+                       WHERE a.vctx = $1 AND a.vtoken = $2) \
+               OR EXISTS (SELECT 1 FROM backend_sessions_v2 b \
+                          WHERE b.vctx = $1 AND b.vtoken = $2) \
+               OR EXISTS (SELECT 1 FROM messages m \
+                          WHERE m.vctx = $1 AND m.vtoken = $2 LIMIT 1)",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .fetch_optional(&self.rpool)
+        .await?;
+        Ok(row.is_some())
     }
 }
 

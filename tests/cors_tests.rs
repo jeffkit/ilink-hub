@@ -48,7 +48,7 @@ fn permissive_allows_any_origin() {
     temp_env::with_var("ILINK_CORS_ORIGINS", None::<&str>, || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -77,7 +77,7 @@ fn permissive_preflight_returns_allow_methods() {
     temp_env::with_var("ILINK_CORS_ORIGINS", None::<&str>, || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -108,7 +108,7 @@ fn list_mode_allows_configured_origin() {
     temp_env::with_var("ILINK_CORS_ORIGINS", Some("https://my.app"), || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -140,7 +140,7 @@ fn list_mode_allows_multiple_origins() {
         || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
-                let app = test_router(build_cors_layer());
+                let app = test_router(build_cors_layer().unwrap());
 
                 for origin in &["https://a.com", "https://b.com"] {
                     let resp = app
@@ -173,7 +173,7 @@ fn list_mode_preflight_includes_allow_methods_and_headers() {
     temp_env::with_var("ILINK_CORS_ORIGINS", Some("https://my.app"), || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -213,7 +213,7 @@ fn list_mode_rejects_unlisted_origin() {
     temp_env::with_var("ILINK_CORS_ORIGINS", Some("https://my.app"), || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -242,7 +242,7 @@ fn list_mode_preflight_rejects_unlisted_origin() {
     temp_env::with_var("ILINK_CORS_ORIGINS", Some("https://my.app"), || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let app = test_router(build_cors_layer());
+            let app = test_router(build_cors_layer().unwrap());
 
             let resp = app
                 .oneshot(
@@ -380,21 +380,21 @@ fn build_router_bot_api_whitelist_allows_configured_origin() {
 // ── illegal format ──────────────────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "without scheme")]
-fn parse_origins_panics_on_bad_format() {
-    ilink_hub::server::parse_origins("bad-origin");
+fn parse_origins_errs_on_bad_format() {
+    let err = ilink_hub::server::parse_origins("bad-origin").unwrap_err();
+    assert!(err.contains("http://") || err.contains("https://"), "{err}");
 }
 
 #[test]
-#[should_panic(expected = "without scheme")]
-fn parse_origins_panics_on_mixed_bad_origin() {
-    ilink_hub::server::parse_origins("https://a.com, bad-origin");
+fn parse_origins_errs_on_mixed_bad_origin() {
+    let err = ilink_hub::server::parse_origins("https://a.com, bad-origin").unwrap_err();
+    assert!(err.contains("bad-origin"), "{err}");
 }
 
 // ── clone / Send+Sync sanity ─────────────────────────────────────────────
 
 #[test]
 fn cors_layer_is_cloneable() {
-    let cors = build_cors_layer();
+    let cors = build_cors_layer().unwrap();
     let _c2 = cors.clone();
 }

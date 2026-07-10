@@ -72,7 +72,11 @@ impl FromRequestParts<Arc<HubState>> for AdminGuard {
         } else {
             Err((
                 StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Unauthorized"})),
+                Json(serde_json::json!({
+                    "error": "Unauthorized",
+                    "ret": 401,
+                    "errmsg": "Unauthorized",
+                })),
             ))
         }
     }
