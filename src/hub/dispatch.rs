@@ -208,107 +208,112 @@ async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessage) {
             push_to_queue(&state.clients.queue, &state.metrics, &vtoken, msg).await;
         }
         RoutingDecision::Broadcast => {
-            let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
-            let online = {
-                let registry = state.clients.registry.read().await;
-                registry
-                    .online_clients()
-                    .iter()
-                    .map(|c| c.vtoken.clone())
-                    .collect::<Vec<_>>()
-            };
-
-            if online.is_empty() {
-                warn!(from_user_id, "no online clients to dispatch to");
-                state
-                    .metrics
-                    .messages_dropped
-                    .fetch_add(1, Ordering::Relaxed);
-                if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
-                    let to_uid = msg.from_user_id.as_deref().unwrap_or("");
-                    let reply_text = build_no_backend_reply(msg.text());
-                    debug!(to = %to_uid, "sending no-backend fallback reply");
-                    let reply = SendMessageRequest::reply(real_ctx, reply_text, to_uid);
-                    match state.ilink.upstream.send_message(reply).await {
-                        Err(e) => error!(error = %e, "failed to send no-clients reply"),
-                        Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
-                            warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected no-clients reply");
-                        }
-                        Ok(_) => {}
-                    }
-                } else {
-                    warn!(
-                        from_user_id,
-                        "no context_token in message, cannot send no-clients reply"
-                    );
-                }
-                return;
-            }
-
-            let real_ctx = match msg.context_token.clone() {
-                Some(ctx) if !ctx.is_empty() => ctx,
-                _ => {
-                    warn!("broadcast message has no context_token, skipping");
-                    return;
-                }
-            };
-            let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
-            let group_id = msg.group_id.clone();
-
-            // Shared vctx per conversation: sessions are isolated by (vctx, vtoken) so
-            // each backend stays independent, while routing-mode changes (broadcast → /use)
-            // don't break session continuity.
-            let vctx = resolve_vctx_for_message(
-                &state,
-                &real_ctx,
-                &peer_user_id,
-                group_id.as_deref(),
-                None,
-            )
-            .await;
-            let vctx_by_vtoken: Vec<(String, String)> =
-                online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
-
-            // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
-            let pairs: Vec<(String, String)> = vctx_by_vtoken
-                .iter()
-                .map(|(vt, vc)| (vc.clone(), vt.clone()))
-                .collect();
-            let hub_ext_data = match state.store.get_hub_ext_batch(&pairs).await {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(error = %e, "get_hub_ext_batch failed; broadcast will proceed without HubExt");
-                    Default::default()
-                }
-            };
-
-            // Share the unchanged fields of the message across recipients —
-            // only `context_token` and `ilink_hub_ext` differ per vtoken, so
-            // we pass the base through `Arc` and let the queue clone it once
-            // per recipient instead of doing N full `WeixinMessage::clone`s
-            // on the broadcast path.
-            let shared_msg: Arc<WeixinMessage> = Arc::new(msg);
-            for (vtoken, vctx) in vctx_by_vtoken {
-                let hub_ext = hub_ext_data.get(&(vctx.clone(), vtoken.clone())).map(
-                    |(session_name, session_id)| HubExt {
-                        session_id: session_id.clone(),
-                        session_name: Some(session_name.clone()),
-                        cli_session_id: None,
-                        a2a_call_id: None,
-                        a2a_depth: None,
-                    },
-                );
-                push_shared_to_queue(
-                    &state.clients.queue,
-                    &state.metrics,
-                    &vtoken,
-                    Arc::clone(&shared_msg),
-                    Some(vctx),
-                    hub_ext,
-                )
-                .await;
-            }
+            handle_broadcast(state, msg).await;
         }
+    }
+}
+
+/// Fan-out path for [`RoutingDecision::Broadcast`]: reply when no backends are
+/// online, otherwise push a shared copy to every online client.
+///
+/// Extracted so unit tests can exercise the arm directly — `Router::route`
+/// currently never returns `Broadcast` (falls through to Help instead), but
+/// the arm remains the intended fan-out implementation if routing re-enables it.
+async fn handle_broadcast(state: Arc<HubState>, msg: WeixinMessage) {
+    let from_user_id = msg.from_user_id.as_deref().unwrap_or("?").to_string();
+    let online = {
+        let registry = state.clients.registry.read().await;
+        registry
+            .online_clients()
+            .iter()
+            .map(|c| c.vtoken.clone())
+            .collect::<Vec<_>>()
+    };
+
+    if online.is_empty() {
+        warn!(from_user_id, "no online clients to dispatch to");
+        state
+            .metrics
+            .messages_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        if let Some(real_ctx) = msg.context_token.clone().filter(|c| !c.is_empty()) {
+            let to_uid = msg.from_user_id.as_deref().unwrap_or("");
+            let reply_text = build_no_backend_reply(msg.text());
+            debug!(to = %to_uid, "sending no-backend fallback reply");
+            let reply = SendMessageRequest::reply(real_ctx, reply_text, to_uid);
+            match state.ilink.upstream.send_message(reply).await {
+                Err(e) => error!(error = %e, "failed to send no-clients reply"),
+                Ok(resp) if resp.ret.map(|r| r != 0).unwrap_or(false) => {
+                    warn!(ret = resp.ret, errmsg = ?resp.errmsg, "iLink rejected no-clients reply");
+                }
+                Ok(_) => {}
+            }
+        } else {
+            warn!(
+                from_user_id,
+                "no context_token in message, cannot send no-clients reply"
+            );
+        }
+        return;
+    }
+
+    let real_ctx = match msg.context_token.clone() {
+        Some(ctx) if !ctx.is_empty() => ctx,
+        _ => {
+            warn!("broadcast message has no context_token, skipping");
+            return;
+        }
+    };
+    let peer_user_id = msg.from_user_id.clone().unwrap_or_default();
+    let group_id = msg.group_id.clone();
+
+    // Shared vctx per conversation: sessions are isolated by (vctx, vtoken) so
+    // each backend stays independent, while routing-mode changes (broadcast → /use)
+    // don't break session continuity.
+    let vctx =
+        resolve_vctx_for_message(&state, &real_ctx, &peer_user_id, group_id.as_deref(), None).await;
+    let vctx_by_vtoken: Vec<(String, String)> =
+        online.iter().map(|vt| (vt.clone(), vctx.clone())).collect();
+
+    // Batch-fetch HubExt session data — 2 queries total instead of 2×N.
+    let pairs: Vec<(String, String)> = vctx_by_vtoken
+        .iter()
+        .map(|(vt, vc)| (vc.clone(), vt.clone()))
+        .collect();
+    let hub_ext_data = match state.store.get_hub_ext_batch(&pairs).await {
+        Ok(data) => data,
+        Err(e) => {
+            warn!(error = %e, "get_hub_ext_batch failed; broadcast will proceed without HubExt");
+            Default::default()
+        }
+    };
+
+    // Share the unchanged fields of the message across recipients —
+    // only `context_token` and `ilink_hub_ext` differ per vtoken, so
+    // we pass the base through `Arc` and let the queue clone it once
+    // per recipient instead of doing N full `WeixinMessage::clone`s
+    // on the broadcast path.
+    let shared_msg: Arc<WeixinMessage> = Arc::new(msg);
+    for (vtoken, vctx) in vctx_by_vtoken {
+        let hub_ext =
+            hub_ext_data
+                .get(&(vctx.clone(), vtoken.clone()))
+                .map(|(session_name, session_id)| HubExt {
+                    session_id: session_id.clone(),
+                    session_name: Some(session_name.clone()),
+                    cli_session_id: None,
+                    a2a_call_id: None,
+                    a2a_depth: None,
+                });
+        push_shared_to_queue(
+            &state.clients.queue,
+            &state.metrics,
+            &vtoken,
+            Arc::clone(&shared_msg),
+            Some(vctx),
+            hub_ext,
+        )
+        .await;
     }
 }
 
@@ -1324,34 +1329,50 @@ mod tests {
     /// M3-5: resolve_quote_from_footer with "session-" prefix must resolve via the
     /// session-name slow path. Catches the `||` → `&&` mutant (482:50) which would
     /// require BOTH "at-" AND "session-" prefixes to match, breaking "session-" alone.
+    ///
+    /// Footer is two-part (`---\nsession-alpha · at-decoy`): name="session-alpha",
+    /// session=Some("at-decoy"). With `||`, session_key uses the name and the DB
+    /// hit succeeds. With `&&`, the if-arm is false and session_key becomes
+    /// "at-decoy" (no DB row) → None.
     #[tokio::test]
     async fn resolve_quote_from_footer_session_prefix_uses_session_path() {
         let (state, vtoken) = make_state_with_client().await;
-        // Register a second client whose footer name starts with "session-…".
-        let (_, session_client_vtoken, _) =
-            state
-                .clients
-                .registry
-                .write()
-                .await
-                .register("session-client".to_string(), None, None);
-        let _ = (vtoken, session_client_vtoken); // bindings used for registration side-effect
+        let session_key = "session-alpha";
 
-        // A footer whose name segment starts with "session-" should trigger the
-        // session-key slow path. Without a DB row, it ultimately returns None, but
-        // we confirm the code reaches the slow path rather than the fast path.
-        let quoted_text = "body\n\n---\nsession-alpha";
+        // Seed scope → vctx → (vctx, session) → vtoken. Do NOT register a client
+        // named "session-alpha" so the fast name lookup misses and we take the
+        // session-prefix slow path.
+        let vctx = state
+            .store
+            .find_or_create_vctx("user1", None, "real-ctx-session-prefix")
+            .await
+            .expect("vctx");
+        state
+            .store
+            .set_backend_session(&vctx, &vtoken, session_key, "cli-sid")
+            .await
+            .expect("backend session");
+
+        // Two-part footer: name starts with session-, but parsed session_name is
+        // a different at-* key. This is the only shape that distinguishes || from &&.
+        let quoted_text = "body\n\n---\nsession-alpha · at-decoy";
         let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
-
-        // The slow path attempts a store lookup; with no rows it returns None.
-        // This test just verifies the code path doesn't panic or short-circuit.
         let result = resolve_quote_from_footer(&state, &msg).await;
-        // None is valid — no DB row exists — but with || → && the function
-        // would take the wrong branch and also return None for different reasons.
-        // The key invariant is that "session-" prefix does NOT short-circuit at
-        // the client-name-only fast path (which would return None because "session-alpha"
-        // is not a registered client name in the registry).
-        let _ = result; // result may be None due to no DB row; absence of panic is enough
+        assert!(
+            result.is_some(),
+            "session- prefix alone must resolve via slow path (|| not &&)"
+        );
+        match result.unwrap() {
+            QuoteOrigin::Client {
+                vtoken: vt,
+                session_name,
+                ..
+            } => {
+                assert_eq!(vt, vtoken);
+                assert_eq!(session_name.as_deref(), Some(session_key));
+            }
+            other => panic!("expected Client origin, got {other:?}"),
+        }
     }
 
     /// M3-6: build_hub_ext_for_vctx must return a non-empty session_id when the
@@ -1446,7 +1467,7 @@ mod tests {
             "test-relay-secret".to_string(),
             AdminConfig::from_env(),
         );
-        // No clients registered → Broadcast / no-backend path when no default route.
+        // No clients registered → no-backend path.
         let msg = WeixinMessage {
             context_token: Some(String::new()),
             from_user_id: Some("user-bcast".into()),
@@ -1459,11 +1480,217 @@ mod tests {
             }])),
             ..Default::default()
         };
-        dispatch_message(Arc::clone(&state), msg).await;
+        // Call handle_broadcast directly: Router::route never returns Broadcast today.
+        handle_broadcast(Arc::clone(&state), msg).await;
         assert_eq!(
             mock_ref.polls_ok(),
             0,
             "empty context on no-backend path must not send reply"
+        );
+    }
+
+    /// No-backend path with a non-empty context must call upstream once.
+    /// Complements the empty-context skip test and pins the filter guard.
+    #[tokio::test]
+    async fn dispatch_broadcast_no_backend_sends_reply_with_context() {
+        let mock = crate::hub::tests::MockUpstream::returning_ok();
+        let store = Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let mock_ref = Arc::clone(&mock);
+        let queue = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let state = HubState::new(
+            mock,
+            Arc::new(store),
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        );
+        let msg = WeixinMessage {
+            context_token: Some("real-ctx-no-backend".into()),
+            from_user_id: Some("user-nobackend".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello world".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        handle_broadcast(Arc::clone(&state), msg).await;
+        assert_eq!(
+            mock_ref.polls_ok(),
+            1,
+            "no-backend path with context must send fallback reply"
+        );
+    }
+
+    /// Broadcast with online clients + empty context must skip queue push.
+    /// Catches match-guard mutants at the Broadcast arm (`!ctx.is_empty()`).
+    #[tokio::test]
+    async fn dispatch_broadcast_online_empty_context_skips_queue() {
+        let (state, vtoken) = make_state_with_client().await;
+        state.clients.registry.write().await.mark_online(&vtoken);
+        let before = state.metrics.messages_dispatched.load(Ordering::Relaxed);
+
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user-bcast-online".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello broadcast".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        handle_broadcast(Arc::clone(&state), msg).await;
+        assert_eq!(
+            state.metrics.messages_dispatched.load(Ordering::Relaxed),
+            before,
+            "empty context must not push_shared to online clients"
+        );
+        let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+        assert!(
+            drained.is_empty(),
+            "queue must stay empty when broadcast context is empty"
+        );
+    }
+
+    /// Broadcast with online clients + real context must push via push_shared_to_queue.
+    /// Catches `push_shared_to_queue → ()` no-op mutant.
+    #[tokio::test]
+    async fn dispatch_broadcast_online_pushes_shared_to_queue() {
+        let (state, vtoken) = make_state_with_client().await;
+        state.clients.registry.write().await.mark_online(&vtoken);
+        let before = state.metrics.messages_dispatched.load(Ordering::Relaxed);
+
+        let msg = WeixinMessage {
+            context_token: Some("real-ctx-bcast".into()),
+            from_user_id: Some("user-bcast-push".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("hello broadcast".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        handle_broadcast(Arc::clone(&state), msg).await;
+        assert_eq!(
+            state.metrics.messages_dispatched.load(Ordering::Relaxed),
+            before + 1,
+            "broadcast must call push_shared_to_queue for each online client"
+        );
+        let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+        assert_eq!(
+            drained.len(),
+            1,
+            "exactly one shared message must be queued"
+        );
+        assert!(
+            drained[0]
+                .context_token
+                .as_deref()
+                .is_some_and(|c| !c.is_empty()),
+            "queued message must carry a non-empty vctx"
+        );
+    }
+
+    /// @mention with empty context_token must not push to the queue.
+    /// Catches `!ctx.is_empty()` match guard → true in handle_at_mention.
+    #[tokio::test]
+    async fn dispatch_at_mention_empty_context_skips_queue() {
+        let (state, vtoken) = make_state_with_client().await;
+        state.clients.registry.write().await.mark_online(&vtoken);
+        let before = state.metrics.messages_dispatched.load(Ordering::Relaxed);
+
+        let msg = WeixinMessage {
+            context_token: Some(String::new()),
+            from_user_id: Some("user-at".into()),
+            item_list: Some(Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some("@test-backend please help".into()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        };
+        dispatch_message(Arc::clone(&state), msg).await;
+        assert_eq!(
+            state.metrics.messages_dispatched.load(Ordering::Relaxed),
+            before,
+            "@mention with empty context must not push to queue"
+        );
+        let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+        assert!(
+            drained.is_empty(),
+            "queue must stay empty for empty-ctx @mention"
+        );
+    }
+
+    /// Timestamp quote lookup must ignore rows whose vtoken is empty.
+    /// Catches `!vtoken.is_empty()` match guard → true in resolve_quote_from_timestamp.
+    #[tokio::test]
+    async fn resolve_quote_from_timestamp_rejects_empty_vtoken() {
+        let (state, _vtoken) = make_state_with_client().await;
+        let peer_user_id = "peer:user-empty-vt";
+        state
+            .store
+            .save_message(
+                "vctx-empty-vt",
+                Some(""),
+                "at-empty-vtoken",
+                peer_user_id,
+                "assistant",
+                "reply with empty vtoken",
+            )
+            .await
+            .expect("save");
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let msg = make_quote_msg("user-empty-vt", now_ms, None);
+        let result = resolve_quote_from_timestamp(&state, &msg).await;
+        assert!(
+            result.is_none(),
+            "empty vtoken row must not become QuoteOrigin::Client"
+        );
+    }
+
+    /// DB content quote lookup must ignore rows whose vtoken is empty.
+    /// Catches `!vtoken.is_empty()` match guard → true in resolve_quote_from_db.
+    #[tokio::test]
+    async fn resolve_quote_from_db_rejects_empty_vtoken() {
+        let (state, _vtoken) = make_state_with_client().await;
+        let peer_user_id = "peer:user-empty-vt-db";
+        let body = "unique-empty-vtoken-prefix-content-xyz";
+        state
+            .store
+            .save_message(
+                "vctx-empty-vt-db",
+                Some(""),
+                "at-empty-vtoken-db",
+                peer_user_id,
+                "assistant",
+                body,
+            )
+            .await
+            .expect("save");
+
+        let msg = make_quote_msg("user-empty-vt-db", 1_000_000, Some(body));
+        let result = resolve_quote_from_db(&state, &msg).await;
+        assert!(
+            result.is_none(),
+            "empty vtoken row must not become QuoteOrigin::Client via DB lookup"
         );
     }
 }
