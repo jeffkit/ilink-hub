@@ -176,6 +176,7 @@ exclude_re = [
     # 同路径上的 `r != 0` → `r == 0`（变异体名不含 map，需单独排除）
     "replace != with == in handle_hub_command",
     "replace != with == in dispatch_message",
+    "replace != with == in handle_broadcast",
     # 2. pairing.rs 时间边界变异（> vs >=）：
     #    `created_at.elapsed() > PAIRING_TTL` 等使用 std::time::Instant，
     #    无法通过 tokio::time::pause() 控制。>= 边界（差 1 纳秒）在业务上无意义。
