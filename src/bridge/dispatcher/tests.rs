@@ -1159,11 +1159,16 @@ async fn final_reply_throttled_thrice_then_delivered() {
 }
 
 #[tokio::test]
-async fn final_reply_transport_error_propagates() {
-    // A non-throttle transport error must surface to the caller (so
-    // the final-reply path can map it to HandleError) instead of
-    // being retried forever.
-    let scripted = ScriptedSender::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+async fn final_reply_transport_error_retried_then_succeeds() {
+    // Transport errors (e.g. stale pooled connection, TCP reset) are
+    // retried within the cumulative budget, not surfaced immediately.
+    // Two consecutive failures followed by a Sent must yield Ok with
+    // exactly 3 total attempts.
+    let scripted = ScriptedSender::new(vec![
+        Err(anyhow::anyhow!("connection reset")),
+        Err(anyhow::anyhow!("connection reset")),
+        Ok(SendOutcome::Sent),
+    ]);
     let shutdown = CancellationToken::new();
     let res = send_final_with_retry(
         &scripted,
@@ -1174,11 +1179,43 @@ async fn final_reply_transport_error_propagates() {
         "final reply",
     )
     .await;
-    assert!(res.is_err(), "transport error must propagate, not retry");
+    assert!(
+        res.is_ok(),
+        "transport errors retried until success must return Ok"
+    );
+    assert_eq!(
+        scripted.sent_count(),
+        3,
+        "two transport failures + one successful send = 3 total attempts"
+    );
+}
+
+#[tokio::test]
+async fn final_reply_transport_error_budget_exhausted_gives_up() {
+    // With a zero-length budget, the budget check fires immediately
+    // after the very first transport error and the helper gives up
+    // gracefully (Ok) without a second attempt.
+    let scripted = ScriptedSender::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+    let shutdown = CancellationToken::new();
+    // Duration::ZERO: any elapsed time satisfies `elapsed >= max_total`,
+    // so the budget check always triggers after the first failure.
+    let res = send_final_with_retry(
+        &scripted,
+        dummy_req(),
+        test_backoff,
+        Duration::ZERO,
+        &shutdown,
+        "final reply",
+    )
+    .await;
+    assert!(
+        res.is_ok(),
+        "budget-exhausted transport error must give up with Ok, not propagate Err"
+    );
     assert_eq!(
         scripted.sent_count(),
         1,
-        "must not retry a non-throttle Err"
+        "exactly one attempt before budget expired"
     );
 }
 

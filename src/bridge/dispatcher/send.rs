@@ -136,6 +136,12 @@ impl HubClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(90))
+            // Evict idle connections after 30 s. Without this, a connection
+            // parked in the pool between two AI calls (which may be minutes
+            // apart) can be silently closed by the server-side load balancer
+            // or NAT, causing the next `sendmessage` to fail with a transport
+            // error and lose the user's reply entirely.
+            .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .context("failed to build reqwest client")?;
         Ok(Self {
@@ -443,17 +449,19 @@ pub(super) async fn run_partial_forward_loop<S: ReplySender>(
     }
 }
 
-/// M3: send one fully-built request, retrying on `Throttled` with the same
-/// exponential backoff as the partial loop, until it lands, `shutdown`
-/// fires, or the M4 cumulative retry budget is exhausted.
+/// M3: send one fully-built request, retrying on both `Throttled` and
+/// transient transport errors with the same exponential backoff as the
+/// partial loop, until it lands, `shutdown` fires, or the M4 cumulative
+/// retry budget is exhausted.
 ///
 /// Unlike the partial loop there is no buffering/overwrite: the final reply,
 /// `cli_session_id` persistence and CLI-error reply each carry one fixed
 /// payload, so we just clone-and-resend the same `req` until delivery.
 ///
-/// Returns `Ok(())` on delivery **or** on a clean give-up/shutdown (the
-/// caller has nothing better to do than continue); only a non-throttle
-/// transport error propagates as `Err`.
+/// Returns `Ok(())` in all cases — on delivery, on a clean give-up after the
+/// budget is exhausted (for both throttle and transport errors), or when
+/// `shutdown` fires.  Callers that map the return value to `HandleError`
+/// can treat all outcomes as "best-effort sent; move on".
 pub(super) async fn send_final_with_retry<S: ReplySender + ?Sized>(
     sender: &S,
     req: SendMessageRequest,
@@ -503,7 +511,41 @@ pub(super) async fn send_final_with_retry<S: ReplySender + ?Sized>(
                     _ = tokio::time::sleep(wait) => {}
                 }
             }
-            Err(e) => return Err(e),
+            // Transport / protocol errors (e.g. stale pooled connection, TCP
+            // reset, transient 5xx) are treated the same as throttling: retry
+            // within the cumulative budget rather than surfacing immediately.
+            // A stale connection from the reqwest pool is the most common
+            // cause here (long-running AI call → connection idle > server
+            // keepalive → "connection reset" on the next write).
+            Err(e) => {
+                let elapsed = start.elapsed();
+                if elapsed >= max_total {
+                    error!(
+                        what,
+                        attempt,
+                        elapsed_secs = elapsed.as_secs(),
+                        budget_secs = max_total.as_secs(),
+                        error = %e,
+                        "final reply abandoned: retry budget exhausted under persistent transport error"
+                    );
+                    return Ok(());
+                }
+                attempt = attempt.saturating_add(1);
+                let wait = backoff_fn(attempt);
+                warn!(
+                    what,
+                    attempt,
+                    backoff_secs = wait.as_secs(),
+                    elapsed_secs = elapsed.as_secs(),
+                    error = %e,
+                    "final reply transport error; retrying with exponential backoff"
+                );
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep(wait) => {}
+                }
+            }
         }
     }
 }

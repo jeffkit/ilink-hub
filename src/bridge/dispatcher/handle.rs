@@ -241,12 +241,20 @@ pub(super) async fn handle_one_message(
                     let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
                     hub_ext.session_name = Some(session_name_for_cli.clone());
                 }
+                // Use an independent (never-cancelled) token rather than
+                // `&shutdown` so a concurrent bridge restart does not
+                // silently drop the error reply before it is sent.  The
+                // CLI has already exited at this point; the reply is the
+                // only user-visible feedback about the failure.  The
+                // per-call `retry_budget` still bounds the total
+                // wall-clock time spent here, and `main()` will abort
+                // the task after its 3 s grace period if needed.
                 if let Err(send_e) = send_final_with_retry(
                     client,
                     req,
                     backoff_for,
                     retry_budget,
-                    &shutdown,
+                    &CancellationToken::new(),
                     "CLI-error reply",
                 )
                 .await
