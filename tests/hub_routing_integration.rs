@@ -73,6 +73,40 @@ async fn register(state: &Arc<HubState>, name: &str) -> (String, String) {
     (outcome.plaintext, outcome.hashed)
 }
 
+/// Deterministically wait until `vtoken`'s queue holds at least `expected`
+/// messages, then drain and return them.
+///
+/// Replaces fixed `tokio::time::sleep` waits that flake on slow/loaded CI
+/// runners — dispatch can take longer than the hard-coded 50–100 ms, so the
+/// drain ran before the message arrived and the assertion saw `0` instead of
+/// the expected count. This polls `queue_sizes` (non-consuming) until the
+/// expected count is reached, with a 5 s deadline; on timeout it drains
+/// whatever is present so the caller's `assert_eq!(msgs.len(), expected)`
+/// fails with a clear actual-vs-expected value instead of hanging.
+async fn drain_expected(
+    state: &Arc<HubState>,
+    vtoken: &str,
+    expected: usize,
+) -> Vec<WeixinMessage> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        let sizes = state
+            .clients
+            .queue
+            .queue_sizes()
+            .await
+            .expect("queue_sizes");
+        if sizes.get(vtoken).copied().unwrap_or(0) >= expected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    state.clients.queue.drain(vtoken).await.expect("drain")
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 /// A message sent from upstream is dispatched to the registered client's queue.
@@ -88,10 +122,7 @@ async fn single_client_receives_dispatched_message() {
     let msg = make_user_msg("user@wx", "real-ctx-001", "hello");
     tx.try_send(msg).unwrap();
 
-    // Give dispatcher a moment to process.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs = drain_expected(&state, &vtoken, 1).await;
     assert_eq!(msgs.len(), 1, "client should receive exactly one message");
     assert_eq!(msgs[0].text(), Some("hello"));
 }
@@ -183,9 +214,7 @@ async fn single_default_client_receives_forward_to_message() {
     let msg = make_user_msg("user@wx", "real-ctx-forward", "forward me");
     tx.try_send(msg).unwrap();
 
-    tokio::time::sleep(Duration::from_millis(80)).await;
-
-    let msgs_default = state.clients.queue.drain(&vtoken_default).await.unwrap();
+    let msgs_default = drain_expected(&state, &vtoken_default, 1).await;
     let msgs_other = state.clients.queue.drain(&vtoken_other).await.unwrap();
 
     assert_eq!(
@@ -229,9 +258,8 @@ async fn at_mention_routes_to_named_backend_on_new_session() {
         "@claude 看下日志 有 空格",
     ))
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let msgs_claude = state.clients.queue.drain(&vtoken_claude).await.unwrap();
+    let msgs_claude = drain_expected(&state, &vtoken_claude, 1).await;
     let msgs_codex = state.clients.queue.drain(&vtoken_codex).await.unwrap();
 
     assert_eq!(
@@ -299,9 +327,8 @@ async fn at_mention_unknown_backend_falls_through_to_normal_routing() {
         "@nobody hello",
     ))
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs = drain_expected(&state, &vtoken, 1).await;
     assert_eq!(msgs.len(), 1, "current backend should receive the message");
     assert_eq!(
         msgs[0].text(),
@@ -323,13 +350,11 @@ async fn same_user_gets_stable_virtual_context_token() {
     // Same real_ctx, same from_user → same vctx.
     tx.try_send(make_user_msg("user@wx", "real-ctx-stable", "msg 1"))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs1 = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs1 = drain_expected(&state, &vtoken, 1).await;
 
     tx.try_send(make_user_msg("user@wx", "real-ctx-stable", "msg 2"))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs2 = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs2 = drain_expected(&state, &vtoken, 1).await;
 
     assert_eq!(msgs1.len(), 1);
     assert_eq!(msgs2.len(), 1);
@@ -352,9 +377,8 @@ async fn sendmessage_translates_virtual_to_real_context_token() {
     // Dispatch a message so a vctx→real_ctx mapping is created.
     tx.try_send(make_user_msg("user@wx", "real-ctx-send", "hello"))
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(80)).await;
 
-    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs = drain_expected(&state, &vtoken, 1).await;
     assert_eq!(msgs.len(), 1);
     let vctx = msgs[0].context_token.clone().unwrap();
 
@@ -413,6 +437,10 @@ async fn messages_queued_in_fifo_order() {
     let (tx, rx) = mpsc::channel(16);
     spawn_dispatcher(Arc::clone(&state), rx);
 
+    // Send 5 messages back-to-back. The dispatcher drains the mpsc channel
+    // sequentially (`dispatch_message(...).await` per message), and mpsc is
+    // FIFO, so queue-push order matches send order without any inter-send
+    // delay. `drain_expected` then waits deterministically for all 5 to land.
     for i in 0..5u8 {
         tx.try_send(make_user_msg(
             "user@wx",
@@ -420,12 +448,9 @@ async fn messages_queued_in_fifo_order() {
             &format!("msg-{i}"),
         ))
         .unwrap();
-        // Small delay to ensure ordering through the async dispatch path.
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let msgs = state.clients.queue.drain(&vtoken).await.unwrap();
+    let msgs = drain_expected(&state, &vtoken, 5).await;
     assert_eq!(msgs.len(), 5);
     for (i, msg) in msgs.iter().enumerate() {
         assert_eq!(msg.text(), Some(format!("msg-{i}").as_str()));
