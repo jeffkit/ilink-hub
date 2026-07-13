@@ -69,6 +69,14 @@ pub fn emit_partial(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Emit a P0 error line (`AGENT_ERROR:<json-string>`). The bridge forwards this to the
+/// user through the partial channel in streaming mode.
+pub fn emit_error(text: &str) -> Result<()> {
+    println!("AGENT_ERROR:{}", serde_json::to_string(text)?);
+    std::io::Write::flush(&mut std::io::stdout()).ok();
+    Ok(())
+}
+
 /// Spawn a background task that drains a child pipe (typically stderr) into a String,
 /// capped at [`crate::bridge::MAX_CLI_CAPTURE_BYTES`]. Draining concurrently prevents a
 /// full pipe buffer from deadlocking the child; the cap prevents a runaway CLI from
@@ -120,10 +128,53 @@ pub struct StreamJsonEvent {
     /// Session ID (present on `type == "result"` events).
     pub session_id: Option<String>,
     /// Present on `type == "result"` events (`"success"` or an error subtype).
-    #[allow(dead_code)]
     pub subtype: Option<String>,
+    /// Present on terminal `result` events when the run failed.
+    pub is_error: Option<bool>,
+    /// Human-readable error strings on failed `result` events (recursive / Claude CLI).
+    pub errors: Option<Vec<String>>,
+    /// Provider stop reason on terminal `result` events.
+    pub stop_reason: Option<String>,
     /// Present on `type == "assistant"` events.
     pub message: Option<StreamMessage>,
+}
+
+impl StreamJsonEvent {
+    /// Whether this terminal `result` event reports a failed run.
+    pub fn is_result_error(&self) -> bool {
+        self.is_error == Some(true) || self.subtype.as_deref() == Some("error_during_execution")
+    }
+
+    /// Best-effort error text from a failed terminal `result` event.
+    pub fn result_error_message(&self) -> Option<String> {
+        if !self.is_result_error() {
+            return None;
+        }
+        if let Some(errors) = &self.errors {
+            let joined = errors
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            if !joined.is_empty() {
+                return Some(joined);
+            }
+        }
+        if let Some(reason) = self
+            .stop_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(reason.to_string());
+        }
+        self.result
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
 }
 
 /// Nested message structure in `type == "assistant"` stream events.
@@ -221,6 +272,24 @@ mod tests {
             msg.text(),
             "",
             "None text field in text block must produce empty output"
+        );
+    }
+
+    #[test]
+    fn result_error_message_prefers_errors_array() {
+        let json = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["LLM 404"],"stop_reason":"provider_stop:LLM 404","session_id":"sess-1"}"#;
+        let event: StreamJsonEvent = serde_json::from_str(json).unwrap();
+        assert!(event.is_result_error());
+        assert_eq!(event.result_error_message().as_deref(), Some("LLM 404"));
+    }
+
+    #[test]
+    fn result_error_message_falls_back_to_stop_reason() {
+        let json = r#"{"type":"result","is_error":true,"stop_reason":"provider_stop:boom","session_id":"sess-1"}"#;
+        let event: StreamJsonEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            event.result_error_message().as_deref(),
+            Some("provider_stop:boom")
         );
     }
 

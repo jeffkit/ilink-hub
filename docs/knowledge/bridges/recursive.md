@@ -3,7 +3,7 @@ type: Reference
 title: Recursive Bridge
 description: 内置 recursive Bridge 的配置、环境变量与 session 持久化说明。
 tags: [bridge, recursive, profile]
-timestamp: 2026-06-30T09:00:00+08:00
+timestamp: 2026-07-13T17:30:00+08:00
 ---
 
 # Recursive Bridge
@@ -12,15 +12,16 @@ timestamp: 2026-06-30T09:00:00+08:00
 
 ## 前置条件
 
-`recursive` CLI 需在 PATH 中可用，或通过 `RECURSIVE_BIN` 指定完整路径。
+`recursive` **≥ 0.8.0** 需在 PATH 中可用，或通过 `RECURSIVE_BIN` 指定完整路径。0.7.x 的 `stream-json` 仍使用旧版 `message_appended` 事件，与本 bridge 不兼容。
 
 ```bash
-# 通过 brew 安装（推荐）
-brew install jeffkit/tap/recursive
+# 推荐：从源码安装最新版（brew tap 可能尚未同步 0.8）
+cd ~/projects/recursive && git checkout v0.8.0
+cargo install --path crates/recursive-cli --force
 
 # 验证版本
-/opt/homebrew/bin/recursive --version
-# recursive 0.7.0
+~/.cargo/bin/recursive --version
+# recursive 0.8.0
 ```
 
 ## Profile YAML 示例
@@ -32,7 +33,7 @@ profiles:
     type: recursive
     cwd: ~/projects/recursive
     env:
-      RECURSIVE_BIN: /opt/homebrew/bin/recursive   # 显式指定 brew 路径
+      RECURSIVE_BIN: ~/.cargo/bin/recursive   # 显式指定 0.8+ 路径
       RECURSIVE_WORKSPACE: ~/projects/recursive
       RECURSIVE_MODEL: deepseek-v4-flash
       RECURSIVE_PROVIDER: anthropic
@@ -52,7 +53,7 @@ routing:
 
 | 变量 | 说明 |
 |------|------|
-| `RECURSIVE_BIN` | binary 完整路径（默认 `recursive`，brew 安装推荐设为 `/opt/homebrew/bin/recursive`） |
+| `RECURSIVE_BIN` | binary 完整路径（默认 `recursive`；**需 0.8+**，推荐 `~/.cargo/bin/recursive`） |
 | `RECURSIVE_WORKSPACE` | agent 可读写的工作区根目录（**推荐设置**） |
 | `RECURSIVE_MODEL` | 覆盖模型（如 `deepseek-chat`、`claude-sonnet-4-5`） |
 | `RECURSIVE_PROVIDER` | 覆盖 provider（`openai` 或 `anthropic`） |
@@ -92,10 +93,19 @@ recursive --headless --output-format stream-json -r <session-uuid> -p "<message>
 
 ## 输出事件
 
-Bridge 只处理 `assistant_text` 类型的 JSON 事件：
+`recursive --output-format stream-json` 使用与 Claude Code 兼容的 NDJSON 协议（与 `claude-code` / `cursor` bridge 相同）：
 
 ```json
-{"type":"assistant_text","text":"...","step":1}
+{"type":"system","subtype":"init","session_id":"…"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+{"type":"result","result":"...","session_id":"…"}
 ```
 
-每个非空 `assistant_text` 事件立即以 `AGENT_PARTIAL:` 行发送给微信用户。
+| 模式 | CLI 参数 | Bridge 行为 |
+|------|----------|-------------|
+| 流式（默认，`streaming: true`） | `--output-format stream-json` | 每个 `assistant` 文本块 → `AGENT_PARTIAL:`；失败时 terminal `result`（`is_error: true`）→ `AGENT_ERROR:`；session 取自 `result.session_id`（stderr UUID 作 fallback） |
+| 一次性（`streaming: false`） | `--output-format json` | 解析终端 `result` 对象，整段回复一次发出；失败时发 `AGENT_ERROR:` |
+
+终端 `result` 事件若 `is_error: true`（或 `subtype: error_during_execution`），bridge 从 `errors` / `stop_reason` 提取可读错误文本，通过 `AGENT_ERROR:` 转发给用户，避免 LLM 失败时静默无回复。
+
+旧版 Recursive 专有事件（`assistant_text` 等）需使用 `--output-format recursive-json`，本 bridge 不处理。

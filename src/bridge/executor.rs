@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::watch;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::bridge::config::{BridgeProfile, StdinMode};
 use crate::ilink::types::WeixinMessage;
@@ -192,6 +192,29 @@ pub(super) fn extract_media_env(msg: &WeixinMessage) -> Vec<(String, String)> {
     env
 }
 
+/// Metrics collected for one `run_cli` invocation (for structured logging).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CliRunSummary {
+    pub duration_ms: u64,
+    pub exit_code: Option<i32>,
+    pub exited_by_signal: bool,
+    pub partial_count: u32,
+    pub body_bytes: usize,
+    pub stderr_bytes: usize,
+    pub cli_session_present: bool,
+}
+
+fn truncate_for_log(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… [truncated, {} bytes total]", &s[..end], s.len())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_cli(
     cfg: &BridgeProfile,
@@ -203,7 +226,8 @@ pub(super) async fn run_cli(
     context_token: &str,
     media_env: &[(String, String)],
     partial_tx: watch::Sender<Option<String>>,
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, Option<String>, CliRunSummary)> {
+    let started = Instant::now();
     let args: Vec<String> = cfg
         .args
         .iter()
@@ -284,6 +308,18 @@ pub(super) async fn run_cli(
         .spawn()
         .with_context(|| format!("failed to spawn `{command}`"))?;
 
+    let pid = child.id();
+    info!(
+        profile = profile_name,
+        session_name = session_name,
+        pid = pid,
+        command = %command,
+        args = ?args,
+        streaming = cfg.streaming,
+        timeout_secs = cfg.timeout_secs,
+        "CLI spawned"
+    );
+
     let dur = Duration::from_secs(cfg.timeout_secs.max(1));
 
     let child_stdout = child.stdout.take().context("stdout pipe missing")?;
@@ -320,12 +356,13 @@ pub(super) async fn run_cli(
         };
 
     let streaming = cfg.streaming;
-    let stream_result: Result<Vec<String>> =
+    let stream_result: Result<(Vec<String>, u32)> =
         tokio::time::timeout(dur, async move {
             use tokio::io::AsyncBufReadExt;
             let mut reader = tokio::io::BufReader::new(child_stdout);
             let mut final_lines: Vec<String> = Vec::new();
             let mut accumulated_bytes: usize = 0;
+            let mut partial_count: u32 = 0;
             let mut line = String::new();
             loop {
                 line.clear();
@@ -338,6 +375,7 @@ pub(super) async fn run_cli(
                     if streaming {
                         match serde_json::from_str::<String>(json_part) {
                             Ok(chunk) => {
+                                partial_count = partial_count.saturating_add(1);
                                 let _ = partial_tx.send(Some(chunk));
                             }
                             Err(e) => {
@@ -359,6 +397,7 @@ pub(super) async fn run_cli(
                             warn!(error_text = %err_text, "agent reported AGENT_ERROR");
                             if !err_text.is_empty() {
                                 if streaming {
+                                    partial_count = partial_count.saturating_add(1);
                                     let _ = partial_tx.send(Some(err_text));
                                 } else {
                                     final_lines.push(format!("{err_text}\n"));
@@ -393,12 +432,12 @@ pub(super) async fn run_cli(
                 }
             }
             drop(partial_tx);
-            Ok(final_lines)
+            Ok((final_lines, partial_count))
         })
         .await
         .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?;
 
-    let final_lines = stream_result?;
+    let (final_lines, partial_count) = stream_result?;
 
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
@@ -421,19 +460,18 @@ pub(super) async fn run_cli(
         }
     };
     if !stderr.is_empty() {
-        tracing::debug!(stderr = %stderr, "CLI stderr");
-    }
-
-    if !status.success() {
-        let code = status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        let stdout_str: String = final_lines.concat();
-        anyhow::bail!(
-            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout_str}"
+        warn!(
+            profile = profile_name,
+            session_name = session_name,
+            pid = pid,
+            stderr = %truncate_for_log(&stderr, 4096),
+            "CLI stderr"
         );
     }
+
+    let exit_code = status.code();
+    let exited_by_signal = !status.success() && exit_code.is_none();
+    let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
     let mut stdout = final_lines.concat();
 
@@ -448,7 +486,43 @@ pub(super) async fn run_cli(
         .unwrap_or("")
         .trim();
     let (body, cli_sid) = split_cli_session_from_stdout(prefix, &stdout);
-    Ok((body, cli_sid))
+    let cli_session_present = cli_sid.as_ref().is_some_and(|s| !s.is_empty());
+
+    let summary = CliRunSummary {
+        duration_ms,
+        exit_code,
+        exited_by_signal,
+        partial_count,
+        body_bytes: body.len(),
+        stderr_bytes: stderr.len(),
+        cli_session_present,
+    };
+
+    info!(
+        profile = profile_name,
+        session_name = session_name,
+        pid = pid,
+        duration_ms = summary.duration_ms,
+        exit_code = ?summary.exit_code,
+        exited_by_signal = summary.exited_by_signal,
+        partial_count = summary.partial_count,
+        body_bytes = summary.body_bytes,
+        stderr_bytes = summary.stderr_bytes,
+        cli_session = summary.cli_session_present,
+        success = status.success(),
+        "CLI finished"
+    );
+
+    if !status.success() {
+        let code = exit_code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        anyhow::bail!(
+            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}"
+        );
+    }
+
+    Ok((body, cli_sid, summary))
 }
 
 #[cfg(test)]
@@ -642,7 +716,7 @@ mod tests {
         let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
         let chunks = spawn_partial_collector(partial_rx);
 
-        let (body, cli_sid) = run_cli(
+        let (body, cli_sid, summary) = run_cli(
             profile,
             "test_profile",
             "hello",
@@ -658,6 +732,7 @@ mod tests {
 
         assert_eq!(cli_sid.as_deref(), Some("sess-xyz"));
         assert_eq!(body.trim(), "final-body");
+        assert_eq!(summary.partial_count, 2);
 
         let chunks = chunks.await.expect("collector panicked");
         // watch channel only retains the latest value, so fast consecutive
@@ -679,7 +754,7 @@ mod tests {
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
 
         let (partial_tx, _partial_rx) = watch::channel::<Option<String>>(None);
-        let (body, _sid) = run_cli(
+        let (body, _sid, _summary) = run_cli(
             profile,
             "test_profile",
             "hello",
@@ -708,7 +783,7 @@ mod tests {
         let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
         let chunks = spawn_partial_collector(partial_rx);
 
-        let (body, _sid) = run_cli(
+        let (body, _sid, _summary) = run_cli(
             profile,
             "test_profile",
             "hello",

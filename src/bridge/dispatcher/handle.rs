@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::bridge::executor::{extract_media_env, run_cli, split_into_parts};
+use crate::bridge::executor::{extract_media_env, run_cli, split_into_parts, CliRunSummary};
 use crate::bridge::AUTH_ERROR_KEYWORDS;
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
@@ -160,7 +160,14 @@ pub(super) async fn handle_one_message(
     }
 
     match cli_result {
-        Ok((raw_body, cli_session)) => {
+        Ok((raw_body, cli_session, summary)) => {
+            log_message_handled_success(
+                profile_name,
+                &session_name_for_cli,
+                &summary,
+                raw_body.trim().is_empty(),
+                is_a2a_inbound,
+            );
             if raw_body.trim().is_empty() {
                 // Empty body: only send if we need to persist a cli_session_id.
                 if let Some(sid) = cli_session {
@@ -213,6 +220,15 @@ pub(super) async fn handle_one_message(
             // Split long replies into multiple messages instead of truncating.
             let parts = split_into_parts(&raw_body, profile.max_reply_chars);
             let total = parts.len();
+            info!(
+                profile = profile_name,
+                session_name = %session_name_for_cli,
+                reply_parts = total,
+                body_bytes = summary.body_bytes,
+                partial_count = summary.partial_count,
+                duration_ms = summary.duration_ms,
+                "message handled: final reply sent"
+            );
             for (i, part) in parts.into_iter().enumerate() {
                 let is_last = i + 1 == total;
                 // cli_session_id is attached only to the last part so it is persisted once.
@@ -273,6 +289,35 @@ pub(super) async fn handle_one_message(
         }
     }
     Ok(())
+}
+
+fn log_message_handled_success(
+    profile_name: &str,
+    session_name: &str,
+    summary: &CliRunSummary,
+    body_empty: bool,
+    is_a2a: bool,
+) {
+    if body_empty {
+        info!(
+            profile = profile_name,
+            session_name = session_name,
+            partial_count = summary.partial_count,
+            cli_session = summary.cli_session_present,
+            duration_ms = summary.duration_ms,
+            a2a = is_a2a,
+            "message handled: empty final body (streaming partials and/or session-only)"
+        );
+    } else if is_a2a {
+        info!(
+            profile = profile_name,
+            session_name = session_name,
+            body_bytes = summary.body_bytes,
+            partial_count = summary.partial_count,
+            duration_ms = summary.duration_ms,
+            "message handled: a2a final reply"
+        );
+    }
 }
 
 /// Attach session metadata (and optional A2A call-id) to an outbound sendmessage.
