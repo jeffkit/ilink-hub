@@ -1,87 +1,126 @@
-# Bridge Profile 规范（P0 Exec Protocol）
+# Bridge Profile 规范（AgentProc 0.3 NDJSON Protocol）
 
-> 最后更新：2026-06-29
+> 最后更新：2026-07-13
 
-iLink Hub Bridge 的 **profile** 就是一个可执行的脚本或程序：收到消息 → 做处理 → 把回复写到 stdout。
+iLink Hub Bridge 的 **profile** 就是一个可执行的脚本或程序：从 stdin 读一行 NDJSON turn → 做处理 → 在 stdout 逐行输出 NDJSON 事件。这是对旧版 P0（环境变量 + sentinel 前缀）的**硬切换**，不再保留双协议兼容。
+
+协议常量：`PROTOCOL_VERSION = "0.3"`。
 
 ---
 
-## 1. P0 协议契约
+## 1. AgentProc 0.3 协议契约
 
-P0 仅依赖环境变量 + stdout，**完全跨平台**（macOS / Linux / Windows）。
+0.3 仅依赖 **stdin + stdout 的 NDJSON**，**完全跨平台**（macOS / Linux / Windows）。环境变量只用于密钥与配置，不再承载消息/session 等业务字段。
 
-### 输入（bridge 自动注入环境变量）
+### 输入（bridge 向 profile stdin 写一行 NDJSON turn）
 
-| 变量名 | 说明 |
-|--------|------|
-| `AGENT_MESSAGE` | 用户消息文本（路由后的净文本，前缀已剥离） |
-| `AGENT_SESSION_ID` | Hub 持久化的后端 session UUID（空 = 新会话） |
-| `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
-| `AGENT_FROM_USER` | 发送消息的用户 ID |
-| `AGENT_CONTEXT_TOKEN` | Hub context token |
-| `AGENT_STREAMING` | `1`（默认）= 流式模式，`0` = 一次性回复模式（见下文） |
-
-> 当 YAML 设置了 `stdin: message` 时，`AGENT_MESSAGE` 同时也会写入 stdin。
-
-### 输出（profile 写 stdout）
-
-```
-[可选] AGENT_SESSION:<uuid>     ← 如需 session 追踪，首行输出这个
-<回复给微信用户的文本>
+```json
+{
+  "type": "turn",
+  "message": "用户消息文本（路由后的净文本，前缀已剥离）",
+  "session_id": "Hub 持久化的后端 session UUID（空 = 新会话）",
+  "from_user": "发送消息的用户 ID",
+  "protocol_version": "0.3",
+  "session_name": "default",
+  "attachments": [
+    {"kind": "image", "url": "https://...", "filename": "a.png", "mime_type": "image/png", "size": 12345}
+  ],
+  "permission": false
+}
 ```
 
-Bridge 从进程启动开始**实时读取** stdout——profile 一旦写入并刷新缓冲区，bridge 立即处理。
+| 字段 | 说明 |
+|------|------|
+| `type` | 固定 `"turn"` |
+| `message` | 用户消息文本 |
+| `session_id` | 后端 session UUID（空 = 新会话） |
+| `from_user` | 发送用户 ID |
+| `protocol_version` | 固定 `"0.3"` |
+| `session_name` | session 可读名称 |
+| `attachments` | 附件数组；`kind` ∈ {`image`, `file`, `video`}，`url` 必填，其余元数据可选 |
+| `permission` | `true` = 开启 permission 通道（stdin 保持开启以接收 `permission_response`） |
 
-### 流式输出（AGENT_PARTIAL）
+写入规则：
 
-当 profile 需要把 AI 生成的文本**逐段发给用户**时，可在终端输出中夹杂 `AGENT_PARTIAL:` 行：
+- `permission: false`（默认）：bridge 写完 turn 后**立即关闭 stdin**；
+- `permission: true`：stdin 保持开启，供后续写入 `permission_response` 帧（见 §Permission）。
 
+> 例外：`AGENT_CONTEXT_TOKEN` 仍由 Hub 作为环境变量注入，用于回调凭证（ilink-hub 扩展，非 AgentProc 标准）。
+
+### 输出（profile 向 stdout 逐行写 NDJSON 事件）
+
+```json
+{"type":"partial","text":"流式片段","role":"output"}
+{"type":"text","text":"最终回复片段"}
+{"type":"session","id":"<uuid>"}
+{"type":"error","message":"可读错误文本"}
+{"type":"permission_request","id":"req-42","tool":"Bash","input":{...}}
 ```
-AGENT_PARTIAL:<JSON 编码的字符串>
-```
 
-- bridge 读到该行后**立即**将解码后的文本通过 sendmessage 发给微信用户，无需等进程退出。
-- `<JSON 编码的字符串>` 是对分块文本调用 `json.dumps(text)` / `JSON.stringify(text)` 的结果，换行等特殊字符会被 JSON 转义，整个标记**只占 stdout 的一行**。
-- profile 内部**无需感知 iLink 协议**——`AGENT_PARTIAL:` 只是 profile 与 bridge 之间的约定，bridge 负责向 Hub 发消息的全部细节。
-- 进程**退出 = EOF**，bridge 结束读取，若剩余 stdout 非空则作为最终消息发送；若全部内容已通过 `AGENT_PARTIAL:` 发出，最终 body 为空时 bridge 会自动跳过最终 sendmessage。
+| 事件 | 用途 | bridge 行为 |
+|------|------|-------------|
+| `partial` | 流式片段（`role`: `output`（默认）/ `thinking`） | `streaming` hint 为真时**立即**转发给用户；否则忽略 |
+| `text` | 最终回复片段（可多次，bridge 拼接） | 累积为最终 body；streaming 模式下若已有 partial 转发则去重丢弃 |
+| `session` | 上报 session id（last-wins） | 持久化为 Hub session ID |
+| `error` | 终端错误 | 标记 turn 失败；错误文本交付用户 |
+| `permission_request` | 工具授权请求（仅 `permission: true`） | 按 `permission_default` 回 `permission_response` |
+
+事件采用**封闭词汇表**：未知 `type` 静默忽略。Bridge 从进程启动起**实时读取** stdout——profile 一旦写入并刷新缓冲区，bridge 立即处理。
+
+#### `partial` vs `text`
+
+- `partial` = 流式增量，仅供 streaming 模式实时推送，**不**进入最终 body。
+- `text` = 最终回复的权威内容；非 streaming 模式下作为唯一回复发出，streaming 模式下若 partial 已转发则被去重。
 
 #### 关闭流式（`streaming: false`）
 
-如果遇到流式 bug 或需要调试，可以在 YAML profile 里将 `streaming` 设为 `false`：
+`streaming` 是 **bridge 侧 hint**，决定是否转发 `partial`。profile 始终可以发 `partial` + `text`，bridge 依据 hint 取舍——agent 侧无需感知模式分支。
 
 ```yaml
 profiles:
   claude:
     type: claude-code
     cwd: /path/to/your/project
-    streaming: false     # 关闭流式，等 AI 完全响应后一次性发送
+    streaming: false     # bridge 不转发 partial，仅以 text 事件作为最终回复
 ```
-
-关闭后：
-- bridge 忽略所有 `AGENT_PARTIAL:` 行，**不实时转发**给用户
-- 同时向子进程注入 `AGENT_STREAMING=0`，内置 profile（如 `claude-code`）会自动切换为一次性输出模式
-- 进程退出后，完整 stdout 作为最终回复**一次性**发送
 
 默认值为 `true`（流式开启）。
 
-**Bash 示例：**
+**Bash 示例（NDJSON 事件）：**
 
 ```bash
 #!/usr/bin/env bash
-# 流式调用示例：用于测试，每秒发一段
-echo 'AGENT_PARTIAL:"第一段，1 秒前发出"'
+# 流式调用示例：每秒发一段 partial，最后发 text + session
+printf '{"type":"partial","text":"第一段，1 秒前发出"}\n'
 sleep 1
-echo 'AGENT_PARTIAL:"第二段，2 秒前发出"'
+printf '{"type":"partial","text":"第二段，2 秒前发出"}\n'
 sleep 1
+printf '{"type":"text","text":"第一段，1 秒前发出\n第二段，2 秒前发出"}\n'
 # 进程退出 → bridge 读到 EOF → 完成
 ```
 
-### 退出码
+### Permission 通道（可选）
 
-| 退出码 | 含义 |
-|--------|------|
-| `0` | 成功，stdout 内容作为回复 |
-| 非 `0` | 失败，bridge 发送错误提示（若 `send_error_reply: true`） |
+profile 设置 `permission: true` 时开启：
+
+1. profile 在需要工具授权时输出 `{"type":"permission_request","id":...,"tool":...,"input":...}`
+2. bridge 依据 `permission_default` 策略（`allow` / `deny` / `ask`）决定，并通过 stdin 写回一行：
+
+```json
+{"type":"permission_response","id":"req-42","behavior":"allow","message":"可选说明"}
+```
+
+3. profile 收到响应后继续执行
+
+> 当前阶段实现 framing 转换与 default policy（`allow`/`deny`）；`ask` 的完整 WeChat 交互审批循环为后续产品特性。
+
+### 退出码优先级
+
+turn 的成败按以下优先级判定（前者覆盖后者）：
+
+1. **timeout** — 进程超时 → turn 失败
+2. **error 事件** — 收到 `{"type":"error",...}` → turn 失败（错误文本已交付用户）
+3. **进程 exit code** — 非零退出但已恢复 session/body 时容错；`0` = 成功
 
 Stderr 记录为 debug 日志，不发给用户（除非 `include_stderr_in_reply: true`）。
 
@@ -121,7 +160,7 @@ profiles:
 
 ## 3. 用 SDK 写 profile（推荐）
 
-SDK 把读取环境变量、写 stdout、管理对话历史的样板代码封装掉，让你**只写业务逻辑**。
+SDK 把读取 stdin turn、写 NDJSON 事件、管理对话历史的样板代码封装掉，让你**只写业务逻辑**。SDK 内部就是按 0.3 NDJSON 与 bridge 通信。
 
 ### Python SDK
 
@@ -135,9 +174,9 @@ pip install agentproc
 from agentproc import create_profile
 
 async def handler(ctx):
-    # ctx.message, ctx.session_id, ctx.from_user, ctx.context_token
+    # ctx.message, ctx.session_id, ctx.from_user, ctx.attachments
     reply = await my_ai_call(ctx.message)
-    return reply   # 直接返回字符串即可
+    return reply   # 直接返回字符串即可，SDK 发 {"type":"text",...}
 
 create_profile(handler)
 ```
@@ -151,14 +190,14 @@ async def handler(ctx):
     new_sid = ctx.session_id
     # AI 每产生一段文本，立即发给用户，无需等到全部完成
     async for chunk, new_sid in stream_ai(ctx.message, ctx.session_id):
-        await ctx.send_partial(chunk)   # 写 AGENT_PARTIAL: + flush
-    # 全部已流式发出，response 置空即可
+        await ctx.send_partial(chunk)   # 发 {"type":"partial","text":...} + flush
+    # 全部已流式发出；如需保证非 streaming 消费者也能收到，再发一次 text
     return AgentResult(response="", session_id=new_sid)
 
 create_profile(handler)
 ```
 
-`send_partial` 的实现只有两行：写 `AGENT_PARTIAL:{json.dumps(text)}\n` 并立即 `flush()`。Bridge 在实时读 stdout 时检测到该前缀，就立即向 Hub 发消息——**profile 完全不感知 iLink 协议**。
+`send_partial` 的实现就是写一行 `{"type":"partial","text":<json>}\n` 并立即 `flush()`。Bridge 在实时读 stdout 时解析该事件，就立即向 Hub 发消息——**profile 完全不感知 iLink 协议**。
 
 YAML 配置：
 
@@ -180,7 +219,7 @@ npm install agentproc
 ```js
 const { createProfile } = require('agentproc');
 
-createProfile(async ({ message, sessionId, fromUser }) => {
+createProfile(async ({ message, sessionId, fromUser, attachments }) => {
   const reply = await myAICall(message);
   return { response: reply };
 });
@@ -222,19 +261,23 @@ create_profile(handler)
 
 ## 4. 不用 SDK 的裸脚本
 
-如果你只需做简单转发或不想引入依赖，直接读 env var、写 stdout 即可。
+如果你只需做简单转发或不想引入依赖，直接从 stdin 读 turn、向 stdout 写 NDJSON 事件即可。
 
 ### Bash
 
 ```bash
 #!/usr/bin/env bash
-# my_handler.sh
+# my_handler.sh —— 读 stdin NDJSON turn，调外部 API，写 text 事件
+
+TURN=$(cat)                       # 读一行 NDJSON turn
+MESSAGE=$(printf '%s' "$TURN" | jq -r '.message')
 
 REPLY=$(curl -s https://api.example.com/chat \
   -H "Authorization: Bearer $MY_API_KEY" \
-  --data-urlencode "message=$AGENT_MESSAGE")
+  --data-urlencode "message=$MESSAGE")
 
-echo "$REPLY"
+# 用 jq 安全转义后输出 text 事件
+jq -nc --arg t "$REPLY" '{"type":"text","text":$t}'
 ```
 
 YAML：
@@ -249,22 +292,28 @@ profiles:
 
 ```python
 #!/usr/bin/env python3
-import os, sys
-message = os.environ.get('AGENT_MESSAGE', '')
-reply = my_ai_call(message)
-sys.stdout.write(reply)
+import json, sys
+
+turn = json.loads(sys.stdin.readline())
+reply = my_ai_call(turn["message"])
+print(json.dumps({"type": "text", "text": reply}), flush=True)
 ```
 
 ### Node.js（无 SDK）
 
 ```js
 #!/usr/bin/env node
-const message = process.env.AGENT_MESSAGE || '';
-async function main() {
-  const reply = await myAI(message);
-  process.stdout.write(reply);
-}
-main().catch(e => { process.stderr.write(String(e)); process.exit(1); });
+const readline = require('readline');
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  const turn = JSON.parse(line);
+  myAI(turn.message).then((reply) => {
+    process.stdout.write(JSON.stringify({ type: 'text', text: reply }) + '\n');
+  }).catch((e) => {
+    process.stdout.write(JSON.stringify({ type: 'error', message: String(e) }) + '\n');
+    process.exit(1);
+  });
+});
 ```
 
 ---
@@ -288,16 +337,15 @@ profiles:
   claude:
     command: ilink-hub-bridge
     args: [profile, claude-code]
-    stdin: message
     cwd: /path/to/your/project
     timeout_secs: 300
-    cli_session_first_line_prefix: "AGENT_SESSION:"
 ```
 
-手动测试：
+手动测试（向 stdin 写一行 turn）：
 
 ```bash
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
+echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | ilink-hub-bridge profile claude-code
 ```
 
 ---
@@ -331,21 +379,18 @@ profiles:
 
 ## 7. 调试
 
-模拟一次 bridge 调用（不启动完整 bridge）：
+模拟一次 bridge 调用（不启动完整 bridge），向 stdin 写一行 turn NDJSON：
 
 ```bash
-AGENT_MESSAGE="你好" \
-AGENT_SESSION_ID="" \
-AGENT_SESSION_NAME="default" \
-AGENT_FROM_USER="test" \
-AGENT_CONTEXT_TOKEN="test-token" \
-python3 ./my_handler.py
+echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | python3 ./my_handler.py
 ```
 
 或用 bridge 内置子命令调用 built-in profile：
 
 ```bash
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
+echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | ilink-hub-bridge profile claude-code
 ```
 
 调试消息路由：
@@ -353,3 +398,14 @@ AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
 ```bash
 ILINKHUB_BRIDGE_DUMP_MSG=1 ilink-hub-bridge --config my.yaml
 ```
+
+---
+
+## 8. 从 0.2 迁移要点
+
+- 输入：`AGENT_MESSAGE` / `AGENT_SESSION_ID` / `AGENT_STREAMING` 等 env → stdin NDJSON turn
+- 输出：`AGENT_PARTIAL:` / `AGENT_SESSION:` / `AGENT_ERROR:` sentinel 行 → `{"type":"partial|session|error",...}` NDJSON 事件
+- 附件：`AGENT_IMAGE_URL` / `AGENT_FILE_URL` env → turn 对象的 `attachments` 数组
+- 最终回复：stdout 末尾的自由文本 → `{"type":"text",...}` 事件
+- 流式：`AGENT_STREAMING` env 分支取消，profile 统一发 `partial` + `text`，由 bridge hint 决定转发
+- YAML：移除 `stdin`（`StdinMode`）与 `cli_session_first_line_prefix` 字段；新增 `env_allowlist` / `kill_grace_secs` / `permission` / `permission_default` / `truncation_suffix` / `{{PROFILE_DIR}}`

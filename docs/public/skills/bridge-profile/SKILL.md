@@ -22,10 +22,10 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 | 术语 | 说明 |
 |------|------|
 | **Profile YAML** | 描述 bridge 行为的配置文件，放在 `~/.ilink-hub-bridge/profiles/` 由 manager 自动发现 |
-| **P0 协议** | bridge 与 handler 间的通信协议：env var 输入 + stdout 输出 |
+| **AgentProc 0.3** | bridge 与 handler 间的通信协议：stdin 写一行 NDJSON turn，stdout 逐行输出 NDJSON 事件 |
 | **type: claude-code** | 内置类型，自动处理 Claude Code CLI 的 `--resume` 会话续接 |
 | **script:** | 指定脚本路径，bridge 按扩展名自动推断运行时（.py/.js/.ts/.sh/.rb） |
-| **SDK** | `agentproc`（Python/Node.js），封装 P0 协议样板代码 |
+| **SDK** | `agentproc`（Python/Node.js），封装 0.3 NDJSON 协议样板代码 |
 
 ---
 
@@ -94,14 +94,14 @@ profiles:
   claude_new:
     type: claude-code
     cwd: /path/to/project
-    env:
-      AGENT_SESSION_ID: ""  # 空 SESSION_ID → 内置 handler 跳过 --resume，开新会话
+    # /new 是 Hub 级命令（强制新会话），无需在此设 env；
+    # 这里仅演示前缀路由到独立 profile。
 
 routing:
   strategy: prefix
   default_profile: claude
   prefix_rules:
-    - prefix: "/new "       # "/new 帮我写函数" → MESSAGE = "帮我写函数"
+    - prefix: "/ask "       # "/ask 帮我写函数" → MESSAGE = "帮我写函数"
       profile: claude_new
 
 skip_bot_messages: true
@@ -118,7 +118,6 @@ profiles:
   my-cli:
     command: your-cli-command
     args: ["-p", "{{MESSAGE}}"]
-    stdin: none
     cwd: /path/to/project
     timeout_secs: 300
     max_reply_chars: 8000
@@ -131,6 +130,8 @@ skip_bot_messages: true
 require_text: true
 send_error_reply: true
 ```
+
+> 自定义 CLI 默认通过 stdin 收到一行 NDJSON turn；若 CLI 需要消息作为命令行参数，用 `{{MESSAGE}}` 占位符（`{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}` 同样可用）。CLI 的 stdout 应逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error`）；若只输出纯文本，bridge 会作为最终回复处理。
 
 ---
 
@@ -172,15 +173,20 @@ send_error_reply: true
 
 | 字段 | 说明 |
 |------|------|
-| `type` | 内置类型：`claude-code` |
+| `type` | 内置类型：`claude-code` / `cursor` / `codex` / `codebuddy-code` / `agy` / `recursive` |
 | `script` | 脚本路径，自动推断运行时 |
 | `command` | 显式命令（优先级高于 script/type） |
-| `args` | 支持占位符 `{{MESSAGE}}` / `{{SESSION_ID}}` / `{{SESSION_NAME}}` |
-| `stdin` | `none`（默认）或 `message`（把消息写入 stdin） |
+| `args` | 支持占位符 `{{MESSAGE}}` / `{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}` |
 | `cwd` | 工作目录，支持 `~` 展开 |
-| `env` | 注入的环境变量 |
+| `env` | 注入的环境变量（仅密钥/配置；业务字段走 stdin turn） |
+| `env_allowlist` | 限制 `env` 变量展开的允许名单（未列出的未知变量展开为空，POSIX 语义） |
 | `timeout_secs` | 超时（默认 60） |
+| `kill_grace_secs` | 超时后优雅退出宽限秒数 |
 | `max_reply_chars` | 回复最大字符数（默认 4000） |
+| `truncation_suffix` | 超长回复截断后缀（默认 `…(已截断)`） |
+| `streaming` | bridge 侧 hint：是否转发 `partial` 事件（默认 true） |
+| `permission` | 开启 permission 通道（默认 false） |
+| `permission_default` | permission 默认策略：`allow` / `deny` / `ask`（默认 deny） |
 | `include_stderr_in_reply` | 是否附加 stderr（默认 false） |
 
 ---
@@ -189,23 +195,34 @@ send_error_reply: true
 
 当内置类型不满足需求，需要调用 LLM API、自定义逻辑、多轮对话时，使用 SDK 编写 handler。
 
-### P0 协议说明
+### AgentProc 0.3 协议说明
 
-bridge 通过以下 env var 传入输入，handler 向 stdout 写出输出：
+bridge 向 handler 的 stdin 写一行 NDJSON turn 对象，handler 在 stdout 逐行输出 NDJSON 事件：
 
-| 输入 env var | 说明 |
-|-------------|------|
-| `AGENT_MESSAGE` | 用户消息文本（前缀路由后的净文本） |
-| `AGENT_SESSION_ID` | Hub 持久化的 session UUID（空=新会话） |
-| `AGENT_SESSION_NAME` | session 可读名称（默认 `default`） |
-| `AGENT_FROM_USER` | 发送消息的用户 ID |
-| `AGENT_CONTEXT_TOKEN` | Hub context token |
+**stdin turn 对象：**
 
-**stdout 输出格式：**
+```json
+{"type":"turn","message":"用户消息","session_id":"<uuid 或空>","from_user":"<user>","protocol_version":"0.3","session_name":"default","attachments":[...],"permission":false}
 ```
-[可选首行] AGENT_SESSION:<uuid>   ← 若需 session 追踪
-<回复给微信用户的文本>
+
+| turn 字段 | 说明 |
+|-----------|------|
+| `message` | 用户消息文本（前缀路由后的净文本） |
+| `session_id` | Hub 持久化的 session UUID（空=新会话） |
+| `session_name` | session 可读名称（默认 `default`） |
+| `from_user` | 发送消息的用户 ID |
+| `attachments` | 附件数组（`kind` / `url` / 元数据） |
+
+**stdout NDJSON 事件：**
+
 ```
+{"type":"partial","text":"流式片段"}        ← 实时分块（streaming hint 为真时转发）
+{"type":"text","text":"最终回复片段"}        ← 最终回复（可多次，bridge 拼接）
+{"type":"session","id":"<uuid>"}            ← 上报 session id
+{"type":"error","message":"可读错误文本"}    ← 终端错误
+```
+
+> SDK（`agentproc`）封装了读写 NDJSON 的样板，handler 只需返回字符串或 `AgentResult`。
 
 ---
 
@@ -371,28 +388,26 @@ profiles:
 
 ## Step 4：测试
 
-不启动完整 bridge，直接模拟 P0 协议调用：
+不启动完整 bridge，向 stdin 写一行 turn NDJSON 模拟调用：
 
 ```bash
+# 公共 turn 模板
+TURN='{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}'
+
 # 测试内置 claude-code
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" \
-  ilink-hub-bridge profile claude-code
+echo "$TURN" | ilink-hub-bridge profile claude-code
 
 # 测试自定义 Python handler
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
-  AGENT_FROM_USER="test" AGENT_CONTEXT_TOKEN="test-token" \
-  python3 /path/to/handler.py
+echo "$TURN" | python3 /path/to/handler.py
 
 # 测试自定义 JS handler
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_SESSION_NAME="default" \
-  AGENT_FROM_USER="test" AGENT_CONTEXT_TOKEN="test-token" \
-  node /path/to/handler.js
+echo "$TURN" | node /path/to/handler.js
 ```
 
-**验证输出：**
-- 若管理 session，首行应为 `AGENT_SESSION:<uuid>`
-- 其余行是给用户的回复文本
-- 退出码 0 = 成功
+**验证输出（NDJSON 事件流）：**
+- 若管理 session，应有 `{"type":"session","id":"<uuid>"}`
+- 回复文本通过 `{"type":"text","text":...}` 事件输出（流式时另有 `partial` 事件）
+- 退出码 0 = 成功；`{"type":"error",...}` 事件 = turn 失败
 
 ---
 
@@ -435,10 +450,9 @@ INFO ilink_hub::bridge::manager: starting child bridge profile=<name> ...
 
 **铁律：永远不要把明文 API key / token / password 写进 profile YAML。**
 
-`env:` 字段里的 `${VAR_NAME}` 会被原样作为字符串传给子进程（**当前没有自动展开**），
-所以 YAML 入 git 是安全的，但**运行时必须有同名 env var**——否则子进程收到的是字面字符串 `${VAR_NAME}`，请求会报 401。
+`env:` 字段里的 `${VAR_NAME}` 会在加载时按 POSIX 语义从 bridge 进程环境变量展开（**未知变量展开为空字符串**，不报错）。若 profile 设置了 `env_allowlist`，则只有名单内的变量允许展开，其余一律展开为空。
 
-### 推荐做法（当前唯一支持的）
+### 推荐做法
 
 ```yaml
 profiles:
@@ -464,11 +478,18 @@ ANTHROPIC_API_KEY="sk-ant-..." ilink-hub-bridge manager
 如果 manager 是 launchd / 守护进程启动的，进程 env 不一定有这些变量——那种场景下需要把
 `export` 写到 `~/.zshenv` / `~/.bash_profile`，或用专门的 env 加载器。
 
-### 计划中的特性
+### env_allowlist（可选）
 
-`${VAR}` shell 插值（启动 manager 时从进程 env 自动展开）正在设计中，见
-`docs/bridge/env-interpolation-spec.md`（需求已写，待实现）。在特性上线前，
-**测试 YAML 时务必先确认子进程能拿到 key**（`env | grep KEY_NAME` 验证）。
+限制可展开的变量，避免意外把敏感环境变量透传给子进程：
+
+```yaml
+profiles:
+  my-bot:
+    script: /path/to/handler.py
+    env_allowlist: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
+    env:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+```
 
 ---
 

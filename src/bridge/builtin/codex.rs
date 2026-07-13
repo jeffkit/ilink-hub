@@ -1,23 +1,20 @@
 //! Built-in `codex` profile: wraps the OpenAI Codex CLI with session continuity.
 //!
-//! Reads P0 env vars, calls `codex exec [resume <thread_id>] <message>
-//! --dangerously-bypass-approvals-and-sandbox --json`, and streams `agent_message`
-//! items to the parent bridge via `AGENT_PARTIAL:` stdout lines.
+//! Reads the 0.3 turn object from stdin, calls `codex exec [resume <thread_id>]
+//! <message> --dangerously-bypass-approvals-and-sandbox --json`, and emits NDJSON
+//! events on stdout:
+//!
+//! - `partial` for each `agent_message` item (streamed live),
+//! - `text` with the concatenation of all `agent_message` items (the final body;
+//!   the bridge dedups against already-forwarded partials in streaming mode),
+//! - `session` with the thread id.
+//!
+//! `streaming` is a bridge-side hint in 0.3, so the agent always streams.
 //!
 //! JSONL event stream from `codex exec --json`:
 //!   {"type":"thread.started","thread_id":"<uuid>"}
 //!   {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
 //!   {"type":"turn.completed","usage":{...}}
-//!
-//! Each `agent_message` item is emitted immediately as:
-//!
-//!   AGENT_PARTIAL:<json-encoded-string>
-//!
-//! When the stream ends, the final P0 session line is written:
-//!
-//!   AGENT_SESSION:<thread_id>
-//!
-//! The response body is left empty so the bridge does not send a duplicate final message.
 //!
 //! If `exec resume` fails (thread expired / not found), automatically retries as a
 //! fresh session so the user gets a response rather than a bare error.
@@ -50,7 +47,8 @@ struct CodexItem {
 }
 
 pub async fn run() -> Result<()> {
-    let (message, session_id) = common::read_message_and_session();
+    let turn = common::read_turn_or_error();
+    let (message, session_id) = common::message_and_session(&turn);
 
     let new_thread_id =
         common::with_session_resume_fallback("codex", &message, &session_id, |m, s| async move {
@@ -58,15 +56,14 @@ pub async fn run() -> Result<()> {
         })
         .await?;
 
-    // P0 output: optional session line only.
-    // All response text was already streamed via AGENT_PARTIAL during execution.
-    common::emit_session_line(new_thread_id.as_deref());
+    common::emit_session(new_thread_id.as_deref());
 
     Ok(())
 }
 
 /// Call `codex exec [resume <session_id>] <message> --json`, emit each `agent_message`
-/// item as an `AGENT_PARTIAL:` stdout line, and return the thread ID.
+/// item as a `partial` event and the concatenation of all of them as a `text` event,
+/// and return the thread ID.
 async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>> {
     // Build: codex exec [resume <id>] <message> --dangerously-bypass-approvals-and-sandbox --json
     let mut args: Vec<String> = vec!["exec".into()];
@@ -103,6 +100,7 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_thread_id: Option<String> = None;
+    let mut final_text = String::new();
 
     loop {
         line.clear();
@@ -131,8 +129,9 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
                 if let Some(item) = &event.item {
                     if item.item_type.as_deref() == Some("agent_message") {
                         if let Some(text) = &item.text {
-                            if !text.is_empty() {
+                            if !text.trim().is_empty() {
                                 common::emit_partial(text)?;
+                                final_text.push_str(text);
                             }
                         }
                     }
@@ -144,6 +143,10 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
 
     let status = child.wait().await.context("wait for codex")?;
     let stderr = stderr_task.await.unwrap_or_default();
+
+    if !final_text.trim().is_empty() {
+        common::emit_text(&final_text)?;
+    }
 
     common::ensure_success("codex", status, &stderr, found_thread_id.is_some())?;
 

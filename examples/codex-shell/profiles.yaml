@@ -13,7 +13,8 @@
 #   4. chmod +x handler.sh（首次使用）
 #
 # 本地测试（不启动 bridge）：
-#   AGENT_MESSAGE="你好" AGENT_SESSION_ID="" AGENT_CWD="$(pwd)" bash handler.sh
+#   echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+#     | AGENT_CWD="$(pwd)" bash handler.sh
 #
 # 启动 bridge：
 #   ilink-hub-bridge --config profiles.yaml
@@ -24,7 +25,6 @@ profiles:
     cwd: /path/to/your/project  # ← 改为你的项目目录（codex 会在此目录下运行）
     timeout_secs: 600
     max_reply_chars: 8000
-    cli_session_first_line_prefix: "AGENT_SESSION:"
 
 routing:
   strategy: fixed

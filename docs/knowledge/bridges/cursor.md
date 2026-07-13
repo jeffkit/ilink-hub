@@ -1,27 +1,29 @@
 ---
 type: Bridge
 title: Cursor Bridge
-description: 内置 Bridge，包装 Cursor agent CLI，支持会话续传和流式输出。
+description: 内置 Bridge，包装 Cursor agent CLI，支持会话续传与 AgentProc 0.3 NDJSON 流式输出。
 resource: src/bridge/builtin/cursor.rs
-tags: [bridge, cursor, builtin, streaming]
-timestamp: 2026-06-18T10:00:00+08:00
+tags: [bridge, cursor, builtin, streaming, agentproc]
+timestamp: 2026-07-13T20:30:00+08:00
 ---
 
 # Cursor Bridge
 
-内置 Bridge，包装 **Cursor `agent` CLI**，实现会话连续性和流式输出。
+内置 Bridge，包装 **Cursor `agent` CLI**，实现会话连续性与流式输出。采用 AgentProc 0.3 NDJSON 协议与 Hub 通信。
 
 ## 工作原理
 
-1. 读取 [P0 环境变量](/bridges/profile-protocol.md)（`AGENT_MESSAGE`、`AGENT_SESSION_ID` 等）
+1. 从 stdin 读取 [AgentProc 0.3 turn](/bridges/profile-protocol.md)（`message` / `session_id` / `attachments`）
 2. 调用 `agent --print --trust --yolo --output-format stream-json [--model <model>] [--resume <uuid>]`
 3. 消息写入 `agent` 进程的 **stdin**（与 Claude Code 不同，后者用 `-p` 参数）
-4. 实时解析 stream-json 事件，每个 assistant 文本块输出一行 `AGENT_PARTIAL:<json>`
-5. 流结束后输出 `AGENT_SESSION:<new_session_id>`，不再输出正文（避免重复发送）
+4. 实时解析 stream-json 事件：每个 `assistant` 文本块 → `partial` NDJSON 事件；终端 `result.result` → `text` 事件
+5. 流结束后输出 `session` 事件上报新 session id
+
+`streaming` 是 bridge 侧 hint：agent 始终以 stream-json 运行；profile `streaming: false` 时 Bridge 不转发 `partial`，仅以 `text` 事件作为最终回复。
 
 ## 会话续传
 
-- 若 `AGENT_SESSION_ID` 非空，先尝试 `--resume <uuid>`
+- 若 turn 的 `session_id` 非空，先尝试 `--resume <uuid>`
 - 若 resume 失败（session 过期/不存在），自动回退为新会话重试，用户不会看到报错
 
 ## stream-json 事件格式
@@ -47,11 +49,11 @@ profiles:
 
 | 特性 | Cursor Bridge | [Claude Code Bridge](claude-code.md) |
 |------|--------------|--------------------------------------|
-| 消息传入方式 | stdin | `-p` 命令行参数 |
+| 消息传入方式 | stdin（原始文本） | `-p` 命令行参数；多模态走 `--input-format stream-json` 的 SDKUserMessage |
 | CLI 工具 | `agent` | `claude` |
-| `AGENT_STREAMING=0` 支持 | 否 | 是 |
+| 多模态附件 | 不支持 | 支持 image / file |
 
 ## 相关文档
 
-- [P0 协议与 Profile](profile-protocol.md)
+- [AgentProc 0.3 协议与 Profile](profile-protocol.md)
 - [Bridge 概览](overview.md)

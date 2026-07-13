@@ -1,14 +1,14 @@
 ---
 type: Reference
 title: Recursive Bridge
-description: 内置 recursive Bridge 的配置、环境变量与 session 持久化说明。
-tags: [bridge, recursive, profile]
-timestamp: 2026-07-13T17:30:00+08:00
+description: 内置 recursive Bridge 的配置、环境变量与 session 持久化说明（AgentProc 0.3 NDJSON）。
+tags: [bridge, recursive, profile, agentproc]
+timestamp: 2026-07-13T20:30:00+08:00
 ---
 
 # Recursive Bridge
 
-内置 `recursive` profile 类型，包装 [`recursive`](https://github.com/jeffkit/recursive) agent CLI，支持 session 持久化与 resume。
+内置 `recursive` profile 类型，包装 [`recursive`](https://github.com/jeffkit/recursive) agent CLI，支持 session 持久化与 resume。采用 AgentProc 0.3 NDJSON 协议与 Hub 通信。
 
 ## 前置条件
 
@@ -61,7 +61,7 @@ routing:
 | `RECURSIVE_API_BASE` | 覆盖 API base URL |
 | `RECURSIVE_MAX_STEPS` | 最大 agent 循环次数（默认取 `~/.recursive/config`） |
 
-标准 P0 变量（`AGENT_MESSAGE`、`AGENT_SESSION_ID` 等）由 Hub 自动注入。
+标准 AgentProc 0.3 turn 字段（`message`、`session_id`、`attachments` 等）由 Hub 通过 stdin NDJSON 注入，profile 不再读取 `AGENT_*` 环境变量。
 
 ## Session 持久化原理
 
@@ -93,7 +93,7 @@ recursive --headless --output-format stream-json -r <session-uuid> -p "<message>
 
 ## 输出事件
 
-`recursive --output-format stream-json` 使用与 Claude Code 兼容的 NDJSON 协议（与 `claude-code` / `cursor` bridge 相同）：
+`recursive --output-format stream-json` 使用与 Claude Code 兼容的 NDJSON 协议（与 `claude-code` / `cursor` bridge 相同）。Bridge 侧（`src/bridge/builtin/recursive.rs`）解析这些事件并按 AgentProc 0.3 重新发为 NDJSON 事件给 Hub：
 
 ```json
 {"type":"system","subtype":"init","session_id":"…"}
@@ -101,11 +101,12 @@ recursive --headless --output-format stream-json -r <session-uuid> -p "<message>
 {"type":"result","result":"...","session_id":"…"}
 ```
 
-| 模式 | CLI 参数 | Bridge 行为 |
-|------|----------|-------------|
-| 流式（默认，`streaming: true`） | `--output-format stream-json` | 每个 `assistant` 文本块 → `AGENT_PARTIAL:`；失败时 terminal `result`（`is_error: true`）→ `AGENT_ERROR:`；session 取自 `result.session_id`（stderr UUID 作 fallback） |
-| 一次性（`streaming: false`） | `--output-format json` | 解析终端 `result` 对象，整段回复一次发出；失败时发 `AGENT_ERROR:` |
+| CLI 参数 | Bridge 行为 |
+|----------|-------------|
+| `--headless --output-format stream-json` | 每个 `assistant` 文本块 → `partial` 事件；终端 `result.result` → `text` 事件；session 取自 `result.session_id`（stderr UUID 作 fallback）→ `session` 事件 |
 
-终端 `result` 事件若 `is_error: true`（或 `subtype: error_during_execution`），bridge 从 `errors` / `stop_reason` 提取可读错误文本，通过 `AGENT_ERROR:` 转发给用户，避免 LLM 失败时静默无回复。
+`streaming` 是 bridge 侧 hint：agent 始终以 stream-json 运行；profile `streaming: false` 时 Bridge 不转发 `partial`，仅以 `text` 事件作为最终回复。
+
+终端 `result` 事件若 `is_error: true`（或 `subtype: error_during_execution`），bridge 从 `errors` / `stop_reason` 提取可读错误文本，通过 `error` 事件转发给用户，避免 LLM 失败时静默无回复。
 
 旧版 Recursive 专有事件（`assistant_text` 等）需使用 `--output-format recursive-json`，本 bridge 不处理。

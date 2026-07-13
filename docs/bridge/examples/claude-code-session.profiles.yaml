@@ -41,8 +41,9 @@
 #
 # ─── 测试 profile 是否工作 ────────────────────────────────────────────────────
 #
-#   不启动 bridge，直接在终端模拟一次调用：
-#     AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
+#   不启动 bridge，直接在终端模拟一次调用（向 stdin 写一行 turn NDJSON）：
+#     echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+#       | ilink-hub-bridge profile claude-code
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -50,8 +51,8 @@ profiles:
   claude:
     type: claude-code       # 内置：自动管理 --resume
     cwd: /path/to/your/project  # ← 改为你的项目目录
-    # streaming: true       # 默认 true，启用流式部分回复（AGENT_PARTIAL）
-                            # 设为 false 则等 Claude 完全响应后一次性发送，适合调试或遇到流式 bug 时使用
+    # streaming: true       # 默认 true，bridge 侧 hint：转发 partial 事件给用户
+                            # 设为 false 则不转发 partial，仅以最终 text 事件作为单条回复，适合调试
     # 若需指定模型或注入 API Key，可添加 env：
     # env:
     #   ILINK_CLAUDE_MODEL: sonnet

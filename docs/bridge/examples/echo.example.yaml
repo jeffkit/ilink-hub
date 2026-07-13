@@ -1,5 +1,7 @@
-# 调试用：把用户消息 echo 回去（需系统有 echo）
-command: echo
-args: ["{{MESSAGE}}"]
-stdin: none
+# 调试用：把用户消息原样 echo 回去（0.3 起 stdout 必须是 NDJSON 事件）。
+# 从 stdin 读 turn，把 message 作为 {"type":"text",...} 事件回传。
+command: python3
+args:
+  - "-c"
+  - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':t['message']}),flush=True)"
 timeout_secs: 10

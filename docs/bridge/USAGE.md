@@ -91,7 +91,8 @@ ilink-hub-bridge --config ~/ilink-claude.yaml
 #### 验证：不启动 bridge，直接测 profile
 
 ```bash
-AGENT_MESSAGE="你好" AGENT_SESSION_ID="" ilink-hub-bridge profile claude-code
+echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | ilink-hub-bridge profile claude-code
 ```
 
 #### 微信里的 session 操作
@@ -110,16 +111,20 @@ Hub 内建 session 管理，可在同一微信对话里维护多个命名 Claude
 
 ```
 微信消息 → Hub → bridge → ilink-hub-bridge profile claude-code
+                                │ stdin: 一行 NDJSON turn
+                                │   {type:"turn", message, session_id, ...}
                                 │
                 ┌───────────────┤
-                │  SESSION_ID 非空 → claude --resume <UUID>（接续上文）
-                │  SESSION_ID 为空 → claude（全新会话）
+                │  session_id 非空 → claude --resume <UUID>（接续上文）
+                │  session_id 为空 → claude（全新会话）
                 └───────────────┤
-                                │ stdout: AGENT_SESSION:<uuid>  ← bridge 存入 Hub
-                                │         <回复文本>
+                                │ stdout: NDJSON 事件流
+                                │   {"type":"partial","text":...}  ← 实时分块
+                                │   {"type":"text","text":...}     ← 最终回复
+                                │   {"type":"session","id":...}    ← bridge 存入 Hub
 ```
 
-Bridge 自动注入 `AGENT_MESSAGE`、`AGENT_SESSION_ID`、`AGENT_SESSION_NAME` 等环境变量，无需在 `env:` 段手动配置。
+Bridge 通过 stdin turn 对象传入 `message` / `session_id` / `session_name` / `attachments` 等，无需在 `env:` 段手动配置。
 
 #### 高级：直接调 claude CLI（完全自定义）
 
@@ -130,23 +135,24 @@ profiles:
   claude:
     command: claude
     args: ["-p", "{{MESSAGE}}", "--continue"]
-    stdin: none
     cwd: /path/to/your/project
     timeout_secs: 600
 ```
 
-想要更深度定制（如指定工具权限、自定义 JSON 解析），可使用仓库 `scripts/ilink-claude-bridge.sh` 包装脚本。关于如何开发自定义 profile 和 SDK，见 [Profile 规范（P0 协议）](./profile-spec.md)。
+> 注意：直接调 `claude -p` 时 stdout 是 Claude 自有格式（非 NDJSON 事件），bridge 会忽略无法识别的行。若需正确流式/回复，建议使用内置 `type: claude-code`（它会把 Claude 输出转换为 0.3 NDJSON 事件）。
+
+想要更深度定制（如指定工具权限、自定义 JSON 解析），可使用仓库 `scripts/ilink-claude-bridge.sh` 包装脚本。关于如何开发自定义 profile 和 SDK，见 [Profile 规范（AgentProc 0.3）](./profile-spec.md)。
 
 ### 4.2 Cursor Agent（`agent`）
 
-Cursor 提供的 CLI 命令名为 **`agent`**（安装后应在 PATH 中；安装见 [Cursor CLI 文档](https://cursor.com/docs/cli/overview)）。非交互场景用 **`-p` / `--print`**：
+Cursor 提供的 CLI 命令名为 **`agent`**（安装后应在 PATH 中；安装见 [Cursor CLI 文档](https://cursor.com/docs/cli/overview)）。推荐用内置 `type: cursor`：
 
 ```yaml
-command: agent
-args: ["-p", "{{MESSAGE}}"]
-stdin: none
-cwd: /path/to/your/project
-timeout_secs: 600
+profiles:
+  cursor:
+    type: cursor
+    cwd: /path/to/your/project
+    timeout_secs: 600
 ```
 
 完整模板：[cursor-agent.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/cursor-agent.example.yaml)。  
@@ -154,14 +160,14 @@ timeout_secs: 600
 
 ### 4.3 OpenAI Codex（`codex`）
 
-非交互执行常见为 **`codex exec`**（以本机 `codex --help` 为准）：
+推荐用内置 `type: codex`：
 
 ```yaml
-command: codex
-args: ["exec", "{{MESSAGE}}"]
-stdin: none
-cwd: /path/to/your/project
-timeout_secs: 600
+profiles:
+  codex:
+    type: codex
+    cwd: /path/to/your/project
+    timeout_secs: 600
 ```
 
 模板：[codex.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/codex.example.yaml)。

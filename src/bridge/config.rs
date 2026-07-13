@@ -48,14 +48,6 @@ pub struct BridgeMultiYaml {
     pub routing: Option<BridgeRoutingYaml>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum StdinMode {
-    #[default]
-    None,
-    Message,
-}
-
 /// Per-profile CLI settings (multi-profile YAML) or the only profile (legacy single file).
 ///
 /// **`type` shorthand**: set `type: claude-code` to use a built-in profile.
@@ -86,32 +78,47 @@ pub struct BridgeProfile {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub stdin: StdinMode,
+    /// Working directory for the agent process. Relative paths resolve against
+    /// `{{PROFILE_DIR}}` (the profile file's directory); omitted defaults to the
+    /// bridge's process cwd. `~` and placeholders are expanded.
     #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Restrict which `${VAR}` references the `env` block may expand against the
+    /// bridge's environment. Absent = expand against the full environment (profiles
+    /// are trusted input). Present = a `${VAR}` not in the list expands to empty
+    /// with a stderr warning. Names must match exactly (no globbing).
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
     /// CLI 主操作超时（秒），只覆盖 stdout 读取阶段。子进程退出后还有额外的
     /// 10s `child.wait()` 等待，因此最坏情况总耗时为 `timeout_secs + 10s`。
     /// 默认 1800s（30 分钟）。
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// SIGTERM → SIGKILL 宽限期（秒），默认 5。
+    #[serde(default = "default_kill_grace_secs")]
+    pub kill_grace_secs: u64,
     #[serde(default = "default_max_reply_chars")]
     pub max_reply_chars: usize,
     #[serde(default = "default_truncation_suffix")]
     pub truncation_suffix: String,
     #[serde(default)]
     pub include_stderr_in_reply: bool,
-    /// If non-empty: stdout 的第一行若以该前缀开头，则该行去掉前缀后的剩余部分为 **CLI 会话 id**，
-    /// 会随 `sendmessage` 写入 Hub；其余行作为发给微信的正文。
-    #[serde(default)]
-    pub cli_session_first_line_prefix: Option<String>,
-    /// 是否启用流式部分回复（`AGENT_PARTIAL:`）。默认 `true`。
-    /// 设为 `false` 时，子进程仍可输出 `AGENT_PARTIAL:` 行，但 bridge 不转发，
-    /// 只等程序退出后将完整 stdout 作为最终回复一次性发送。
+    /// 是否启用流式 partial 转发（bridge 侧 hint，不进 wire）。默认 `true`。
+    /// 设为 `false` 时，agent 仍会输出 `{"type":"partial"}` 事件，但 bridge
+    /// 不转发，只从 `{"type":"text"}` 事件拼最终回复一次性发送。
     #[serde(default = "default_true")]
     pub streaming: bool,
+    /// 启用可选的 tool-permission 通道（agentproc 0.3）。默认 `false`，bridge
+    /// 写完 turn 对象即关闭 stdin；`true` 时保持 stdin 开着，处理
+    /// `{"type":"permission_request"}` 并写回 `{"type":"permission_response"}`。
+    #[serde(default)]
+    pub permission: bool,
+    /// 当 permission 通道开启但没有交互式用户批准闭环时，bridge 对每个
+    /// permission_request 的默认动作。默认 `allow`（等价 skip-permissions）。
+    #[serde(default)]
+    pub permission_default: super::protocol::PermissionDefaultPolicy,
     /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
     #[serde(default)]
     pub description: Option<String>,
@@ -124,15 +131,17 @@ impl Default for BridgeProfile {
             script: None,
             command: String::new(),
             args: Vec::new(),
-            stdin: StdinMode::default(),
             cwd: None,
             env: HashMap::new(),
+            env_allowlist: None,
             timeout_secs: default_timeout_secs(),
+            kill_grace_secs: default_kill_grace_secs(),
             max_reply_chars: default_max_reply_chars(),
             truncation_suffix: default_truncation_suffix(),
             include_stderr_in_reply: false,
-            cli_session_first_line_prefix: None,
             streaming: true,
+            permission: false,
+            permission_default: super::protocol::PermissionDefaultPolicy::default(),
             description: None,
         }
     }
@@ -140,6 +149,10 @@ impl Default for BridgeProfile {
 
 fn default_timeout_secs() -> u64 {
     1800
+}
+
+fn default_kill_grace_secs() -> u64 {
+    5
 }
 
 fn default_max_reply_chars() -> usize {
@@ -161,13 +174,15 @@ pub struct BridgeConfig {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
-    pub stdin: StdinMode,
-    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    #[serde(default = "default_kill_grace_secs")]
+    pub kill_grace_secs: u64,
     #[serde(default = "default_max_reply_chars")]
     pub max_reply_chars: usize,
     #[serde(default = "default_truncation_suffix")]
@@ -180,10 +195,12 @@ pub struct BridgeConfig {
     pub send_error_reply: bool,
     #[serde(default)]
     pub include_stderr_in_reply: bool,
-    #[serde(default)]
-    pub cli_session_first_line_prefix: Option<String>,
     #[serde(default = "default_true")]
     pub streaming: bool,
+    #[serde(default)]
+    pub permission: bool,
+    #[serde(default)]
+    pub permission_default: super::protocol::PermissionDefaultPolicy,
     /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
     #[serde(default)]
     pub description: Option<String>,
@@ -250,15 +267,17 @@ impl BridgeApp {
             script: None,
             command: c.command.clone(),
             args: c.args.clone(),
-            stdin: c.stdin.clone(),
             cwd: c.cwd.clone(),
             env: c.env.clone(),
+            env_allowlist: c.env_allowlist.clone(),
             timeout_secs: c.timeout_secs,
+            kill_grace_secs: c.kill_grace_secs,
             max_reply_chars: c.max_reply_chars,
             truncation_suffix: c.truncation_suffix.clone(),
             include_stderr_in_reply: c.include_stderr_in_reply,
-            cli_session_first_line_prefix: c.cli_session_first_line_prefix.clone(),
             streaming: c.streaming,
+            permission: c.permission,
+            permission_default: c.permission_default,
             description: c.description,
         };
         reject_shell_injection_risk(&profile, "default")?;
@@ -508,15 +527,11 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
     }
 
     /// Build the standard ilink-hub-bridge self-invocation for built-in profile types.
-    /// All built-ins use `stdin: message` so the bridge writes the user text to the
-    /// child's stdin pipe (unused by env-var readers, but harmless and kept for symmetry).
-    fn make_builtin(mut p: BridgeProfile, type_name: &str, with_session: bool) -> BridgeProfile {
+    /// Under agentproc 0.3 the bridge always writes the NDJSON turn object to the
+    /// child's stdin, so no per-profile stdin wiring is needed.
+    fn make_builtin(mut p: BridgeProfile, type_name: &str, _with_session: bool) -> BridgeProfile {
         p.command = "ilink-hub-bridge".to_string();
         p.args = vec!["profile".to_string(), type_name.to_string()];
-        p.stdin = StdinMode::Message;
-        if with_session && p.cli_session_first_line_prefix.is_none() {
-            p.cli_session_first_line_prefix = Some("AGENT_SESSION:".to_string());
-        }
         p
     }
 
@@ -542,10 +557,11 @@ fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
 ///
 /// `tokio::process::Command` does NOT invoke a shell automatically, so this is
 /// only dangerous when the user explicitly invokes a shell with `-c`.
-/// Safe alternatives: use `stdin: message`, or a non-shell command.
+/// Safe alternatives: pass the message via the stdin turn object (always done
+/// under agentproc 0.3), or use a non-shell command.
 ///
 /// Only the dangerous combo is rejected; shell + `-c` without `{{MESSAGE}}`,
-/// or shell with `stdin: message` and no placeholder in args/env, still loads.
+/// or shell with no placeholder in args/env, still loads.
 fn reject_shell_injection_risk(p: &BridgeProfile, name: &str) -> Result<()> {
     // Include common POSIX / busybox shells. Interpreters (python -c, etc.)
     // and wrapper cmds (env/nice) are out of this round's scope.
@@ -682,6 +698,89 @@ pub fn expand_env_var_named(
     Ok(out)
 }
 
+/// AgentProc 0.3 `${VAR}` expansion with `env_allowlist` filtering and POSIX
+/// "unknown variable → empty string" semantics.
+///
+/// Differs from [`expand_env_var_named`] in two ways, both required by the 0.3
+/// spec:
+/// - When `allowlist` is `Some`, a `${VAR}` whose name is **not** in the list
+///   expands to the empty string and a WARN is logged (the process still
+///   starts — a typo surfaces as an empty variable, not a hard failure).
+/// - Unknown variables (not present in `env`) expand to the empty string
+///   rather than erroring, matching POSIX shell behaviour. A missing secret
+///   therefore surfaces downstream as an auth error from the CLI, not here.
+///
+/// `$$` still collapses to a literal `$`; invalid identifiers (`${}`, `${1FOO}`)
+/// remain hard errors because they signal a malformed profile, not a missing
+/// environment value.
+pub fn expand_env_var_named_with_allowlist(
+    template: &str,
+    env: &std::collections::HashMap<String, String>,
+    allowlist: Option<&[String]>,
+    profile: Option<&str>,
+    field: Option<&str>,
+) -> Result<String> {
+    let mut out = String::with_capacity(template.len());
+    let bytes = template.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] != b'$' {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= len {
+            out.push('$');
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'$' => {
+                out.push('$');
+                i += 2;
+            }
+            b'{' => {
+                let start = i + 2;
+                let end = match template[start..].find('}') {
+                    Some(rel) => start + rel,
+                    None => {
+                        anyhow::bail!(
+                            "{}unclosed `${{` in env template: {:?}",
+                            location_prefix(profile, field),
+                            template
+                        );
+                    }
+                };
+                let ident = &template[start..end];
+                validate_env_ident(ident, template, profile, field)?;
+                if let Some(list) = allowlist {
+                    if !list.iter().any(|name| name == ident) {
+                        tracing::warn!(
+                            profile = profile.unwrap_or(""),
+                            field = field.unwrap_or(""),
+                            var = ident,
+                            "env_allowlist blocked ${{{}}}; expanded to empty",
+                            ident
+                        );
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                let value = env.get(ident).map(|s| s.as_str()).unwrap_or("");
+                out.push_str(value);
+                i = end + 1;
+            }
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn validate_env_ident(
     ident: &str,
     template: &str,
@@ -734,7 +833,6 @@ mod tests {
         let y = r#"
 command: echo
 args: ["{{MESSAGE}}"]
-stdin: none
 "#;
         let app = BridgeApp::parse_yaml(y).unwrap();
         assert_eq!(app.profile_names(), vec!["default"]);
@@ -750,12 +848,10 @@ profiles:
   a:
     command: echo
     args: ["A", "{{MESSAGE}}"]
-    stdin: none
     timeout_secs: 5
   b:
     command: echo
     args: ["B", "{{MESSAGE}}"]
-    stdin: none
     timeout_secs: 5
 routing:
   strategy: prefix
@@ -781,12 +877,10 @@ profiles:
   p1:
     command: echo
     args: ["1", "{{MESSAGE}}"]
-    stdin: none
     timeout_secs: 3
   p2:
     command: echo
     args: ["2", "{{MESSAGE}}"]
-    stdin: none
     timeout_secs: 3
 routing:
   strategy: fixed
@@ -925,16 +1019,16 @@ routing:
     }
 
     #[test]
-    fn shell_with_stdin_message_still_loads() {
+    fn shell_without_dash_c_still_loads() {
+        // A shell running a script (no `-c`) is fine; the message travels via
+        // the stdin turn object under agentproc 0.3, never via argv.
         let y = r#"
 command: bash
 args: ["./run.sh"]
-stdin: message
 "#;
         let app = BridgeApp::parse_yaml(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "bash");
-        assert_eq!(p.stdin, StdinMode::Message);
     }
 
     #[test]
@@ -1006,7 +1100,7 @@ args: ["-c", "echo {{MESSAGE}}"]
     }
 
     #[test]
-    fn type_recursive_expands_to_builtin_with_session_prefix() {
+    fn type_recursive_expands_to_builtin_invocation() {
         let y = r#"
 profiles:
   rec:
@@ -1020,11 +1114,6 @@ routing:
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "ilink-hub-bridge");
         assert_eq!(p.args, vec!["profile", "recursive"]);
-        assert_eq!(p.stdin, StdinMode::Message);
-        assert_eq!(
-            p.cli_session_first_line_prefix.as_deref(),
-            Some("AGENT_SESSION:")
-        );
     }
 
     #[test]

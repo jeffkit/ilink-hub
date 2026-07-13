@@ -4,7 +4,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::bridge::executor::{extract_media_env, run_cli, split_into_parts, CliRunSummary};
+use crate::bridge::executor::{build_attachments, run_cli, split_into_parts, CliRunSummary};
 use crate::bridge::AUTH_ERROR_KEYWORDS;
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
@@ -73,7 +73,7 @@ pub(super) async fn handle_one_message(
         return Ok(());
     }
 
-    let media_env = extract_media_env(&msg);
+    let attachments = build_attachments(&msg);
 
     let (profile_name, profile, payload) = app
         .resolve(&text)
@@ -150,7 +150,7 @@ pub(super) async fn handle_one_message(
         &session_name_for_cli,
         &from_user,
         &ctx,
-        &media_env,
+        &attachments,
         partial_tx,
     )
     .await;
@@ -161,14 +161,26 @@ pub(super) async fn handle_one_message(
 
     match cli_result {
         Ok((raw_body, cli_session, summary)) => {
+            // A1 dedup: in streaming mode with partials already forwarded live
+            // to the user, the agent's final `text` body duplicates the
+            // streamed content — skip the final send (but still persist the
+            // session id). A2A inbound is exempt: its partials are suppressed,
+            // so the caller always needs the final body.
+            let body_already_delivered =
+                !is_a2a_inbound && profile.streaming && summary.partial_count > 0;
+            let effective_body = if body_already_delivered {
+                String::new()
+            } else {
+                raw_body
+            };
             log_message_handled_success(
                 profile_name,
                 &session_name_for_cli,
                 &summary,
-                raw_body.trim().is_empty(),
+                effective_body.trim().is_empty(),
                 is_a2a_inbound,
             );
-            if raw_body.trim().is_empty() {
+            if effective_body.trim().is_empty() {
                 // Empty body: only send if we need to persist a cli_session_id.
                 if let Some(sid) = cli_session {
                     if !sid.trim().is_empty() {
@@ -193,7 +205,7 @@ pub(super) async fn handle_one_message(
                         )
                         .await
                         {
-                            warn!(error = %e, "failed to persist cli_session_id after AGENT_PARTIAL-only reply")
+                            warn!(error = %e, "failed to persist cli_session_id after partial-only reply")
                         }
                     }
                 }
@@ -203,7 +215,7 @@ pub(super) async fn handle_one_message(
                 // Single sendmessage with a2a_call_id; Hub suppresses upstream
                 // delivery and resolves the caller's MCP waiter instead.
                 let mut req =
-                    SendMessageRequest::reply_text(ctx, raw_body, &from_user, cli_session);
+                    SendMessageRequest::reply_text(ctx, effective_body, &from_user, cli_session);
                 attach_outbound_hub_ext(&mut req, &session_name_for_cli, a2a_call_id.as_deref());
                 send_final_with_retry(
                     client,
@@ -218,7 +230,7 @@ pub(super) async fn handle_one_message(
                 return Ok(());
             }
             // Split long replies into multiple messages instead of truncating.
-            let parts = split_into_parts(&raw_body, profile.max_reply_chars);
+            let parts = split_into_parts(&effective_body, profile.max_reply_chars);
             let total = parts.len();
             info!(
                 profile = profile_name,
@@ -227,6 +239,7 @@ pub(super) async fn handle_one_message(
                 body_bytes = summary.body_bytes,
                 partial_count = summary.partial_count,
                 duration_ms = summary.duration_ms,
+                error_event = summary.error_event,
                 "message handled: final reply sent"
             );
             for (i, part) in parts.into_iter().enumerate() {

@@ -28,13 +28,9 @@
 #
 # ─── 测试脚本 ─────────────────────────────────────────────────────────────
 #
-#   不启动 bridge，直接在终端模拟一次调用：
-#     AGENT_MESSAGE="你好" \
-#     AGENT_SESSION_ID="" \
-#     AGENT_SESSION_NAME="default" \
-#     AGENT_FROM_USER="test" \
-#     AGENT_CONTEXT_TOKEN="test-token" \
-#     python3 ./my_handler.py
+#   不启动 bridge，向 stdin 写一行 turn NDJSON 模拟一次调用：
+#     echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+#       | python3 ./my_handler.py
 #
 # ─────────────────────────────────────────────────────────────────────────
 

@@ -35,9 +35,8 @@
 #
 # ─── 终端模拟测试（不启动 bridge）─────────────────────────────────────────────
 #
-#   AGENT_MESSAGE="你好，简短介绍自己" AGENT_SESSION_ID="" \
-#     ILINK_CODEBUDDY_MODEL="glm-5.1-ioa" \
-#     ilink-hub-bridge profile codebuddy-code
+#   echo '{"type":"turn","message":"你好，简短介绍自己","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+#     | ILINK_CODEBUDDY_MODEL="glm-5.1-ioa" ilink-hub-bridge profile codebuddy-code
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -53,22 +52,12 @@ profiles:
       # 如需切换为 DeepSeek：
       # ILINK_CODEBUDDY_MODEL: "deepseek-v3-2-volc-ioa"
 
-  codebuddy-new:                                # /new 前缀强制开新会话
-    type: codebuddy-code
-    cwd: /Users/kongjie/projects/ilink-hub
-    timeout_secs: 600
-    max_reply_chars: 8000
-    streaming: false
-    env:
-      ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"
-      AGENT_SESSION_ID: ""                      # 覆盖注入，强制新会话
+# 注：/new 是 Hub 级命令（强制开新会话），无需在此配置独立 profile。
+# session_id 由 Hub 通过 stdin turn 下发，env 无法覆盖。
 
 routing:
-  strategy: prefix
+  strategy: fixed
   default_profile: codebuddy
-  prefix_rules:
-    - prefix: "/new "
-      profile: codebuddy-new
 
 skip_bot_messages: true
 require_text: true

@@ -151,9 +151,8 @@ INFO bridge: waiting for messages…
 ### 先验证 Bridge 本身能调通 Claude
 
 ```bash
-AGENT_MESSAGE="用一句话介绍你自己" \
-AGENT_SESSION_ID="" \
-ilink-hub-bridge profile claude-code
+echo '{"type":"turn","message":"用一句话介绍你自己","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | ilink-hub-bridge profile claude-code
 ```
 
 看到 Claude 的回复就说明链路通了。

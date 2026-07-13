@@ -1,16 +1,14 @@
 //! Built-in `agy` profile: wraps the Antigravity (Google DeepMind) `agy` CLI with
 //! session continuity.
 //!
-//! Unlike Claude Code or Cursor, `agy` outputs plain text to stdout (no stream-json).
-//! The conversation ID is extracted from the agy log file written during execution.
+//! Unlike Claude Code or Cursor, `agy` outputs plain text to stdout (no stream-json),
+//! so there are no `partial` events — the full reply is emitted as a single `text`
+//! event. The conversation ID is extracted from the agy log file written during
+//! execution and surfaced via a `session` event.
 //!
 //! Session management:
 //!   - New session: run `agy -p <message>`, parse `Created conversation <uuid>` from log
 //!   - Resume: run `agy --conversation <uuid> -p <message>`, keep the same ID
-//!
-//! P0 output:
-//!   AGENT_SESSION:<conversation_id>   (if available)
-//!   <response text>
 //!
 //! Note: agy requires stdin to be a pipe (not a terminal); the handler closes stdin
 //! immediately after spawning so agy does not block waiting for interactive input.
@@ -23,7 +21,8 @@ use tokio::process::Command;
 use super::common;
 
 pub async fn run() -> Result<()> {
-    let (message, session_id) = common::read_message_and_session();
+    let turn = common::read_turn_or_error();
+    let (message, session_id) = common::message_and_session(&turn);
 
     let (response, new_session_id) =
         common::with_session_resume_fallback("agy", &message, &session_id, |m, s| async move {
@@ -31,10 +30,10 @@ pub async fn run() -> Result<()> {
         })
         .await?;
 
-    // P0 output: optional session line first, then response text.
-    common::emit_session_line(new_session_id.as_deref());
-    print!("{response}");
-    std::io::Write::flush(&mut std::io::stdout()).ok();
+    common::emit_session(new_session_id.as_deref());
+    if !response.trim().is_empty() {
+        common::emit_text(&response)?;
+    }
 
     Ok(())
 }

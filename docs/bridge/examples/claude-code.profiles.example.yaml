@@ -7,42 +7,44 @@
 # │ {{MESSAGE}}      │ 用户本条文本（prefix 路由时会去掉匹配前缀后的余文）                │
 # │ {{SESSION_ID}}   │ Hub 存储的后端 session UUID（如 Claude --resume 目标）            │
 # │ {{SESSION_NAME}} │ Hub session 可读名称（如 "feature-a"，默认 "default"）           │
+# │ {{PROFILE_DIR}}  │ profile YAML 文件所在目录                                         │
 # └──────────────────┴──────────────────────────────────────────────────────────────────┘
 #
 # 每个 profile 还可配置（非占位符，字面量或 YAML 类型）：
-#   command, args, stdin (none|message), cwd, env, timeout_secs, max_reply_chars,
-#   truncation_suffix, include_stderr_in_reply, cli_session_first_line_prefix（可选）
+#   command, args, cwd, env, env_allowlist, timeout_secs, kill_grace_secs,
+#   max_reply_chars, truncation_suffix, streaming, permission, permission_default,
+#   include_stderr_in_reply
+#
+# 0.3 起：消息/session 经 stdin NDJSON turn 传入；profile stdout 必须是 NDJSON 事件
+# （partial / text / session / error）。直接调 Claude/Cursor/Codex CLI 需用内置
+# type 或自写包装脚本转换为 NDJSON 事件。
 #
 # 整文件顶层（多 profile 模式）：profiles, routing, 以及可选 skip_bot_messages /
 # require_text / send_error_reply（与 README 一致）。
 
 profiles:
-  # 单会话多轮：固定 cwd 下 --continue
+  # 推荐：内置 type 自动管理 --resume 并转换输出为 NDJSON 事件
   claude_continue:
-    command: claude
-    args: ["-p", "{{MESSAGE}}", "--continue"]
-    stdin: none
+    type: claude-code
     cwd: /path/to/your/project
     timeout_secs: 600
     max_reply_chars: 8000
     truncation_suffix: "\n\n…(输出已截断)"
     include_stderr_in_reply: false
-    env:
-      # 若你写包装脚本，可把 Hub 注入的 CLI 会话 id 交给脚本做 --resume（勿把密钥写进仓库）
-      ILINK_CLI_SESSION: "{{SESSION_ID}}"
+    # env:
+    #   ILINK_CLAUDE_MODEL: sonnet
+    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # 从 bridge 进程 env 展开，勿写明文
 
-  # 多会话 / --resume：由脚本根据 AGENT_SESSION_ID（bridge 自动注入）拼出 claude --resume 目标
+  # 自写包装脚本：脚本负责把 Claude 输出转为 NDJSON 事件（partial/text/session）
   claude_via_wrapper:
     command: /path/to/ilink-claude-bridge.sh
     args: ["{{MESSAGE}}"]
-    stdin: none
     cwd: /path/to/your/project
     timeout_secs: 600
     max_reply_chars: 8000
-    # 脚本首行输出 AGENT_SESSION:<uuid>，配此前缀让 bridge 提取并回报 Hub 以续接下一轮
-    cli_session_first_line_prefix: "AGENT_SESSION:"
     env:
-      AGENT_SESSION_ID: "{{SESSION_ID}}"
+      # 包装脚本可从 stdin turn 读 session_id，或经占位符传入
+      ILINK_CLI_SESSION: "{{SESSION_ID}}"
 
 routing:
   strategy: fixed

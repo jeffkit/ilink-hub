@@ -44,14 +44,17 @@ ilink-hub serve --addr 127.0.0.1:8765
 
 ## 第三步：准备 `ilink-hub-bridge.yaml`
 
-在另一终端、任意目录新建：
+在另一终端、任意目录新建（一个最小的 echo profile：从 stdin 读 turn，把消息原样作为 `text` 事件回传）：
 
 ```yaml
-command: echo
-args: ["{{MESSAGE}}"]
-stdin: none
+command: python3
+args:
+  - "-c"
+  - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':t['message']}),flush=True)"
 timeout_secs: 10
 ```
+
+> 0.3 起 profile 的 stdout 必须是 NDJSON 事件（`{"type":"text",...}` 等）；纯文本行会被忽略。
 
 ---
 

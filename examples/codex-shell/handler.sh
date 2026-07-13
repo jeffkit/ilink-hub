@@ -1,18 +1,18 @@
 #!/usr/bin/env bash
 #
-# Codex Bridge Profile（Shell 版）
+# Codex Bridge Profile（Shell 版）— AgentProc 0.3 NDJSON
 #
-# 通过 Codex CLI 的 JSONL 输出模式（--json）接收用户消息，
-# 支持多轮对话（exec resume <session_id>）和流式输出（AGENT_PARTIAL）。
+# 从 stdin 读取一行 NDJSON turn 对象，调用 Codex CLI 的 JSONL 输出模式（--json），
+# 支持多轮对话（exec resume <session_id>）与流式输出（partial 事件），
+# 在 stdout 逐行输出 AgentProc 0.3 NDJSON 事件。
 #
 # ─── 依赖 ──────────────────────────────────────────────────────────────────
 #   必需：  codex CLI（已安装并认证：codex login）
-#           jq（JSON 解析与 AGENT_PARTIAL 编码：brew install jq）
+#           jq（JSON 解析与 NDJSON 编码：brew install jq）
 #
 # ─── 本地测试（不启动 bridge）──────────────────────────────────────────────
-#   AGENT_MESSAGE="你好，介绍一下自己" \
-#   AGENT_SESSION_ID="" \
-#   bash handler.sh
+#   echo '{"type":"turn","message":"你好，介绍一下自己","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+#     | bash handler.sh
 #
 # ─── 接入 bridge ────────────────────────────────────────────────────────────
 #   ilink-hub-bridge --config profiles.yaml
@@ -21,18 +21,21 @@
 
 set -euo pipefail
 
-MESSAGE="${AGENT_MESSAGE:-}"
-SESSION_ID="${AGENT_SESSION_ID:-}"
 CODEX_BYPASS="--dangerously-bypass-approvals-and-sandbox"
 
-# 切换工作目录（由 YAML cwd 字段注入，或从 AGENT_CWD 读取）
-if [[ -n "${AGENT_CWD:-}" && -d "$AGENT_CWD" ]]; then
-    cd "$AGENT_CWD"
+if ! command -v jq &>/dev/null; then
+    printf '{"type":"error","message":"未找到 jq，请先安装（brew install jq 或 sudo apt install jq）"}\n'
+    exit 1
 fi
 
-if ! command -v jq &>/dev/null; then
-    >&2 echo "[codex-bridge] 错误：未找到 jq，请先安装（brew install jq 或 sudo apt install jq）"
-    exit 1
+# ── 读取 stdin NDJSON turn ──────────────────────────────────────────────────
+TURN=$(cat)
+MESSAGE=$(printf '%s' "$TURN" | jq -r '.message // empty')
+SESSION_ID=$(printf '%s' "$TURN" | jq -r '.session_id // empty')
+
+# 切换工作目录（由 YAML cwd 字段注入）
+if [[ -n "${AGENT_CWD:-}" && -d "$AGENT_CWD" ]]; then
+    cd "$AGENT_CWD"
 fi
 
 # 构造 codex 命令：有 session_id 时用 exec resume（多轮对话），否则新建会话
@@ -43,15 +46,19 @@ else
 fi
 
 # ── 流式处理 JSONL 输出 ──────────────────────────────────────────────────────
-# codex --json 逐行输出事件，边输出边解析，将 agent_message 通过 AGENT_PARTIAL 实时推送给用户。
+# codex --json 逐行输出事件，边输出边解析，将 agent_message 通过 partial 事件实时推送给用户，
+# 累积为最终 text 事件，thread.started 提取 session id。
 #
 # 事件类型说明：
-#   thread.started          → session_id（保存，进程结束后输出 AGENT_SESSION:）
-#   item.completed (agent_message) → 回复文本（立即输出 AGENT_PARTIAL:）
-#
-# AGENT_PARTIAL: 格式要求文本必须 JSON 编码（换行等特殊字符转义），用 jq -cn 完成。
-#
+#   thread.started                       → session id（保存，进程结束后输出 session 事件）
+#   item.completed (agent_message)       → 回复文本（立即输出 partial 事件，并累积进 text）
 NEW_SESSION_ID=""
+FINAL_TEXT=""
+
+emit_ndjson() {
+    # $1 = jq filter producing an object; $2.. = jq args
+    jq -nc "$@"
+}
 
 while IFS= read -r line; do
     [[ -z "$line" ]] && continue
@@ -67,16 +74,19 @@ while IFS= read -r line; do
             if [[ "$item_type" == "agent_message" ]]; then
                 text=$(printf '%s' "$line" | jq -r '.item.text // empty' 2>/dev/null) || continue
                 if [[ -n "$text" ]]; then
-                    # JSON-encode text so newlines and special chars are safely escaped on one line.
-                    encoded=$(printf '%s' "$text" | jq -Rs '.')
-                    printf 'AGENT_PARTIAL:%s\n' "$encoded"
+                    # partial 事件：实时推送
+                    jq -nc --arg t "$text" '{"type":"partial","text":$t}'
+                    FINAL_TEXT="${FINAL_TEXT}${text}"
                 fi
             fi
             ;;
     esac
 done < <(echo "" | codex "${CODEX_ARGS[@]}" $CODEX_BYPASS --json 2>/dev/null)
 
-# ── P0 协议输出：AGENT_SESSION（仅在有 session_id 时输出）───────────────────
+# ── AgentProc 0.3 输出：text 事件（最终回复）+ session 事件 ─────────────────
+if [[ -n "$FINAL_TEXT" ]]; then
+    jq -nc --arg t "$FINAL_TEXT" '{"type":"text","text":$t}'
+fi
 if [[ -n "$NEW_SESSION_ID" ]]; then
-    printf 'AGENT_SESSION:%s\n' "$NEW_SESSION_ID"
+    jq -nc --arg id "$NEW_SESSION_ID" '{"type":"session","id":$id}'
 fi

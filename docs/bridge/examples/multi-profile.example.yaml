@@ -1,8 +1,11 @@
 # 多 Profile 示例：一个进程、一份 YAML，按消息前缀选不同 CLI。
 # 路由规则见 routing；未命中任何 prefix 时用 default_profile。
 #
+# 0.3 起 profile stdout 必须是 NDJSON 事件；下面用 python3 一行式
+# 从 stdin 读 turn，把 message 作为 {"type":"text",...} 事件回传（带前缀标签）。
+#
 # 微信里示例：
-#   普通文字        → echo 型 profile `plain`（默认）
+#   普通文字        → profile `plain`（默认）
 #   以 "/b " 开头   → profile `bar`（前缀会去掉再传给 {{MESSAGE}}）
 #   以 "/a " 开头   → profile `foo`
 
@@ -11,19 +14,22 @@ require_text: true
 
 profiles:
   plain:
-    command: echo
-    args: ["[plain]", "{{MESSAGE}}"]
-    stdin: none
+    command: python3
+    args:
+      - "-c"
+      - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':'[plain] '+t['message']}),flush=True)"
     timeout_secs: 15
   foo:
-    command: echo
-    args: ["[foo]", "{{MESSAGE}}"]
-    stdin: none
+    command: python3
+    args:
+      - "-c"
+      - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':'[foo] '+t['message']}),flush=True)"
     timeout_secs: 15
   bar:
-    command: echo
-    args: ["[bar]", "{{MESSAGE}}"]
-    stdin: none
+    command: python3
+    args:
+      - "-c"
+      - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':'[bar] '+t['message']}),flush=True)"
     timeout_secs: 15
 
 routing:

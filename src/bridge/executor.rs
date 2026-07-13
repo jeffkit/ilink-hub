@@ -1,12 +1,20 @@
+//! AgentProc 0.3 bridge-side executor: spawn the agent process, write the NDJSON
+//! turn object to its stdin, read NDJSON events from its stdout, and forward
+//! partials / assemble the final reply body.
+//!
+//! See `docs/knowledge/bridges/profile-protocol.md` and the upstream spec at
+//! `~/projects/agentproc/spec/protocol.md`.
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
-use crate::bridge::config::{BridgeProfile, StdinMode};
+use crate::bridge::config::BridgeProfile;
+use crate::bridge::protocol::{self, AgentEvent, Attachment, PermissionResponse, TurnObject};
 use crate::ilink::types::WeixinMessage;
 use crate::paths::expand_user_path;
 
@@ -17,25 +25,26 @@ use crate::paths::expand_user_path;
 /// this cap is ~8000× any legitimate reply and never triggers in normal use.
 pub const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 
-/// AgentProc protocol version implemented by this bridge, injected as
-/// `AGENT_PROTOCOL_VERSION` so profiles can feature-detect. Mirrors the
-/// `**Version:**` field in the agentproc spec.
-pub const AGENTPROC_PROTOCOL_VERSION: &str = "0.3";
-
-/// Replace `{{MESSAGE}}`, `{{SESSION_ID}}`, and `{{SESSION_NAME}}` in a template string.
+/// Replace `{{MESSAGE}}`, `{{SESSION_ID}}`, `{{SESSION_NAME}}`, and
+/// `{{PROFILE_DIR}}` in a template string.
 ///
 /// SEC-003: `message` is user-controlled (forwarded WeChat message text). We
 /// refuse to inject any string that contains bytes which would be interpreted
 /// by a shell-style wrapper (`bash -c`, `sh -c`, `env` parsing) — NUL,
 /// newlines, or carriage returns. Only validates a field when its placeholder
-/// actually appears in the template; callers that deliver the message via stdin
-/// (not argv/env) will not have `{{MESSAGE}}` in any arg template and must not
-/// be rejected just because the message contains newlines.
+/// actually appears in the template; callers that deliver the message via the
+/// stdin turn object (the 0.3 default) will not have `{{MESSAGE}}` in any arg
+/// template and must not be rejected just because the message contains
+/// newlines.
+///
+/// `{{PROFILE_DIR}}` expands to the profile file's directory (empty when the
+/// profile was built programmatically without a file, per the spec).
 pub(super) fn apply_placeholders(
     template: &str,
     message: &str,
     session_id: &str,
     session_name: &str,
+    profile_dir: &str,
 ) -> Result<String, PlaceholderError> {
     if template.contains("{{MESSAGE}}") {
         validate_safe_value("message", message)?;
@@ -49,7 +58,8 @@ pub(super) fn apply_placeholders(
     Ok(template
         .replace("{{MESSAGE}}", message)
         .replace("{{SESSION_ID}}", session_id)
-        .replace("{{SESSION_NAME}}", session_name))
+        .replace("{{SESSION_NAME}}", session_name)
+        .replace("{{PROFILE_DIR}}", profile_dir))
 }
 
 /// Reject values that contain characters unsafe for shell-style wrappers.
@@ -102,94 +112,69 @@ pub enum PlaceholderError {
     UnsafeValue { field: String },
 }
 
-/// If the first line of `stdout` starts with `prefix`, the remainder of that line is the CLI session id
-/// (returned as `Some`); the rest of `stdout` (following lines) is the reply body. If `prefix` is empty
-/// or the first line does not match, returns `(stdout, None)`.
-pub(super) fn split_cli_session_from_stdout(
-    prefix: &str,
-    stdout: &str,
-) -> (String, Option<String>) {
-    if prefix.is_empty() {
-        return (stdout.to_string(), None);
-    }
-    let mut lines = stdout.lines();
-    let Some(first) = lines.next() else {
-        return (stdout.to_string(), None);
-    };
-    if let Some(rest) = first.strip_prefix(prefix) {
-        let sid = rest.trim();
-        if sid.is_empty() {
-            return (stdout.to_string(), None);
-        }
-        let rest_lines: String = lines.collect::<Vec<_>>().join("\n");
-        return (rest_lines, Some(sid.to_string()));
-    }
-    (stdout.to_string(), None)
-}
-
-/// Split `s` into a sequence of parts, each at most `max_chars` Unicode chars.
-/// Returns at least one element (possibly an empty string when `s` is empty).
-pub(super) fn split_into_parts(s: &str, max_chars: usize) -> Vec<String> {
-    if max_chars == 0 {
-        return vec![s.to_string()];
-    }
-    let mut parts = Vec::new();
-    let mut chars = s.chars().peekable();
-    while chars.peek().is_some() {
-        let part: String = chars.by_ref().take(max_chars).collect();
-        parts.push(part);
-    }
-    if parts.is_empty() {
-        parts.push(String::new());
-    }
-    parts
-}
-
-/// Extract media-related environment variables from a WeChat message so that CLI scripts
-/// can handle image / file / video inputs without manually parsing the full JSON payload.
-pub(super) fn extract_media_env(msg: &WeixinMessage) -> Vec<(String, String)> {
+/// Build the `attachments` array for the turn object from a WeChat message's
+/// media items. Replaces the 0.2 `AGENT_IMAGE_URL` / `AGENT_FILE_URL` /
+/// `AGENT_VIDEO_URL` env vars — under 0.3 all media travels in the turn object.
+pub(super) fn build_attachments(msg: &WeixinMessage) -> Vec<Attachment> {
     use crate::ilink::types::msg_type;
-    let mut env = Vec::new();
-    let items = match msg.item_list.as_ref() {
-        Some(l) => l,
-        None => return env,
+    let mut out = Vec::new();
+    let Some(items) = msg.item_list.as_ref() else {
+        return out;
     };
     for item in items.iter() {
         match item.item_type {
             Some(msg_type::IMAGE) => {
-                env.push(("AGENT_ITEM_TYPE".into(), "image".into()));
-                if let Some(url) = item.image_item.as_ref().and_then(|i| i.cdn_url.as_deref()) {
-                    if !url.is_empty() {
-                        env.push(("AGENT_IMAGE_URL".into(), url.to_string()));
-                    }
+                if let Some(url) = item
+                    .image_item
+                    .as_ref()
+                    .and_then(|i| i.cdn_url.as_deref())
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(Attachment {
+                        kind: "image".into(),
+                        url: url.to_string(),
+                        filename: None,
+                        mime_type: None,
+                        size: None,
+                    });
                 }
                 break;
             }
             Some(msg_type::FILE) => {
-                env.push(("AGENT_ITEM_TYPE".into(), "file".into()));
                 if let Some(fi) = item.file_item.as_ref() {
                     if let Some(url) = fi.cdn_url.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("AGENT_FILE_URL".into(), url.to_string()));
-                    }
-                    if let Some(name) = fi.file_name.as_deref().filter(|s| !s.is_empty()) {
-                        env.push(("AGENT_FILE_NAME".into(), name.to_string()));
+                        out.push(Attachment {
+                            kind: "file".into(),
+                            url: url.to_string(),
+                            filename: fi.file_name.as_deref().map(|s| s.to_string()),
+                            mime_type: None,
+                            size: None,
+                        });
                     }
                 }
                 break;
             }
             Some(msg_type::VIDEO) => {
-                env.push(("AGENT_ITEM_TYPE".into(), "video".into()));
-                if let Some(url) = item.video_item.as_ref().and_then(|v| v.cdn_url.as_deref()) {
-                    if !url.is_empty() {
-                        env.push(("AGENT_VIDEO_URL".into(), url.to_string()));
-                    }
+                if let Some(url) = item
+                    .video_item
+                    .as_ref()
+                    .and_then(|v| v.cdn_url.as_deref())
+                    .filter(|s| !s.is_empty())
+                {
+                    out.push(Attachment {
+                        kind: "video".into(),
+                        url: url.to_string(),
+                        filename: None,
+                        mime_type: None,
+                        size: None,
+                    });
                 }
                 break;
             }
             _ => {}
         }
     }
-    env
+    out
 }
 
 /// Metrics collected for one `run_cli` invocation (for structured logging).
@@ -198,10 +183,15 @@ pub(super) struct CliRunSummary {
     pub duration_ms: u64,
     pub exit_code: Option<i32>,
     pub exited_by_signal: bool,
+    /// Number of `partial` events actually forwarded to the user (0 when
+    /// `streaming: false` — the bridge ignores partials in that mode).
     pub partial_count: u32,
     pub body_bytes: usize,
     pub stderr_bytes: usize,
     pub cli_session_present: bool,
+    /// True when the agent emitted an `error` event (turn is failed regardless
+    /// of exit code; the error text was already forwarded to the user).
+    pub error_event: bool,
 }
 
 fn truncate_for_log(s: &str, max_bytes: usize) -> String {
@@ -215,6 +205,27 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     format!("{}… [truncated, {} bytes total]", &s[..end], s.len())
 }
 
+/// Compose the fixed infra set the child always inherits (per agentproc 0.3).
+/// None of these are credential-bearing; they let the agent find its
+/// interpreter, temp dir, and locale.
+fn infra_env_vars() -> &'static [&'static str] {
+    &[
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TERM",
+        "TMPDIR",
+        "TZ",
+        "PWD",
+    ]
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_cli(
     cfg: &BridgeProfile,
@@ -224,15 +235,18 @@ pub(super) async fn run_cli(
     session_name: &str,
     from_user: &str,
     context_token: &str,
-    media_env: &[(String, String)],
+    attachments: &[Attachment],
     partial_tx: watch::Sender<Option<String>>,
 ) -> Result<(String, Option<String>, CliRunSummary)> {
     let started = Instant::now();
+    // {{PROFILE_DIR}} is not yet wired to the profile file's directory; expand
+    // to empty (spec-compliant when the profile is used without a file path).
+    const PROFILE_DIR: &str = "";
     let args: Vec<String> = cfg
         .args
         .iter()
         .map(|a| {
-            apply_placeholders(a, message, session_id, session_name)
+            apply_placeholders(a, message, session_id, session_name, PROFILE_DIR)
                 .with_context(|| format!("unsafe placeholder value in args template `{a}`"))
         })
         .collect::<Result<_>>()?;
@@ -245,7 +259,7 @@ pub(super) async fn run_cli(
 
     if let Some(dir) = &cfg.cwd {
         let dir = expand_user_path(
-            &apply_placeholders(dir, message, session_id, session_name)
+            &apply_placeholders(dir, message, session_id, session_name, PROFILE_DIR)
                 .with_context(|| format!("unsafe placeholder value in cwd template `{dir}`"))?,
         );
         cmd.current_dir(&dir);
@@ -253,39 +267,31 @@ pub(super) async fn run_cli(
         cmd.current_dir(&home);
     }
 
-    cmd.env(
-        "AGENT_MESSAGE",
-        sanitize_env_value("AGENT_MESSAGE", message),
-    );
-    cmd.env(
-        "AGENT_SESSION_ID",
-        sanitize_env_value("AGENT_SESSION_ID", session_id),
-    );
-    cmd.env(
-        "AGENT_SESSION_NAME",
-        sanitize_env_value("AGENT_SESSION_NAME", session_name),
-    );
-    cmd.env(
-        "AGENT_FROM_USER",
-        sanitize_env_value("AGENT_FROM_USER", from_user),
-    );
+    // Infra set: always copied from the bridge's own environment (0.3 removes
+    // the `env_inherit` escape hatch; ambient vars a profile needs must be
+    // declared in its `env` block).
+    let bridge_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    for name in infra_env_vars() {
+        if let Some(val) = bridge_env.get(*name) {
+            cmd.env(name, val);
+        }
+    }
+
+    // AGENT_CONTEXT_TOKEN is an ilink-hub extension (not part of the agentproc
+    // turn object) carried in the env so external profiles that call back to
+    // the Hub can read it. No built-in profile consumes it.
     cmd.env(
         "AGENT_CONTEXT_TOKEN",
         sanitize_env_value("AGENT_CONTEXT_TOKEN", context_token),
     );
-    cmd.env("AGENT_STREAMING", if cfg.streaming { "1" } else { "0" });
-    cmd.env("AGENT_PROTOCOL_VERSION", AGENTPROC_PROTOCOL_VERSION);
-
-    for (k, v) in media_env {
-        cmd.env(k, sanitize_env_value(k, v));
-    }
 
     for (k, v) in &cfg.env {
-        let v = apply_placeholders(v, message, session_id, session_name)
+        let v = apply_placeholders(v, message, session_id, session_name, PROFILE_DIR)
             .with_context(|| format!("unsafe placeholder value in env var `{k}`"))?;
-        let v = crate::bridge::config::expand_env_var_named(
+        let v = crate::bridge::config::expand_env_var_named_with_allowlist(
             &v,
-            &std::env::vars().collect(),
+            &bridge_env,
+            cfg.env_allowlist.as_deref(),
             Some(profile_name),
             Some(&format!("env.{k}")),
         )
@@ -293,14 +299,8 @@ pub(super) async fn run_cli(
         cmd.env(k, v);
     }
 
-    match cfg.stdin {
-        StdinMode::None => {
-            cmd.stdin(std::process::Stdio::null());
-        }
-        StdinMode::Message => {
-            cmd.stdin(std::process::Stdio::piped());
-        }
-    }
+    // stdin always carries the NDJSON turn object.
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
@@ -316,6 +316,7 @@ pub(super) async fn run_cli(
         command = %command,
         args = ?args,
         streaming = cfg.streaming,
+        permission = cfg.permission,
         timeout_secs = cfg.timeout_secs,
         "CLI spawned"
     );
@@ -336,121 +337,238 @@ pub(super) async fn run_cli(
         String::from_utf8_lossy(&buf).into_owned()
     });
 
-    let stdin_task: Option<tokio::task::JoinHandle<Result<()>>> =
-        if matches!(cfg.stdin, StdinMode::Message) {
-            let mut stdin = child
-                .stdin
-                .take()
-                .context("stdin pipe missing for stdin: message")?;
-            let message_owned = message.to_string();
-            Some(tokio::spawn(async move {
-                stdin
-                    .write_all(message_owned.as_bytes())
-                    .await
-                    .context("write stdin")?;
-                stdin.shutdown().await.context("shutdown stdin")?;
-                Ok(())
-            }))
+    // Build the turn object and write it as the first stdin line. When
+    // `permission: true`, stdin stays open for permission_response frames.
+    let turn = TurnObject::new(
+        message,
+        session_id,
+        if session_name.is_empty() {
+            "default"
         } else {
-            None
-        };
+            session_name
+        },
+        from_user,
+        attachments.to_vec(),
+        cfg.permission,
+    );
+    let turn_line = turn.to_ndjson().context("serialize turn object")?;
+    let permission_enabled = cfg.permission;
+
+    let (perm_tx, mut perm_rx) = mpsc::channel::<PermissionResponse>(16);
+    let mut child_stdin = child.stdin.take().context("stdin pipe missing")?;
+    let stdin_task: tokio::task::JoinHandle<Result<()>> = tokio::spawn(async move {
+        child_stdin
+            .write_all(turn_line.as_bytes())
+            .await
+            .context("write turn object to stdin")?;
+        child_stdin
+            .write_all(b"\n")
+            .await
+            .context("write turn newline")?;
+        if !permission_enabled {
+            child_stdin.shutdown().await.context("shutdown stdin")?;
+            return Ok(());
+        }
+        // Keep stdin open; forward permission_response frames as they arrive.
+        while let Some(resp) = perm_rx.recv().await {
+            let line = resp.to_ndjson().context("serialize permission response")?;
+            if child_stdin.write_all(line.as_bytes()).await.is_err() {
+                // Child closed stdin; stop writing.
+                break;
+            }
+            if child_stdin.write_all(b"\n").await.is_err() {
+                break;
+            }
+            child_stdin.flush().await.ok();
+        }
+        // No more responses coming; close stdin so the agent can finalize.
+        let _ = child_stdin.shutdown().await;
+        Ok(())
+    });
 
     let streaming = cfg.streaming;
-    let stream_result: Result<(Vec<String>, u32)> =
-        tokio::time::timeout(dur, async move {
-            use tokio::io::AsyncBufReadExt;
-            let mut reader = tokio::io::BufReader::new(child_stdout);
-            let mut final_lines: Vec<String> = Vec::new();
-            let mut accumulated_bytes: usize = 0;
-            let mut partial_count: u32 = 0;
-            let mut line = String::new();
-            loop {
-                line.clear();
-                let n = reader.read_line(&mut line).await.context("read stdout")?;
-                if n == 0 {
-                    break;
-                }
+    let max_chars = cfg.max_reply_chars;
+    let truncation_suffix = cfg.truncation_suffix.clone();
+    let truncation_suffix_for_body = truncation_suffix.clone();
+    let permission_default = cfg.permission_default;
+
+    /// Output of the stdout-parsing loop: text chunks, session id, forwarded
+    /// partial count, error-event flag, and the error message (for non-streaming
+    /// final body). Factored into a type alias to keep the closure signature readable.
+    type StreamOutcome = (Vec<String>, Option<String>, u32, bool, Option<String>);
+
+    let stream_result: Result<StreamOutcome> = tokio::time::timeout(dur, async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(child_stdout);
+        let mut text_chunks: Vec<String> = Vec::new();
+        let mut text_bytes: usize = 0;
+        let mut session_id: Option<String> = None;
+        let mut partial_count: u32 = 0;
+        let mut cumulative_partial_chars: usize = 0;
+        let mut partials_truncated = false;
+        let mut error_seen = false;
+        let mut error_message: Option<String> = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.context("read stdout")?;
+            if n == 0 {
+                break;
+            }
+            let Some(event) = protocol::parse_event(&line) else {
+                // Malformed / unknown line: log and ignore (not body, per 0.3).
                 let trimmed = line.trim_end_matches(['\n', '\r']);
-                if let Some(json_part) = trimmed.strip_prefix("AGENT_PARTIAL:") {
-                    if streaming {
-                        match serde_json::from_str::<String>(json_part) {
-                            Ok(chunk) => {
-                                partial_count = partial_count.saturating_add(1);
-                                let _ = partial_tx.send(Some(chunk));
-                            }
-                            Err(e) => {
-                                warn!(error = %e, raw = %json_part, "failed to decode AGENT_PARTIAL chunk; skipping");
-                            }
-                        }
-                    }
-                    continue;
-                }
-                if let Some(json_part) = trimmed.strip_prefix("AGENT_ERROR:") {
-                    // AgentProc v0.3: agent reports an error via a JSON-encoded
-                    // string. In streaming mode we forward the decoded text to the
-                    // user through the partial channel so it is visible immediately.
-                    // In non-streaming mode we append it to the captured body so it
-                    // is returned as the final reply (consistent with how AGENT_PARTIAL
-                    // is suppressed in that mode).
-                    match serde_json::from_str::<String>(json_part) {
-                        Ok(err_text) => {
-                            warn!(error_text = %err_text, "agent reported AGENT_ERROR");
-                            if !err_text.is_empty() {
-                                if streaming {
-                                    partial_count = partial_count.saturating_add(1);
-                                    let _ = partial_tx.send(Some(err_text));
-                                } else {
-                                    final_lines.push(format!("{err_text}\n"));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, raw = %json_part, "failed to decode AGENT_ERROR chunk; skipping");
-                        }
-                    }
-                    continue;
-                }
-                if accumulated_bytes >= MAX_CLI_CAPTURE_BYTES {
-                    // Drop further reads entirely; previously-captured buffer
-                    // is already at the cap so we must not grow it.
-                    continue;
-                }
-                let projected = accumulated_bytes.saturating_add(line.len());
-                if projected > MAX_CLI_CAPTURE_BYTES {
-                    // Trim the line so the *total* buffer stays at the cap.
-                    let remaining = MAX_CLI_CAPTURE_BYTES - accumulated_bytes;
-                    line.truncate(remaining);
-                    final_lines.push(line.clone());
-                    accumulated_bytes = MAX_CLI_CAPTURE_BYTES;
+                if !trimmed.is_empty() {
                     warn!(
-                        limit_bytes = MAX_CLI_CAPTURE_BYTES,
-                        "CLI stdout exceeded capture limit; hard-truncating accumulated reply"
+                        profile = profile_name,
+                        raw = %truncate_for_log(trimmed, 512),
+                        "ignoring non-NDJSON stdout line (not a recognised event)"
                     );
-                } else {
-                    accumulated_bytes = projected;
-                    final_lines.push(line.clone());
+                }
+                continue;
+            };
+            match event {
+                AgentEvent::Partial { text, role: _ } => {
+                    if error_seen || !streaming || partials_truncated || text.is_empty() {
+                        continue;
+                    }
+                    let remaining = max_chars.saturating_sub(cumulative_partial_chars);
+                    if remaining == 0 {
+                        let _ = partial_tx.send(Some(truncation_suffix.clone()));
+                        partials_truncated = true;
+                        continue;
+                    }
+                    if text.chars().count() > remaining {
+                        let chunk: String = text.chars().take(remaining).collect();
+                        partial_count = partial_count.saturating_add(1);
+                        let _ = partial_tx.send(Some(chunk));
+                        let _ = partial_tx.send(Some(truncation_suffix.clone()));
+                        partials_truncated = true;
+                        cumulative_partial_chars = max_chars;
+                    } else {
+                        partial_count = partial_count.saturating_add(1);
+                        cumulative_partial_chars += text.chars().count();
+                        let _ = partial_tx.send(Some(text));
+                    }
+                }
+                AgentEvent::Text { text } => {
+                    if error_seen {
+                        continue;
+                    }
+                    if text_bytes + text.len() > MAX_CLI_CAPTURE_BYTES {
+                        let room = MAX_CLI_CAPTURE_BYTES - text_bytes;
+                        let mut added = 0usize;
+                        let chunk: String = text
+                            .chars()
+                            .take_while(|c| {
+                                let len = c.len_utf8();
+                                if added + len > room {
+                                    return false;
+                                }
+                                added += len;
+                                true
+                            })
+                            .collect();
+                        if !chunk.is_empty() {
+                            text_chunks.push(chunk);
+                            text_bytes = MAX_CLI_CAPTURE_BYTES;
+                        }
+                        warn!(
+                            limit_bytes = MAX_CLI_CAPTURE_BYTES,
+                            "CLI text body exceeded capture limit; hard-truncating"
+                        );
+                    } else {
+                        text_bytes += text.len();
+                        text_chunks.push(text);
+                    }
+                }
+                AgentEvent::Session { id } => {
+                    if !id.is_empty() {
+                        session_id = Some(id);
+                    }
+                }
+                AgentEvent::Error { message } => {
+                    if !message.trim().is_empty() {
+                        error_message = Some(message.clone());
+                    }
+                    error_seen = true;
+                    // Forward the error text to the user immediately (streaming)
+                    // or as the final body (non-streaming).
+                    if streaming {
+                        let _ = partial_tx.send(Some(message));
+                    }
+                }
+                AgentEvent::PermissionRequest(req) => {
+                    if !permission_enabled {
+                        // Profile didn't opt in; ignore (spec says log + don't block).
+                        warn!(
+                            profile = profile_name,
+                            request_id = %req.request_id,
+                            tool = %req.tool_name,
+                            "ignoring permission_request (profile.permission is false)"
+                        );
+                        continue;
+                    }
+                    let resp = match permission_default {
+                        protocol::PermissionDefaultPolicy::Allow => {
+                            info!(
+                                profile = profile_name,
+                                request_id = %req.request_id,
+                                tool = %req.tool_name,
+                                "permission auto-allowed (permission_default)"
+                            );
+                            PermissionResponse::allow(req.request_id)
+                        }
+                        protocol::PermissionDefaultPolicy::Deny
+                        | protocol::PermissionDefaultPolicy::DenyLogged => {
+                            warn!(
+                                profile = profile_name,
+                                request_id = %req.request_id,
+                                tool = %req.tool_name,
+                                input = ?req.input,
+                                "permission denied (permission_default)"
+                            );
+                            PermissionResponse::deny(
+                                req.request_id,
+                                "denied by bridge permission_default policy",
+                            )
+                        }
+                    };
+                    // Send to the stdin writer task. If the channel is closed
+                    // (child died / stdin gone) the response is dropped — the
+                    // agent is expected to exit shortly.
+                    let _ = perm_tx.send(resp).await;
                 }
             }
-            drop(partial_tx);
-            Ok((final_lines, partial_count))
-        })
-        .await
-        .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?;
+        }
+        drop(partial_tx);
+        drop(perm_tx);
+        Ok((
+            text_chunks,
+            session_id,
+            partial_count,
+            error_seen,
+            error_message,
+        ))
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?;
 
-    let (final_lines, partial_count) = stream_result?;
+    let (text_chunks, cli_sid, partial_count, error_seen, error_message) = stream_result?;
+
+    // The stdin task may still be alive if it is blocked sending a permission
+    // response; closing perm_tx above unblocks it. Wait briefly for it to flush.
+    if let Err(e) = tokio::time::timeout(Duration::from_secs(2), stdin_task)
+        .await
+        .map_err(|_| anyhow::anyhow!("stdin task timed out"))
+    {
+        warn!(error = ?e, "stdin task joined with error (non-fatal)");
+    }
 
     let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
         .await
         .map_err(|_| anyhow::anyhow!("CLI failed to exit after stdout EOF"))?
         .context("wait for CLI process")?;
-
-    if let Some(task) = stdin_task {
-        match task.await {
-            Ok(Err(e)) => warn!(error = %e, "stdin write error (non-fatal)"),
-            Err(e) => warn!(error = %e, "stdin task panicked"),
-            Ok(Ok(())) => {}
-        }
-    }
 
     let stderr = match stderr_task.await {
         Ok(s) => s,
@@ -473,21 +591,51 @@ pub(super) async fn run_cli(
     let exited_by_signal = !status.success() && exit_code.is_none();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    let mut stdout = final_lines.concat();
-
-    if cfg.include_stderr_in_reply && !stderr.is_empty() {
-        stdout.push_str("\n--- stderr ---\n");
-        stdout.push_str(&stderr);
+    // Assemble the final body from text events. In non-streaming mode this is
+    // what the user receives; in streaming mode the dispatcher drops it when
+    // partials were already forwarded (A1 dedup policy).
+    let mut body = text_chunks.concat();
+    if !body.is_empty() && body.chars().count() > max_chars {
+        let truncated: String = body.chars().take(max_chars).collect();
+        body = format!("{truncated}{truncation_suffix_for_body}");
     }
 
-    let prefix = cfg
-        .cli_session_first_line_prefix
-        .as_deref()
-        .unwrap_or("")
-        .trim();
-    let (body, cli_sid) = split_cli_session_from_stdout(prefix, &stdout);
-    let cli_session_present = cli_sid.as_ref().is_some_and(|s| !s.is_empty());
+    // Error event: the turn is failed. The error text was already forwarded
+    // (streaming) or becomes the final body (non-streaming). Persist the
+    // session anyway (the error terminates the turn, not the session).
+    if error_seen {
+        let err_text = error_message.unwrap_or_default();
+        let body_out = if streaming { String::new() } else { err_text };
+        let cli_session_present = cli_sid.as_ref().is_some_and(|s| !s.is_empty());
+        let summary = CliRunSummary {
+            duration_ms,
+            exit_code,
+            exited_by_signal,
+            partial_count,
+            body_bytes: body_out.len(),
+            stderr_bytes: stderr.len(),
+            cli_session_present,
+            error_event: true,
+        };
+        info!(
+            profile = profile_name,
+            session_name = session_name,
+            pid = pid,
+            duration_ms = summary.duration_ms,
+            exit_code = ?summary.exit_code,
+            partial_count = summary.partial_count,
+            cli_session = summary.cli_session_present,
+            "CLI finished: error event"
+        );
+        return Ok((body_out, cli_sid, summary));
+    }
 
+    if cfg.include_stderr_in_reply && !stderr.is_empty() {
+        body.push_str("\n--- stderr ---\n");
+        body.push_str(&stderr);
+    }
+
+    let cli_session_present = cli_sid.as_ref().is_some_and(|s| !s.is_empty());
     let summary = CliRunSummary {
         duration_ms,
         exit_code,
@@ -496,6 +644,7 @@ pub(super) async fn run_cli(
         body_bytes: body.len(),
         stderr_bytes: stderr.len(),
         cli_session_present,
+        error_event: false,
     };
 
     info!(
@@ -513,16 +662,38 @@ pub(super) async fn run_cli(
         "CLI finished"
     );
 
-    if !status.success() {
+    // Exit-code precedence: timeout (handled above) > error event (handled
+    // above) > process exit code. A non-zero exit is tolerated when we
+    // recovered a session id or any body text (matches the legacy
+    // `ensure_success(recovered=...)` behaviour).
+    if !status.success() && cli_sid.is_none() && body.trim().is_empty() {
         let code = exit_code
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".into());
         anyhow::bail!(
-            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{stdout}"
+            "command exited with status {code}\n--- stderr ---\n{stderr}\n--- stdout ---\n{body}"
         );
     }
 
     Ok((body, cli_sid, summary))
+}
+
+/// Split `s` into a sequence of parts, each at most `max_chars` Unicode chars.
+/// Returns at least one element (possibly an empty string when `s` is empty).
+pub(super) fn split_into_parts(s: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![s.to_string()];
+    }
+    let mut parts = Vec::new();
+    let mut chars = s.chars().peekable();
+    while chars.peek().is_some() {
+        let part: String = chars.by_ref().take(max_chars).collect();
+        parts.push(part);
+    }
+    if parts.is_empty() {
+        parts.push(String::new());
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -535,25 +706,34 @@ mod tests {
     fn placeholders_message_session_id_and_name() {
         assert_eq!(
             apply_placeholders(
-                "{{MESSAGE}}|{{SESSION_ID}}|{{SESSION_NAME}}",
+                "{{MESSAGE}}|{{SESSION_ID}}|{{SESSION_NAME}}|{{PROFILE_DIR}}",
                 "hi",
                 "sid-9",
-                "feat-a"
+                "feat-a",
+                "/p"
             )
             .unwrap(),
-            "hi|sid-9|feat-a"
+            "hi|sid-9|feat-a|/p"
+        );
+    }
+
+    #[test]
+    fn placeholders_profile_dir_empty_when_unset() {
+        assert_eq!(
+            apply_placeholders("{{PROFILE_DIR}}/b.py", "hi", "sid", "name", "").unwrap(),
+            "/b.py"
         );
     }
 
     #[test]
     fn placeholders_reject_nul_in_message() {
-        let err = apply_placeholders("{{MESSAGE}}", "evil\0payload", "sid", "name").unwrap_err();
+        let err =
+            apply_placeholders("{{MESSAGE}}", "evil\0payload", "sid", "name", "").unwrap_err();
         assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
     }
 
-    /// Newline in message is OK when the template does not use {{MESSAGE}} (stdin: message mode).
-    /// This is the fix for the WeChat newline bug: profiles that deliver the message via stdin
-    /// rather than as a CLI arg must not be rejected at the arg-template stage.
+    /// Newline in message is OK when the template does not use {{MESSAGE}}
+    /// (the 0.3 default — the message travels via the stdin turn object).
     #[test]
     fn placeholders_allow_newline_in_message_when_placeholder_absent() {
         let result = apply_placeholders(
@@ -561,6 +741,7 @@ mod tests {
             "line1\nline2",
             "sid-1",
             "default",
+            "",
         );
         assert!(
             result.is_ok(),
@@ -570,40 +751,24 @@ mod tests {
 
     #[test]
     fn placeholders_reject_newline_in_session_id() {
-        // A newline in SESSION_ID could break out of a quoted arg slot.
-        let err = apply_placeholders("session={{SESSION_ID}}", "msg", "sid\nrm -rf /", "name")
+        let err = apply_placeholders("session={{SESSION_ID}}", "msg", "sid\nrm -rf /", "name", "")
             .unwrap_err();
         assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
     }
 
     #[test]
     fn placeholders_reject_carriage_return_in_session_name() {
-        let err =
-            apply_placeholders("name={{SESSION_NAME}}", "msg", "sid", "feat\r\noops").unwrap_err();
+        let err = apply_placeholders("name={{SESSION_NAME}}", "msg", "sid", "feat\r\noops", "")
+            .unwrap_err();
         assert!(matches!(err, PlaceholderError::UnsafeValue { .. }));
     }
 
     #[test]
     fn placeholder_session_name_defaults_to_default() {
         assert_eq!(
-            apply_placeholders("name={{SESSION_NAME}}", "", "", "default").unwrap(),
+            apply_placeholders("name={{SESSION_NAME}}", "", "", "default", "").unwrap(),
             "name=default"
         );
-    }
-
-    #[test]
-    fn split_cli_session_first_line() {
-        let (body, sid) =
-            split_cli_session_from_stdout("AGENT_SESSION:", "AGENT_SESSION:uuid-1\nhello\n");
-        assert_eq!(sid.as_deref(), Some("uuid-1"));
-        assert_eq!(body, "hello");
-    }
-
-    #[test]
-    fn split_cli_session_no_match_returns_full() {
-        let (body, sid) = split_cli_session_from_stdout("AGENT_SESSION:", "plain\n");
-        assert!(sid.is_none());
-        assert_eq!(body, "plain\n");
     }
 
     #[test]
@@ -632,56 +797,8 @@ mod tests {
 
     #[test]
     fn split_into_parts_unicode() {
-        // Each Chinese char is 1 Unicode scalar, so 2 chars per part → 3 parts.
         let parts = split_into_parts("一二三四五", 2);
         assert_eq!(parts, vec!["一二", "三四", "五"]);
-    }
-
-    #[tokio::test]
-    async fn test_stdin_write_timeout() {
-        let sleep_cmd = if cfg!(target_os = "macos") {
-            "/bin/sleep"
-        } else {
-            "/usr/bin/sleep"
-        };
-        let yaml =
-            format!("command: {sleep_cmd}\nargs: [\"10\"]\nstdin: message\ntimeout_secs: 1\n");
-        let app = BridgeApp::parse_yaml(&yaml).unwrap();
-        let (_name, profile, _payload) = app.resolve("hello").unwrap();
-
-        let large_msg = "A".repeat(128 * 1024);
-
-        let start = std::time::Instant::now();
-        let (partial_tx, _partial_rx) = watch::channel::<Option<String>>(None);
-        let res = run_cli(
-            profile,
-            "test_profile",
-            &large_msg,
-            "session-123",
-            "session-name",
-            "user-123",
-            "ctx-123",
-            &[],
-            partial_tx,
-        )
-        .await;
-
-        let elapsed = start.elapsed();
-        assert!(
-            res.is_err(),
-            "Expected stdin write to timeout, but it succeeded: {:?}",
-            res
-        );
-        let err_msg = res.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("timed out")
-                || err_msg.contains("stdin")
-                || err_msg.contains("spawn")
-                || err_msg.contains("No such file"),
-            "Expected timeout or spawn error, got: {}",
-            err_msg
-        );
-        assert!(elapsed.as_secs() < 3, "Took too long: {:?}", elapsed);
     }
 
     #[test]
@@ -698,18 +815,29 @@ mod tests {
         assert_eq!(sanitize_env_value("test", "a\0b\nc\rd"), "ab c d");
     }
 
-    /// End-to-end: a profile that emits `AGENT_PARTIAL:` lines, an
-    /// `AGENT_SESSION:` first line, and a final body — verifying the renamed
-    /// agentproc v0.3 sentinel parsing and session extraction.
+    /// Build a bridge YAML that runs `sh <temp-script>` with a piped stdin.
+    /// The script is written to a temp file so YAML quoting of shell
+    /// metacharacters is a non-issue.
+    fn shell_profile_yaml(script: &str, timeout_secs: u64) -> String {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().expect("create temp script");
+        write!(tmp, "{script}").expect("write temp script");
+        let path = tmp.into_temp_path().keep().expect("keep temp script");
+        let path_str = path.to_string_lossy().to_string();
+        format!("command: /bin/sh\nargs:\n  - \"{path_str}\"\ntimeout_secs: {timeout_secs}\n")
+    }
+
+    /// A 0.3 agent that reads the turn object from stdin and emits NDJSON
+    /// events: a session event, two partials, and a final text body.
     #[tokio::test]
-    async fn test_agentproc_partial_and_session_parsing() {
-        let script = "printf 'AGENT_SESSION:sess-xyz\\n'; printf 'AGENT_PARTIAL:%s\\n' '\"chunk-a\"'; printf 'AGENT_PARTIAL:%s\\n' '\"chunk-b\"'; printf 'final-body\\n'";
-        // Set cli_session_first_line_prefix so the AGENT_SESSION: line is
-        // parsed into a session id rather than treated as body.
-        let yaml = format!(
-            "{}cli_session_first_line_prefix: \"AGENT_SESSION:\"\n",
-            shell_profile_yaml(script, 5)
-        );
+    async fn test_agentproc_partial_session_text_parsing() {
+        // sh script: read stdin (the turn line), then emit NDJSON events.
+        let script = r#"read -r line; \
+printf '%s\n' '{"type":"session","id":"sess-xyz"}'; \
+printf '%s\n' '{"type":"partial","text":"chunk-a"}'; \
+printf '%s\n' '{"type":"partial","text":"chunk-b"}'; \
+printf '%s\n' '{"type":"text","text":"final-body"}'"#;
+        let yaml = shell_profile_yaml(script, 5);
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
 
@@ -731,24 +859,103 @@ mod tests {
         .expect("run_cli failed");
 
         assert_eq!(cli_sid.as_deref(), Some("sess-xyz"));
-        assert_eq!(body.trim(), "final-body");
+        assert_eq!(body, "final-body");
         assert_eq!(summary.partial_count, 2);
+        assert!(!summary.error_event);
 
         let chunks = chunks.await.expect("collector panicked");
-        // watch channel only retains the latest value, so fast consecutive
-        // sends may coalesce — assert the most recent chunk is observed.
         assert!(
             chunks.iter().any(|c| c == "chunk-b"),
-            "expected chunk-b (latest partial) in forwarded partials, got {:?}",
+            "expected chunk-b in forwarded partials, got {:?}",
             chunks
         );
     }
 
-    /// The bridge injects `AGENT_PROTOCOL_VERSION` with the current constant
-    /// value. Verified by a profile that echoes it back as the reply body.
+    /// Non-streaming mode: partials are ignored; the body comes from text events.
     #[tokio::test]
-    async fn test_agentproc_protocol_version_injected() {
-        let script = "printf '%s\\n' \"$AGENT_PROTOCOL_VERSION\"";
+    async fn test_non_streaming_ignores_partials() {
+        let script = r#"read -r line; \
+printf '%s\n' '{"type":"partial","text":"live-chunk"}'; \
+printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
+        let yaml = format!("{}\nstreaming: false\n", shell_profile_yaml(script, 5));
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+
+        let (body, _sid, summary) = run_cli(
+            profile,
+            "test_profile",
+            "hello",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert_eq!(body, "assembled-body");
+        assert_eq!(summary.partial_count, 0);
+
+        let chunks = chunks.await.expect("collector panicked");
+        assert!(
+            chunks.is_empty(),
+            "non-streaming must not forward partials, got {:?}",
+            chunks
+        );
+    }
+
+    /// An error event forwards the error text to the user (streaming) and
+    /// produces an empty final body so the dispatcher skips the final send.
+    #[tokio::test]
+    async fn test_error_event_forwarded_as_partial() {
+        let script =
+            r#"read -r line; printf '%s\n' '{"type":"error","message":"boom: bad model"}'"#;
+        let yaml = shell_profile_yaml(script, 5);
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hello").unwrap();
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+
+        let (body, _sid, summary) = run_cli(
+            profile,
+            "test_profile",
+            "hello",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert!(
+            body.is_empty(),
+            "streaming error → empty body, got: {body:?}"
+        );
+        assert!(summary.error_event);
+
+        let chunks = chunks.await.expect("collector panicked");
+        assert!(
+            chunks.iter().any(|c| c == "boom: bad model"),
+            "error text not forwarded as partial; got {:?}",
+            chunks
+        );
+    }
+
+    /// The turn object the bridge writes to stdin carries the message and
+    /// protocol_version. Verified by an agent that echoes the parsed message.
+    #[tokio::test]
+    async fn test_turn_object_written_to_stdin() {
+        // Use python3 to parse the JSON turn and emit it back as a text event.
+        let script = r#"python3 -c 'import sys,json; t=json.loads(sys.stdin.readline()); print(json.dumps({"type":"text","text":"echo:"+t["message"]+"/"+t["protocol_version"]}))'"#;
         let yaml = shell_profile_yaml(script, 5);
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
@@ -768,46 +975,7 @@ mod tests {
         .await
         .expect("run_cli failed");
 
-        assert_eq!(body.trim(), AGENTPROC_PROTOCOL_VERSION);
-    }
-
-    /// `AGENT_ERROR:` lines are decoded and forwarded as a partial chunk so
-    /// the user sees the agent's error text.
-    #[tokio::test]
-    async fn test_agentproc_error_forwarded_as_partial() {
-        let script = "printf 'AGENT_ERROR:%s\\n' '\"boom: bad model\"'";
-        let yaml = shell_profile_yaml(script, 5);
-        let app = BridgeApp::parse_yaml(&yaml).unwrap();
-        let (_name, profile, _payload) = app.resolve("hello").unwrap();
-
-        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
-        let chunks = spawn_partial_collector(partial_rx);
-
-        let (body, _sid, _summary) = run_cli(
-            profile,
-            "test_profile",
-            "hello",
-            "",
-            "default",
-            "user-1",
-            "ctx-1",
-            &[],
-            partial_tx,
-        )
-        .await
-        .expect("run_cli failed");
-
-        assert!(
-            body.trim().is_empty(),
-            "body should be empty, got: {body:?}"
-        );
-
-        let chunks = chunks.await.expect("collector panicked");
-        assert!(
-            chunks.iter().any(|c| c == "boom: bad model"),
-            "AGENT_ERROR text not forwarded as partial; got {:?}",
-            chunks
-        );
+        assert_eq!(body, "echo:hello/0.3");
     }
 
     /// Spawn a task that drains a partial watch channel into a Vec<String>,
@@ -825,19 +993,5 @@ mod tests {
             }
             out
         })
-    }
-
-    /// Build a bridge YAML that runs `sh <temp-script>` with no stdin. The
-    /// script is written to a temp file so YAML quoting of shell metacharacters
-    /// is a non-issue.
-    fn shell_profile_yaml(script: &str, timeout_secs: u64) -> String {
-        use std::io::Write;
-        let mut tmp = tempfile::NamedTempFile::new().expect("create temp script");
-        write!(tmp, "{script}").expect("write temp script");
-        let path = tmp.into_temp_path().keep().expect("keep temp script");
-        let path_str = path.to_string_lossy().to_string();
-        format!(
-            "command: /bin/sh\nargs:\n  - \"{path_str}\"\nstdin: none\ntimeout_secs: {timeout_secs}\n"
-        )
     }
 }

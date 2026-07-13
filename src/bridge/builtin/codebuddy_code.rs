@@ -1,29 +1,26 @@
 //! Built-in `codebuddy-code` profile: wraps the CodeBuddy Code CLI with session continuity.
 //!
-//! Reads P0 env vars, calls `codebuddy -p --output-format stream-json [--resume <uuid>]`,
-//! and streams text output to the parent bridge via `AGENT_PARTIAL:` stdout lines.
+//! Reads the 0.3 turn object from stdin, calls `codebuddy -p --output-format
+//! stream-json [--resume <uuid>]`, and emits NDJSON events on stdout:
+//!
+//! - `partial` for each assistant text chunk (streamed live),
+//! - `text` with the full concatenated reply (the final body; the bridge dedups
+//!   against already-forwarded partials in streaming mode and uses it as the
+//!   single reply in non-streaming mode),
+//! - `session` with the new session id.
+//!
+//! `streaming` is a bridge-side hint in 0.3, so the agent always runs the
+//! underlying CLI in stream-json mode and emits both `partial` and `text` events.
 //!
 //! CodeBuddy Code CLI is compatible with Claude Code's `stream-json` protocol:
 //!   {"type":"system","session_id":"<uuid>", ...}
 //!   {"type":"assistant","message":{"content":[{"type":"text","text":"..."}],...},...}
 //!   {"type":"result","subtype":"success","result":"...","session_id":"<uuid>"}
 //!
-//! Each assistant text chunk is written immediately as:
-//!
-//!   AGENT_PARTIAL:<json-encoded-string>
-//!
-//! When the stream ends, the final P0 session line is written:
-//!
-//!   AGENT_SESSION:<new_session_id>
-//!
-//! The response body is left empty so the bridge does not send a duplicate final message.
-//!
 //! If `--resume` fails (session expired / not found), automatically retries as a
 //! fresh session so the user gets a response rather than a bare error.
 //!
 //! Supported env vars:
-//!   AGENT_MESSAGE          — inbound user message (P0)
-//!   AGENT_SESSION_ID       — existing session UUID to resume (P0, empty = new)
 //!   ILINK_CODEBUDDY_MODEL  — override the CodeBuddy model (e.g. claude-sonnet-4.6)
 
 use anyhow::{Context, Result};
@@ -39,44 +36,38 @@ use super::common;
 type CodeBuddyStreamEvent = common::StreamJsonEvent;
 
 pub async fn run() -> Result<()> {
-    let (message, session_id) = common::read_message_and_session();
-    let streaming = std::env::var("AGENT_STREAMING").as_deref() != Ok("0");
+    let turn = common::read_turn_or_error();
+    let (message, session_id) = common::message_and_session(&turn);
 
-    let (new_session_id, buffered_reply) = common::with_session_resume_fallback(
+    let (new_session_id, body) = common::with_session_resume_fallback(
         "codebuddy-code",
         &message,
         &session_id,
-        |m, s| async move { stream_codebuddy(&m, &s, streaming).await },
+        |m, s| async move { stream_codebuddy(&m, &s).await },
     )
     .await?;
 
-    // In non-streaming mode the full reply was not emitted as AGENT_PARTIAL lines;
-    // print it now as a plain body so the bridge can forward it as a single message.
-    if !streaming {
-        if let Some(reply) = buffered_reply.filter(|s| !s.is_empty()) {
-            print!("{reply}");
-        }
+    common::emit_session(new_session_id.as_deref());
+    if let Some(reply) = body.filter(|s| !s.trim().is_empty()) {
+        common::emit_text(&reply)?;
     }
-
-    // P0 output: optional session line only.
-    common::emit_session_line(new_session_id.as_deref());
 
     Ok(())
 }
 
-/// Call `codebuddy -p --output-format stream-json`, emit every assistant text chunk as an
-/// `AGENT_PARTIAL:` stdout line (when `streaming` is true), or accumulate chunks into a
-/// single String (when `streaming` is false).
+/// Call `codebuddy -p --output-format stream-json`, emit every assistant text chunk
+/// as a `partial` event, and accumulate the full reply into a `text` event.
 ///
-/// Returns `(session_id, buffered_reply)`. `buffered_reply` is `Some` only when
-/// `streaming` is false and contains the full concatenated reply.
+/// Returns `(session_id, body)`. `body` is the concatenated reply (assistant chunks
+/// plus any `result.result` that was not already the last chunk), emitted as the
+/// final `text` event by `run()`.
 ///
-/// When the model uses tools between turns, the final assistant reply may only appear
-/// in `result.result` (with no preceding `assistant` event); we handle it in both modes.
+/// When the model uses tools between turns, the final assistant reply may only
+/// appear in `result.result` (with no preceding `assistant` event); it is appended
+/// to the body in that case.
 async fn stream_codebuddy(
     message: &str,
     session_id: &str,
-    streaming: bool,
 ) -> Result<(Option<String>, Option<String>)> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -124,10 +115,9 @@ async fn stream_codebuddy(
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_session_id: Option<String> = None;
-    // Track the last text chunk sent/buffered so we can detect when result.result differs.
+    // Track the last text chunk appended so we can detect when result.result differs.
     let mut last_chunk: Option<String> = None;
-    // Buffer for non-streaming mode: accumulate all assistant text here.
-    let mut buffer: Option<String> = if streaming { None } else { Some(String::new()) };
+    let mut body = String::new();
 
     loop {
         line.clear();
@@ -156,11 +146,8 @@ async fn stream_codebuddy(
                     // "\n" emitted between tool calls) do not produce an empty-looking
                     // message that the user sees as blank.
                     if !text.trim().is_empty() {
-                        if streaming {
-                            common::emit_partial(&text)?;
-                        } else if let Some(buf) = &mut buffer {
-                            buf.push_str(&text);
-                        }
+                        common::emit_partial(&text)?;
+                        body.push_str(&text);
                         last_chunk = Some(text);
                     }
                 }
@@ -169,16 +156,11 @@ async fn stream_codebuddy(
                 found_session_id = event.session_id;
                 // When the model uses tools between turns, the final assistant reply text
                 // may only appear in result.result and have no corresponding assistant event.
-                // Handle it in both streaming and non-streaming modes if it differs from
-                // the last chunk already sent/buffered.
+                // Append it to the body if it differs from the last chunk already accumulated.
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
                     let already_handled = last_chunk.as_deref() == Some(result_text.as_str());
                     if !already_handled {
-                        if streaming {
-                            common::emit_partial(&result_text)?;
-                        } else if let Some(buf) = &mut buffer {
-                            buf.push_str(&result_text);
-                        }
+                        body.push_str(&result_text);
                     }
                 }
             }
@@ -191,7 +173,12 @@ async fn stream_codebuddy(
 
     common::ensure_success("codebuddy", status, &stderr, found_session_id.is_some())?;
 
-    Ok((found_session_id, buffer))
+    let body_opt = if body.trim().is_empty() {
+        None
+    } else {
+        Some(body)
+    };
+    Ok((found_session_id, body_opt))
 }
 
 #[cfg(test)]

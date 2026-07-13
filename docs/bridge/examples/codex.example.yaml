@@ -1,8 +1,11 @@
-# OpenAI Codex CLI：命令与子命令以本机 `codex --help` 为准。
-# 常见非交互执行：`codex exec "<提示>"`；此处用占位符注入用户消息。
+# OpenAI Codex CLI：推荐使用内置 `type: codex`（自动把 Codex JSONL 输出
+# 转换为 AgentProc 0.3 NDJSON 事件并管理 exec resume）。
+#
+# 直接调 `codex exec` 的 stdout 是 Codex 自有 JSONL 格式（非 NDJSON 事件），
+# bridge 会忽略无法识别的行 → 用户收不到回复。直接 CLI 仅适合你自己写
+# 包装脚本的场景（见 examples/codex-shell/）。
 command: codex
 args: ["exec", "{{MESSAGE}}"]
-stdin: none
 cwd: /path/to/your/project
 timeout_secs: 600
 max_reply_chars: 8000

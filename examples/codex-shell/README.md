@@ -1,6 +1,6 @@
 # Codex Bridge Profile（Shell 版）
 
-用纯 Shell 脚本把 OpenAI Codex CLI 接入 iLink Hub Bridge，支持多轮对话。
+用纯 Shell 脚本把 OpenAI Codex CLI 接入 iLink Hub Bridge，支持多轮对话。采用 AgentProc 0.3 NDJSON 协议与 bridge 通信。
 
 ## 前提条件
 
@@ -12,7 +12,7 @@ codex --version       # 验证已安装
 codex login           # 或 export OPENAI_API_KEY=sk-...
 ```
 
-- `jq` 已安装（用于解析 JSONL 输出）
+- `jq` 已安装（用于解析 JSONL 输出与编码 NDJSON 事件）
 
 ```bash
 brew install jq       # macOS
@@ -21,20 +21,19 @@ sudo apt install jq   # Ubuntu/Debian
 
 ## 本地测试
 
-不需要启动完整的 bridge，直接模拟一次调用：
+不需要启动完整的 bridge，向 stdin 写一行 turn NDJSON 即可模拟一次调用：
 
 ```bash
-AGENT_MESSAGE="你好，用一句话介绍你自己" \
-AGENT_SESSION_ID="" \
-AGENT_CWD="$(pwd)" \
-bash handler.sh
+echo '{"type":"turn","message":"你好，用一句话介绍你自己","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | AGENT_CWD="$(pwd)" bash handler.sh
 ```
 
-预期输出（第一行为 session_id，其余为 Codex 的回复）：
+预期输出（NDJSON 事件流，最后一行为 session 事件）：
 
 ```
-AGENT_SESSION:xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-你好！我是 Codex，一个 AI 编程助手。有什么可以帮你的吗？
+{"type":"partial","text":"你好！我是 Codex，一个 AI 编程助手。有什么可以帮你的吗？"}
+{"type":"text","text":"你好！我是 Codex，一个 AI 编程助手。有什么可以帮你的吗？"}
+{"type":"session","id":"xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"}
 ```
 
 ## 接入 Bridge
@@ -52,17 +51,19 @@ ilink-hub-bridge --config profiles.yaml
 
 ```
 微信消息 → Hub → bridge → bash handler.sh
+                              │ stdin: 一行 NDJSON turn
+                              │   {type:"turn", message, session_id, ...}
                               │
               ┌───────────────┤
-              │  SESSION_ID 非空 → codex exec resume <UUID> <消息>（接续上文）
-              │  SESSION_ID 为空 → codex exec <消息>（全新会话）
+              │  session_id 非空 → codex exec resume <UUID> <消息>（接续上文）
+              │  session_id 为空 → codex exec <消息>（全新会话）
               └───────────────┤
-                              │ stdout: AGENT_SESSION:<uuid>
-                              │         <回复文本>
+                              │ stdout: NDJSON 事件流
+                              │   {"type":"partial","text":...}   ← 实时分块
+                              │   {"type":"text","text":...}      ← 最终回复
+                              │   {"type":"session","id":...}     ← session id
 ```
 
 `handler.sh` 调用 `codex exec --json`，从 JSONL 事件流中提取：
-- `thread.started` 事件的 `thread_id` → 作为新 session_id 写到第一行
-- `item.completed` 事件的 `item.text` → 作为回复正文
-
-支持 `jq`（首选）和 `python3`（备用）两种 JSON 解析方式。
+- `thread.started` 事件的 `thread_id` → 发 `session` 事件
+- `item.completed (agent_message)` 事件的 `item.text` → 发 `partial` 事件并累积进最终 `text` 事件

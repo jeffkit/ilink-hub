@@ -1,10 +1,11 @@
 //! Shared helpers for the built-in profile handlers.
 //!
-//! Every built-in (`claude-code`, `codex`, `cursor`, `agy`) follows the same P0
-//! exec protocol: read `AGENT_MESSAGE` / `AGENT_SESSION_ID`, run the underlying
-//! CLI (resuming the session when one exists, falling back to a fresh session on
-//! failure), stream partials, and finally print `AGENT_SESSION:<id>`. This module
-//! factors out that boilerplate so each handler only carries its CLI-specific glue.
+//! Every built-in (`claude-code`, `codex`, `cursor`, `agy`, `recursive`) is an
+//! agentproc 0.3 **agent**: it reads the NDJSON [`TurnInput`](crate::bridge::protocol::TurnInput)
+//! from stdin, runs the underlying CLI (resuming the session when one exists,
+//! falling back to a fresh session on failure), streams `partial` events, and
+//! finally emits a `session` event and a `text` event. This module factors out
+//! that boilerplate so each handler only carries its CLI-specific glue.
 
 use std::future::Future;
 use std::process::ExitStatus;
@@ -14,12 +15,28 @@ use serde::Deserialize;
 use tokio::io::AsyncRead;
 use tokio::task::JoinHandle;
 
-/// Read the two P0 env vars injected by the bridge: the inbound user message and
-/// the existing session id (empty string = no session yet).
-pub fn read_message_and_session() -> (String, String) {
-    let message = std::env::var("AGENT_MESSAGE").unwrap_or_default();
-    let session_id = std::env::var("AGENT_SESSION_ID").unwrap_or_default();
-    (message, session_id)
+use crate::bridge::protocol::{self, TurnInput};
+
+/// Read the turn object the bridge wrote to stdin. On a missing/empty turn,
+/// emits an `error` event and returns a tuple with an empty message/session so
+/// the caller can exit cleanly.
+pub fn read_turn_or_error() -> TurnInput {
+    match protocol::read_turn() {
+        Some(turn) if turn.has_content() => turn,
+        Some(_) => {
+            emit_error("turn is empty (no message and no attachments)");
+            TurnInput::default()
+        }
+        None => {
+            emit_error("no turn object on stdin");
+            TurnInput::default()
+        }
+    }
+}
+
+/// Backwards-compat accessor pair for handlers that only need message + session.
+pub fn message_and_session(turn: &TurnInput) -> (String, String) {
+    (turn.message.clone(), turn.session_id.clone())
 }
 
 /// Run `op(message, session_id)`. When `session_id` is non-empty (a resume attempt)
@@ -51,30 +68,42 @@ where
     }
 }
 
-/// Print the final P0 session line (`AGENT_SESSION:<id>`) when an id is present and
-/// non-empty. A no-op otherwise.
-pub fn emit_session_line(session_id: Option<&str>) {
+/// Emit a `{"type":"session","id":...}` event when an id is present and
+/// non-empty. A no-op otherwise. Last-wins on the bridge side.
+pub fn emit_session(session_id: Option<&str>) {
     if let Some(sid) = session_id {
         if !sid.is_empty() {
-            println!("AGENT_SESSION:{sid}");
+            println!("{}", serde_json::json!({"type":"session","id":sid}));
+            std::io::Write::flush(&mut std::io::stdout()).ok();
         }
     }
 }
 
-/// Emit one streamed chunk as a P0 partial line (`AGENT_PARTIAL:<json-string>`) and
-/// flush stdout so the bridge forwards it immediately.
+/// Emit one streamed chunk as a `{"type":"partial","text":...}` event and flush
+/// stdout so the bridge forwards it immediately. The bridge forwards partials
+/// only when the profile's `streaming` hint is true; otherwise it ignores them
+/// and assembles the reply from `text` events.
 pub fn emit_partial(text: &str) -> Result<()> {
-    println!("AGENT_PARTIAL:{}", serde_json::to_string(text)?);
+    println!("{}", serde_json::json!({"type":"partial","text":text}));
     std::io::Write::flush(&mut std::io::stdout()).ok();
     Ok(())
 }
 
-/// Emit a P0 error line (`AGENT_ERROR:<json-string>`). The bridge forwards this to the
-/// user through the partial channel in streaming mode.
-pub fn emit_error(text: &str) -> Result<()> {
-    println!("AGENT_ERROR:{}", serde_json::to_string(text)?);
+/// Emit a `{"type":"text","text":...}` event — a piece of the final reply body.
+/// Multiple `text` events concatenate on the bridge side. Flush so ordering is
+/// preserved relative to preceding `partial`/`session` events.
+pub fn emit_text(text: &str) -> Result<()> {
+    println!("{}", serde_json::json!({"type":"text","text":text}));
     std::io::Write::flush(&mut std::io::stdout()).ok();
     Ok(())
+}
+
+/// Emit a terminal `{"type":"error","message":...}` event. The bridge forwards
+/// the message to the user and marks the turn failed. The agent SHOULD exit
+/// non-zero shortly after; this helper does not exit for the caller.
+pub fn emit_error(text: &str) {
+    println!("{}", serde_json::json!({"type":"error","message":text}));
+    std::io::Write::flush(&mut std::io::stdout()).ok();
 }
 
 /// Spawn a background task that drains a child pipe (typically stderr) into a String,

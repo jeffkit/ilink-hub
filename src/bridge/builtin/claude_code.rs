@@ -39,73 +39,48 @@ const ANTHROPIC_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const ANTHROPIC_MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 pub async fn run() -> Result<()> {
-    let (message, session_id) = common::read_message_and_session();
-    // AGENT_STREAMING is injected by the bridge: "1" = stream partials,
-    // "0" or unset (default) = one-shot mode (emit full text to stdout at the end, no AGENT_PARTIAL lines).
-    let streaming = std::env::var("AGENT_STREAMING")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false);
+    let turn = common::read_turn_or_error();
+    let (message, session_id) = common::message_and_session(&turn);
+    let attachments = turn.attachments.clone();
 
-    let new_session_id = common::with_session_resume_fallback(
-        "claude-code",
-        &message,
-        &session_id,
-        |m, s| async move { invoke_claude(&m, &s, streaming).await },
-    )
-    .await?;
+    let new_session_id =
+        common::with_session_resume_fallback("claude-code", &message, &session_id, |m, s| {
+            let atts = attachments.clone();
+            async move { invoke_claude(&m, &s, &atts).await }
+        })
+        .await?;
 
-    // P0 output: optional session line only.
-    // All response text was already streamed via AGENT_PARTIAL during execution.
-    common::emit_session_line(new_session_id.as_deref());
+    // invoke_claude emits partials + the final text event itself; we only
+    // surface the session event here (last-wins on the bridge side).
+    common::emit_session(new_session_id.as_deref());
 
     Ok(())
 }
 
-/// Dispatch to streaming or one-shot mode based on `streaming`.
-async fn invoke_claude(message: &str, session_id: &str, streaming: bool) -> Result<Option<String>> {
-    if streaming {
-        stream_claude(message, session_id).await
+/// Dispatch to text or multimodal mode based on whether the turn carries
+/// attachments. Always uses `--output-format stream-json` (0.3: `streaming` is
+/// a bridge-side hint, not a wire field, so the agent always streams).
+async fn invoke_claude(
+    message: &str,
+    session_id: &str,
+    attachments: &[crate::bridge::protocol::Attachment],
+) -> Result<Option<String>> {
+    if !attachments.is_empty() {
+        stream_claude_multimodal(message, session_id, attachments).await
     } else {
-        oneshot_claude(message, session_id).await
+        stream_claude(message, session_id).await
     }
 }
 
-/// Call `claude --output-format stream-json`, emit every assistant text chunk as an
-/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
+/// Call `claude --output-format stream-json [--resume <uuid>]`, emit every
+/// assistant text chunk as a `partial` event, the terminal `result.result` as a
+/// `text` event, and return the session ID from the result event.
 ///
-/// All visible response text is streamed via AGENT_PARTIAL. When the model uses tools
-/// between turns, the final assistant reply may only appear in `result.result` (with no
-/// preceding `assistant` event); we emit it as an extra AGENT_PARTIAL in that case.
-///
-/// When the inbound message carries an image or file (URLs set by the bridge in
-/// `AGENT_IMAGE_URL` / `AGENT_FILE_URL`), switches to the bidirectional `stream-json`
-/// input/output mode and writes a single `SDKUserMessage` to stdin whose `content` is
-/// an array of `[text, image/document]` blocks. This is the same protocol the Claude
-/// Code TS SDK uses internally.
-///
-/// Limitations on the Claude side (verified against the Anthropic Messages API docs):
-/// - **Image**: JPEG/PNG/GIF/WebP, ≤5 MB base64 (per-request cap; 10 MB on direct API).
-/// - **Document**: PDF or plain text only via `document` content block, ≤32 MB.
-///   Other file types are NOT supported through this path (no `video` block, no generic
-///   file block). Non-matching files surface a clear error before the CLI is spawned.
+/// All visible response text is streamed via `partial` events. When the model
+/// uses tools between turns, the final assistant reply may only appear in
+/// `result.result` (with no preceding `assistant` event); it is emitted as the
+/// final `text` event so non-streaming consumers still receive it.
 async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>> {
-    let image_url = std::env::var("AGENT_IMAGE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-    let file_url = std::env::var("AGENT_FILE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
-
-    if image_url.is_some() || file_url.is_some() {
-        return stream_claude_multimodal(
-            message,
-            session_id,
-            image_url.as_deref(),
-            file_url.as_deref(),
-        )
-        .await;
-    }
-
     let mut args: Vec<String> = vec![
         "--output-format".into(),
         "stream-json".into(),
@@ -152,8 +127,8 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut line = String::new();
     let mut found_session_id: Option<String> = None;
-    // Track the last partial text sent so we can detect when result.result differs.
-    let mut last_partial: Option<String> = None;
+    let mut final_text: Option<String> = None;
+    let mut error_emitted = false;
 
     loop {
         line.clear();
@@ -178,25 +153,22 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
             Some("assistant") => {
                 if let Some(msg) = &event.message {
                     let text = msg.text();
-                    // Guard with trim() so that whitespace-only text blocks (e.g. a bare
-                    // "\n" emitted between tool calls) do not produce an empty-looking
-                    // AGENT_PARTIAL that the user sees as a blank message.
+                    // Guard with trim() so whitespace-only text blocks do not
+                    // produce an empty-looking partial.
                     if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
-                        last_partial = Some(text);
                     }
                 }
             }
             Some("result") => {
-                found_session_id = event.session_id;
-                // When the model uses tools between turns, the final assistant reply text
-                // may only appear in result.result and have no corresponding assistant event.
-                // Send it as a partial if it differs from the last streamed chunk.
-                if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
-                    if !already_sent {
-                        common::emit_partial(&result_text)?;
+                found_session_id = event.session_id.clone();
+                if event.is_result_error() {
+                    if let Some(err_text) = event.result_error_message() {
+                        common::emit_error(&err_text);
+                        error_emitted = true;
                     }
+                } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
+                    final_text = Some(result_text);
                 }
             }
             _ => {}
@@ -206,45 +178,59 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let status = child.wait().await.context("wait for claude")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
+    if !error_emitted {
+        if let Some(text) = final_text {
+            common::emit_text(&text)?;
+        }
+    }
+
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
 
     Ok(found_session_id)
 }
 
-/// Multimodal variant: download any inbound image and/or file, base64-encode them,
+/// Multimodal variant: download each attachment in the turn, base64-encode it,
 /// and feed Claude via the bidirectional `stream-json` protocol (a single
 /// `SDKUserMessage` written to stdin, with `content = [text, image?, document?]`).
 ///
-/// `--input-format stream-json` requires `--output-format stream-json` and uses `--print`
-/// mode under the hood. Session continuity is provided by the `session_id` field of
-/// `SDKUserMessage` (empty string = new session, otherwise resume that UUID).
+/// `--input-format stream-json` requires `--output-format stream-json` and uses
+/// `--print` mode under the hood. Session continuity is provided by the
+/// `session_id` field of `SDKUserMessage` (empty string = new session).
 ///
-/// Only **PDF** and **plain text** are accepted as files — see `download_document_as_base64`.
-/// All other file types fail before the CLI is spawned, with a clear error explaining
-/// the limitation (no `video` block, no generic file block on the Anthropic side).
+/// Only **image** and **PDF/plain-text file** attachments are accepted — see
+/// `download_document_as_base64`. `video` and other file types fail before the
+/// CLI is spawned with a clear `error` event.
 async fn stream_claude_multimodal(
     message: &str,
     session_id: &str,
-    image_url: Option<&str>,
-    file_url: Option<&str>,
+    attachments: &[crate::bridge::protocol::Attachment],
 ) -> Result<Option<String>> {
     let mut content_blocks: Vec<serde_json::Value> = Vec::new();
     content_blocks.push(json!({ "type": "text", "text": message }));
 
-    if let Some(url) = image_url {
-        let (media_type, b64_data) = download_image_as_base64(url).await?;
-        content_blocks.push(json!({
-            "type": "image",
-            "source": { "type": "base64", "media_type": media_type, "data": b64_data }
-        }));
-    }
-
-    if let Some(url) = file_url {
-        let (media_type, b64_data) = download_document_as_base64(url).await?;
-        content_blocks.push(json!({
-            "type": "document",
-            "source": { "type": "base64", "media_type": media_type, "data": b64_data }
-        }));
+    for att in attachments {
+        match att.kind.as_str() {
+            "image" => {
+                let (media_type, b64_data) = download_image_as_base64(&att.url).await?;
+                content_blocks.push(json!({
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+                }));
+            }
+            "file" => {
+                let (media_type, b64_data) = download_document_as_base64(&att.url).await?;
+                content_blocks.push(json!({
+                    "type": "document",
+                    "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+                }));
+            }
+            other => {
+                common::emit_error(&format!(
+                    "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
+                ));
+                return Ok(None);
+            }
+        }
     }
 
     let mut args: Vec<String> = vec![
@@ -286,8 +272,6 @@ async fn stream_claude_multimodal(
     let stderr_task = common::spawn_capped_drain(child_stderr);
 
     // Build SDKUserMessage: {type:"user", message:{role:"user", content:[...]}, session_id, parent_tool_use_id:null}
-    // The protocol is line-delimited JSON on stdin, terminated by a newline.
-    // See fake-cc/src/server/directConnectManager.ts:130 and src/utils/teleport/api.ts:376.
     let user_message = json!({
         "type": "user",
         "message": {
@@ -311,7 +295,8 @@ async fn stream_claude_multimodal(
     let mut reader = tokio::io::BufReader::new(child_stdout);
     let mut out_line = String::new();
     let mut found_session_id: Option<String> = None;
-    let mut last_partial: Option<String> = None;
+    let mut final_text: Option<String> = None;
+    let mut error_emitted = false;
 
     loop {
         out_line.clear();
@@ -336,20 +321,20 @@ async fn stream_claude_multimodal(
             Some("assistant") => {
                 if let Some(msg) = &event.message {
                     let text = msg.text();
-                    // Consistent with the text-only path: skip whitespace-only blocks.
                     if !text.trim().is_empty() {
                         common::emit_partial(&text)?;
-                        last_partial = Some(text);
                     }
                 }
             }
             Some("result") => {
-                found_session_id = event.session_id;
-                if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    let already_sent = last_partial.as_deref() == Some(result_text.as_str());
-                    if !already_sent {
-                        common::emit_partial(&result_text)?;
+                found_session_id = event.session_id.clone();
+                if event.is_result_error() {
+                    if let Some(err_text) = event.result_error_message() {
+                        common::emit_error(&err_text);
+                        error_emitted = true;
                     }
+                } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
+                    final_text = Some(result_text);
                 }
             }
             _ => {}
@@ -358,6 +343,12 @@ async fn stream_claude_multimodal(
 
     let status = child.wait().await.context("wait for claude")?;
     let stderr = stderr_task.await.unwrap_or_default();
+
+    if !error_emitted {
+        if let Some(text) = final_text {
+            common::emit_text(&text)?;
+        }
+    }
 
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
 
@@ -489,98 +480,6 @@ async fn download_document_as_base64(url: &str) -> Result<(String, String)> {
     }
 
     Ok((media_type, B64.encode(&buf)))
-}
-
-/// Call `claude --output-format json` (one-shot) and print the full reply text to stdout
-/// so the bridge captures it as the final response body.  No `AGENT_PARTIAL:` lines are
-/// emitted; the session ID is written as `AGENT_SESSION:<id>` on the first stdout line.
-async fn oneshot_claude(message: &str, session_id: &str) -> Result<Option<String>> {
-    let mut args: Vec<String> = vec![
-        "--output-format".into(),
-        "json".into(),
-        "--dangerously-skip-permissions".into(),
-        "--disallowed-tools".into(),
-        "AskUserQuestion".into(),
-    ];
-
-    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
-        if !model.trim().is_empty() {
-            args.push("--model".into());
-            args.push(model.trim().to_string());
-        }
-    }
-
-    if !session_id.is_empty() {
-        args.push("--resume".into());
-        args.push(session_id.to_string());
-    }
-
-    args.push("-p".into());
-    args.push(message.to_string());
-
-    let mut cmd = tokio::process::Command::new("claude");
-    cmd.args(&args);
-    cmd.stdin(std::process::Stdio::null());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .context("failed to spawn `claude`; ensure it is installed and in PATH")?;
-
-    // Drain both pipes concurrently with a hard size cap instead of
-    // `wait_with_output`, so a runaway CLI can't buffer unbounded output in
-    // memory. A truncated body will fail JSON parsing below, which is the
-    // correct failure mode (better than OOM).
-    let child_stdout = child.stdout.take().context("claude stdout pipe missing")?;
-    let child_stderr = child.stderr.take().context("claude stderr pipe missing")?;
-    let stderr_task = common::spawn_capped_drain(child_stderr);
-    let stdout_task = common::spawn_capped_drain(child_stdout);
-    let status = child.wait().await.context("wait for claude")?;
-    let stderr = stderr_task.await.unwrap_or_default();
-    let stdout_str = stdout_task.await.unwrap_or_default();
-
-    // Parse `--output-format json` result.
-    // Claude CLI ≥ 2.1.153 emits a JSON array of all events (system, assistant,
-    // rate_limit_event, result, …) instead of a single result object.
-    // Older versions output a single JSON object with `result` and `session_id`.
-    // Handle both formats so a CLI upgrade doesn't silently break one-shot mode.
-    let event: ClaudeStreamEvent = {
-        let trimmed = stdout_str.trim();
-        if trimmed.starts_with('[') {
-            let events: Vec<ClaudeStreamEvent> = serde_json::from_str(trimmed)
-                .with_context(|| format!("parse claude json output: {stdout_str}"))?;
-            events
-                .into_iter()
-                .find(|e| e.event_type.as_deref() == Some("result"))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("no result event in claude json output: {stdout_str}")
-                })?
-        } else {
-            serde_json::from_str(trimmed)
-                .with_context(|| format!("parse claude json output: {stdout_str}"))?
-        }
-    };
-
-    common::ensure_success("claude", status, &stderr, event.session_id.is_some())?;
-
-    let found_session_id = event.session_id.clone();
-
-    if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-        // Emit session id first (bridge splits on cli_session_first_line_prefix).
-        if let Some(ref sid) = found_session_id {
-            if !sid.is_empty() {
-                println!("AGENT_SESSION:{sid}");
-            }
-        }
-        println!("{result_text}");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        // Return None so the outer run() does not emit a duplicate AGENT_SESSION line.
-        return Ok(None);
-    }
-
-    Ok(found_session_id)
 }
 
 #[cfg(test)]

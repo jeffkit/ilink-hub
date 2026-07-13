@@ -184,17 +184,22 @@ manager 只做进程管理：它会为每个有效 YAML 启动一个真实的 `i
 |------|------|------|------|
 | `command` | string | （必填） | 可执行文件名或绝对路径 |
 | `args` | string 数组 | `[]` | 参数；支持占位符（见下） |
-| `stdin` | `none` / `message` | `none` | `message` 时将用户消息全文以 UTF-8 写入子进程 stdin |
 | `cwd` | string | 不设置 | 子进程工作目录。可与 CLI 一样使用下方**占位符**（例如按 `{{SESSION_ID}}` 分目录；目录需已存在或由你的脚本创建） |
-| `env` | map | `{}` | 额外环境变量（值支持占位符） |
+| `env` | map | `{}` | 环境变量（仅密钥/配置；`${VAR}` 从 bridge 进程 env 按 POSIX 语义展开，未知变量展开为空） |
+| `env_allowlist` | string 数组 | 不设置 | 限制 `env` 可展开的变量名单；未列出的变量展开为空 |
 | `timeout_secs` | number | `1800` | 单条消息等待子进程的最长时间（秒） |
+| `kill_grace_secs` | number | 见默认 | 超时后优雅退出宽限秒数 |
 | `max_reply_chars` | number | `8000` | 回复按 **Unicode 字符数** 截断上限 |
 | `truncation_suffix` | string | `…(输出已截断)` | 超长时在末尾追加的提示 |
+| `streaming` | bool | `true` | bridge 侧 hint：是否转发 `partial` 事件 |
+| `permission` | bool | `false` | 开启 permission 通道（stdin 保持开启以接收 `permission_response`） |
+| `permission_default` | `allow`/`deny`/`ask` | `deny` | permission 默认策略 |
 | `skip_bot_messages` | bool | `true` | 忽略 `message_type == 2`（机器人侧消息），避免回路 |
 | `require_text` | bool | `true` | 无文本时是否仍触发 CLI；`true` 则忽略纯图片/语音等 |
-| `send_error_reply` | bool | `true` | CLI 非零退出或超时时，是否向用户发简短错误说明 |
+| `send_error_reply` | bool | `true` | CLI 失败或收到 `error` 事件时，是否向用户发简短错误说明 |
 | `include_stderr_in_reply` | bool | `false` | 成功时是否把 stderr 拼在 stdout 后面一并发出 |
-| `cli_session_first_line_prefix` | string | 不设置 | 若 stdout **首行**以该前缀开头，则去掉前缀后的**整行余下部分**视为 **CLI 会话 id**，会随 `sendmessage` 的 `ilink_cli_session_id` 上报 Hub；首行之后的正文作为发给微信的回复。用于让 CLI 把会话 id 与正文分开发（见下） |
+
+> **AgentProc 0.3 NDJSON**：bridge 向子进程 stdin 写一行 turn 对象（`message` / `session_id` / `attachments` 等），子进程在 stdout 逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error`）。非 NDJSON 的 stdout 行会被忽略。0.2 的 `stdin`（`StdinMode`）与 `cli_session_first_line_prefix` 字段已移除。
 
 ### 占位符
 
@@ -204,22 +209,18 @@ manager 只做进程管理：它会为每个有效 YAML 启动一个真实的 `i
 |--------|------|
 | `{{MESSAGE}}` | 当前用户消息的文本（多 Profile 的 `prefix` 模式下为**去掉匹配前缀后**的余文） |
 | `{{SESSION_ID}}` | 与下行 JSON 字段 **`ilink_hub_session_id`** 一致：由 **Hub 按虚拟线程（`vctx`）记录**——来自 bridge 上一次成功回复里上报的 **`ilink_cli_session_id`**（CLI 产生、bridge 透传）。若该线程尚未上报过，则为**空字符串**。**不是** Hub 用微信 `session_id` 或 `context_token` 推导出来的值。 |
+| `{{SESSION_NAME}}` | session 可读名称（默认 `default`） |
+| `{{PROFILE_DIR}}` | profile YAML 文件所在目录 |
 
-**闭环**：CLI 在 stdout 首行（配合 `cli_session_first_line_prefix`）或通过你自建的侧车文件等方式，把 **CLI 侧的会话标识**交给 bridge → `sendmessage` 带 `ilink_cli_session_id` → Hub 写入映射 → 下次同线程用户消息在 `getupdates` 里带上 **`ilink_hub_session_id`** → `{{SESSION_ID}}` 传给 CLI（例如 `claude --resume` 由你在 YAML/脚本里组合）。`context_token` 仍由 Hub 下发、**`sendmessage` 回包必须与之一致**，但**不作为**占位符暴露。
+**闭环**：CLI 通过 `{"type":"session","id":...}` 事件把 **CLI 侧的会话标识**交给 bridge → `sendmessage` 带 `ilink_cli_session_id` → Hub 写入映射 → 下次同线程用户消息在 `getupdates` 里带上 **`ilink_hub_session_id`** → bridge 写入 stdin turn 的 `session_id` 字段（也可经 `{{SESSION_ID}}` 占位符传给 CLI）。`context_token` 仍由 Hub 下发、**`sendmessage` 回包必须与之一致**，但**不作为**占位符暴露。
 
 Hub 在 `getupdates` 下发的 JSON 里会带 **`ilink_hub_session_id`**；用 `ILINKHUB_BRIDGE_DUMP_MSG=1` 可在 stderr 看到完整消息体。
 
 `args` 以 **JSON/YAML 数组** 传给进程，**不经过 shell**，可避免常见注入；请勿自行拼 `sh -c` 再把用户原文塞进去。
 
 ::: danger 安全警告：注入风险
-**不要**在配置中将 `{{MESSAGE}}` 作为 shell `-c` 参数的一部分（例如 `command: bash`, `args: ["-c", "echo {{MESSAGE}}"]`）。这样做会导致严重的 shell 命令行注入安全漏洞。
-如果需要将用户消息作为输入，推荐使用 `stdin: message` 模式，将消息内容通过标准输入（stdin）安全地传递给子进程：
-```yaml
-profiles:
-  my-command:
-    command: /usr/local/bin/my-script
-    stdin: message
-```
+**不要**在配置中将 `{{MESSAGE}}` 作为 shell `-c` 参数的一部分（例如 `command: bash`, `args: ["-c", "echo {{MESSAGE}}"]`）。这样做会导致严重的 shell 命令行注入安全漏洞，bridge 在加载时会拒绝这种高危组合。
+如果需要把用户消息传给子进程，0.3 已统一通过 stdin NDJSON turn 传递（`message` 字段），无需再使用旧的 `stdin: message` 模式。
 :::
 
 ::: warning 安全

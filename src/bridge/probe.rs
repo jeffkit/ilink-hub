@@ -196,16 +196,7 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
         cmd.current_dir(&expanded_dir);
     }
 
-    cmd.env("AGENT_MESSAGE", message);
-    cmd.env("AGENT_SESSION_ID", "");
-    cmd.env("AGENT_SESSION_NAME", "default");
-    cmd.env("AGENT_FROM_USER", "probe");
     cmd.env("AGENT_CONTEXT_TOKEN", "probe");
-    cmd.env("AGENT_STREAMING", if profile.streaming { "1" } else { "0" });
-    cmd.env(
-        "AGENT_PROTOCOL_VERSION",
-        crate::bridge::executor::AGENTPROC_PROTOCOL_VERSION,
-    );
 
     for (k, v) in &profile.env {
         let v = v
@@ -215,11 +206,23 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
         cmd.env(k, v);
     }
 
-    cmd.stdin(std::process::Stdio::null());
+    // Write the agentproc 0.3 turn object to stdin (one NDJSON line, then EOF).
+    let turn = crate::bridge::protocol::TurnObject::new(
+        message,
+        "",
+        "default",
+        "probe",
+        Vec::new(),
+        false,
+    );
+    let turn_line = turn
+        .to_ndjson()
+        .map_err(|e| ProbeError::ExecutionError(format!("serialize turn object: {e}")))?;
+    cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -228,6 +231,15 @@ pub async fn dry_run_profile(profile: &BridgeProfile, message: &str) -> Result<S
             return Err(ProbeError::ExecutionError(format!("无法启动进程: {e}")));
         }
     };
+
+    // Write the turn line and close stdin so the agent finalises its turn.
+    if let Some(stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = stdin;
+        let _ = stdin.write_all(turn_line.as_bytes()).await;
+        let _ = stdin.write_all(b"\n").await;
+        let _ = stdin.shutdown().await;
+    }
 
     let output =
         match tokio::time::timeout(std::time::Duration::from_secs(10), child.wait_with_output())

@@ -1,21 +1,17 @@
 //! Built-in `cursor` profile: wraps the Cursor `agent` CLI with session continuity.
 //!
-//! Reads P0 env vars, calls `agent --print --trust --yolo --output-format stream-json
-//! [--model <model>] [--resume <uuid>]`, and delivers the response in one of two modes
-//! depending on the `AGENT_STREAMING` env var injected by the bridge:
+//! Reads the 0.3 turn object from stdin, calls `agent --print --trust --yolo
+//! --output-format stream-json [--model <model>] [--resume <uuid>]`, and emits
+//! NDJSON events on stdout:
 //!
-//! **Streaming mode** (`AGENT_STREAMING=1`, default):
-//!   Each assistant text chunk is written immediately as:
-//!     AGENT_PARTIAL:<json-encoded-string>
-//!   When the stream ends, the final P0 session line is written:
-//!     AGENT_SESSION:<new_session_id>
-//!   The response body is left empty so the bridge does not send a duplicate final message.
+//! - `partial` for each assistant text chunk (streamed live),
+//! - `text` for the terminal `result.result` (the concat of all assistant chunks;
+//!   the bridge dedups against already-forwarded partials in streaming mode, and
+//!   uses it as the final body in non-streaming mode),
+//! - `session` with the new session id.
 //!
-//! **One-shot mode** (`AGENT_STREAMING=0`):
-//!   Waits for the run to complete, then writes:
-//!     AGENT_SESSION:<new_session_id>
-//!     <full response text>
-//!   No AGENT_PARTIAL lines are emitted; the bridge sends a single final message.
+//! `streaming` is a bridge-side hint in 0.3, so the agent always runs the
+//! underlying CLI in stream-json mode and emits both `partial` and `text` events.
 //!
 //! Message is written to the `agent` process stdin (unlike `claude` which uses `-p`).
 //!
@@ -34,40 +30,30 @@ use super::common;
 type CursorStreamEvent = common::StreamJsonEvent;
 
 pub async fn run() -> Result<()> {
-    let (message, session_id) = common::read_message_and_session();
-    // AGENT_STREAMING is injected by the bridge: "1" (default) = stream partials,
-    // "0" = one-shot mode (emit full text to stdout at the end, no AGENT_PARTIAL lines).
-    let streaming = std::env::var("AGENT_STREAMING")
-        .map(|v| v.trim() != "0")
-        .unwrap_or(true);
+    let turn = common::read_turn_or_error();
+    let (message, session_id) = common::message_and_session(&turn);
 
     let new_session_id =
         common::with_session_resume_fallback("cursor", &message, &session_id, |m, s| async move {
-            if streaming {
-                stream_cursor(&m, &s).await
-            } else {
-                oneshot_cursor(&m, &s).await
-            }
+            stream_cursor(&m, &s).await
         })
         .await?;
 
-    // P0 output: optional session line only.
-    // In streaming mode all response text was already emitted via AGENT_PARTIAL.
-    // In one-shot mode the session line + full text were already printed by oneshot_cursor,
-    // and it returns None to suppress a duplicate AGENT_SESSION line here.
-    common::emit_session_line(new_session_id.as_deref());
+    common::emit_session(new_session_id.as_deref());
 
     Ok(())
 }
 
-/// Call `agent --output-format stream-json`, emit every assistant text chunk as an
-/// `AGENT_PARTIAL:` stdout line, and return the session ID from the result event.
+/// Call `agent --output-format stream-json`, emit every assistant text chunk as a
+/// `partial` event and the terminal `result.result` as a `text` event, and return
+/// the session ID from the result event.
 ///
-/// All visible response text is streamed via AGENT_PARTIAL. Cursor's `result.result`
-/// is the concatenation of every assistant text already streamed, so it is not re-sent
-/// in the normal case. The sole exception: when **no** assistant text events were emitted
-/// (the model responded with tool-only actions), `result.result` is used as a fallback
-/// so the user receives at least one message.
+/// Cursor's `result.result` is the concatenation of every assistant text chunk.
+/// In streaming mode the bridge forwards the `partial` events and drops the final
+/// `text` body (dedup); in non-streaming mode it sends the `text` body as the
+/// single reply. When no assistant text events were emitted (tool-only run),
+/// `result.result` is the only content and becomes the `text` event so the user
+/// still receives a message.
 async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>> {
     let mut args: Vec<String> = vec![
         "--print".into(),
@@ -120,6 +106,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let mut found_session_id: Option<String> = None;
     let mut assistant_event_count: u32 = 0;
     let mut assistant_total_chars: usize = 0;
+    let mut final_text: Option<String> = None;
 
     loop {
         line.clear();
@@ -145,7 +132,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     // Guard with trim() so that whitespace-only text blocks (e.g. a bare
-                    // "\n" between tool calls) do not produce an empty-looking AGENT_PARTIAL.
+                    // "\n" between tool calls) do not produce an empty-looking partial.
                     if !text.trim().is_empty() {
                         assistant_event_count += 1;
                         assistant_total_chars += text.len();
@@ -162,26 +149,13 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
             Some("result") => {
                 found_session_id = event.session_id;
                 if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
-                    if assistant_event_count == 0 {
-                        // No assistant text events were emitted: the model responded with
-                        // tool-only actions and produced no explanatory text during the run.
-                        // result.result is our only source of content; emit it as a fallback
-                        // so the user receives at least one message instead of total silence.
-                        debug!(
-                            len = result_text.len(),
-                            "cursor result fallback (0 assistant events)"
-                        );
-                        common::emit_partial(&result_text)?;
-                    } else {
-                        // Normal case: Cursor's result.result = concat of all assistant texts
-                        // already streamed. Re-sending would duplicate the full conversation.
-                        debug!(
-                            len = result_text.len(),
-                            assistant_events = assistant_event_count,
-                            assistant_chars = assistant_total_chars,
-                            "cursor result skipped (already streamed)"
-                        );
-                    }
+                    debug!(
+                        len = result_text.len(),
+                        assistant_events = assistant_event_count,
+                        assistant_chars = assistant_total_chars,
+                        "cursor result text captured"
+                    );
+                    final_text = Some(result_text);
                 }
             }
             _ => {}
@@ -191,109 +165,11 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let status = child.wait().await.context("wait for agent")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    common::ensure_success("agent", status, &stderr, found_session_id.is_some())?;
-
-    Ok(found_session_id)
-}
-
-/// One-shot mode: run `agent --output-format stream-json`, collect all events, then
-/// emit `AGENT_SESSION:<sid>\n<text>` to stdout so the bridge sends a single final
-/// message without any AGENT_PARTIAL lines.
-///
-/// Uses `result.result` as the response text (it equals the concatenation of every
-/// assistant chunk). Returns `None` so the outer `run()` does not emit a duplicate
-/// `ILINK_SESSION` line.
-async fn oneshot_cursor(message: &str, session_id: &str) -> Result<Option<String>> {
-    let mut args: Vec<String> = vec![
-        "--print".into(),
-        "--trust".into(),
-        "--yolo".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-    ];
-
-    if let Ok(model) = std::env::var("CURSOR_MODEL") {
-        if !model.trim().is_empty() {
-            args.push("--model".into());
-            args.push(model.trim().to_string());
-        }
+    if let Some(text) = final_text {
+        common::emit_text(&text)?;
     }
-
-    if !session_id.is_empty() {
-        args.push("--resume".into());
-        args.push(session_id.to_string());
-    }
-
-    let mut cmd = Command::new("agent");
-    cmd.args(&args);
-    cmd.stdin(std::process::Stdio::piped());
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    cmd.kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .context("failed to spawn `agent`; ensure Cursor Agent CLI is installed and in PATH")?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(message.as_bytes())
-            .await
-            .context("write message to agent stdin")?;
-    }
-
-    let child_stdout = child.stdout.take().context("stdout pipe missing")?;
-    let child_stderr = child.stderr.take().context("stderr pipe missing")?;
-    let stderr_task = common::spawn_capped_drain(child_stderr);
-
-    let mut reader = tokio::io::BufReader::new(child_stdout);
-    let mut line = String::new();
-    let mut found_session_id: Option<String> = None;
-    let mut result_text: Option<String> = None;
-
-    loop {
-        line.clear();
-        let n = reader
-            .read_line(&mut line)
-            .await
-            .context("read agent stdout")?;
-        if n == 0 {
-            break;
-        }
-
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let Ok(event) = serde_json::from_str::<CursorStreamEvent>(trimmed) else {
-            continue;
-        };
-
-        if event.event_type.as_deref() == Some("result") {
-            found_session_id = event.session_id;
-            result_text = event.result.filter(|t| !t.trim().is_empty());
-        }
-    }
-
-    let status = child.wait().await.context("wait for agent")?;
-    let stderr = stderr_task.await.unwrap_or_default();
 
     common::ensure_success("agent", status, &stderr, found_session_id.is_some())?;
-
-    if let Some(text) = result_text {
-        // Emit session id first so split_cli_session_from_stdout can parse it,
-        // then the full response text as the raw body.
-        if let Some(ref sid) = found_session_id {
-            if !sid.is_empty() {
-                println!("AGENT_SESSION:{sid}");
-            }
-        }
-        println!("{text}");
-        std::io::Write::flush(&mut std::io::stdout()).ok();
-        // Return None so the outer run() does not emit a duplicate ILINK_SESSION line.
-        return Ok(None);
-    }
 
     Ok(found_session_id)
 }

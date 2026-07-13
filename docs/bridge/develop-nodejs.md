@@ -1,8 +1,8 @@
 # 用 Node.js 开发 Bridge Profile
 
-> 最后更新：2026-06-26
+> 最后更新：2026-07-13
 
-本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。
+本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。Profile 通过 **AgentProc 0.3 NDJSON 协议**与 bridge 通信：从 stdin 读一行 turn 对象，在 stdout 逐行输出 NDJSON 事件。
 
 ---
 
@@ -39,9 +39,9 @@ createProfile(async ({ message, sessionId, fromUser }) => {
 ```
 
 `createProfile` 帮你做了所有样板工作：
-- 读取 `AGENT_MESSAGE`、`AGENT_SESSION_ID` 等环境变量
+- 从 stdin 读取 NDJSON turn 对象（`message` / `session_id` / `from_user` / `attachments` 等）
 - 调用你的 handler 函数
-- 按 P0 协议把回复写到 stdout
+- 按 AgentProc 0.3 协议把回复作为 `{"type":"text",...}` 事件写到 stdout
 
 ### 调用真实 AI（以 OpenAI 为例）
 
@@ -68,19 +68,17 @@ createProfile(async ({ message }) => {
 
 ## 第三步：本地测试
 
-不需要启动完整的 bridge，直接用环境变量模拟调用：
+不需要启动完整的 bridge，向 stdin 写一行 turn NDJSON 即可模拟调用：
 
 ```bash
-AGENT_MESSAGE="你好，介绍一下自己" \
-AGENT_SESSION_ID="" \
-AGENT_FROM_USER="test-user" \
-node handler.js
+echo '{"type":"turn","message":"你好，介绍一下自己","session_id":"","from_user":"test-user","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+  | node handler.js
 ```
 
-你会看到类似这样的输出：
+你会看到类似这样的 NDJSON 事件输出：
 
 ```
-你说的是：你好，介绍一下自己
+{"type":"text","text":"你说的是：你好，介绍一下自己"}
 ```
 
 ---
@@ -221,6 +219,6 @@ profiles:
 
 ## 下一步
 
-- [P0 协议规范](/bridge/profile-spec) — 完整技术规范
+- [AgentProc 0.3 协议规范](/bridge/profile-spec) — 完整技术规范
 - [Python 版本教程](/bridge/develop-python) — 用 Python 编写同等功能的 Profile
 - [接入 Claude Code](/guide/claude-code) — 使用内置 claude-code profile
