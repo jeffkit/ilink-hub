@@ -1,4 +1,4 @@
-//! Quote-reply resolution fallbacks (timestamp → DB → footer).
+//! Quote-reply resolution fallbacks (msg_id exact match → timestamp → DB → footer).
 use std::sync::Arc;
 use tracing::{debug, warn};
 
@@ -17,6 +17,61 @@ pub(super) fn derive_peer_scope(msg: &crate::ilink::types::WeixinMessage) -> Opt
         Some(format!("peer:{from_user_id}"))
     } else {
         None
+    }
+}
+
+/// **L0 — exact match**: use `ref_msg.message_item.msg_id` to find the exact
+/// assistant message the user quoted. iLink preserves the Hub-assigned
+/// `message_id` and echoes it back here, so this uniquely identifies the quoted
+/// row — no timestamp window, no content prefix, no footer parse. Tried first
+/// in the dispatch pipeline; falls through to L1 (timestamp) when the id is
+/// absent (pre-feature rows, user-side quotes) or unparseable.
+pub(super) async fn resolve_quote_from_msg_id(
+    state: &Arc<HubState>,
+    msg: &crate::ilink::types::WeixinMessage,
+) -> Option<QuoteOrigin> {
+    let raw = quote_route::collect_quoted_msg_id(msg)?;
+    let ilink_msg_id: i64 = raw.trim().parse().ok()?;
+    let peer_user_id = derive_peer_scope(msg)?;
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        state
+            .store
+            .find_assistant_message_by_msg_id(&peer_user_id, ilink_msg_id),
+    )
+    .await
+    {
+        Ok(Ok(Some((vtoken, session_name)))) if !vtoken.is_empty() => {
+            let (name, label) = {
+                let registry = state.clients.registry.read().await;
+                registry
+                    .get_by_vtoken(&vtoken)
+                    .map(|c| (c.name.clone(), c.label.clone()))
+                    .unwrap_or_else(|| (vtoken.clone(), None))
+            };
+            debug!(
+                peer = %peer_user_id,
+                vtoken = %crate::redact_token(&vtoken),
+                session = ?session_name,
+                ilink_msg_id,
+                "resolved via msg_id exact match"
+            );
+            Some(QuoteOrigin::Client {
+                vtoken,
+                name,
+                label,
+                session_name,
+            })
+        }
+        Ok(Ok(_)) => None,
+        Ok(Err(e)) => {
+            warn!(error = %e, "msg_id quote lookup failed");
+            None
+        }
+        Err(_) => {
+            warn!(peer = %peer_user_id, "timeout in msg_id quote lookup");
+            None
+        }
     }
 }
 

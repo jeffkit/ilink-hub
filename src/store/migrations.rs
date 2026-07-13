@@ -262,6 +262,7 @@ impl Store {
         self.migrate_to_v10_tx(&mut tx).await?;
         self.migrate_to_v11_tx(&mut tx).await?;
         self.migrate_to_v12_tx(&mut tx).await?;
+        self.migrate_to_v13_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -1001,6 +1002,73 @@ impl Store {
         Ok(())
     }
 
+    /// v13: Add `ilink_msg_id` column + lookup index to `messages` for exact
+    /// quote-reply routing via the iLink-preserved `ref_msg.message_item.msg_id`.
+    pub(super) async fn migrate_to_v13_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 13).await? {
+            return Ok(());
+        }
+        // Guard: messages table may be absent in partial-schema test environments.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => {
+                sqlx::query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'")
+                    .fetch_optional(&mut **tx)
+                    .await?
+                    .is_some()
+            }
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'messages' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+
+        if table_exists {
+            let col_exists = match self.kind {
+                DatabaseKind::Sqlite => sqlx::query(
+                    "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'ilink_msg_id'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+                DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'messages' AND column_name = 'ilink_msg_id' LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+            };
+            if !col_exists {
+                sqlx::query(V13_ADD_ILINK_MSG_ID)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V13_ADD_ILINK_MSG_ID}\n  Error: {e}")
+                    })?;
+            }
+            tracing::info!(version = 13, "migration applied: messages.ilink_msg_id");
+        } else {
+            tracing::debug!(
+                "v13 migration: messages table absent (partial schema), skipping ilink_msg_id column"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v13(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v13_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -1146,3 +1214,5 @@ const V10_DDLS: &[&str] = &[include_str!("../../migrations/0010_client_persona.s
 const V11_ADD_A2A_DEPTH: &str = include_str!("../../migrations/0011_a2a_depth.sql");
 
 const V12_ADD_DESCRIPTION: &str = include_str!("../../migrations/0012_client_description.sql");
+
+const V13_ADD_ILINK_MSG_ID: &str = include_str!("../../migrations/0013_messages_ilink_msg_id.sql");

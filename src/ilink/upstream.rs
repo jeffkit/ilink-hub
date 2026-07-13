@@ -230,7 +230,11 @@ impl UpstreamClient {
             .text()
             .await
             .map_err(upstream_http_err)?;
-        debug!(response = %text, "send_message raw response");
+        debug!(
+            outbound_msg_id = req.msg.as_ref().and_then(|m| m.message_id).unwrap_or(0),
+            response = %text,
+            "send_message raw response"
+        );
         // Empty body means success
         if text.trim().is_empty() {
             return Ok(SendMessageResponse::ok());

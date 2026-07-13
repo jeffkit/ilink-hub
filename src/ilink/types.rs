@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 pub const ILINK_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
@@ -354,7 +355,34 @@ impl WeixinMessage {
         {
             self.client_id = Some(new_client_id());
         }
+        // Assign a Hub-generated `message_id` that iLink preserves verbatim and
+        // echoes back as `ref_msg.message_item.msg_id` on quote-reply (verified
+        // against the live iLink service). Persisted in `messages.ilink_msg_id`
+        // at send time so inbound quote-replies can route to the exact backend/
+        // session (L0 exact match) instead of the ±10s timestamp fallback.
+        if self.message_id.is_none() {
+            self.message_id = Some(new_outbound_msg_id());
+        }
     }
+}
+
+/// Restart-safe, Hub-generated outbound `message_id` (i64).
+///
+/// Structure: `unix_millis * 1_000_000 + counter % 1_000_000`.
+/// * `unix_millis` (~1.78e12) advances across restarts, so two processes (or a
+///   restarted hub) never collide on the same id;
+/// * the 20-bit counter slot disambiguates multiple sends within the same ms;
+/// * magnitude ~1.78e18 stays well under `i64::MAX` (9.22e18) and in the range
+///   confirmed to be preserved by iLink.
+fn new_outbound_msg_id() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed) % 1_000_000;
+    (millis * 1_000_000 + n) as i64
 }
 
 fn new_client_id() -> String {
