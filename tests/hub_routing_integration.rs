@@ -28,7 +28,15 @@ async fn make_state() -> Arc<HubState> {
     let upstream =
         Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("test upstream client"));
     let queue = Arc::new(InMemoryQueue::new());
-    let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let (tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    // Pin the sender alive so the watch channel is never fully closed during
+    // the test. fcc128b's dispatcher uses a biased tokio::select! to wait on
+    // `shutdown.changed()`; with every sender dropped, the future resolves
+    // immediately with `Err` and the biased select! spins forever without
+    // ever polling `rx.recv()`, dropping every dispatched message.
+    // Production code in main.rs keeps the sender alive in a dedicated task;
+    // the rate-limit test at the bottom of this file uses the same pattern.
+    let _tx_keepalive: &'static _ = Box::leak(Box::new(tx));
     HubState::new(
         upstream,
         Arc::new(store),
