@@ -38,9 +38,39 @@ impl Store {
         role: &str,
         content: &str,
     ) -> Result<()> {
+        self.save_message_with_msg_id(
+            vctx,
+            vtoken,
+            session_name,
+            peer_user_id,
+            role,
+            content,
+            None,
+        )
+        .await
+    }
+
+    /// Same as [`save_message`](Self::save_message) but also persists the
+    /// iLink `message_id` the Hub assigned to an outbound assistant reply.
+    /// iLink preserves this id and echoes it back as
+    /// `ref_msg.message_item.msg_id` on quote-reply, enabling exact routing
+    /// (L0) instead of the ±10s timestamp fallback. `None` for user-side rows
+    /// and pre-feature rows.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_message_with_msg_id(
+        &self,
+        vctx: &str,
+        vtoken: Option<&str>,
+        session_name: &str,
+        peer_user_id: &str,
+        role: &str,
+        content: &str,
+        ilink_msg_id: Option<i64>,
+    ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO messages (vctx, vtoken, session_name, peer_user_id, role, content) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO messages \
+             (vctx, vtoken, session_name, peer_user_id, role, content, ilink_msg_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(vctx)
         .bind(vtoken)
@@ -48,6 +78,7 @@ impl Store {
         .bind(peer_user_id)
         .bind(role)
         .bind(content)
+        .bind(ilink_msg_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -108,6 +139,37 @@ impl Store {
         .bind(lo)
         .bind(hi)
         .bind(ref_unix_secs)
+        .fetch_optional(&self.rpool)
+        .await?;
+        Ok(row.map(|r| {
+            let vtoken: Option<String> = r.get("vtoken");
+            let session_name: String = r.get("session_name");
+            (vtoken.unwrap_or_default(), Some(session_name))
+        }))
+    }
+
+    /// Find the assistant message whose stored `ilink_msg_id` equals the given
+    /// iLink message_id. This is the **L0 exact-match** resolver for quote-reply
+    /// routing: iLink preserves the Hub-assigned `message_id` and echoes it back
+    /// as `ref_msg.message_item.msg_id`, so this lookup uniquely identifies the
+    /// quoted message — no timestamp window, no content prefix.
+    ///
+    /// `peer_user_id` is included as a defence-in-depth scope filter even though
+    /// `ilink_msg_id` is globally unique (snowflake). Returns `(vtoken, session_name)`
+    /// or `None` when no row carries that id (e.g. pre-feature rows, or a user-side
+    /// message that was quoted — caller falls back to L1).
+    pub async fn find_assistant_message_by_msg_id(
+        &self,
+        peer_user_id: &str,
+        ilink_msg_id: i64,
+    ) -> Result<Option<(String, Option<String>)>> {
+        let row = sqlx::query(
+            "SELECT vtoken, session_name FROM messages \
+             WHERE peer_user_id = $1 AND role = 'assistant' AND ilink_msg_id = $2 \
+             LIMIT 1",
+        )
+        .bind(peer_user_id)
+        .bind(ilink_msg_id)
         .fetch_optional(&self.rpool)
         .await?;
         Ok(row.map(|r| {
@@ -585,6 +647,81 @@ mod tests {
             .await
             .expect("find");
         assert!(result.is_none(), "timestamp outside window must not match");
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_msg_id_returns_exact_row() {
+        let store = make_store().await;
+        let msg_id = 1_783_912_191_000_000_111i64;
+        store
+            .save_message_with_msg_id(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-A",
+                "peer:user-1",
+                "assistant",
+                "exact msg",
+                Some(msg_id),
+            )
+            .await
+            .expect("save");
+        let (vtoken, session) = store
+            .find_assistant_message_by_msg_id("peer:user-1", msg_id)
+            .await
+            .expect("find")
+            .expect("must find row by ilink_msg_id");
+        assert_eq!(vtoken, "vtok-A");
+        assert_eq!(session, Some("sess-A".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_msg_id_ignores_user_role_rows() {
+        let store = make_store().await;
+        let msg_id = 1_783_912_191_000_000_222i64;
+        // A user-side row carrying the same ilink_msg_id must not match.
+        store
+            .save_message_with_msg_id(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-A",
+                "peer:user-1",
+                "user",
+                "user msg",
+                Some(msg_id),
+            )
+            .await
+            .expect("save");
+        let result = store
+            .find_assistant_message_by_msg_id("peer:user-1", msg_id)
+            .await
+            .expect("find");
+        assert!(result.is_none(), "user-role rows must be skipped");
+    }
+
+    #[tokio::test]
+    async fn find_assistant_message_by_msg_id_scoped_by_peer() {
+        let store = make_store().await;
+        let msg_id = 1_783_912_191_000_000_333i64;
+        store
+            .save_message_with_msg_id(
+                "vctx-1",
+                Some("vtok-A"),
+                "sess-A",
+                "peer:other",
+                "assistant",
+                "other peer",
+                Some(msg_id),
+            )
+            .await
+            .expect("save");
+        let result = store
+            .find_assistant_message_by_msg_id("peer:user-1", msg_id)
+            .await
+            .expect("find");
+        assert!(
+            result.is_none(),
+            "msg_id lookup must be scoped by peer_user_id"
+        );
     }
 
     #[tokio::test]

@@ -11,7 +11,8 @@ use super::hub_ext::{build_hub_ext_for_vctx, build_no_backend_reply, resolve_vct
 use super::mention::handle_at_mention;
 use super::queue::{push_shared_to_queue, push_to_queue};
 use super::quote::{
-    resolve_quote_from_db, resolve_quote_from_footer, resolve_quote_from_timestamp,
+    resolve_quote_from_db, resolve_quote_from_footer, resolve_quote_from_msg_id,
+    resolve_quote_from_timestamp,
 };
 
 pub fn spawn_dispatcher(state: Arc<HubState>, mut rx: mpsc::Receiver<WeixinMessage>) {
@@ -96,19 +97,36 @@ pub(super) async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessag
     // Pre-extract ref_ms to detect "has quote but all fallbacks missed" later without
     // re-running the item scan after the resolution block.
     let ref_ms_hint = quote_route::collect_quoted_timestamp(&msg);
+    if let Some(ref_id) = quote_route::collect_quoted_msg_id(&msg) {
+        debug!(
+            quoted_msg_id = %ref_id,
+            ref_ms = ?ref_ms_hint,
+            peer = ?msg.from_user_id.as_deref().unwrap_or("?"),
+            "inbound quote-reply ref_msg"
+        );
+    }
     let quoted = {
-        // Try timestamp lookup first (most reliable — iLink always provides
-        // create_time_ms even when text is absent), then content-prefix DB lookup,
-        // then footer text parsing as last resort.
-        let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
-        if from_ts.is_some() {
-            from_ts
+        // L0: exact match on the iLink-preserved `ref_msg.message_item.msg_id`
+        // (unique id of the quoted assistant message). Tried first because it is
+        // unambiguous; falls through to the timestamp/content/footer fallbacks
+        // for pre-feature rows or user-side quotes that carry no Hub msg_id.
+        let from_msg_id = resolve_quote_from_msg_id(&state, &msg).await;
+        if from_msg_id.is_some() {
+            from_msg_id
         } else {
-            let from_db = resolve_quote_from_db(&state, &msg).await;
-            if from_db.is_some() {
-                from_db
+            // L1: timestamp lookup (iLink always provides create_time_ms even
+            // when text is absent), then L2 content-prefix DB lookup, then L3
+            // footer text parsing as last resort.
+            let from_ts = resolve_quote_from_timestamp(&state, &msg).await;
+            if from_ts.is_some() {
+                from_ts
             } else {
-                resolve_quote_from_footer(&state, &msg).await
+                let from_db = resolve_quote_from_db(&state, &msg).await;
+                if from_db.is_some() {
+                    from_db
+                } else {
+                    resolve_quote_from_footer(&state, &msg).await
+                }
             }
         }
     };

@@ -2,10 +2,13 @@
 //! produced the quoted message.
 //!
 //! **Why DB-backed?** The real iLink `getupdates` stream does **not** echo bot
-//! messages back, and the `ref_msg.message_item` carried by a user's quote-reply contains
-//! **no `msg_id` / `message_id`** — only the quoted text plus second-granularity
-//! timestamps. Routing therefore relies on three DB fallback layers:
+//! messages back, so the Hub learns the iLink-assigned id of its own outgoing
+//! replies only indirectly. Routing therefore relies on four layers, tried in
+//! order of precision:
 //!
+//! * **L0** Exact `msg_id` lookup — `ref_msg.message_item.msg_id` (preserved by
+//!   iLink from the Hub-assigned outbound `message_id`) against `messages.ilink_msg_id`.
+//!   Unambiguous; the primary path for any reply sent after this feature shipped.
 //! * **L1** Timestamp lookup — `ref_msg.create_time_ms` ± 10 s window against `messages`.
 //! * **L2** Content-prefix lookup — 48-char prefix `LIKE` match against `messages`.
 //! * **L3** Footer text parsing — parse the embedded `--- name · session` footer.
@@ -127,6 +130,29 @@ pub fn collect_quoted_timestamp(msg: &crate::ilink::types::WeixinMessage) -> Opt
         // create_time_ms may be present even when text_item is absent.
         if let Some(ms) = mi.get("create_time_ms").and_then(|v| v.as_i64()) {
             return Some(ms);
+        }
+    }
+    None
+}
+
+/// Extract the iLink `msg_id` of the quoted message from `ref_msg.message_item`.
+/// Real iLink quote-replies carry `msg_id` even though `text_item` is omitted —
+/// this is the most precise signal for routing (uniquely identifies the quoted
+/// assistant message). Used by the L0 exact-match resolver. Returns the raw
+/// string form as carried on the wire; the caller parses it to `i64`.
+pub fn collect_quoted_msg_id(msg: &crate::ilink::types::WeixinMessage) -> Option<String> {
+    let items = msg.item_list.as_ref()?;
+    for item in items.iter() {
+        let Some(extra) = item.extra.as_object() else {
+            continue;
+        };
+        let Some(mi) = extra.get("ref_msg").and_then(|r| r.get("message_item")) else {
+            continue;
+        };
+        if let Some(id) = mi.get("msg_id").and_then(|v| v.as_str()) {
+            if !id.trim().is_empty() {
+                return Some(id.to_string());
+            }
         }
     }
     None

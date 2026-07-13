@@ -82,6 +82,114 @@ fn make_quote_msg(
     }
 }
 
+/// Build a WeixinMessage that carries a quote-reply ref_msg with the given
+/// iLink `msg_id` (wire form: a JSON string, matching real iLink payloads)
+/// and an old `create_time_ms` so L1 timestamp lookup cannot match — isolating
+/// L0 msg_id routing.
+fn make_quote_msg_with_id(from_user_id: &str, ref_msg_id: i64) -> WeixinMessage {
+    let extra = serde_json::json!({
+        "ref_msg": {
+            "message_item": {
+                "create_time_ms": 1_000_000i64,
+                "msg_id": ref_msg_id.to_string(),
+            }
+        }
+    });
+    let item = MessageItem {
+        item_type: Some(1),
+        text_item: Some(TextItem {
+            text: Some("this is the follow-up reply".to_string()),
+        }),
+        extra,
+        ..Default::default()
+    };
+    WeixinMessage {
+        from_user_id: Some(from_user_id.to_string()),
+        item_list: Some(Arc::new(vec![item])),
+        ..Default::default()
+    }
+}
+/// L0: quote-reply exact routing via `ref_msg.message_item.msg_id`.
+///
+/// Inserts an assistant message with a stored `ilink_msg_id`, then builds a
+/// quote-reply whose ref_msg carries that same id (and an old create_time_ms so
+/// L1 cannot match). Verifies `resolve_quote_from_msg_id` returns the exact
+/// `(vtoken, session_name)` — no timestamp window involved.
+#[tokio::test]
+async fn quote_reply_l0_msg_id_exact_routing() {
+    let (state, vtoken) = make_state_with_client().await;
+    let peer_user_id = "peer:user1";
+    let session_name = "at-20260713-090000000";
+    let ilink_msg_id = 1_783_912_191_000_000_123i64;
+
+    state
+        .store
+        .save_message_with_msg_id(
+            "vctx-test",
+            Some(&vtoken),
+            session_name,
+            peer_user_id,
+            "assistant",
+            "exact-match reply",
+            Some(ilink_msg_id),
+        )
+        .await
+        .expect("save message with msg_id");
+
+    let msg = make_quote_msg_with_id("user1", ilink_msg_id);
+    let result = resolve_quote_from_msg_id(&state, &msg).await;
+
+    assert!(result.is_some(), "L0 msg_id lookup must find the exact row");
+    match result.unwrap() {
+        QuoteOrigin::Client {
+            session_name: sn,
+            vtoken: vt,
+            ..
+        } => {
+            assert_eq!(sn, Some(session_name.to_string()));
+            assert_eq!(vt, vtoken);
+        }
+        other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+    }
+}
+
+/// L0 miss: a ref_msg.msg_id that no assistant row carries must return `None`
+/// so the pipeline falls through to L1/L2/L3.
+#[tokio::test]
+async fn quote_reply_l0_msg_id_miss_returns_none() {
+    let (state, _vtoken) = make_state_with_client().await;
+    // No row stored for this id.
+    let msg = make_quote_msg_with_id("user1", 9_000_000_000_000_000_000);
+    let result = resolve_quote_from_msg_id(&state, &msg).await;
+    assert!(result.is_none(), "unknown msg_id must not resolve via L0");
+}
+
+/// L0 does not cross peers: even if the msg_id matches a row stored under a
+/// different peer scope, the lookup must miss (defence-in-depth peer filter).
+#[tokio::test]
+async fn quote_reply_l0_msg_id_scoped_to_peer() {
+    let (state, vtoken) = make_state_with_client().await;
+    let ilink_msg_id = 1_783_912_191_000_000_456i64;
+    state
+        .store
+        .save_message_with_msg_id(
+            "vctx-other",
+            Some(&vtoken),
+            "at-20260713-090000000",
+            "peer:other-user",
+            "assistant",
+            "other-peer reply",
+            Some(ilink_msg_id),
+        )
+        .await
+        .expect("save message with msg_id");
+
+    // Quote-reply arrives from a different peer but with the same msg_id.
+    let msg = make_quote_msg_with_id("user1", ilink_msg_id);
+    let result = resolve_quote_from_msg_id(&state, &msg).await;
+    assert!(result.is_none(), "L0 must not match across peer scopes");
+}
+
 /// F5 / AT1: @mention → quote-reply L1 timestamp routing.
 ///
 /// Inserts an assistant message for peer:user1 with session_name="at-20260704-103000000".

@@ -563,6 +563,11 @@ pub async fn sendmessage(
         .unwrap_or(false);
     if !is_partial {
         if let Some(content) = req.msg.as_ref().and_then(|m| m.text()).map(str::to_string) {
+            // The Hub-assigned message_id (set in `ensure_outbound`) that iLink
+            // preserves and echoes back as `ref_msg.message_item.msg_id` on
+            // quote-reply. Persist it so the L0 exact-match resolver can route
+            // follow-ups to this precise reply.
+            let ilink_msg_id = req.msg.as_ref().and_then(|m| m.message_id);
             let session_name = active_session.as_deref().unwrap_or("default").to_string();
             let store = state.store.clone();
             let (vctx4, vtoken4, peer4) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
@@ -576,13 +581,14 @@ pub async fn sendmessage(
                     return;
                 };
                 if let Err(e) = store
-                    .save_message(
+                    .save_message_with_msg_id(
                         &vctx4,
                         Some(&vtoken4),
                         &session_name,
                         &peer4,
                         "assistant",
                         &content,
+                        ilink_msg_id,
                     )
                     .await
                 {
