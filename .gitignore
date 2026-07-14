@@ -49,3 +49,4 @@ package-lock.json
 mutants-output/
 mutants.out/
 mutants.out.old/
+.gitnexus

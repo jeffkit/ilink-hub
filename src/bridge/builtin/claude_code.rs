@@ -19,9 +19,11 @@
 use anyhow::{Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use serde_json::json;
+use serde_json::{json, Value};
+use std::time::Duration;
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 
 use super::common;
 
@@ -42,11 +44,12 @@ pub async fn run() -> Result<()> {
     let turn = common::read_turn_or_error();
     let (message, session_id) = common::message_and_session(&turn);
     let attachments = turn.attachments.clone();
+    let permission = turn.permission;
 
     let new_session_id =
         common::with_session_resume_fallback("claude-code", &message, &session_id, |m, s| {
             let atts = attachments.clone();
-            async move { invoke_claude(&m, &s, &atts).await }
+            async move { invoke_claude(&m, &s, &atts, permission).await }
         })
         .await?;
 
@@ -57,15 +60,20 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Dispatch to text or multimodal mode based on whether the turn carries
-/// attachments. Always uses `--output-format stream-json` (0.3: `streaming` is
-/// a bridge-side hint, not a wire field, so the agent always streams).
+/// Dispatch to text, multimodal, or permission mode. Permission mode is used
+/// when the bridge enabled the permission channel (`turn.permission == true`):
+/// the underlying `claude` CLI runs with `--permission-prompt-tool stdio` and
+/// we translate Claude `control_request`/`control_response` ↔ AgentProc
+/// `permission_request`/`permission_response` NDJSON frames.
 async fn invoke_claude(
     message: &str,
     session_id: &str,
     attachments: &[crate::bridge::protocol::Attachment],
+    permission: bool,
 ) -> Result<Option<String>> {
-    if !attachments.is_empty() {
+    if permission {
+        stream_claude_permission(message, session_id, attachments).await
+    } else if !attachments.is_empty() {
         stream_claude_multimodal(message, session_id, attachments).await
     } else {
         stream_claude(message, session_id).await
@@ -187,6 +195,320 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
 
     Ok(found_session_id)
+}
+
+/// Bidirectional permission mode: run `claude --permission-prompt-tool stdio`
+/// with `--input-format stream-json`, translate Claude `control_request`
+/// (can_use_tool) into AgentProc `permission_request` events, and translate the
+/// bridge's `permission_response` frames back into Claude `control_response`
+/// frames written to the CLI's stdin. Supports multimodal content blocks when
+/// the turn carries image/file attachments.
+async fn stream_claude_permission(
+    message: &str,
+    session_id: &str,
+    attachments: &[crate::bridge::protocol::Attachment],
+) -> Result<Option<String>> {
+    // Build the SDKUserMessage `content`: a plain string for text-only turns,
+    // or an array of content blocks for multimodal turns (image/document).
+    let content: Value = if attachments.is_empty() {
+        json!(message)
+    } else {
+        let mut blocks: Vec<Value> = vec![json!({ "type": "text", "text": message })];
+        for att in attachments {
+            match att.kind.as_str() {
+                "image" => {
+                    let (media_type, b64_data) = download_image_as_base64(&att.url).await?;
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+                    }));
+                }
+                "file" => {
+                    let (media_type, b64_data) = download_document_as_base64(&att.url).await?;
+                    blocks.push(json!({
+                        "type": "document",
+                        "source": { "type": "base64", "media_type": media_type, "data": b64_data }
+                    }));
+                }
+                other => {
+                    common::emit_error(&format!(
+                        "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
+                    ));
+                    return Ok(None);
+                }
+            }
+        }
+        json!(blocks)
+    };
+
+    let mut args: Vec<String> = vec![
+        "--print".into(),
+        "--output-format".into(),
+        "stream-json".into(),
+        "--input-format".into(),
+        "stream-json".into(),
+        "--verbose".into(),
+        "--permission-prompt-tool".into(),
+        "stdio".into(),
+        "--permission-mode".into(),
+        "default".into(),
+        "--disallowed-tools".into(),
+        "AskUserQuestion".into(),
+    ];
+
+    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
+        if !model.trim().is_empty() {
+            args.push("--model".into());
+            args.push(model.trim().to_string());
+        }
+    }
+    if !session_id.is_empty() {
+        args.push("--resume".into());
+        args.push(session_id.to_string());
+    }
+
+    let mut cmd = Command::new("claude");
+    cmd.args(&args);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .context("failed to spawn `claude`; ensure it is installed and in PATH")?;
+
+    let mut child_stdin = child.stdin.take().context("stdin pipe missing")?;
+    let child_stdout = child.stdout.take().context("stdout pipe missing")?;
+    let child_stderr = child.stderr.take().context("stderr pipe missing")?;
+    let stderr_task = common::spawn_capped_drain(child_stderr);
+
+    // Write the initial SDKUserMessage (the user's turn). `session_id` empty =
+    // new session; Claude distinguishes new vs resume by this field's value.
+    let user_message = json!({
+        "type": "user",
+        "message": { "role": "user", "content": content },
+        "parent_tool_use_id": null,
+        "session_id": session_id,
+    });
+    let line = serde_json::to_string(&user_message)? + "\n";
+    use tokio::io::AsyncWriteExt;
+    child_stdin
+        .write_all(line.as_bytes())
+        .await
+        .context("write SDKUserMessage to claude stdin")?;
+
+    // Background thread reading OUR stdin for permission_response frames the
+    // bridge writes after we emit a permission_request. std::io::stdin is
+    // blocking, so this runs on a std thread and forwards via a tokio mpsc.
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Value>(16);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        for line in stdin.lock().lines() {
+            let Ok(raw) = line else { break };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+                continue;
+            };
+            if v.get("type").and_then(|t| t.as_str()) == Some("permission_response")
+                && resp_tx.blocking_send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    let mut reader = tokio::io::BufReader::new(child_stdout);
+    let mut line = String::new();
+    let mut found_session_id: Option<String> = None;
+    let mut final_text: Option<String> = None;
+    let mut error_emitted = false;
+
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .await
+            .context("read claude stdout")?;
+        if n == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        let etype = v.get("type").and_then(|t| t.as_str());
+
+        if etype == Some("control_request") {
+            if let Some(req) = control_to_permission_request(&v) {
+                let original_input = req.get("input").cloned().unwrap_or_else(|| json!({}));
+                // Emit the permission_request event to the bridge and flush so
+                // the bridge can prompt the user immediately.
+                println!("{}", serde_json::to_string(&req)?);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+
+                // Await the bridge's permission_response. The bridge enforces
+                // its own ask timeout; if it dies, our stdin closes and
+                // recv() returns None → we deny so Claude can finish.
+                let resp =
+                    match tokio::time::timeout(Duration::from_secs(1800), resp_rx.recv()).await {
+                        Ok(Some(r)) => r,
+                        _ => json!({
+                            "type": "permission_response",
+                            "request_id": req.get("request_id").cloned().unwrap_or_default(),
+                            "behavior": "deny",
+                            "message": "no permission response (bridge timeout/closed)",
+                        }),
+                    };
+
+                let ctrl = permission_response_to_control(&resp, &original_input);
+                let ctrl_line = serde_json::to_string(&ctrl)? + "\n";
+                if child_stdin.write_all(ctrl_line.as_bytes()).await.is_err() {
+                    // Claude closed stdin; stop trying to drive permissions.
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Other control_* noise from the CLI is not part of the can_use_tool
+        // permission flow; ignore it (matches the agentproc hub behaviour).
+        if matches!(
+            etype,
+            Some("control_response") | Some("sdk_control_request")
+        ) {
+            continue;
+        }
+
+        let Ok(event) = serde_json::from_str::<ClaudeStreamEvent>(trimmed) else {
+            continue;
+        };
+        match event.event_type.as_deref() {
+            Some("assistant") => {
+                if let Some(msg) = &event.message {
+                    let text = msg.text();
+                    if !text.trim().is_empty() {
+                        common::emit_partial(&text)?;
+                    }
+                }
+            }
+            Some("result") => {
+                found_session_id = event.session_id.clone();
+                if event.is_result_error() {
+                    if let Some(err_text) = event.result_error_message() {
+                        common::emit_error(&err_text);
+                        error_emitted = true;
+                    }
+                } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
+                    final_text = Some(result_text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let status = child.wait().await.context("wait for claude")?;
+    let stderr = stderr_task.await.unwrap_or_default();
+
+    if !error_emitted {
+        if let Some(text) = final_text {
+            common::emit_text(&text)?;
+        }
+    }
+
+    common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
+
+    Ok(found_session_id)
+}
+
+/// Map a Claude `control_request` (subtype `can_use_tool`) to an AgentProc
+/// `permission_request` event payload. Returns `None` for non-can_use_tool
+/// control requests (those are not tool-authorisation prompts).
+fn control_to_permission_request(event: &Value) -> Option<Value> {
+    let request = event.get("request")?;
+    if request.get("subtype").and_then(|s| s.as_str()) != Some("can_use_tool") {
+        return None;
+    }
+    let request_id = event.get("request_id")?.as_str()?.trim();
+    if request_id.is_empty() {
+        return None;
+    }
+    let tool_name = request
+        .get("tool_name")
+        .and_then(|t| t.as_str())
+        .or_else(|| request.get("display_name").and_then(|t| t.as_str()))
+        .unwrap_or("tool");
+    let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
+    let mut payload = json!({
+        "type": "permission_request",
+        "request_id": request_id,
+        "tool_name": tool_name,
+        "input": input,
+    });
+    if let Some(desc) = request.get("description").and_then(|d| d.as_str()) {
+        if !desc.is_empty() {
+            payload["description"] = json!(desc);
+        }
+    }
+    if let Some(tuid) = request.get("tool_use_id").and_then(|d| d.as_str()) {
+        if !tuid.is_empty() {
+            payload["tool_use_id"] = json!(tuid);
+        }
+    }
+    Some(payload)
+}
+
+/// Map an AgentProc `permission_response` to a Claude `control_response` frame
+/// written to the CLI's stdin. `allow` carries `updatedInput` (defaults to the
+/// original tool input); `deny` carries a reason.
+fn permission_response_to_control(resp: &Value, original_input: &Value) -> Value {
+    let request_id = resp
+        .get("request_id")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    let behavior = resp.get("behavior").and_then(|b| b.as_str()).unwrap_or("");
+    if behavior == "allow" {
+        let updated = resp
+            .get("updated_input")
+            .cloned()
+            .unwrap_or_else(|| original_input.clone());
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {
+                    "behavior": "allow",
+                    "updatedInput": updated,
+                },
+            },
+        })
+    } else {
+        let message = resp
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("denied by bridge")
+            .to_string();
+        json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {
+                    "behavior": "deny",
+                    "message": message,
+                },
+            },
+        })
+    }
 }
 
 /// Multimodal variant: download each attachment in the turn, base64-encode it,
@@ -516,6 +838,63 @@ mod tests {
         assert_eq!(event.event_type.as_deref(), Some("system"));
         assert!(event.result.is_none());
         assert!(event.message.is_none());
+    }
+
+    // ── permission mode translation ──────────────────────────────────────────
+
+    #[test]
+    fn control_request_can_use_tool_maps_to_permission_request() {
+        let event: Value = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"req_1","request":{
+                "subtype":"can_use_tool","tool_name":"Bash",
+                "input":{"command":"rm -rf /"},"description":"run bash",
+                "tool_use_id":"toolu_1"}}"#,
+        )
+        .unwrap();
+        let req = control_to_permission_request(&event).expect("can_use_tool maps");
+        assert_eq!(req["type"], "permission_request");
+        assert_eq!(req["request_id"], "req_1");
+        assert_eq!(req["tool_name"], "Bash");
+        assert_eq!(req["input"]["command"], "rm -rf /");
+        assert_eq!(req["description"], "run bash");
+        assert_eq!(req["tool_use_id"], "toolu_1");
+    }
+
+    #[test]
+    fn control_request_non_can_use_tool_is_ignored() {
+        let event: Value = serde_json::from_str(
+            r#"{"type":"control_request","request_id":"x","request":{"subtype":"other"}}"#,
+        )
+        .unwrap();
+        assert!(control_to_permission_request(&event).is_none());
+    }
+
+    #[test]
+    fn permission_response_allow_becomes_control_response_allow() {
+        let resp: Value = serde_json::from_str(
+            r#"{"type":"permission_response","request_id":"req_1","behavior":"allow"}"#,
+        )
+        .unwrap();
+        let ctrl = permission_response_to_control(&resp, &json!({"command":"echo hi"}));
+        assert_eq!(ctrl["type"], "control_response");
+        assert_eq!(ctrl["response"]["request_id"], "req_1");
+        assert_eq!(ctrl["response"]["response"]["behavior"], "allow");
+        // updatedInput defaults to the original tool input.
+        assert_eq!(
+            ctrl["response"]["response"]["updatedInput"]["command"],
+            "echo hi"
+        );
+    }
+
+    #[test]
+    fn permission_response_deny_becomes_control_response_deny_with_message() {
+        let resp: Value = serde_json::from_str(
+            r#"{"type":"permission_response","request_id":"r2","behavior":"deny","message":"user said no"}"#,
+        )
+        .unwrap();
+        let ctrl = permission_response_to_control(&resp, &json!({}));
+        assert_eq!(ctrl["response"]["response"]["behavior"], "deny");
+        assert_eq!(ctrl["response"]["response"]["message"], "user said no");
     }
 
     /// Claude CLI ≥ 2.1.153 changed `--output-format json` to emit a JSON array of all

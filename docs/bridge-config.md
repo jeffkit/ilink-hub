@@ -29,7 +29,8 @@ Do NOT use `{{MESSAGE}}` as part of a shell `-c` parameter (e.g., `args: ["-c", 
 | `env_allowlist` | 无 | 限制 `env` 变量展开的允许名单；未列出的未知变量展开为空（POSIX 语义） |
 | `kill_grace_secs` | 见 `default_kill_grace_secs` | 超时后优雅退出宽限秒数 |
 | `permission` | `false` | 开启 permission 通道（stdin 保持开启以接收 `permission_response`） |
-| `permission_default` | `deny` | permission 默认策略：`allow` / `deny` / `ask` |
+| `permission_default` | `allow` | permission 默认策略：`allow` / `deny` / `deny_logged` / `ask`（`ask` 暂停 turn 走微信交互审批） |
+| `permission_ask_timeout_secs` | `600` | `ask` 策略等待用户回复秒数；超时自动 deny 并提示用户 |
 | `truncation_suffix` | `…(已截断)` | 超长回复截断后缀 |
 | `streaming` | `true` | bridge 侧 hint：是否转发 `partial` 事件 |
 

@@ -186,7 +186,8 @@ send_error_reply: true
 | `truncation_suffix` | 超长回复截断后缀（默认 `…(已截断)`） |
 | `streaming` | bridge 侧 hint：是否转发 `partial` 事件（默认 true） |
 | `permission` | 开启 permission 通道（默认 false） |
-| `permission_default` | permission 默认策略：`allow` / `deny` / `ask`（默认 deny） |
+| `permission_default` | permission 默认策略：`allow` / `deny` / `deny_logged` / `ask`（默认 allow；`ask` 走微信交互审批） |
+| `permission_ask_timeout_secs` | `ask` 策略等待用户回复秒数（默认 600）；超时自动 deny |
 | `include_stderr_in_reply` | 是否附加 stderr（默认 false） |
 
 ---
@@ -490,6 +491,21 @@ profiles:
     env:
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
+
+### permission 通道与 `ask` 审批（可选）
+
+`permission: true` 开启工具授权通道：handler 发 `{"type":"permission_request",...}` 事件，bridge 按 `permission_default` 决策并经 stdin 回写 `{"type":"permission_response",...}`。`permission_default: ask` 会暂停 turn、经微信向用户提问「🔧 工具 X 请求授权…回复『允许』或『拒绝』」，用户在**同一 session** 的下一条消息被解析为审批回复（`允许`/`yes`/`1` → allow，`拒绝`/`no`/`0` → deny，未识别重提示最多 2 次后拒绝），超时（`permission_ask_timeout_secs`，默认 600s）自动拒绝。
+
+```yaml
+profiles:
+  claude:
+    type: claude-code
+    permission: true
+    permission_default: ask
+    permission_ask_timeout_secs: 600
+```
+
+内置 `claude-code` 在 `permission: true` 时自动切换到 `claude --permission-prompt-tool stdio`，把 Claude 的 `control_request`/`control_response` 与 AgentProc permission 帧双向转译，从而把 Claude 工具授权接到微信 `ask` 闭环。
 
 ---
 

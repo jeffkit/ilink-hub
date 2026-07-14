@@ -1155,6 +1155,145 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
         assert_eq!(body, "echo:hello/0.3");
     }
 
+    // ─── ask permission strategy ────────────────────────────────────────────
+
+    #[test]
+    fn parse_approval_reply_recognizes_tokens() {
+        assert_eq!(parse_approval_reply("允许"), Some(true));
+        assert_eq!(parse_approval_reply(" YES "), Some(true));
+        assert_eq!(parse_approval_reply("ok"), Some(true));
+        assert_eq!(parse_approval_reply("1"), Some(true));
+        assert_eq!(parse_approval_reply("拒绝"), Some(false));
+        assert_eq!(parse_approval_reply("no"), Some(false));
+        assert_eq!(parse_approval_reply("0"), Some(false));
+        assert_eq!(parse_approval_reply(""), None);
+        assert_eq!(parse_approval_reply("maybe later"), None);
+    }
+
+    #[test]
+    fn format_approval_question_includes_tool_and_input() {
+        let req = protocol::PermissionRequest {
+            request_id: "r1".into(),
+            tool_name: "Bash".into(),
+            input: serde_json::json!({"command": "echo hi"}),
+            description: None,
+            tool_use_id: None,
+        };
+        let q = format_approval_question(&req);
+        assert!(q.contains("Bash"));
+        assert!(q.contains("echo hi"));
+        assert!(q.contains("允许"));
+    }
+
+    /// A fake agent that emits a permission_request, waits for the bridge's
+    /// permission_response on stdin, then emits a final text event.
+    fn permission_ask_script() -> &'static str {
+        r#"read -r _turn; \
+printf '%s\n' '{"type":"permission_request","request_id":"r1","tool_name":"Bash","input":{"command":"rm -rf x"}}'; \
+read -r _resp; \
+printf '%s\n' '{"type":"text","text":"after-permission"}'"#
+    }
+
+    fn ask_profile_yaml(script: &str, ask_timeout: u64) -> String {
+        format!(
+            "{}permission: true\npermission_default: ask\npermission_ask_timeout_secs: {}\nstreaming: false\n",
+            shell_profile_yaml(script, 30),
+            ask_timeout
+        )
+    }
+
+    fn reply_msg(text: &str) -> WeixinMessage {
+        use crate::ilink::types::{MessageItem, TextItem};
+        WeixinMessage {
+            item_list: Some(std::sync::Arc::new(vec![MessageItem {
+                item_type: Some(1),
+                text_item: Some(TextItem {
+                    text: Some(text.to_string()),
+                }),
+                ..Default::default()
+            }])),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_permission_allows_on_user_yes() {
+        let yaml = ask_profile_yaml(permission_ask_script(), 10);
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hi").unwrap();
+
+        let broker = ApprovalBroker::new();
+        let deliver_broker = broker.clone();
+        tokio::spawn(async move {
+            // Give run_cli a moment to register its inbox and send the prompt.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(
+                deliver_broker.deliver("test", &reply_msg("允许")),
+                "inbox should be registered by now"
+            );
+        });
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+        let (body, _sid, summary) = run_cli(
+            profile,
+            "ask_profile",
+            "hi",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+            broker,
+            "test".to_string(),
+        )
+        .await
+        .expect("run_cli failed");
+
+        assert_eq!(body, "after-permission");
+        assert!(!summary.error_event);
+        let chunks = chunks.await.expect("collector panicked");
+        assert!(
+            chunks.iter().any(|c| c.contains("已允许")),
+            "expected an allowance confirmation partial, got {chunks:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_permission_denies_on_timeout() {
+        // 1s timeout; never deliver a reply.
+        let yaml = ask_profile_yaml(permission_ask_script(), 1);
+        let app = BridgeApp::parse_yaml(&yaml).unwrap();
+        let (_name, profile, _payload) = app.resolve("hi").unwrap();
+
+        let (partial_tx, partial_rx) = watch::channel::<Option<String>>(None);
+        let chunks = spawn_partial_collector(partial_rx);
+        let (body, _sid, _summary) = run_cli(
+            profile,
+            "ask_profile",
+            "hi",
+            "",
+            "default",
+            "user-1",
+            "ctx-1",
+            &[],
+            partial_tx,
+            ApprovalBroker::new(),
+            "test".to_string(),
+        )
+        .await
+        .expect("run_cli failed");
+
+        // The agent receives a deny response and proceeds to emit its text.
+        assert_eq!(body, "after-permission");
+        let chunks = chunks.await.expect("collector panicked");
+        assert!(
+            chunks.iter().any(|c| c.contains("超时")),
+            "expected a timeout notice partial, got {chunks:?}"
+        );
+    }
+
     /// Spawn a task that drains a partial watch channel into a Vec<String>,
     /// returning a handle to the collected chunks. Skips the initial `None`
     /// slot. Completes when the sender is dropped.

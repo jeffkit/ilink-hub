@@ -4,7 +4,7 @@ title: AgentProc 0.3 协议与 Bridge Profile
 description: Bridge 与 profile 进程之间的 AgentProc 0.3 通信契约：NDJSON turn 输入、NDJSON 事件输出、流式与 permission 通道。
 resource: docs/bridge/profile-spec.md
 tags: [bridge, profile, protocol, agentproc, ndjson]
-timestamp: 2026-07-13T20:30:00+08:00
+timestamp: 2026-07-13T21:30:00+08:00
 ---
 
 # AgentProc 0.3 协议与 Bridge Profile
@@ -91,16 +91,40 @@ turn 的成败按以下优先级判定（前者覆盖后者）：
 
 profile 设置 `permission: true` 时开启：
 
-1. Agent 在需要工具授权时发 `permission_request` 事件（含 `id` / `tool` / `input`）
-2. Bridge 依据 `permission_default` 策略（`allow` / `deny` / `ask`）决定，并通过 stdin 写回一行 `permission_response` NDJSON：
+1. Agent 在需要工具授权时发 `permission_request` 事件（含 `request_id` / `tool_name` / `input`）
+2. Bridge 依据 `permission_default` 策略决定，并通过 stdin 写回一行 `permission_response` NDJSON：
 
 ```json
-{"type":"permission_response","id":"req-42","behavior":"allow","message":"可选说明"}
+{"type":"permission_response","request_id":"req-42","behavior":"allow","message":"可选说明"}
 ```
 
 3. Agent 收到响应后继续执行
 
-> 当前阶段实现 framing 转换与 default policy（`allow`/`deny`）；`ask` 的完整 WeChat 交互审批循环为后续产品特性。
+### `permission_default` 策略
+
+| 策略 | 行为 |
+|------|------|
+| `allow` | 自动批准所有工具调用（等价 `--dangerously-skip-permissions`，默认） |
+| `deny` | 拒绝所有工具调用，agent 需在没有该工具的情况下继续 |
+| `deny_logged` | 记录请求并拒绝（审计安全默认） |
+| `ask` | **暂停 turn，经微信向用户提问**「🔧 工具 X 请求授权…回复『允许』或『拒绝』」，等用户下一条消息解析后回写 `permission_response` |
+
+### `ask` 交互审批循环
+
+`ask` 是完整的 WeChat 人机审批闭环：
+
+1. Bridge executor 收到 `permission_request`，经 partial 通道向用户发出提问（工具名 + 输入预览）
+2. 在 `ApprovalBroker` 上按 session-dispatch key 注册一个收件箱，turn 暂停
+3. 用户在**同一 session** 的下一条消息被 `SessionDispatcher::dispatch` 优先投递到该收件箱（而非进入正常消息队列）
+4. Bridge 宽松解析回复（`允许`/`yes`/`y`/`是`/`ok`/`1` → allow；`拒绝`/`no`/`n`/`否`/`0` → deny）；未识别则重新提示，**最多 2 次**后按拒绝处理
+5. 超时（`permission_ask_timeout_secs`，默认 **600s / 10 分钟**）未回复 → 自动 deny 并提示用户「授权超时已拒绝」
+6. 决策写回 agent stdin，agent 继续
+
+> 审批窗口内用户的任何消息都视为审批回复（按上述规则解析）；不会并发触发新的 turn。
+
+### 内置 `claude-code` 的 permission 模式
+
+当 `type: claude-code` 的 profile 同时设置 `permission: true`，内置 agent 切换到 `claude --permission-prompt-tool stdio --permission-mode default`（替代 `--dangerously-skip-permissions`），并在 Claude 的 `control_request`(can_use_tool) ↔ AgentProc `permission_request`、`permission_response` ↔ Claude `control_response` 之间双向转译，从而把 Claude 的工具授权提示接到上面的 WeChat `ask` 闭环。多模态（image/file 附件）在 permission 模式下同样支持。
 
 ## Profile YAML 结构
 
@@ -143,7 +167,8 @@ profiles:
 | `env_allowlist` | 无（全放行） | 限制 `env` 中变量展开的允许名单（未列出的未知变量展开为空，POSIX 语义） |
 | `kill_grace_secs` | `default_kill_grace_secs` | 超时后给进程的优雅退出宽限秒数 |
 | `permission` | `false` | 开启 permission 通道 |
-| `permission_default` | `deny` | permission 默认策略：`allow` / `deny` / `ask` |
+| `permission_default` | `allow` | permission 默认策略：`allow` / `deny` / `deny_logged` / `ask`（`ask` 走 WeChat 交互审批） |
+| `permission_ask_timeout_secs` | `600` | `ask` 策略等待用户回复的秒数；超时自动 deny |
 | `truncation_suffix` | `"…(已截断)"` | 超长回复截断后缀 |
 | `{{PROFILE_DIR}}` | — | 占位符，展开为 profile 目录 |
 
