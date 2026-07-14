@@ -55,24 +55,31 @@ use tokio::sync::{mpsc, Mutex};
 
 // ─── MockUpstream ────────────────────────────────────────────────────────────
 
-/// Records every `sendmessage` call. `sent_messages()` returns a snapshot of
-/// the recorded list — assertions can read it after the bridge has driven the
-/// flow.
+/// Records every `sendmessage` call. Reads are non-destructive snapshots so
+/// one test can assert on the outbound stream and keep asserting across turns.
+/// Use [`MockUpstream::clear`] to drain the buffer between phases, and
+/// [`MockUpstream::last_message`] to peek at the most recent outbound message
+/// (e.g. to recover the Hub-assigned `message_id` for a quote-reply round-trip).
 #[derive(Default)]
 struct MockUpstream {
     sent: Mutex<Vec<SendMessageRequest>>,
 }
 
 impl MockUpstream {
+    /// Non-destructive snapshot of every recorded `sendmessage`.
     async fn sent_messages(&self) -> Vec<SendMessageRequest> {
-        // SendMessageRequest doesn't derive Clone, so we drain-and-replay.
-        let mut guard = self.sent.lock().await;
-        let mut out = Vec::with_capacity(guard.len());
-        while let Some(m) = guard.pop() {
-            out.push(m);
-        }
-        out.reverse();
-        out
+        self.sent.lock().await.clone()
+    }
+
+    /// Non-destructive peek at the most recent outbound message.
+    async fn last_message(&self) -> Option<SendMessageRequest> {
+        self.sent.lock().await.last().cloned()
+    }
+
+    /// Drop every recorded message. Used between test phases that want a
+    /// clean slate without tearing down the harness.
+    async fn clear(&self) {
+        self.sent.lock().await.clear();
     }
 }
 
@@ -471,7 +478,7 @@ async fn no_default_no_route_sends_help_not_broadcast() {
     let _ = poll_for_messages(&h.base_url, &v2, 0).await;
 
     // Clear any upstream messages produced by the polls above.
-    let _ = h.mock.sent_messages().await;
+    h.mock.clear().await;
 
     h._dispatch_tx
         .try_send(user_text_msg("carol@wechat", "real-ctx-bcast", "ping"))
@@ -616,7 +623,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Drain /use ack from upstream.
-    let _ = h.mock.sent_messages().await;
+    h.mock.clear().await;
 
     // ── Turn 1b: user asks claude a question.
     h._dispatch_tx
@@ -654,7 +661,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     // Discard the /use ack from upstream.
-    let _ = h.mock.sent_messages().await;
+    h.mock.clear().await;
 
     // ── Turn 2: user quote-replies claude's answer.
     // `ref_msg.text` contains the full registered text (body + footer).
@@ -696,6 +703,172 @@ async fn quote_reply_routes_back_to_originating_backend() {
 /// by closeness to this value when several origins share the same text.
 fn chrono_millis_now() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+// ─── Quote-reply routing — L0 exact msg_id match ─────────────────────────────
+//
+// L0 is the most precise quote-routing layer: the Hub assigns a unique
+// `message_id` to every outbound reply (`WeixinMessage::ensure_outbound`),
+// persists it as `messages.ilink_msg_id` at send time, and resolves the next
+// quote-reply by matching `ref_msg.message_item.msg_id` against that column.
+// iLink echoes the Hub-assigned id back verbatim, so this uniquely identifies
+// the quoted assistant row — no timestamp window, no content prefix, no footer
+// parse. The tests below exercise the full closed loop:
+//
+//   Hub assigns id → persists → iLink echo → user quotes id → L0 routes home.
+//
+// They isolate L0 by stripping every other signal (`text_item`, footer,
+// `create_time_ms`) from `ref_msg`, so only the msg_id column can match.
+
+/// L0 happy path: user quote-replies carrying *only* `ref_msg.message_item.msg_id`.
+/// The Hub must route the follow-up back to the backend that produced the
+/// quoted reply, even though the current `/use` default points elsewhere.
+///
+/// This is the closed loop that "Message ID 可以自定义" enables: the id the
+/// Hub minted on send is the same id that comes back on the quote.
+#[tokio::test]
+async fn quote_reply_routes_via_l0_msg_id_exact_match() {
+    let h = boot_without_default().await;
+    let va = register_client(&h.base_url, "claude").await;
+    let vb = register_client(&h.base_url, "codex").await;
+    let user = "alice@wechat";
+    let real_ctx = "real-ctx-l0-001";
+
+    // Mark both bridges online.
+    let _ = poll_for_messages(&h.base_url, &va, 0).await;
+    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+
+    // ── Turn 1: /use claude, then ask a question.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use claude"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    h.mock.clear().await; // drop the /use ack
+
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "what is foo?"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
+    assert_eq!(claude_msgs.len(), 1, "/use claude must route to claude");
+    let claude_vctx = claude_msgs[0].context_token.as_deref().unwrap().to_string();
+
+    // ── Claude replies. The Hub assigns a `message_id` and persists it.
+    let _ = bridge_send_with_session(
+        &h.base_url,
+        &va,
+        &claude_vctx,
+        user,
+        "the meaning of foo is 42",
+        Some("default"),
+        None,
+    )
+    .await;
+    // Let the fire-and-forget `save_message_with_msg_id` settle.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // 🔑 Recover the Hub-assigned message_id from the outbound stream.
+    // This is the value iLink would echo back as ref_msg.message_item.msg_id.
+    let outbound_msg_id = h
+        .mock
+        .last_message()
+        .await
+        .and_then(|r| r.msg)
+        .and_then(|m| m.message_id)
+        .expect("claude reply must carry a Hub-assigned message_id");
+
+    // ── Switch the user's default to codex. The quote must override this.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use codex"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    h.mock.clear().await; // drop the /use ack
+
+    // ── Turn 2: quote-reply carrying ONLY msg_id (no text, no timestamp).
+    //    Only L0 can match this — L1 needs create_time_ms, L2 needs text,
+    //    L3 needs a footer. So a pass here proves the L0 column was hit.
+    let quote_text = "but what about bar?";
+    let mut msg = user_text_msg(user, real_ctx, quote_text);
+    let items = std::sync::Arc::make_mut(msg.item_list.as_mut().unwrap());
+    items[0].extra = json!({
+        "ref_msg": {
+            "message_item": {
+                "msg_id": outbound_msg_id.to_string(),
+            }
+        }
+    });
+    h._dispatch_tx.try_send(msg).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Codex (current /use default) must NOT receive it.
+    let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
+    assert!(
+        codex_after.is_empty(),
+        "L0 quote-reply must NOT land on codex (current /use default); got {:?}",
+        codex_after.iter().map(|m| m.text()).collect::<Vec<_>>()
+    );
+    // Claude (originator) MUST receive it.
+    let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
+    assert_eq!(
+        claude_after.len(),
+        1,
+        "L0 quote-reply must route back to claude (msg_id originator)"
+    );
+    assert_eq!(claude_after[0].text(), Some(quote_text));
+}
+
+/// L0 negative: a quote-reply whose `ref_msg.message_item.msg_id` does NOT
+/// correspond to any persisted assistant message must fall through L0 without
+/// matching. With no other signal either, the message lands on the current
+/// `/use` default (base routing), NOT on any backend that happens to share
+/// the fabricated id.
+#[tokio::test]
+async fn quote_reply_with_unknown_msg_id_falls_through_l0() {
+    let h = boot_without_default().await;
+    let va = register_client(&h.base_url, "claude").await;
+    let vb = register_client(&h.base_url, "codex").await;
+    let user = "alice@wechat";
+    let real_ctx = "real-ctx-l0-miss-001";
+
+    let _ = poll_for_messages(&h.base_url, &va, 0).await;
+    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+
+    // /use codex — this is where base routing should send the follow-up.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use codex"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    h.mock.clear().await;
+
+    // Quote-reply with a fabricated msg_id that no assistant row has, and no
+    // other L1/L2/L3 signal. L0 must miss and fall through to base routing.
+    let quote_text = "where were we?";
+    let mut msg = user_text_msg(user, real_ctx, quote_text);
+    let items = std::sync::Arc::make_mut(msg.item_list.as_mut().unwrap());
+    items[0].extra = json!({
+        "ref_msg": {
+            "message_item": {
+                "msg_id": "7777777777777777777",
+            }
+        }
+    });
+    h._dispatch_tx.try_send(msg).unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
+    let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
+    assert!(
+        claude_after.is_empty(),
+        "unknown msg_id must not route to claude; got {:?}",
+        claude_after.iter().map(|m| m.text()).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        codex_after.len(),
+        1,
+        "L0 miss with no other signal must fall through to /use codex (base routing)"
+    );
+    assert_eq!(codex_after[0].text(), Some(quote_text));
 }
 
 // ─── Hub commands end-to-end ────────────────────────────────────────────────
@@ -757,7 +930,7 @@ async fn hub_command_use_reroutes_subsequent_messages() {
     tokio::time::sleep(Duration::from_millis(150)).await;
 
     // Discard the /use ack message — we care about the *next* user turn.
-    let _ = h.mock.sent_messages().await;
+    h.mock.clear().await;
 
     // The user's follow-up should now land in codex's queue, not claude's.
     h._dispatch_tx
@@ -799,7 +972,7 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
         ))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
-    let _ = h.mock.sent_messages().await;
+    h.mock.clear().await;
 
     // Now send a normal message; the inbound message on the bridge side must
     // carry session_name = "feature-x".
