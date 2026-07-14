@@ -13,6 +13,7 @@ use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 use super::handle::handle_one_message;
 use super::send::{sanitize_errmsg, HubClient, SendOutcome};
 use super::BridgeStop;
+use crate::bridge::ApprovalBroker;
 
 pub(super) fn session_dispatch_key(msg: &WeixinMessage) -> String {
     let ctx = msg.context_token.as_deref().unwrap_or("");
@@ -31,6 +32,7 @@ pub(super) async fn run_session_worker(
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
+    approval_broker: Arc<ApprovalBroker>,
 ) {
     const SESSION_WORKER_MAX_BACKOFF_SECS: u64 = 60;
     let mut consecutive_failures: u32 = 0;
@@ -102,7 +104,7 @@ pub(super) async fn run_session_worker(
                 }
                 return;
             }
-            r = handle_one_message(&client, &app, msg, shutdown.clone()) => r,
+            r = handle_one_message(&client, &app, msg, shutdown.clone(), &approval_broker) => r,
         };
 
         match result {
@@ -157,6 +159,7 @@ pub(super) struct SessionDispatcher {
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
+    approval_broker: Arc<ApprovalBroker>,
     /// Cumulative count of messages dropped because MAX_SESSION_WORKERS cap was reached.
     /// Visible in structured logs via the warn! on each drop; exposed in the bridge
     /// metrics endpoint (TODO: requires a bridge-side HTTP server).
@@ -169,6 +172,7 @@ impl SessionDispatcher {
         app: Arc<BridgeApp>,
         stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
         shutdown: CancellationToken,
+        approval_broker: Arc<ApprovalBroker>,
     ) -> Self {
         Self {
             senders: std::sync::Mutex::new(HashMap::new()),
@@ -176,12 +180,23 @@ impl SessionDispatcher {
             app,
             stop_tx,
             shutdown,
+            approval_broker,
             sessions_dropped_on_cap: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub(super) async fn dispatch(&self, msg: WeixinMessage) {
         let key = session_dispatch_key(&msg);
+
+        // `ask` permission strategy: if a turn on this session is currently
+        // blocked waiting for the user to approve/deny a tool call, route the
+        // user's reply to that turn instead of the normal session queue. The
+        // broker returns false when no approval is pending, in which case we
+        // fall through to normal dispatch.
+        if self.approval_broker.deliver(&key, &msg) {
+            return;
+        }
+
         // N-04 / F-M1-N04: match the poison-safe style used by
         // `evict_closed_senders` below — recover from a poisoned mutex by
         // taking the inner state instead of panicking the Tokio worker.
@@ -218,6 +233,7 @@ impl SessionDispatcher {
             let app = Arc::clone(&self.app);
             let stop_tx = self.stop_tx.clone();
             let shutdown = self.shutdown.clone();
+            let approval_broker = Arc::clone(&self.approval_broker);
             tokio::spawn(run_session_worker(
                 key.clone(),
                 rx,
@@ -225,6 +241,7 @@ impl SessionDispatcher {
                 app,
                 stop_tx,
                 shutdown,
+                approval_broker,
             ));
         }
 

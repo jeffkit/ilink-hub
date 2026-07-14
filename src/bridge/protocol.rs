@@ -256,9 +256,11 @@ pub enum PermissionBehavior {
     Deny,
 }
 
-/// The bridge's default action when a `permission_request` arrives and no
-/// interactive user-approval loop is wired up (the WeChat interactive approval
-/// is a follow-on phase; for now the profile declares a default policy).
+/// The bridge's default action when a `permission_request` arrives.
+///
+/// `Ask` pauses the turn and prompts the user over WeChat to allow/deny the
+/// tool call (the interactive approval loop lives in the dispatcher's
+/// `ApprovalBroker` and the executor's ask handling).
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionDefaultPolicy {
@@ -269,6 +271,9 @@ pub enum PermissionDefaultPolicy {
     Deny,
     /// Log the request and deny (safe default for auditing without blocking).
     DenyLogged,
+    /// Pause the turn and ask the user to approve/deny over WeChat. Falls back
+    /// to `Deny` if no interactive broker is wired up (e.g. in tests/probe).
+    Ask,
 }
 
 fn is_false(b: &bool) -> bool {

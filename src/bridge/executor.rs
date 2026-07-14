@@ -5,6 +5,7 @@
 //! See `docs/knowledge/bridges/profile-protocol.md` and the upstream spec at
 //! `~/projects/agentproc/spec/protocol.md`.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -15,6 +16,7 @@ use tracing::{info, warn};
 
 use crate::bridge::config::BridgeProfile;
 use crate::bridge::protocol::{self, AgentEvent, Attachment, PermissionResponse, TurnObject};
+use crate::bridge::ApprovalBroker;
 use crate::ilink::types::WeixinMessage;
 use crate::paths::expand_user_path;
 
@@ -237,6 +239,8 @@ pub(super) async fn run_cli(
     context_token: &str,
     attachments: &[Attachment],
     partial_tx: watch::Sender<Option<String>>,
+    approval_broker: Arc<ApprovalBroker>,
+    session_key: String,
 ) -> Result<(String, Option<String>, CliRunSummary)> {
     let started = Instant::now();
     // {{PROFILE_DIR}} is not yet wired to the profile file's directory; expand
@@ -391,6 +395,8 @@ pub(super) async fn run_cli(
     let truncation_suffix = cfg.truncation_suffix.clone();
     let truncation_suffix_for_body = truncation_suffix.clone();
     let permission_default = cfg.permission_default;
+    let ask_timeout = Duration::from_secs(cfg.permission_ask_timeout_secs.max(1));
+    let approval_broker = Some(approval_broker);
 
     /// Output of the stdout-parsing loop: text chunks, session id, forwarded
     /// partial count, error-event flag, and the error message (for non-streaming
@@ -529,9 +535,55 @@ pub(super) async fn run_cli(
                                 "permission denied (permission_default)"
                             );
                             PermissionResponse::deny(
-                                req.request_id,
+                                req.request_id.clone(),
                                 "denied by bridge permission_default policy",
                             )
+                        }
+                        protocol::PermissionDefaultPolicy::Ask => {
+                            // Interactive approval: pause the turn, prompt the
+                            // user over WeChat via the partial channel, and
+                            // await their reply on the same session (routed
+                            // back by the ApprovalBroker). Falls back to deny
+                            // when no broker is wired (tests / probe).
+                            match approval_broker.as_ref() {
+                                None => {
+                                    warn!(
+                                        profile = profile_name,
+                                        request_id = %req.request_id,
+                                        tool = %req.tool_name,
+                                        "permission ask: no approval broker; denying"
+                                    );
+                                    PermissionResponse::deny(
+                                        req.request_id.clone(),
+                                        "ask policy unavailable (no approval broker)",
+                                    )
+                                }
+                                Some(broker) => {
+                                    let question = format_approval_question(&req);
+                                    // Register the inbox BEFORE sending the
+                                    // question so the user's reply cannot
+                                    // arrive before we listen.
+                                    let (mut inbox, guard) = broker.register(session_key.clone());
+                                    let _ = partial_tx.send(Some(question));
+                                    info!(
+                                        profile = profile_name,
+                                        request_id = %req.request_id,
+                                        tool = %req.tool_name,
+                                        timeout_secs = ask_timeout.as_secs(),
+                                        "permission ask: prompting user"
+                                    );
+                                    let resp = await_user_approval(
+                                        &mut inbox,
+                                        &req.request_id,
+                                        &req.tool_name,
+                                        ask_timeout,
+                                        &partial_tx,
+                                    )
+                                    .await;
+                                    drop(guard);
+                                    resp
+                                }
+                            }
                         }
                     };
                     // Send to the stdin writer task. If the channel is closed
@@ -696,6 +748,123 @@ pub(super) fn split_into_parts(s: &str, max_chars: usize) -> Vec<String> {
     parts
 }
 
+// ─── `ask` permission strategy helpers ───────────────────────────────────────
+
+/// Build the WeChat-facing prompt for a `permission_request`. The tool input
+/// is pretty-printed and capped so a huge command/object doesn't blow up the
+/// message.
+fn format_approval_question(req: &protocol::PermissionRequest) -> String {
+    const MAX_INPUT_CHARS: usize = 800;
+    let input_preview = {
+        let raw = if req.input.is_null() {
+            String::new()
+        } else {
+            serde_json::to_string_pretty(&req.input).unwrap_or_else(|_| req.input.to_string())
+        };
+        let raw = raw.trim();
+        if raw.chars().count() <= MAX_INPUT_CHARS {
+            raw.to_string()
+        } else {
+            let truncated: String = raw.chars().take(MAX_INPUT_CHARS).collect();
+            format!("{truncated}\n…(输入已截断)")
+        }
+    };
+    let tool = req.tool_name.trim();
+    if input_preview.is_empty() {
+        format!("🔧 工具「{tool}」请求授权\n回复「允许」或「拒绝」")
+    } else {
+        format!("🔧 工具「{tool}」请求授权：\n{input_preview}\n\n回复「允许」或「拒绝」")
+    }
+}
+
+/// Parse a user reply into an allow/deny decision.
+///
+/// Loose matching (Q2=A) over a fixed token set: 允许/yes/y/是/ok/好/同意/1 →
+/// allow; 拒绝/no/n/否/0/deny/取消 → deny; anything else → `None` (caller
+/// reprompts). Matching is on the trimmed, lower-cased reply so "Yes", " OK "
+/// and "允许" all work, but a free-form sentence won't misfire on a stray
+/// single letter.
+fn parse_approval_reply(text: &str) -> Option<bool> {
+    let t = text.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+    const ALLOW: &[&str] = &[
+        "允许", "yes", "y", "是", "ok", "好", "同意", "1", "allow", "approve", "许可",
+    ];
+    const DENY: &[&str] = &[
+        "拒绝", "no", "n", "否", "0", "deny", "reject", "取消", "cancel", "不行",
+    ];
+    if ALLOW.contains(&t.as_str()) {
+        return Some(true);
+    }
+    if DENY.contains(&t.as_str()) {
+        return Some(false);
+    }
+    None
+}
+
+/// Await the user's allow/deny reply on the approval inbox.
+///
+/// Loose matching with up to 2 unrecognized reprompts before denying (Q2=A,
+/// Q3=A: any inbound message during the ask window is treated as the reply).
+/// On timeout the tool is denied and the user is notified (Q1=C).
+async fn await_user_approval(
+    inbox: &mut mpsc::Receiver<WeixinMessage>,
+    request_id: &str,
+    tool_name: &str,
+    timeout: Duration,
+    partial_tx: &watch::Sender<Option<String>>,
+) -> PermissionResponse {
+    const MAX_REPROMPTS: u32 = 2;
+    let mut unrecognized: u32 = 0;
+    loop {
+        match tokio::time::timeout(timeout, inbox.recv()).await {
+            Err(_) => {
+                let _ =
+                    partial_tx.send(Some(format!("⏱️ 工具「{tool_name}」授权超时，已自动拒绝")));
+                return PermissionResponse::deny(
+                    request_id.to_string(),
+                    "approval timed out (no user reply)",
+                );
+            }
+            Ok(None) => {
+                // Inbox closed (broker dropped / bridge shutdown). Deny quietly.
+                return PermissionResponse::deny(request_id.to_string(), "approval channel closed");
+            }
+            Ok(Some(msg)) => {
+                let text = msg.text().unwrap_or("");
+                match parse_approval_reply(text) {
+                    Some(true) => {
+                        let _ = partial_tx.send(Some(format!("✅ 已允许工具「{tool_name}」")));
+                        return PermissionResponse::allow(request_id.to_string());
+                    }
+                    Some(false) => {
+                        let _ = partial_tx.send(Some(format!("🚫 已拒绝工具「{tool_name}」")));
+                        return PermissionResponse::deny(request_id.to_string(), "denied by user");
+                    }
+                    None => {
+                        unrecognized += 1;
+                        if unrecognized >= MAX_REPROMPTS {
+                            let _ = partial_tx.send(Some(format!(
+                                "未识别回复「{text}」，已按拒绝处理工具「{tool_name}」"
+                            )));
+                            return PermissionResponse::deny(
+                                request_id.to_string(),
+                                "unrecognized approval reply",
+                            );
+                        }
+                        let _ = partial_tx.send(Some(format!(
+                            "未识别回复「{text}」，请回复「允许」或「拒绝」"
+                        )));
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1023,8 @@ printf '%s\n' '{"type":"text","text":"final-body"}'"#;
             "ctx-1",
             &[],
             partial_tx,
+            ApprovalBroker::new(),
+            "test".to_string(),
         )
         .await
         .expect("run_cli failed");
@@ -894,6 +1065,8 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
             "ctx-1",
             &[],
             partial_tx,
+            ApprovalBroker::new(),
+            "test".to_string(),
         )
         .await
         .expect("run_cli failed");
@@ -932,6 +1105,8 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
             "ctx-1",
             &[],
             partial_tx,
+            ApprovalBroker::new(),
+            "test".to_string(),
         )
         .await
         .expect("run_cli failed");
@@ -971,6 +1146,8 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
             "ctx-1",
             &[],
             partial_tx,
+            ApprovalBroker::new(),
+            "test".to_string(),
         )
         .await
         .expect("run_cli failed");

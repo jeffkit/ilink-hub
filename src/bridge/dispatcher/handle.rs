@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -10,8 +11,9 @@ use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
 use super::backoff::{backoff_for, retry_budget};
 use super::send::{run_partial_forward_loop, sanitize_field, send_final_with_retry, HubClient};
-use super::session::HandleError;
+use super::session::{session_dispatch_key, HandleError};
 use super::BridgeStop;
+use crate::bridge::ApprovalBroker;
 
 pub(super) fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
     let Ok(flag) = std::env::var("ILINKHUB_BRIDGE_DUMP_MSG") else {
@@ -57,6 +59,7 @@ pub(super) async fn handle_one_message(
     app: &BridgeApp,
     msg: WeixinMessage,
     shutdown: CancellationToken,
+    approval_broker: &Arc<ApprovalBroker>,
 ) -> Result<(), HandleError> {
     dump_inbound_weixin_message_for_debug(&msg);
 
@@ -142,6 +145,11 @@ pub(super) async fn handle_one_message(
 
     let retry_budget = retry_budget(profile.timeout_secs);
 
+    // Session-dispatch key for the `ask` permission strategy: when the agent
+    // emits a permission_request, the turn registers an approval inbox under
+    // this key and waits for the user's next message on the same session.
+    let session_key = session_dispatch_key(&msg);
+
     let cli_result = run_cli(
         profile,
         profile_name,
@@ -152,6 +160,8 @@ pub(super) async fn handle_one_message(
         &ctx,
         &attachments,
         partial_tx,
+        Arc::clone(approval_broker),
+        session_key,
     )
     .await;
 

@@ -1,7 +1,8 @@
 use super::{
     backoff_for, backoff_for_test, classify_sendoutcome, parse_sendoutcome,
     run_partial_forward_loop, sanitize_errmsg, send_final_with_retry, session_dispatch_key,
-    BridgeStop, HubClient, ReplySender, SendOutcome, SessionDispatcher, MAX_BACKOFF_SECS,
+    ApprovalBroker, BridgeStop, HubClient, ReplySender, SendOutcome, SessionDispatcher,
+    MAX_BACKOFF_SECS,
 };
 use crate::bridge::config::BridgeApp;
 use crate::ilink::types::{
@@ -105,6 +106,7 @@ async fn same_key_reuses_single_sender() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     let msg = make_msg("ctx-a", "default");
     disp.dispatch(msg.clone()).await;
@@ -119,6 +121,7 @@ async fn different_ctx_tokens_get_separate_senders() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     disp.dispatch(make_msg("ctx-a", "default")).await;
     disp.dispatch(make_msg("ctx-b", "default")).await;
@@ -132,6 +135,7 @@ async fn different_session_names_get_separate_senders() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     disp.dispatch(make_msg("ctx-a", "feature-x")).await;
     disp.dispatch(make_msg("ctx-a", "feature-y")).await;
@@ -148,6 +152,7 @@ async fn three_distinct_sessions_create_three_senders() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     disp.dispatch(make_msg("ctx-1", "default")).await;
     disp.dispatch(make_msg("ctx-2", "default")).await;
@@ -165,6 +170,7 @@ async fn repeated_same_key_does_not_grow_sender_map() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     let msg = make_msg("ctx-x", "s1");
     for _ in 0..5 {
@@ -180,6 +186,7 @@ async fn dead_sender_triggers_new_worker_on_next_dispatch() {
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
+        ApprovalBroker::new(),
     );
     let msg = make_msg("ctx-z", "default");
 

@@ -4,6 +4,7 @@
 //!
 //! Used by the `ilink-hub-bridge` binary; see `docs/bridge/README.md`.
 
+mod approval;
 pub mod builtin;
 mod config;
 mod connection;
@@ -14,6 +15,8 @@ mod paths;
 mod probe;
 pub mod protocol;
 pub mod vtoken_env;
+
+pub(crate) use approval::ApprovalBroker;
 
 pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy};
 pub use connection::{

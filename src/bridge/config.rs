@@ -117,8 +117,13 @@ pub struct BridgeProfile {
     pub permission: bool,
     /// 当 permission 通道开启但没有交互式用户批准闭环时，bridge 对每个
     /// permission_request 的默认动作。默认 `allow`（等价 skip-permissions）。
+    /// `ask` 暂停 turn，经微信问用户允许/拒绝。
     #[serde(default)]
     pub permission_default: super::protocol::PermissionDefaultPolicy,
+    /// `permission_default: ask` 时，等待用户微信回复的最长秒数；超时后
+    /// 自动 deny 并提示用户「授权超时已拒绝」。默认 600s（10 分钟）。
+    #[serde(default = "default_permission_ask_timeout_secs")]
+    pub permission_ask_timeout_secs: u64,
     /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
     #[serde(default)]
     pub description: Option<String>,
@@ -142,6 +147,7 @@ impl Default for BridgeProfile {
             streaming: true,
             permission: false,
             permission_default: super::protocol::PermissionDefaultPolicy::default(),
+            permission_ask_timeout_secs: default_permission_ask_timeout_secs(),
             description: None,
         }
     }
@@ -161,6 +167,10 @@ fn default_max_reply_chars() -> usize {
 
 fn default_truncation_suffix() -> String {
     "\n\n…(输出已截断)".to_string()
+}
+
+fn default_permission_ask_timeout_secs() -> u64 {
+    600
 }
 
 fn default_true() -> bool {
@@ -201,6 +211,8 @@ pub struct BridgeConfig {
     pub permission: bool,
     #[serde(default)]
     pub permission_default: super::protocol::PermissionDefaultPolicy,
+    #[serde(default = "default_permission_ask_timeout_secs")]
+    pub permission_ask_timeout_secs: u64,
     /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
     #[serde(default)]
     pub description: Option<String>,
@@ -278,6 +290,7 @@ impl BridgeApp {
             streaming: c.streaming,
             permission: c.permission,
             permission_default: c.permission_default,
+            permission_ask_timeout_secs: c.permission_ask_timeout_secs,
             description: c.description,
         };
         reject_shell_injection_risk(&profile, "default")?;
