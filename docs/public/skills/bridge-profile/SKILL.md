@@ -25,7 +25,7 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 | **AgentProc 0.3** | bridge 与 handler 间的通信协议：stdin 写一行 NDJSON turn，stdout 逐行输出 NDJSON 事件 |
 | **type: claude-code** | 内置类型，自动处理 Claude Code CLI 的 `--resume` 会话续接 |
 | **script:** | 指定脚本路径，bridge 按扩展名自动推断运行时（.py/.js/.ts/.sh/.rb） |
-| **SDK** | `agentproc`（Python/Node.js），封装 0.3 NDJSON 协议样板代码 |
+| **SDK** | `agentproc`（Python/Node.js），封装 0.4 NDJSON 协议样板代码 |
 
 ---
 

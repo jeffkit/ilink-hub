@@ -322,6 +322,7 @@ pub(super) async fn handle_broadcast(state: Arc<HubState>, msg: WeixinMessage) {
                     cli_session_id: None,
                     a2a_call_id: None,
                     a2a_depth: None,
+                    usage: None,
                 });
         // Grant ownership before the bridge can reply (same as ForwardTo path).
         let session_name = hub_ext

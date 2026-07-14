@@ -107,10 +107,10 @@ pub struct BridgeProfile {
     pub include_stderr_in_reply: bool,
     /// 是否启用流式 partial 转发（bridge 侧 hint，不进 wire）。默认 `true`。
     /// 设为 `false` 时，agent 仍会输出 `{"type":"partial"}` 事件，但 bridge
-    /// 不转发，只从 `{"type":"text"}` 事件拼最终回复一次性发送。
+    /// 不转发，只从 `{"type":"result"}` 事件取最终回复一次性发送。
     #[serde(default = "default_true")]
     pub streaming: bool,
-    /// 启用可选的 tool-permission 通道（agentproc 0.3）。默认 `false`，bridge
+    /// 启用可选的 tool-permission 通道（agentproc 0.4）。默认 `false`，bridge
     /// 写完 turn 对象即关闭 stdin；`true` 时保持 stdin 开着，处理
     /// `{"type":"permission_request"}` 并写回 `{"type":"permission_response"}`。
     #[serde(default)]
@@ -711,7 +711,7 @@ pub fn expand_env_var_named(
     Ok(out)
 }
 
-/// AgentProc 0.3 `${VAR}` expansion with `env_allowlist` filtering and POSIX
+/// AgentProc 0.4 `${VAR}` expansion with `env_allowlist` filtering and POSIX
 /// "unknown variable → empty string" semantics.
 ///
 /// Differs from [`expand_env_var_named`] in two ways, both required by the 0.3

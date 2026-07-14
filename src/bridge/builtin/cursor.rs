@@ -33,19 +33,17 @@ pub async fn run() -> Result<()> {
     let turn = common::read_turn_or_error();
     let (message, session_id) = common::message_and_session(&turn);
 
-    let new_session_id =
+    let _new_session_id =
         common::with_session_resume_fallback("cursor", &message, &session_id, |m, s| async move {
             stream_cursor(&m, &s).await
         })
         .await?;
 
-    common::emit_session(new_session_id.as_deref());
-
     Ok(())
 }
 
 /// Call `agent --output-format stream-json`, emit every assistant text chunk as a
-/// `partial` event and the terminal `result.result` as a `text` event, and return
+/// `partial` event and the terminal `result.result` as a `result` event, and return
 /// the session ID from the result event.
 ///
 /// Cursor's `result.result` is the concatenation of every assistant text chunk.
@@ -55,6 +53,7 @@ pub async fn run() -> Result<()> {
 /// `result.result` is the only content and becomes the `text` event so the user
 /// still receives a message.
 async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--trust".into(),
@@ -142,7 +141,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
                             total_chars = assistant_total_chars,
                             "cursor assistant chunk"
                         );
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                     }
                 }
             }
@@ -165,9 +164,7 @@ async fn stream_cursor(message: &str, session_id: &str) -> Result<Option<String>
     let status = child.wait().await.context("wait for agent")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if let Some(text) = final_text {
-        common::emit_text(&text)?;
-    }
+    emitter.emit_result_opt(final_text.as_deref(), found_session_id.as_deref())?;
 
     common::ensure_success("agent", status, &stderr, found_session_id.is_some())?;
 

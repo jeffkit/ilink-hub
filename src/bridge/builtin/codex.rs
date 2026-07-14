@@ -50,21 +50,20 @@ pub async fn run() -> Result<()> {
     let turn = common::read_turn_or_error();
     let (message, session_id) = common::message_and_session(&turn);
 
-    let new_thread_id =
+    let _new_thread_id =
         common::with_session_resume_fallback("codex", &message, &session_id, |m, s| async move {
             stream_codex(&m, &s).await
         })
         .await?;
 
-    common::emit_session(new_thread_id.as_deref());
-
     Ok(())
 }
 
 /// Call `codex exec [resume <session_id>] <message> --json`, emit each `agent_message`
-/// item as a `partial` event and the concatenation of all of them as a `text` event,
-/// and return the thread ID.
+/// item as a `partial` event and the concatenation as a `result` event (with
+/// `session_id` when known), and return the thread ID.
 async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     // Build: codex exec [resume <id>] <message> --dangerously-bypass-approvals-and-sandbox --json
     let mut args: Vec<String> = vec!["exec".into()];
 
@@ -130,7 +129,7 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
                     if item.item_type.as_deref() == Some("agent_message") {
                         if let Some(text) = &item.text {
                             if !text.trim().is_empty() {
-                                common::emit_partial(text)?;
+                                emitter.emit_partial(text)?;
                                 final_text.push_str(text);
                             }
                         }
@@ -144,9 +143,10 @@ async fn stream_codex(message: &str, session_id: &str) -> Result<Option<String>>
     let status = child.wait().await.context("wait for codex")?;
     let stderr = stderr_task.await.unwrap_or_default();
 
-    if !final_text.trim().is_empty() {
-        common::emit_text(&final_text)?;
-    }
+    emitter.emit_result_opt(
+        (!final_text.trim().is_empty()).then_some(final_text.as_str()),
+        found_thread_id.as_deref(),
+    )?;
 
     common::ensure_success("codex", status, &stderr, found_thread_id.is_some())?;
 

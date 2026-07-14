@@ -7,7 +7,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::auth::{extract_vtoken, AdminGuard, UNKNOWN_VTOKEN_MSG};
 use super::wait::wait_notify_or_shutdown;
@@ -474,6 +474,40 @@ pub async fn sendmessage(
                     if let Err(e) = set_result {
                         warn!(error = %e, vctx = %vctx, "failed to persist backend session");
                     }
+                }
+            }
+
+            if let Some(usage) = ext.usage.take() {
+                let session_name = active_session
+                    .clone()
+                    .unwrap_or_else(|| "default".to_string());
+                match serde_json::to_string(&usage) {
+                    Ok(usage_json) => {
+                        let set_result = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            state.store.set_backend_session_usage(
+                                &vctx,
+                                &vtoken,
+                                &session_name,
+                                &usage_json,
+                            ),
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("set_backend_session_usage timed out"))
+                        });
+                        if let Err(e) = set_result {
+                            warn!(error = %e, vctx = %vctx, "failed to persist agent usage");
+                        } else {
+                            info!(
+                                vctx = %vctx,
+                                session_name = %session_name,
+                                usage = %usage_json,
+                                "persisted agentproc usage"
+                            );
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to serialize agent usage"),
                 }
             }
 

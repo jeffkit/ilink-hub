@@ -1,17 +1,17 @@
 ---
 type: Reference
-title: AgentProc 0.3 协议与 Bridge Profile
-description: Bridge 与 profile 进程之间的 AgentProc 0.3 通信契约：NDJSON turn 输入、NDJSON 事件输出、流式与 permission 通道。
+title: AgentProc 0.4 协议与 Bridge Profile
+description: Bridge 与 profile 进程之间的 AgentProc 0.4 通信契约：NDJSON turn 输入、NDJSON 事件输出、流式与 permission 通道。
 resource: docs/bridge/profile-spec.md
 tags: [bridge, profile, protocol, agentproc, ndjson]
-timestamp: 2026-07-13T21:30:00+08:00
+timestamp: 2026-07-14T13:00:00+08:00
 ---
 
-# AgentProc 0.3 协议与 Bridge Profile
+# AgentProc 0.4 协议与 Bridge Profile
 
-ilink-hub 的 Bridge 与 profile 进程之间采用 **AgentProc 0.3** 协议：以 **NDJSON**（Newline Delimited JSON）作为双向底层载体，**零 SDK 依赖**，跨平台。这是对旧版 0.2（环境变量输入 + sentinel 前缀 stdout）的**硬切换**，不再保留双协议兼容。
+ilink-hub 的 Bridge 与 profile 进程之间采用 **AgentProc 0.4** 协议：以 **NDJSON**（Newline Delimited JSON）作为双向底层载体，**零 SDK 依赖**，跨平台。这是对旧版 0.3（`text`/`session` 专用事件）的**硬切换**，不再保留双协议兼容。stdin turn 形态与 0.3 相同；变更集中在 stdout 事件词表。
 
-协议常量：`PROTOCOL_VERSION = "0.3"`（定义在 `src/bridge/protocol.rs`）。
+协议常量：`PROTOCOL_VERSION = "0.4"`（定义在 `src/bridge/protocol.rs`）。
 
 ## 输入：Bridge → Agent（stdin，单条 NDJSON turn）
 
@@ -28,7 +28,7 @@ turn 对象结构：
   "message": "用户消息文本（路由后净文本，前缀已剥离）",
   "session_id": "Hub 持久化的后端 session UUID（空 = 新会话）",
   "from_user": "发送消息的用户 ID",
-  "protocol_version": "0.3",
+  "protocol_version": "0.4",
   "session_name": "session 可读名称（默认 default）",
   "attachments": [
     {"kind": "image", "url": "https://...", "filename": "a.png", "mime_type": "image/png", "size": 12345},
@@ -44,7 +44,7 @@ turn 对象结构：
 | `message` | 用户消息文本 |
 | `session_id` | 后端 session UUID（空 = 新会话） |
 | `from_user` | 发送用户 ID |
-| `protocol_version` | 固定 `"0.3"` |
+| `protocol_version` | 固定 `"0.4"` |
 | `session_name` | session 可读名称 |
 | `attachments` | 附件数组；`kind` ∈ {`image`, `file`, `video`}，`url` 为可下载地址，其余元数据可选 |
 | `permission` | `true` = 开启 permission 通道（stdin 保持开启） |
@@ -57,27 +57,32 @@ turn 对象结构：
 Agent 在 stdout 上逐行输出 NDJSON 事件，Bridge 从进程启动起**实时读取**。事件采用**封闭词汇表**：未知 `type` 静默忽略。
 
 ```json
-{"type":"partial","text":"流式片段","role":"output"}
-{"type":"text","text":"最终回复片段"}
-{"type":"session","id":"<uuid>"}
-{"type":"error","message":"可读错误文本"}
-{"type":"permission_request","id":"req-42","tool":"Bash","input":{...}}
+{"type":"partial","text":"流式片段","role":"output","session_id":"<uuid>"}
+{"type":"result","text":"最终回复","session_id":"<uuid>","usage":{"input_tokens":12,"output_tokens":34}}
+{"type":"error","message":"可读错误文本","session_id":"<uuid>"}
+{"type":"permission_request","request_id":"req-42","tool_name":"Bash","input":{...},"session_id":"<uuid>"}
 ```
 
 | 事件 | 用途 | Bridge 行为 |
 |------|------|-------------|
 | `partial` | 流式片段（`role`: `output`（默认）/ `thinking`） | `streaming` hint 为真时**立即**转发给用户；否则忽略 |
-| `text` | 最终回复片段（可多次，Bridge 拼接） | 累积为最终 body；streaming 模式下若已有 partial 转发则去重丢弃（A1 dedup） |
-| `session` | 上报 session id（last-wins） | 持久化为 Hub session ID |
+| `result` | 终端成功正文（每 turn 至多一条；可选 `usage`） | 非 streaming 下作为最终 body；streaming 下若已有 partial 转发则去重丢弃（A1 dedup） |
 | `error` | 终端错误 | 标记 turn 失败；streaming 模式经 partial 转发，非 streaming 进最终 body |
 | `permission_request` | 工具授权请求（仅 `permission: true`） | 按 `permission_default` 策略回 `permission_response` |
 
-### `partial` vs `text` 的分工
+### `session_id`（事件字段，替代 0.3 的 `session` 事件）
+
+- 可选字段，可出现在 `partial` / `result` / `error` / `permission_request` 上。
+- Bridge **first non-empty wins**：捕获第一个非空值并持久化；后续冲突值告警并忽略。
+- Agent 可在 id 已知前 omit（early omit 合法）；无 resume 能力的 agent 全程 omit（不要伪造 id）。
+- 0.3 的 `{"type":"session"}` / `{"type":"text"}` 在 0.4 中为未知类型，**静默忽略**。
+
+### `partial` vs `result` 的分工
 
 - `partial` = 流式增量，仅供 streaming 模式实时推送，**不**进入最终 body。
-- `text` = 最终回复的权威内容，非 streaming 模式下作为唯一回复发出；streaming 模式下若 partial 已转发则被去重。
+- `result` = 最终回复的权威内容（至多一条）；非 streaming 模式下作为唯一回复发出；streaming 模式下若 partial 已转发则被去重。空 `text` 的 `result` 仍可用于携带 `session_id` / `usage`。
 
-builtin agent 统一始终以 `stream-json` 运行底层 CLI 并**同时**发 `partial` + `text`，由 Bridge 依据 profile 的 `streaming` hint 决定取舍——agent 侧不再有 oneshot/streaming 分支。
+builtin agent 统一始终以 `stream-json` 运行底层 CLI 并**同时**发 `partial` + `result`，由 Bridge 依据 profile 的 `streaming` hint 决定取舍——agent 侧不再有 oneshot/streaming 分支。
 
 ## Exit code 优先级
 
@@ -160,7 +165,7 @@ profiles:
 
 `streaming` 是 **bridge 侧 hint**，决定是否转发 `partial`；agent 始终以 stream-json 运行。
 
-### 0.3 新增字段
+### 0.3/0.4 沿用字段
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -190,14 +195,23 @@ profiles:
 任何可执行程序（Python、Node、shell 脚本等）都可以作为 profile，只需：
 
 1. 从 stdin 读取一行 NDJSON `turn` 对象（`message` / `session_id` / `attachments` 等）
-2. 在 stdout 逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error`）
+2. 在 stdout 逐行输出 NDJSON 事件（`partial` / `result` / `error`；可选在事件上带 `session_id`）
+
+推荐直接用官方 SDK（`pip install "agentproc>=0.9"` / `npm install agentproc@^0.9`）。
 
 完整示例见 [`examples/`](../../examples/)。
+
+## 从 0.3 迁移要点
+
+- 删除 `{"type":"session"}` / `{"type":"text"}`；最终正文改为单条 `{"type":"result"}`
+- session 连续性改为事件字段 `session_id`（Bridge first-wins）
+- `protocol_version` 改为 `"0.4"`
+- 可选：在 `result` / `error` 上附带 `usage`（Bridge 当前可忽略）
 
 ## 从 0.2 迁移要点
 
 - 输入：`AGENT_MESSAGE` / `AGENT_SESSION_ID` / `AGENT_STREAMING` 等 env → stdin NDJSON turn
-- 输出：`AGENT_PARTIAL:` / `AGENT_SESSION:` / `AGENT_ERROR:` sentinel 行 → `{"type":"partial|session|error",...}` NDJSON 事件
+- 输出：`AGENT_PARTIAL:` / `AGENT_SESSION:` / `AGENT_ERROR:` sentinel 行 → `{"type":"partial|result|error",...}` NDJSON 事件（session 经事件字段 `session_id`）
 - 附件：`AGENT_IMAGE_URL` / `AGENT_FILE_URL` env → turn 对象的 `attachments` 数组
-- 最终回复：stdout 末尾的自由文本 → `{"type":"text",...}` 事件
+- 最终回复：stdout 末尾的自由文本 → `{"type":"result",...}` 事件
 - 流式：`AGENT_STREAMING` env 分支取消，agent 统一 stream-json，由 bridge hint 决定转发

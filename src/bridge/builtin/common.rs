@@ -1,11 +1,12 @@
 //! Shared helpers for the built-in profile handlers.
 //!
 //! Every built-in (`claude-code`, `codex`, `cursor`, `agy`, `recursive`) is an
-//! agentproc 0.3 **agent**: it reads the NDJSON [`TurnInput`](crate::bridge::protocol::TurnInput)
+//! agentproc 0.4 **agent**: it reads the NDJSON [`TurnInput`](crate::bridge::protocol::TurnInput)
 //! from stdin, runs the underlying CLI (resuming the session when one exists,
 //! falling back to a fresh session on failure), streams `partial` events, and
-//! finally emits a `session` event and a `text` event. This module factors out
-//! that boilerplate so each handler only carries its CLI-specific glue.
+//! finally emits a single `result` event (with optional `session_id`). This
+//! module factors out that boilerplate so each handler only carries its
+//! CLI-specific glue.
 
 use std::future::Future;
 use std::process::ExitStatus;
@@ -68,42 +69,154 @@ where
     }
 }
 
-/// Emit a `{"type":"session","id":...}` event when an id is present and
-/// non-empty. A no-op otherwise. Last-wins on the bridge side.
-pub fn emit_session(session_id: Option<&str>) {
-    if let Some(sid) = session_id {
-        if !sid.is_empty() {
-            println!("{}", serde_json::json!({"type":"session","id":sid}));
-            std::io::Write::flush(&mut std::io::stdout()).ok();
-        }
-    }
-}
-
 /// Emit one streamed chunk as a `{"type":"partial","text":...}` event and flush
-/// stdout so the bridge forwards it immediately. The bridge forwards partials
-/// only when the profile's `streaming` hint is true; otherwise it ignores them
-/// and assembles the reply from `text` events.
-pub fn emit_partial(text: &str) -> Result<()> {
-    println!("{}", serde_json::json!({"type":"partial","text":text}));
+/// stdout so the bridge forwards it immediately.
+pub fn emit_partial_with_session(text: &str, session_id: Option<&str>) -> Result<()> {
+    let mut obj = serde_json::json!({"type":"partial","text":text});
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        obj["session_id"] = serde_json::json!(sid);
+    }
+    println!("{obj}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
     Ok(())
 }
 
-/// Emit a `{"type":"text","text":...}` event — a piece of the final reply body.
-/// Multiple `text` events concatenate on the bridge side. Flush so ordering is
-/// preserved relative to preceding `partial`/`session` events.
-pub fn emit_text(text: &str) -> Result<()> {
-    println!("{}", serde_json::json!({"type":"text","text":text}));
+/// Emit the terminal `{"type":"result","text":...}` success body (at most one
+/// per turn). When `session_id` is present and non-empty it is attached for
+/// continuity; otherwise the field is omitted (stateless agents).
+pub fn emit_result(text: &str, session_id: Option<&str>) -> Result<()> {
+    let mut obj = serde_json::json!({"type":"result","text":text});
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        obj["session_id"] = serde_json::json!(sid);
+    }
+    println!("{obj}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
     Ok(())
+}
+
+/// Emit `result` when there is a body and/or a session id to report. No-op when
+/// both are empty (nothing to persist or show).
+pub fn emit_result_or_session(text: Option<&str>, session_id: Option<&str>) -> Result<()> {
+    let body = text.unwrap_or("");
+    let has_sid = session_id.is_some_and(|s| !s.is_empty());
+    if body.is_empty() && !has_sid {
+        return Ok(());
+    }
+    emit_result(body, session_id)
 }
 
 /// Emit a terminal `{"type":"error","message":...}` event. The bridge forwards
 /// the message to the user and marks the turn failed. The agent SHOULD exit
 /// non-zero shortly after; this helper does not exit for the caller.
 pub fn emit_error(text: &str) {
-    println!("{}", serde_json::json!({"type":"error","message":text}));
+    emit_error_with_session(text, None);
+}
+
+/// Like [`emit_error`], optionally attaching `session_id` so a failed turn can
+/// still hand back continuity (0.4).
+pub fn emit_error_with_session(text: &str, session_id: Option<&str>) {
+    let mut obj = serde_json::json!({"type":"error","message":text});
+    if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+        obj["session_id"] = serde_json::json!(sid);
+    }
+    println!("{obj}");
     std::io::Write::flush(&mut std::io::stdout()).ok();
+}
+
+/// Helper that stamps `session_id` on AgentProc 0.4 events.
+///
+/// - When the inbound turn already carries a session id (resume), every event
+///   is stamped immediately (spec SHOULD).
+/// - When starting a new session, `partial`s are buffered until the CLI
+///   discovers an id, then flushed with that id. `permission_request` must not
+///   be buffered (callers emit those directly). If the turn ends with no id
+///   (stateless), buffered partials are flushed without `session_id`.
+pub struct SessionEmitter {
+    inbound: String,
+    discovered: Option<String>,
+    buffered_partials: Vec<String>,
+}
+
+impl SessionEmitter {
+    pub fn new(inbound_session_id: &str) -> Self {
+        Self {
+            inbound: inbound_session_id.to_string(),
+            discovered: None,
+            buffered_partials: Vec::new(),
+        }
+    }
+
+    /// Effective id to stamp: inbound (resume) wins until/unless discovery
+    /// fills in a new-session id.
+    pub fn current_id(&self) -> Option<&str> {
+        if !self.inbound.is_empty() {
+            Some(self.inbound.as_str())
+        } else {
+            self.discovered.as_deref().filter(|s| !s.is_empty())
+        }
+    }
+
+    /// Record a CLI-discovered session id (no-op when empty or when inbound
+    /// already provides continuity). Flushes any buffered partials.
+    pub fn discover(&mut self, id: Option<&str>) -> Result<()> {
+        let Some(id) = id.filter(|s| !s.is_empty()) else {
+            return Ok(());
+        };
+        if self.inbound.is_empty() && self.discovered.is_none() {
+            self.discovered = Some(id.to_string());
+            self.flush_partials()?;
+        }
+        Ok(())
+    }
+
+    pub fn emit_partial(&mut self, text: &str) -> Result<()> {
+        if let Some(sid) = self.current_id() {
+            emit_partial_with_session(text, Some(sid))
+        } else {
+            // New session, id not yet known — buffer.
+            self.buffered_partials.push(text.to_string());
+            Ok(())
+        }
+    }
+
+    pub fn emit_result_opt(&mut self, text: Option<&str>, session_id: Option<&str>) -> Result<()> {
+        self.discover(session_id)?;
+        let sid = self
+            .current_id()
+            .map(str::to_string)
+            .or_else(|| session_id.filter(|s| !s.is_empty()).map(str::to_string));
+        self.flush_partials()?;
+        emit_result_or_session(text.filter(|t| !t.is_empty()), sid.as_deref())
+    }
+
+    pub fn emit_error(&mut self, text: &str, session_id: Option<&str>) -> Result<()> {
+        self.discover(session_id)?;
+        let sid = self
+            .current_id()
+            .map(str::to_string)
+            .or_else(|| session_id.filter(|s| !s.is_empty()).map(str::to_string));
+        // Flush buffered partials before the terminal error so ordering is preserved.
+        self.flush_partials()?;
+        emit_error_with_session(text, sid.as_deref());
+        Ok(())
+    }
+
+    /// Flush remaining buffered partials without a session id (stateless end).
+    pub fn finish_without_session(&mut self) -> Result<()> {
+        self.flush_partials()
+    }
+
+    fn flush_partials(&mut self) -> Result<()> {
+        if self.buffered_partials.is_empty() {
+            return Ok(());
+        }
+        let sid = self.current_id().map(str::to_string);
+        let pending = std::mem::take(&mut self.buffered_partials);
+        for text in pending {
+            emit_partial_with_session(&text, sid.as_deref())?;
+        }
+        Ok(())
+    }
 }
 
 /// Spawn a background task that drains a child pipe (typically stderr) into a String,

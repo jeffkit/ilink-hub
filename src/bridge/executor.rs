@@ -1,6 +1,7 @@
-//! AgentProc 0.3 bridge-side executor: spawn the agent process, write the NDJSON
-//! turn object to its stdin, read NDJSON events from its stdout, and forward
-//! partials / assemble the final reply body.
+//! AgentProc 0.4 bridge-side executor: spawn the agent process, write the NDJSON
+//! turn object to its stdin, read NDJSON events from its stdout (`partial` /
+//! `result` / `error` / `permission_request`), and forward partials / assemble
+//! the final reply body.
 //!
 //! See `docs/knowledge/bridges/profile-protocol.md` and the upstream spec at
 //! `~/projects/agentproc/spec/protocol.md`.
@@ -16,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::bridge::config::BridgeProfile;
 use crate::bridge::protocol::{self, AgentEvent, Attachment, PermissionResponse, TurnObject};
+use crate::bridge::wire_assemble::is_valid_session_id;
 use crate::bridge::ApprovalBroker;
 use crate::ilink::types::WeixinMessage;
 use crate::paths::expand_user_path;
@@ -35,7 +37,7 @@ pub const MAX_CLI_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 /// by a shell-style wrapper (`bash -c`, `sh -c`, `env` parsing) — NUL,
 /// newlines, or carriage returns. Only validates a field when its placeholder
 /// actually appears in the template; callers that deliver the message via the
-/// stdin turn object (the 0.3 default) will not have `{{MESSAGE}}` in any arg
+/// stdin turn object (the 0.4 default) will not have `{{MESSAGE}}` in any arg
 /// template and must not be rejected just because the message contains
 /// newlines.
 ///
@@ -116,7 +118,7 @@ pub enum PlaceholderError {
 
 /// Build the `attachments` array for the turn object from a WeChat message's
 /// media items. Replaces the 0.2 `AGENT_IMAGE_URL` / `AGENT_FILE_URL` /
-/// `AGENT_VIDEO_URL` env vars — under 0.3 all media travels in the turn object.
+/// `AGENT_VIDEO_URL` env vars — under 0.4 all media travels in the turn object.
 pub(super) fn build_attachments(msg: &WeixinMessage) -> Vec<Attachment> {
     use crate::ilink::types::msg_type;
     let mut out = Vec::new();
@@ -180,7 +182,7 @@ pub(super) fn build_attachments(msg: &WeixinMessage) -> Vec<Attachment> {
 }
 
 /// Metrics collected for one `run_cli` invocation (for structured logging).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct CliRunSummary {
     pub duration_ms: u64,
     pub exit_code: Option<i32>,
@@ -194,6 +196,9 @@ pub(super) struct CliRunSummary {
     /// True when the agent emitted an `error` event (turn is failed regardless
     /// of exit code; the error text was already forwarded to the user).
     pub error_event: bool,
+    /// Optional AgentProc 0.4 `usage` object from `result` / `error` (MAY ignore
+    /// unknown keys). Surfaced in logs and forwarded to Hub via `HubExt`.
+    pub usage: Option<serde_json::Value>,
 }
 
 fn truncate_for_log(s: &str, max_bytes: usize) -> String {
@@ -207,7 +212,7 @@ fn truncate_for_log(s: &str, max_bytes: usize) -> String {
     format!("{}… [truncated, {} bytes total]", &s[..end], s.len())
 }
 
-/// Compose the fixed infra set the child always inherits (per agentproc 0.3).
+/// Compose the fixed infra set the child always inherits (per agentproc 0.4).
 /// None of these are credential-bearing; they let the agent find its
 /// interpreter, temp dir, and locale.
 fn infra_env_vars() -> &'static [&'static str] {
@@ -271,7 +276,7 @@ pub(super) async fn run_cli(
         cmd.current_dir(&home);
     }
 
-    // Infra set: always copied from the bridge's own environment (0.3 removes
+    // Infra set: always copied from the bridge's own environment (0.4 removes
     // the `env_inherit` escape hatch; ambient vars a profile needs must be
     // declared in its `env` block).
     let bridge_env: std::collections::HashMap<String, String> = std::env::vars().collect();
@@ -401,7 +406,14 @@ pub(super) async fn run_cli(
     /// Output of the stdout-parsing loop: text chunks, session id, forwarded
     /// partial count, error-event flag, and the error message (for non-streaming
     /// final body). Factored into a type alias to keep the closure signature readable.
-    type StreamOutcome = (Vec<String>, Option<String>, u32, bool, Option<String>);
+    type StreamOutcome = (
+        Vec<String>,
+        Option<String>,
+        u32,
+        bool,
+        Option<String>,
+        Option<serde_json::Value>,
+    );
 
     let stream_result: Result<StreamOutcome> = tokio::time::timeout(dur, async move {
         use tokio::io::AsyncBufReadExt;
@@ -414,6 +426,7 @@ pub(super) async fn run_cli(
         let mut partials_truncated = false;
         let mut error_seen = false;
         let mut error_message: Option<String> = None;
+        let mut usage: Option<serde_json::Value> = None;
         let mut line = String::new();
         loop {
             line.clear();
@@ -422,7 +435,7 @@ pub(super) async fn run_cli(
                 break;
             }
             let Some(event) = protocol::parse_event(&line) else {
-                // Malformed / unknown line: log and ignore (not body, per 0.3).
+                // Malformed / unknown line: log and ignore (not body, per 0.4).
                 let trimmed = line.trim_end_matches(['\n', '\r']);
                 if !trimmed.is_empty() {
                     warn!(
@@ -433,8 +446,33 @@ pub(super) async fn run_cli(
                 }
                 continue;
             };
+            // 0.4: session continuity is an optional field on events; first
+            // non-empty wins. A later conflicting value is a violation — keep
+            // the first and warn.
+            if let Some(sid) = event.session_id() {
+                if !is_valid_session_id(sid) {
+                    warn!(
+                        profile = profile_name,
+                        session_id = %sid,
+                        "ignoring invalid session_id (path separators/control chars)"
+                    );
+                } else {
+                    match &session_id {
+                        None => session_id = Some(sid.to_string()),
+                        Some(existing) if existing != sid => {
+                            warn!(
+                                profile = profile_name,
+                                kept = %existing,
+                                ignored = %sid,
+                                "conflicting session_id on event; keeping first"
+                            );
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
             match event {
-                AgentEvent::Partial { text, role: _ } => {
+                AgentEvent::Partial { text, role: _, .. } => {
                     if error_seen || !streaming || partials_truncated || text.is_empty() {
                         continue;
                     }
@@ -457,8 +495,23 @@ pub(super) async fn run_cli(
                         let _ = partial_tx.send(Some(text));
                     }
                 }
-                AgentEvent::Text { text } => {
+                AgentEvent::Result {
+                    text,
+                    usage: event_usage,
+                    ..
+                } => {
+                    if usage.is_none() {
+                        usage = event_usage;
+                    }
                     if error_seen {
+                        continue;
+                    }
+                    // At most one result per turn; subsequent ones are ignored.
+                    if !text_chunks.is_empty() {
+                        warn!(
+                            profile = profile_name,
+                            "ignoring subsequent result event (at most one per turn)"
+                        );
                         continue;
                     }
                     if text_bytes + text.len() > MAX_CLI_CAPTURE_BYTES {
@@ -481,19 +534,21 @@ pub(super) async fn run_cli(
                         }
                         warn!(
                             limit_bytes = MAX_CLI_CAPTURE_BYTES,
-                            "CLI text body exceeded capture limit; hard-truncating"
+                            "CLI result body exceeded capture limit; hard-truncating"
                         );
                     } else {
                         text_bytes += text.len();
                         text_chunks.push(text);
                     }
                 }
-                AgentEvent::Session { id } => {
-                    if !id.is_empty() {
-                        session_id = Some(id);
+                AgentEvent::Error {
+                    message,
+                    usage: event_usage,
+                    ..
+                } => {
+                    if usage.is_none() {
+                        usage = event_usage;
                     }
-                }
-                AgentEvent::Error { message } => {
                     if !message.trim().is_empty() {
                         error_message = Some(message.clone());
                     }
@@ -601,12 +656,13 @@ pub(super) async fn run_cli(
             partial_count,
             error_seen,
             error_message,
+            usage,
         ))
     })
     .await
     .map_err(|_| anyhow::anyhow!("CLI timed out after {}s", cfg.timeout_secs))?;
 
-    let (text_chunks, cli_sid, partial_count, error_seen, error_message) = stream_result?;
+    let (text_chunks, cli_sid, partial_count, error_seen, error_message, usage) = stream_result?;
 
     // The stdin task may still be alive if it is blocked sending a permission
     // response; closing perm_tx above unblocks it. Wait briefly for it to flush.
@@ -643,8 +699,8 @@ pub(super) async fn run_cli(
     let exited_by_signal = !status.success() && exit_code.is_none();
     let duration_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
 
-    // Assemble the final body from text events. In non-streaming mode this is
-    // what the user receives; in streaming mode the dispatcher drops it when
+    // Assemble the final body from the result event. In non-streaming mode this
+    // is what the user receives; in streaming mode the dispatcher drops it when
     // partials were already forwarded (A1 dedup policy).
     let mut body = text_chunks.concat();
     if !body.is_empty() && body.chars().count() > max_chars {
@@ -668,6 +724,7 @@ pub(super) async fn run_cli(
             stderr_bytes: stderr.len(),
             cli_session_present,
             error_event: true,
+            usage: usage.clone(),
         };
         info!(
             profile = profile_name,
@@ -677,6 +734,7 @@ pub(super) async fn run_cli(
             exit_code = ?summary.exit_code,
             partial_count = summary.partial_count,
             cli_session = summary.cli_session_present,
+            usage = ?summary.usage,
             "CLI finished: error event"
         );
         return Ok((body_out, cli_sid, summary));
@@ -697,6 +755,7 @@ pub(super) async fn run_cli(
         stderr_bytes: stderr.len(),
         cli_session_present,
         error_event: false,
+        usage: usage.clone(),
     };
 
     info!(
@@ -710,6 +769,7 @@ pub(super) async fn run_cli(
         body_bytes = summary.body_bytes,
         stderr_bytes = summary.stderr_bytes,
         cli_session = summary.cli_session_present,
+        usage = ?summary.usage,
         success = status.success(),
         "CLI finished"
     );
@@ -902,7 +962,7 @@ mod tests {
     }
 
     /// Newline in message is OK when the template does not use {{MESSAGE}}
-    /// (the 0.3 default — the message travels via the stdin turn object).
+    /// (the 0.4 default — the message travels via the stdin turn object).
     #[test]
     fn placeholders_allow_newline_in_message_when_placeholder_absent() {
         let result = apply_placeholders(
@@ -996,16 +1056,15 @@ mod tests {
         format!("command: /bin/sh\nargs:\n  - \"{path_str}\"\ntimeout_secs: {timeout_secs}\n")
     }
 
-    /// A 0.3 agent that reads the turn object from stdin and emits NDJSON
-    /// events: a session event, two partials, and a final text body.
+    /// A 0.4 agent that reads the turn object from stdin and emits NDJSON
+    /// events: partials (with session_id) and a final result body.
     #[tokio::test]
     async fn test_agentproc_partial_session_text_parsing() {
         // sh script: read stdin (the turn line), then emit NDJSON events.
         let script = r#"read -r line; \
-printf '%s\n' '{"type":"session","id":"sess-xyz"}'; \
-printf '%s\n' '{"type":"partial","text":"chunk-a"}'; \
-printf '%s\n' '{"type":"partial","text":"chunk-b"}'; \
-printf '%s\n' '{"type":"text","text":"final-body"}'"#;
+printf '%s\n' '{"type":"partial","text":"chunk-a","session_id":"sess-xyz"}'; \
+printf '%s\n' '{"type":"partial","text":"chunk-b","session_id":"sess-xyz"}'; \
+printf '%s\n' '{"type":"result","text":"final-body","session_id":"sess-xyz"}'"#;
         let yaml = shell_profile_yaml(script, 5);
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
@@ -1047,7 +1106,7 @@ printf '%s\n' '{"type":"text","text":"final-body"}'"#;
     async fn test_non_streaming_ignores_partials() {
         let script = r#"read -r line; \
 printf '%s\n' '{"type":"partial","text":"live-chunk"}'; \
-printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
+printf '%s\n' '{"type":"result","text":"assembled-body"}'"#;
         let yaml = format!("{}\nstreaming: false\n", shell_profile_yaml(script, 5));
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
@@ -1130,7 +1189,7 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
     #[tokio::test]
     async fn test_turn_object_written_to_stdin() {
         // Use python3 to parse the JSON turn and emit it back as a text event.
-        let script = r#"python3 -c 'import sys,json; t=json.loads(sys.stdin.readline()); print(json.dumps({"type":"text","text":"echo:"+t["message"]+"/"+t["protocol_version"]}))'"#;
+        let script = r#"python3 -c 'import sys,json; t=json.loads(sys.stdin.readline()); print(json.dumps({"type":"result","text":"echo:"+t["message"]+"/"+t["protocol_version"]}))'"#;
         let yaml = shell_profile_yaml(script, 5);
         let app = BridgeApp::parse_yaml(&yaml).unwrap();
         let (_name, profile, _payload) = app.resolve("hello").unwrap();
@@ -1152,7 +1211,7 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
         .await
         .expect("run_cli failed");
 
-        assert_eq!(body, "echo:hello/0.3");
+        assert_eq!(body, "echo:hello/0.4");
     }
 
     // ─── ask permission strategy ────────────────────────────────────────────
@@ -1178,6 +1237,7 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
             input: serde_json::json!({"command": "echo hi"}),
             description: None,
             tool_use_id: None,
+            session_id: None,
         };
         let q = format_approval_question(&req);
         assert!(q.contains("Bash"));
@@ -1186,12 +1246,12 @@ printf '%s\n' '{"type":"text","text":"assembled-body"}'"#;
     }
 
     /// A fake agent that emits a permission_request, waits for the bridge's
-    /// permission_response on stdin, then emits a final text event.
+    /// permission_response on stdin, then emits a final result event.
     fn permission_ask_script() -> &'static str {
         r#"read -r _turn; \
 printf '%s\n' '{"type":"permission_request","request_id":"r1","tool_name":"Bash","input":{"command":"rm -rf x"}}'; \
 read -r _resp; \
-printf '%s\n' '{"type":"text","text":"after-permission"}'"#
+printf '%s\n' '{"type":"result","text":"after-permission"}'"#
     }
 
     fn ask_profile_yaml(script: &str, ask_timeout: u64) -> String {

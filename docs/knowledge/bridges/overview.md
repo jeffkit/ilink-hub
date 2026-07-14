@@ -1,14 +1,14 @@
 ---
 type: Concept
 title: Bridge 概览
-description: Bridge 是 ilink-hub 的客户端适配层，每种 AI 工具对应一种 Bridge 实现（AgentProc 0.3 NDJSON 协议）。
+description: Bridge 是 ilink-hub 的客户端适配层，每种 AI 工具对应一种 Bridge 实现（AgentProc 0.4 NDJSON 协议）。
 tags: [bridge, architecture, agentproc]
 timestamp: 2026-07-13T20:30:00+08:00
 ---
 
 # Bridge 概览
 
-Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 工具通信，将微信消息转发给对应的 AI 后端并把回复传回用户。Bridge 与 profile 进程之间采用 **AgentProc 0.3** NDJSON 协议（见 [P0 协议与 Profile](profile-protocol.md)）。
+Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 工具通信，将微信消息转发给对应的 AI 后端并把回复传回用户。Bridge 与 profile 进程之间采用 **AgentProc 0.4** NDJSON 协议（见 [P0 协议与 Profile](profile-protocol.md)）。
 
 ## 内置 Bridge
 
@@ -37,7 +37,7 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 ```
 src/bridge/
 ├── mod.rs              # Bridge trait 定义与注册
-├── protocol.rs         # AgentProc 0.3 wire 协议：TurnObject / AgentEvent / PermissionResponse
+├── protocol.rs         # AgentProc 0.4 wire 协议：TurnObject / AgentEvent / PermissionResponse
 ├── executor.rs         # 进程编排：写 NDJSON turn 到 stdin、解析 NDJSON 事件、permission 通道
 ├── config.rs           # BridgeProfile / BridgeConfig schema（env_allowlist / permission / kill_grace_secs 等）
 ├── probe.rs            # profile 健康探针（0.3 NDJSON turn）
@@ -54,5 +54,5 @@ src/bridge/
 
 ## 相关文档
 
-- [AgentProc 0.3 协议与 Profile](profile-protocol.md) — NDJSON turn/事件契约
+- [AgentProc 0.4 协议与 Profile](profile-protocol.md) — NDJSON turn/事件契约
 - [微信命令](/api/commands.md) — `/use <name>` 切换 Bridge

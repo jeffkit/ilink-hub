@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### agentproc wire 0.4 对齐（2026-07-14）
+
+**⚠️ Breaking Change** — Bridge ↔ profile 的 stdout 事件词表从 0.3 硬切换到 agentproc wire `0.4`（SDK 0.9.0）。stdin turn 对象形态不变。
+
+| 0.3 | 0.4 |
+|-----|-----|
+| `{"type":"text","text":...}`（可多次拼接） | 单条 `{"type":"result","text":...}`（可选 `usage`） |
+| `{"type":"session","id":...}`（last-wins） | 删除；改用事件上的可选字段 `session_id`（first non-empty wins；非法 id 拒绝） |
+| `protocol_version: "0.3"` | `"0.4"` |
+
+自定义 profile / 外部 agentproc SDK agent 需升级到 SDK ≥ 0.9.0，或自行改发 `result` + `session_id`。仍发 `text`/`session` 的 agent 会被 Bridge 静默忽略（无正文 / 无 session 持久化）。
+
+**实现范围**
+
+- `src/bridge/protocol.rs`：事件枚举、`PROTOCOL_VERSION`、解析与单测
+- `src/bridge/executor.rs` / `wire_assemble.rs`：消费 `result` + `session_id` 校验 + `usage` 捕获
+- `src/bridge/builtin/*`：`SessionEmitter`（inbound stamp + 新会话缓冲 flush）
+- `usage` 落库：`HubExt.usage` → Hub `backend_sessions_v2.last_usage_json`（migration v14）+ 结构化日志
+- conformance：`tests/fixtures/agentproc_scenarios_0.4.json` + `tests/agentproc_conformance.rs`
+- 文档：`docs/knowledge/bridges/profile-protocol.md` 等
+
 ### agentproc 协议对齐 Step 1：Rust bridge 协议改名（2026-06-26）
 
 **⚠️ Breaking Change** — bridge ↔ profile 进程间的 P0 协议变量名从 `ILINK_*` 改名为 agentproc v0.3.0 的 `AGENT_*`。用户**自定义 YAML** 中若硬编码了 `cli_session_first_line_prefix: "ILINK_SESSION:"` 需更新为 `"AGENT_SESSION:"`。自定义 profile 脚本若读取 `ILINK_MESSAGE`/`ILINK_SESSION_ID`/`ILINK_PARTIAL:` 等需改读 `AGENT_*`；附件相关 env var（`ILINK_IMAGE_URL`/`ILINK_FILE_URL`/`ILINK_FILE_NAME`/`ILINK_VIDEO_URL`/`ILINK_ITEM_TYPE`）及 `ILINK_CONTEXT_TOKEN` 也一并改名（见下表）。Hub 自身配置变量（`ILINK_ADMIN_TOKEN`、`ILINK_HUB_MASTER_KEY`、`ILINK_CORS_ORIGINS`、`ILINK_TOKEN`、`ILINK_BASE_URL` 等）**不变**。

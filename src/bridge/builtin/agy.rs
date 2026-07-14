@@ -2,9 +2,9 @@
 //! session continuity.
 //!
 //! Unlike Claude Code or Cursor, `agy` outputs plain text to stdout (no stream-json),
-//! so there are no `partial` events — the full reply is emitted as a single `text`
-//! event. The conversation ID is extracted from the agy log file written during
-//! execution and surfaced via a `session` event.
+//! so there are no `partial` events — the full reply is emitted as a single `result`
+//! event (with optional `session_id`). The conversation ID is extracted from the
+//! agy log file written during execution.
 //!
 //! Session management:
 //!   - New session: run `agy -p <message>`, parse `Created conversation <uuid>` from log
@@ -30,10 +30,11 @@ pub async fn run() -> Result<()> {
         })
         .await?;
 
-    common::emit_session(new_session_id.as_deref());
-    if !response.trim().is_empty() {
-        common::emit_text(&response)?;
-    }
+    let mut emitter = common::SessionEmitter::new(&session_id);
+    emitter.emit_result_opt(
+        (!response.trim().is_empty()).then_some(response.as_str()),
+        new_session_id.as_deref(),
+    )?;
 
     Ok(())
 }

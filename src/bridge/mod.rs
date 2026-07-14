@@ -15,6 +15,7 @@ mod paths;
 mod probe;
 pub mod protocol;
 pub mod vtoken_env;
+pub mod wire_assemble;
 
 pub(crate) use approval::ApprovalBroker;
 

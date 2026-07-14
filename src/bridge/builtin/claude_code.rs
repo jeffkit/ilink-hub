@@ -46,16 +46,12 @@ pub async fn run() -> Result<()> {
     let attachments = turn.attachments.clone();
     let permission = turn.permission;
 
-    let new_session_id =
+    let _new_session_id =
         common::with_session_resume_fallback("claude-code", &message, &session_id, |m, s| {
             let atts = attachments.clone();
             async move { invoke_claude(&m, &s, &atts, permission).await }
         })
         .await?;
-
-    // invoke_claude emits partials + the final text event itself; we only
-    // surface the session event here (last-wins on the bridge side).
-    common::emit_session(new_session_id.as_deref());
 
     Ok(())
 }
@@ -89,6 +85,7 @@ async fn invoke_claude(
 /// `result.result` (with no preceding `assistant` event); it is emitted as the
 /// final `text` event so non-streaming consumers still receive it.
 async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     let mut args: Vec<String> = vec![
         "--output-format".into(),
         "stream-json".into(),
@@ -164,7 +161,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
                     // Guard with trim() so whitespace-only text blocks do not
                     // produce an empty-looking partial.
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                     }
                 }
             }
@@ -172,7 +169,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
                 found_session_id = event.session_id.clone();
                 if event.is_result_error() {
                     if let Some(err_text) = event.result_error_message() {
-                        common::emit_error(&err_text);
+                        emitter.emit_error(&err_text, found_session_id.as_deref())?;
                         error_emitted = true;
                     }
                 } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
@@ -187,9 +184,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !error_emitted {
-        if let Some(text) = final_text {
-            common::emit_text(&text)?;
-        }
+        emitter.emit_result_opt(final_text.as_deref(), found_session_id.as_deref())?;
     }
 
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
@@ -208,6 +203,7 @@ async fn stream_claude_permission(
     session_id: &str,
     attachments: &[crate::bridge::protocol::Attachment],
 ) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     // Build the SDKUserMessage `content`: a plain string for text-only turns,
     // or an array of content blocks for multimodal turns (image/document).
     let content: Value = if attachments.is_empty() {
@@ -231,9 +227,12 @@ async fn stream_claude_permission(
                     }));
                 }
                 other => {
-                    common::emit_error(&format!(
-                        "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
-                    ));
+                    emitter.emit_error(
+                        &format!(
+                            "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
+                        ),
+                        None,
+                    )?;
                     return Ok(None);
                 }
             }
@@ -395,7 +394,7 @@ async fn stream_claude_permission(
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                     }
                 }
             }
@@ -403,7 +402,7 @@ async fn stream_claude_permission(
                 found_session_id = event.session_id.clone();
                 if event.is_result_error() {
                     if let Some(err_text) = event.result_error_message() {
-                        common::emit_error(&err_text);
+                        emitter.emit_error(&err_text, found_session_id.as_deref())?;
                         error_emitted = true;
                     }
                 } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
@@ -418,9 +417,7 @@ async fn stream_claude_permission(
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !error_emitted {
-        if let Some(text) = final_text {
-            common::emit_text(&text)?;
-        }
+        emitter.emit_result_opt(final_text.as_deref(), found_session_id.as_deref())?;
     }
 
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
@@ -527,6 +524,7 @@ async fn stream_claude_multimodal(
     session_id: &str,
     attachments: &[crate::bridge::protocol::Attachment],
 ) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     let mut content_blocks: Vec<serde_json::Value> = Vec::new();
     content_blocks.push(json!({ "type": "text", "text": message }));
 
@@ -547,9 +545,12 @@ async fn stream_claude_multimodal(
                 }));
             }
             other => {
-                common::emit_error(&format!(
-                    "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
-                ));
+                emitter.emit_error(
+                    &format!(
+                        "unsupported attachment kind `{other}` for claude-code (only image and file are accepted)"
+                    ),
+                    None,
+                )?;
                 return Ok(None);
             }
         }
@@ -644,7 +645,7 @@ async fn stream_claude_multimodal(
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                     }
                 }
             }
@@ -652,7 +653,7 @@ async fn stream_claude_multimodal(
                 found_session_id = event.session_id.clone();
                 if event.is_result_error() {
                     if let Some(err_text) = event.result_error_message() {
-                        common::emit_error(&err_text);
+                        emitter.emit_error(&err_text, found_session_id.as_deref())?;
                         error_emitted = true;
                     }
                 } else if let Some(result_text) = event.result.filter(|t| !t.trim().is_empty()) {
@@ -667,9 +668,7 @@ async fn stream_claude_multimodal(
     let stderr = stderr_task.await.unwrap_or_default();
 
     if !error_emitted {
-        if let Some(text) = final_text {
-            common::emit_text(&text)?;
-        }
+        emitter.emit_result_opt(final_text.as_deref(), found_session_id.as_deref())?;
     }
 
     common::ensure_success("claude", status, &stderr, found_session_id.is_some())?;
