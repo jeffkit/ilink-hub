@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-14
+
+> **⚠️ 本版本含 Breaking Change**：bridge ↔ profile 协议从 agentproc wire 0.3 硬切换到 0.4。
+> 自定义 profile / 外部 agentproc SDK agent 需升级到 SDK ≥ 0.9.0，或自行改发 `result` + `session_id`；
+> 仍发 `text` / `session` 的 agent 会被 Bridge 静默忽略（无正文 / 无 session 持久化）。详见下方「agentproc wire 0.4 对齐」。
+
 ### agentproc wire 0.4 对齐（2026-07-14）
 
 **⚠️ Breaking Change** — Bridge ↔ profile 的 stdout 事件词表从 0.3 硬切换到 agentproc wire `0.4`（SDK 0.9.0）。stdin turn 对象形态不变。
@@ -97,8 +103,6 @@ All notable changes to this project will be documented in this file.
 - 拆分 `server/routes.rs` (1302 行) → `routes/{ilink,hub,admin,metrics}.rs`
 - 拆分 `store/store_tests.rs` (2140 行) → 各模块 `_tests.rs`
 - 错误类型统一（HubError vs anyhow）
-
-### Bridge — claude_code 多模态（图片 + PDF/文本文件）支持
 
 ### Bridge — claude_code 多模态（图片 + PDF/文本文件）支持
 
