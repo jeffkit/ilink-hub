@@ -2,7 +2,7 @@
 
 > 最后更新：2026-07-13
 
-本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。Profile 通过 **AgentProc 0.3 NDJSON 协议**与 bridge 通信：从 stdin 读一行 turn 对象，在 stdout 逐行输出 NDJSON 事件。
+本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。Profile 通过 **AgentProc 0.4 NDJSON 协议**与 bridge 通信：从 stdin 读一行 turn 对象，在 stdout 逐行输出 NDJSON 事件。
 
 ---
 
@@ -19,7 +19,7 @@
 ```bash
 mkdir my-ai-profile && cd my-ai-profile
 npm init -y
-npm install agentproc
+npm install agentproc@^0.9
 ```
 
 ---
@@ -41,7 +41,7 @@ createProfile(async ({ message, sessionId, fromUser }) => {
 `createProfile` 帮你做了所有样板工作：
 - 从 stdin 读取 NDJSON turn 对象（`message` / `session_id` / `from_user` / `attachments` 等）
 - 调用你的 handler 函数
-- 按 AgentProc 0.3 协议把回复作为 `{"type":"text",...}` 事件写到 stdout
+- 按 AgentProc 0.4 协议把回复作为 `{"type":"text",...}` 事件写到 stdout
 
 ### 调用真实 AI（以 OpenAI 为例）
 
@@ -219,6 +219,6 @@ profiles:
 
 ## 下一步
 
-- [AgentProc 0.3 协议规范](/bridge/profile-spec) — 完整技术规范
+- [AgentProc 0.4 协议规范](/bridge/profile-spec) — 完整技术规范
 - [Python 版本教程](/bridge/develop-python) — 用 Python 编写同等功能的 Profile
 - [接入 Claude Code](/guide/claude-code) — 使用内置 claude-code profile

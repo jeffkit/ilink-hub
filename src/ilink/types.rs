@@ -226,6 +226,10 @@ pub struct HubExt {
     /// Hub rejects `call_agent` when depth >= MAX_A2A_DEPTH.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub a2a_depth: Option<u8>,
+    /// Bridge → Hub: optional AgentProc 0.4 `usage` object from the terminal
+    /// `result` / `error` event (token/cost stats). Hub MAY persist for display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
 }
 
 impl WeixinMessage {

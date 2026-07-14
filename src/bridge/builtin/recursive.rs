@@ -1,15 +1,14 @@
 //! Built-in `recursive` profile: wraps the `recursive` CLI with session continuity.
 //!
-//! AgentProc 0.3 agent: reads the NDJSON turn object from stdin, calls
+//! AgentProc 0.4 agent: reads the NDJSON turn object from stdin, calls
 //! `recursive --headless --output-format stream-json [-r <session_id>] -p <message>`,
 //! and emits agentproc NDJSON events on stdout:
 //!
 //! - `{"type":"partial","text":...}` for each `assistant` text chunk (the bridge
 //!   forwards these live when the profile's `streaming` hint is true).
-//! - `{"type":"session","id":...}` at the end (last-wins on the bridge side).
-//! - `{"type":"text","text":...}` for the terminal `result.result` (the final
-//!   reply body; the bridge drops it when partials already delivered it).
-//! - `{"type":"error","message":...}` when the terminal `result` reports a failure.
+//! - `{"type":"result","text":...,"session_id":...}` for the terminal body + continuity.
+//! - `{"type":"error","message":...,"session_id":...}` when the terminal CLI
+//!   `result` reports a failure.
 //!
 //! ## Output parsing
 //!
@@ -59,7 +58,7 @@ pub async fn run() -> Result<()> {
     let turn = common::read_turn_or_error();
     let (message, session_id) = common::message_and_session(&turn);
 
-    let new_session_id = common::with_session_resume_fallback(
+    let _new_session_id = common::with_session_resume_fallback(
         "recursive",
         &message,
         &session_id,
@@ -67,19 +66,16 @@ pub async fn run() -> Result<()> {
     )
     .await?;
 
-    // stream_recursive emits partials + the final text event itself; we only
-    // surface the session event here (last-wins on the bridge side).
-    common::emit_session(new_session_id.as_deref());
-
     Ok(())
 }
 
 /// Call `recursive --headless --output-format stream-json [-r <session_id>] -p <message>`,
 /// emit each `assistant` text chunk as a `partial` event, the terminal
-/// `result.result` as a `text` event, and return the session ID (from the
-/// `result` event, stderr UUID as fallback). On a failed `result`, emit an
-/// `error` event and still return the session id so the bridge persists it.
+/// `result.result` as a `result` event (with `session_id`), and return the session
+/// ID (from the `result` event, stderr UUID as fallback). On a failed `result`,
+/// emit an `error` event and still return the session id so the bridge persists it.
 async fn stream_recursive(message: &str, session_id: &str) -> Result<Option<String>> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     let args = build_recursive_args(message, session_id, "stream-json");
     let bin = recursive_bin();
 
@@ -129,7 +125,7 @@ async fn stream_recursive(message: &str, session_id: &str) -> Result<Option<Stri
                 if let Some(msg) = &event.message {
                     let text = msg.text();
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                         got_any_output = true;
                     }
                 }
@@ -139,7 +135,7 @@ async fn stream_recursive(message: &str, session_id: &str) -> Result<Option<Stri
                 found_session_id = event.session_id.clone();
                 if is_error {
                     if let Some(err_text) = event.result_error_message() {
-                        common::emit_error(&err_text);
+                        emitter.emit_error(&err_text, found_session_id.as_deref())?;
                         error_emitted = true;
                         got_any_output = true;
                     }
@@ -156,13 +152,11 @@ async fn stream_recursive(message: &str, session_id: &str) -> Result<Option<Stri
     let (stderr, stderr_session_id) = stderr_task.await.unwrap_or_default();
     let resolved_session_id = prefer_session_id(found_session_id, stderr_session_id);
 
-    // Emit the final reply body (text event). The bridge drops it in streaming
+    // Emit the final reply body (result event). The bridge drops it in streaming
     // mode when partials already delivered the content (A1 dedup), and sends it
     // as the sole reply in non-streaming mode.
     if !error_emitted {
-        if let Some(text) = final_text {
-            common::emit_text(&text)?;
-        }
+        emitter.emit_result_opt(final_text.as_deref(), resolved_session_id.as_deref())?;
     }
 
     common::ensure_success(

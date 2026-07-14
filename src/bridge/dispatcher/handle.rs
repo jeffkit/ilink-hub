@@ -204,6 +204,7 @@ pub(super) async fn handle_one_message(
                             &mut req,
                             &session_name_for_cli,
                             a2a_call_id.as_deref(),
+                            summary.usage.as_ref(),
                         );
                         if let Err(e) = send_final_with_retry(
                             client,
@@ -226,7 +227,12 @@ pub(super) async fn handle_one_message(
                 // delivery and resolves the caller's MCP waiter instead.
                 let mut req =
                     SendMessageRequest::reply_text(ctx, effective_body, &from_user, cli_session);
-                attach_outbound_hub_ext(&mut req, &session_name_for_cli, a2a_call_id.as_deref());
+                attach_outbound_hub_ext(
+                    &mut req,
+                    &session_name_for_cli,
+                    a2a_call_id.as_deref(),
+                    summary.usage.as_ref(),
+                );
                 send_final_with_retry(
                     client,
                     req,
@@ -258,7 +264,12 @@ pub(super) async fn handle_one_message(
                 let session_id = if is_last { cli_session.clone() } else { None };
                 let mut req =
                     SendMessageRequest::reply_text(ctx.clone(), part, &from_user, session_id);
-                attach_outbound_hub_ext(&mut req, &session_name_for_cli, None);
+                attach_outbound_hub_ext(
+                    &mut req,
+                    &session_name_for_cli,
+                    None,
+                    summary.usage.as_ref(),
+                );
                 send_final_with_retry(
                     client,
                     req,
@@ -328,6 +339,7 @@ fn log_message_handled_success(
             partial_count = summary.partial_count,
             cli_session = summary.cli_session_present,
             duration_ms = summary.duration_ms,
+            usage = ?summary.usage,
             a2a = is_a2a,
             "message handled: empty final body (streaming partials and/or session-only)"
         );
@@ -348,12 +360,16 @@ pub(super) fn attach_outbound_hub_ext(
     req: &mut SendMessageRequest,
     session_name: &str,
     a2a_call_id: Option<&str>,
+    usage: Option<&serde_json::Value>,
 ) {
     if let Some(ref mut msg) = req.msg {
         let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
         hub_ext.session_name = Some(session_name.to_string());
         if let Some(id) = a2a_call_id.filter(|s| !s.is_empty()) {
             hub_ext.a2a_call_id = Some(id.to_string());
+        }
+        if let Some(u) = usage {
+            hub_ext.usage = Some(u.clone());
         }
     }
 }

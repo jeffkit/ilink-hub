@@ -75,6 +75,7 @@ pub async fn build_hub_ext_for_vctx(
             cli_session_id: None,
             a2a_call_id: None,
             a2a_depth: None,
+            usage: None,
         });
     }
 
@@ -103,6 +104,7 @@ pub async fn build_hub_ext_for_vctx(
         cli_session_id: None,
         a2a_call_id: None,
         a2a_depth: None,
+        usage: None,
     })
 }
 

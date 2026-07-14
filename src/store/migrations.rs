@@ -263,6 +263,7 @@ impl Store {
         self.migrate_to_v11_tx(&mut tx).await?;
         self.migrate_to_v12_tx(&mut tx).await?;
         self.migrate_to_v13_tx(&mut tx).await?;
+        self.migrate_to_v14_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -1060,6 +1061,62 @@ impl Store {
         Ok(())
     }
 
+    pub(super) async fn migrate_to_v14_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 14).await? {
+            return Ok(());
+        }
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => sqlx::query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='backend_sessions_v2'",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'backend_sessions_v2' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+        if table_exists {
+            let col_exists = match self.kind {
+                DatabaseKind::Sqlite => sqlx::query(
+                    "SELECT 1 FROM pragma_table_info('backend_sessions_v2') WHERE name = 'last_usage_json'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+                DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                    "SELECT 1 FROM information_schema.columns                      WHERE table_name = 'backend_sessions_v2' AND column_name = 'last_usage_json' LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+            };
+            if !col_exists {
+                sqlx::query(V14_ADD_SESSION_USAGE)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V14_ADD_SESSION_USAGE}\n  Error: {e}")
+                    })?;
+            }
+            tracing::info!(
+                version = 14,
+                "migration applied: backend_sessions_v2.last_usage_json"
+            );
+        } else {
+            tracing::debug!(
+                "v14 migration: backend_sessions_v2 absent (partial schema), skipping last_usage_json"
+            );
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(super) async fn migrate_to_v13(&self) -> Result<()> {
         let mut conn = self.pool.acquire().await?;
@@ -1216,3 +1273,5 @@ const V11_ADD_A2A_DEPTH: &str = include_str!("../../migrations/0011_a2a_depth.sq
 const V12_ADD_DESCRIPTION: &str = include_str!("../../migrations/0012_client_description.sql");
 
 const V13_ADD_ILINK_MSG_ID: &str = include_str!("../../migrations/0013_messages_ilink_msg_id.sql");
+
+const V14_ADD_SESSION_USAGE: &str = include_str!("../../migrations/0014_backend_session_usage.sql");

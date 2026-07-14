@@ -46,17 +46,19 @@ pub async fn run() -> Result<()> {
         |m, s| async move { stream_codebuddy(&m, &s).await },
     )
     .await?;
-
-    common::emit_session(new_session_id.as_deref());
-    if let Some(reply) = body.filter(|s| !s.trim().is_empty()) {
-        common::emit_text(&reply)?;
-    }
+    let mut emitter = common::SessionEmitter::new(&session_id);
+    // stream_codebuddy already emitted live partials without session stamp; attach
+    // continuity on the terminal result (inbound stamp when resuming).
+    emitter.emit_result_opt(
+        body.as_deref().filter(|s| !s.trim().is_empty()),
+        new_session_id.as_deref(),
+    )?;
 
     Ok(())
 }
 
 /// Call `codebuddy -p --output-format stream-json`, emit every assistant text chunk
-/// as a `partial` event, and accumulate the full reply into a `text` event.
+/// as a `partial` event, and accumulate the full reply into a `result` event.
 ///
 /// Returns `(session_id, body)`. `body` is the concatenated reply (assistant chunks
 /// plus any `result.result` that was not already the last chunk), emitted as the
@@ -69,6 +71,7 @@ async fn stream_codebuddy(
     message: &str,
     session_id: &str,
 ) -> Result<(Option<String>, Option<String>)> {
+    let mut emitter = common::SessionEmitter::new(session_id);
     let mut args: Vec<String> = vec![
         "--print".into(),
         "--output-format".into(),
@@ -146,7 +149,7 @@ async fn stream_codebuddy(
                     // "\n" emitted between tool calls) do not produce an empty-looking
                     // message that the user sees as blank.
                     if !text.trim().is_empty() {
-                        common::emit_partial(&text)?;
+                        emitter.emit_partial(&text)?;
                         body.push_str(&text);
                         last_chunk = Some(text);
                     }
@@ -170,6 +173,10 @@ async fn stream_codebuddy(
 
     let status = child.wait().await.context("wait for codebuddy")?;
     let stderr = stderr_task.await.unwrap_or_default();
+
+    // Flush any buffered partials (new-session discovery) before returning.
+    emitter.discover(found_session_id.as_deref())?;
+    emitter.finish_without_session()?;
 
     common::ensure_success("codebuddy", status, &stderr, found_session_id.is_some())?;
 

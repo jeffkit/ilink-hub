@@ -1,21 +1,23 @@
-//! AgentProc wire protocol 0.3 — NDJSON in both directions.
+//! AgentProc wire protocol 0.4 — NDJSON in both directions.
 //!
 //! - **stdin**: the bridge writes exactly one [`TurnObject`] line, then EOF
 //!   (unless `permission: true`, in which case stdin stays open for
 //!   [`PermissionResponse`] frames).
 //! - **stdout**: the agent emits one JSON object per line, distinguished by a
-//!   `type` field from a closed vocabulary: `partial` / `text` / `session` /
-//!   `error` / `permission_request`. Unknown or malformed lines are logged and
-//!   ignored — they are NOT treated as reply body (this is the 0.2→0.3 cutover).
+//!   `type` field from a closed vocabulary: `partial` / `result` / `error` /
+//!   `permission_request`. Unknown or malformed lines are logged and ignored
+//!   — they are NOT treated as reply body (hard cutover from 0.3's `text` /
+//!   `session` events).
 //!
-//! See `docs/knowledge/bridges/profile-protocol.md` and the upstream spec at
-//! `~/projects/agentproc/spec/protocol.md`.
+//! Session continuity is an optional `session_id` field on events (first
+//! non-empty wins). See `docs/knowledge/bridges/profile-protocol.md` and the
+//! upstream spec at `~/projects/agentproc/spec/protocol.md`.
 
 use serde::{Deserialize, Serialize};
 
 /// Wire-protocol version string carried in the turn object. Opaque and
 /// non-comparable per the spec — agents MUST NOT order or range-check it.
-pub const PROTOCOL_VERSION: &str = "0.3";
+pub const PROTOCOL_VERSION: &str = "0.4";
 
 /// One element of the turn object's `attachments` array.
 ///
@@ -159,6 +161,9 @@ pub struct PermissionRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub tool_use_id: Option<String>,
+    /// Optional session continuity (0.4). Empty string is treated as absent.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// A parsed stdout event from the agent. Unknown / malformed lines do not
@@ -172,15 +177,41 @@ pub enum AgentEvent {
         text: String,
         #[serde(default)]
         role: Option<PartialRole>,
+        #[serde(default)]
+        session_id: Option<String>,
     },
-    /// A piece of the final reply body. Multiple `text` events concatenate.
-    Text { text: String },
-    /// Declares or updates the session id. Last one wins.
-    Session { id: String },
+    /// Terminal success body. At most one per turn; subsequent ones are ignored.
+    Result {
+        text: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        /// Optional stats; bridges MAY ignore. Forward-compatible unknown keys.
+        #[serde(default)]
+        usage: Option<serde_json::Value>,
+    },
     /// A terminal error message forwarded to the user.
-    Error { message: String },
+    Error {
+        message: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        usage: Option<serde_json::Value>,
+    },
     /// Optional tool-permission request (only when `permission: true`).
     PermissionRequest(PermissionRequest),
+}
+
+impl AgentEvent {
+    /// Non-empty `session_id` carried on this event, if any (0.4 continuity).
+    pub fn session_id(&self) -> Option<&str> {
+        let sid = match self {
+            Self::Partial { session_id, .. }
+            | Self::Result { session_id, .. }
+            | Self::Error { session_id, .. } => session_id.as_deref(),
+            Self::PermissionRequest(req) => req.session_id.as_deref(),
+        };
+        sid.filter(|s| !s.is_empty())
+    }
 }
 
 /// Parse one stdout line into a typed [`AgentEvent`].
@@ -294,7 +325,7 @@ mod tests {
         assert!(json.contains("\"message\":\"hi\""));
         assert!(json.contains("\"session_id\":\"\""));
         assert!(json.contains("\"from_user\":\"u1\""));
-        assert!(json.contains("\"protocol_version\":\"0.3\""));
+        assert!(json.contains("\"protocol_version\":\"0.4\""));
         assert!(json.contains("\"session_name\":\"default\""));
         assert!(json.contains("\"attachments\":[]"));
     }
@@ -331,9 +362,14 @@ mod tests {
     fn parse_partial_event() {
         let ev = parse_event(r#"{"type":"partial","text":"hello "}"#).unwrap();
         match ev {
-            AgentEvent::Partial { text, role } => {
+            AgentEvent::Partial {
+                text,
+                role,
+                session_id,
+            } => {
                 assert_eq!(text, "hello ");
                 assert_eq!(role, None);
+                assert_eq!(session_id, None);
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -352,28 +388,62 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_event() {
-        let ev = parse_event(r#"{"type":"text","text":"final"}"#).unwrap();
+    fn parse_partial_with_session_id() {
+        let ev = parse_event(r#"{"type":"partial","text":"hi","session_id":"sess-1"}"#).unwrap();
+        assert_eq!(ev.session_id(), Some("sess-1"));
+    }
+
+    #[test]
+    fn parse_result_event() {
+        let ev = parse_event(r#"{"type":"result","text":"final","session_id":"s1"}"#).unwrap();
         match ev {
-            AgentEvent::Text { text } => assert_eq!(text, "final"),
+            AgentEvent::Result {
+                text,
+                session_id,
+                usage,
+            } => {
+                assert_eq!(text, "final");
+                assert_eq!(session_id.as_deref(), Some("s1"));
+                assert!(usage.is_none());
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
-    fn parse_session_event() {
-        let ev = parse_event(r#"{"type":"session","id":"sess-1"}"#).unwrap();
+    fn parse_result_with_usage() {
+        let ev = parse_event(
+            r#"{"type":"result","text":"","usage":{"input_tokens":1,"output_tokens":2}}"#,
+        )
+        .unwrap();
         match ev {
-            AgentEvent::Session { id } => assert_eq!(id, "sess-1"),
+            AgentEvent::Result { usage: Some(u), .. } => {
+                assert_eq!(u["input_tokens"], 1);
+                assert_eq!(u["output_tokens"], 2);
+            }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_legacy_text_and_session_are_unknown() {
+        // Hard cutover from 0.3: dedicated text/session events are ignored.
+        assert!(parse_event(r#"{"type":"text","text":"final"}"#).is_none());
+        assert!(parse_event(r#"{"type":"session","id":"sess-1"}"#).is_none());
     }
 
     #[test]
     fn parse_error_event() {
-        let ev = parse_event(r#"{"type":"error","message":"boom"}"#).unwrap();
+        let ev = parse_event(r#"{"type":"error","message":"boom","session_id":"s1"}"#).unwrap();
         match ev {
-            AgentEvent::Error { message } => assert_eq!(message, "boom"),
+            AgentEvent::Error {
+                message,
+                session_id,
+                ..
+            } => {
+                assert_eq!(message, "boom");
+                assert_eq!(session_id.as_deref(), Some("s1"));
+            }
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -381,7 +451,7 @@ mod tests {
     #[test]
     fn parse_permission_request_event() {
         let ev = parse_event(
-            r#"{"type":"permission_request","request_id":"1","tool_name":"Bash","input":{"command":"echo hi"}}"#,
+            r#"{"type":"permission_request","request_id":"1","tool_name":"Bash","input":{"command":"echo hi"},"session_id":"s1"}"#,
         )
         .unwrap();
         match ev {
@@ -390,6 +460,7 @@ mod tests {
                 assert_eq!(req.tool_name, "Bash");
                 assert_eq!(req.input["command"], "echo hi");
                 assert!(req.description.is_none());
+                assert_eq!(req.session_id.as_deref(), Some("s1"));
             }
             other => panic!("unexpected: {other:?}"),
         }

@@ -33,6 +33,31 @@ impl Store {
         Ok(())
     }
 
+    /// Persist the latest AgentProc `usage` JSON for a named backend session.
+    pub async fn set_backend_session_usage(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+        usage_json: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO backend_sessions_v2 (vctx, vtoken, session_name, backend_session_id, last_usage_json)
+            VALUES ($1, $2, $3, '', $4)
+            ON CONFLICT (vctx, vtoken, session_name) DO UPDATE SET
+                last_usage_json = excluded.last_usage_json
+            "#,
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .bind(usage_json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Get the backend session UUID for a named session scoped to a specific backend.
     pub async fn get_backend_session(
         &self,

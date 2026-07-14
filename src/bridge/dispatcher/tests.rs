@@ -24,6 +24,7 @@ fn make_msg(ctx: &str, session_name: &str) -> WeixinMessage {
             cli_session_id: None,
             a2a_call_id: None,
             a2a_depth: None,
+            usage: None,
         }),
         item_list: Some(std::sync::Arc::new(vec![MessageItem {
             item_type: Some(1),

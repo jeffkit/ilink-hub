@@ -439,6 +439,7 @@ mod tests {
             cli_session_id: None,
             a2a_call_id: Some("call-123".to_string()),
             a2a_depth: Some(1),
+            usage: None,
         };
         let msg = build_synthetic_message("vctx-1", "user-1", "hi", Some(hub_ext));
         let ext = msg.ilink_hub_ext.expect("hub_ext must be set");

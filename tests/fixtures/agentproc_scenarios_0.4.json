@@ -1,0 +1,157 @@
+{
+  "_comment": "Multi-line stdout NDJSON scenarios for the bridge-side runner (wire 0.4). Each scenario feeds the listed lines as the agent's stdout, then asserts reply (from result / streaming rules), session_id (first non-empty), error, exit_code, and partials. Both Python and Node runners MUST match. session/text event types are unknown in 0.4 and are ignored as malformed.",
+  "scenarios": [
+    {
+      "name": "session_id first-non-empty wins (conflicting later ignored)",
+      "lines": [
+        "{\"type\":\"result\",\"text\":\"done\",\"session_id\":\"first\"}",
+        "{\"type\":\"result\",\"text\":\"ignored\",\"session_id\":\"second\"}"
+      ],
+      "streaming": true,
+      "expect": {"reply": "done", "session_id": "first", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "session_id discovered late on result after partials without id",
+      "lines": [
+        "{\"type\":\"partial\",\"text\":\"Here is the first part. \"}",
+        "{\"type\":\"partial\",\"text\":\"And the second.\"}",
+        "{\"type\":\"result\",\"text\":\"\",\"session_id\":\"cli-sess-9f3a2c1e\"}"
+      ],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "cli-sess-9f3a2c1e", "error": "", "exit_code": 0, "partials": ["Here is the first part. ", "And the second."]}
+    },
+    {
+      "name": "one-shot result with session_id",
+      "lines": ["{\"type\":\"result\",\"text\":\"Here is the complete answer.\",\"session_id\":\"f47ac10b-58cc-4372\"}"],
+      "streaming": true,
+      "expect": {"reply": "Here is the complete answer.", "session_id": "f47ac10b-58cc-4372", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "error mid-stream (rate-limit case)",
+      "lines": ["{\"type\":\"partial\",\"text\":\"Let me look that up... \"}", "{\"type\":\"error\",\"message\":\"Upstream API rate limited. Try again in 60s.\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "Upstream API rate limited. Try again in 60s.", "exit_code": 1, "partials": ["Let me look that up... "]}
+    },
+    {
+      "name": "session_id on error is persisted",
+      "lines": ["{\"type\":\"error\",\"message\":\"turn failed\",\"session_id\":\"sess-before-error\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "sess-before-error", "error": "turn failed", "exit_code": 1, "partials": []}
+    },
+    {
+      "name": "partials after error are discarded",
+      "lines": ["{\"type\":\"partial\",\"text\":\"before\"}", "{\"type\":\"error\",\"message\":\"boom\"}", "{\"type\":\"partial\",\"text\":\"after\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "boom", "exit_code": 1, "partials": ["before"]}
+    },
+    {
+      "name": "result after error is discarded",
+      "lines": ["{\"type\":\"error\",\"message\":\"boom\"}", "{\"type\":\"result\",\"text\":\"should not appear\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "boom", "exit_code": 1, "partials": []}
+    },
+    {
+      "name": "session_id on error after partials without id still captured",
+      "lines": ["{\"type\":\"partial\",\"text\":\"x\"}", "{\"type\":\"error\",\"message\":\"boom\",\"session_id\":\"learned-after-error\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "learned-after-error", "error": "boom", "exit_code": 1, "partials": ["x"]}
+    },
+    {
+      "name": "result text carries newlines verbatim",
+      "lines": ["{\"type\":\"result\",\"text\":\"line 1\\nline 2\\nline 3\"}"],
+      "streaming": true,
+      "expect": {"reply": "line 1\nline 2\nline 3", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "second result is ignored (at most one)",
+      "lines": ["{\"type\":\"result\",\"text\":\"a\"}", "{\"type\":\"result\",\"text\":\"b\"}"],
+      "streaming": true,
+      "expect": {"reply": "a", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "empty output → empty reply, success",
+      "lines": [],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "streaming=false ignores partials, uses result",
+      "lines": ["{\"type\":\"partial\",\"text\":\"ignored\"}", "{\"type\":\"result\",\"text\":\"final body\",\"session_id\":\"abc-123\"}"],
+      "streaming": false,
+      "expect": {"reply": "final body", "session_id": "abc-123", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "invalid session_id (path separator) is ignored",
+      "lines": ["{\"type\":\"result\",\"text\":\"done\",\"session_id\":\"bad/path\"}"],
+      "streaming": true,
+      "expect": {"reply": "done", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "invalid session_id after valid one preserves the valid",
+      "lines": [
+        "{\"type\":\"partial\",\"text\":\"x\",\"session_id\":\"valid-1\"}",
+        "{\"type\":\"result\",\"text\":\"done\",\"session_id\":\"bad/path\"}"
+      ],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "valid-1", "error": "", "exit_code": 0, "partials": ["x"]}
+    },
+    {
+      "name": "session_id with spaces and colons is valid on the wire",
+      "lines": ["{\"type\":\"result\",\"text\":\"done\",\"session_id\":\"ok: spaced\"}"],
+      "streaming": true,
+      "expect": {"reply": "done", "session_id": "ok: spaced", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "partial with role streams; empty result text does not duplicate body",
+      "lines": ["{\"type\":\"partial\",\"text\":\"thinking...\",\"role\":\"thinking\"}", "{\"type\":\"result\",\"text\":\"\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "", "exit_code": 0, "partials": ["thinking..."]}
+    },
+    {
+      "name": "streaming with partials: non-empty result.text is not appended to reply",
+      "lines": [
+        "{\"type\":\"partial\",\"text\":\"hello\"}",
+        "{\"type\":\"result\",\"text\":\"hello\"}"
+      ],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "", "error": "", "exit_code": 0, "partials": ["hello"]}
+    },
+    {
+      "name": "legacy session/text events are malformed and ignored",
+      "lines": ["{\"type\":\"session\",\"id\":\"old\"}", "{\"type\":\"text\",\"text\":\"old body\"}", "{\"type\":\"result\",\"text\":\"ok\"}"],
+      "streaming": true,
+      "expect": {"reply": "ok", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "malformed lines are ignored, never appended to reply",
+      "lines": ["hello world", "not json", "{\"type\":\"result\",\"text\":\"ok\"}"],
+      "streaming": true,
+      "expect": {"reply": "ok", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "non-streaming result truncated at max_reply_chars",
+      "profile_overrides": {"max_reply_chars": 10},
+      "lines": ["{\"type\":\"result\",\"text\":\"0123456789ABCDEF\"}"],
+      "streaming": false,
+      "expect": {"reply": "0123456789\n\n…(truncated)", "session_id": "", "error": "", "exit_code": 0, "partials": []}
+    },
+    {
+      "name": "streaming partials truncated at max_reply_chars",
+      "profile_overrides": {"max_reply_chars": 10},
+      "lines": ["{\"type\":\"partial\",\"text\":\"hello \"}", "{\"type\":\"partial\",\"text\":\"world!!\"}", "{\"type\":\"result\",\"text\":\"\",\"session_id\":\"sess-1\"}"],
+      "streaming": true,
+      "expect": {"reply": "", "session_id": "sess-1", "error": "", "exit_code": 0, "partials": ["hello ", "worl", "\n\n…(truncated)"]}
+    },
+    {
+      "name": "streaming partials: first chunk already exceeds cap",
+      "profile_overrides": {"max_reply_chars": 3},
+      "lines": ["{\"type\":\"partial\",\"text\":\"hello\"}", "{\"type\":\"partial\",\"text\":\"world\"}"],
+      "streaming": true,
+      "expect": {
+        "reply": "", "session_id": "", "error": "", "exit_code": 0,
+        "partials_any_of": [["hel", "\n\n…(truncated)"], ["\n\n…(truncated)"]],
+        "_note": "Spec leaves it implementation-defined whether a chunk that exceeds the remaining cap is forwarded as a tail-truncated slice or dropped entirely."
+      }
+    }
+  ]
+}
