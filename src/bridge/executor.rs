@@ -472,7 +472,7 @@ pub(super) async fn run_cli(
                 }
             }
             match event {
-                AgentEvent::Partial { text, role: _, .. } => {
+                AgentEvent::Partial { text, .. } => {
                     if error_seen || !streaming || partials_truncated || text.is_empty() {
                         continue;
                     }

@@ -126,8 +126,12 @@ jobs:
   build-desktop:
     name: Desktop (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    # Desktop (Tauri) installers are best-effort: a desktop build failure must NOT
-    # block the hub/bridge release or the Homebrew tap update (see create-release).
+    # Desktop (Tauri) installers are intentionally skipped for the 0.3.0 release:
+    # this release ships hub + bridge + manager only (no desktop). Re-enable by
+    # removing the `if: false` below. The job remains best-effort
+    # (continue-on-error) and is NOT a dependency of create-release /
+    # update-homebrew-tap, so even when enabled it cannot block the release.
+    if: false
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -300,9 +304,7 @@ jobs:
           body: |
             ## Install
 
-            ### Desktop app (Tauri)
-
-            Prebuilt installers are attached as `ilink-hub-desktop-*` assets (macOS `.dmg` Apple Silicon + Intel, Windows `.msi`, Linux `.deb`). Unsigned macOS builds may require **right-click → Open** the first time. Linux: `sudo apt install ./ilink-hub-desktop-linux-x86_64.deb` (or use your package manager). Same Hub behavior as `ilink-hub serve`; see [docs](https://jeffkit.github.io/ilink-hub/guide/installation#desktop).
+            > This release ships **hub + bridge + manager** only (no desktop app).
 
             ### Linux / macOS — download binary
 
