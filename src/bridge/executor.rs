@@ -5,6 +5,14 @@
 //!
 //! See `docs/knowledge/bridges/profile-protocol.md` and the upstream spec at
 //! `~/projects/agentproc/spec/protocol.md`.
+//
+// MIGRATION NOTE: the dispatcher now drives `agentproc::run` via
+// `dispatcher/agentproc_runner`. The functions below (run_cli, CliRunSummary,
+// apply_placeholders, permission helpers, env expansion) are dead code that
+// will be deleted in the cleanup task. Kept compiling via this allow so the
+// migration lands in reviewable steps. Only build_attachments /
+// split_into_parts / MAX_CLI_CAPTURE_BYTES are still live.
+#![allow(dead_code)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

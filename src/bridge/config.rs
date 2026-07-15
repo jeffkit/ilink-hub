@@ -726,6 +726,7 @@ pub fn expand_env_var_named(
 /// `$$` still collapses to a literal `$`; invalid identifiers (`${}`, `${1FOO}`)
 /// remain hard errors because they signal a malformed profile, not a missing
 /// environment value.
+#[allow(dead_code)] // MIGRATION: only used by executor.rs run_cli (dead); remove in cleanup task
 pub fn expand_env_var_named_with_allowlist(
     template: &str,
     env: &std::collections::HashMap<String, String>,

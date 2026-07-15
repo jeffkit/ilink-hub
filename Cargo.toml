@@ -100,6 +100,12 @@ serde_norway = "0.9.42"
 url = "2"
 percent-encoding = "2.3.2"
 
+# AgentProc SDK — protocol layer (turn object, NDJSON events, in-process
+# executor registry, run()). Replaces ilink-hub's bridge/protocol.rs +
+# executor.rs + builtin/*.rs. Pinned to a commit until agentproc-rs publishes
+# to crates.io.
+agentproc = { git = "https://github.com/jeffkit/agentproc.git", rev = "dbe2b21" }
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

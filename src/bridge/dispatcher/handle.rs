@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::bridge::executor::{build_attachments, run_cli, split_into_parts, CliRunSummary};
+use crate::bridge::executor::{build_attachments, split_into_parts};
 use crate::bridge::AUTH_ERROR_KEYWORDS;
 use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
@@ -150,15 +150,15 @@ pub(super) async fn handle_one_message(
     // this key and waits for the user's next message on the same session.
     let session_key = session_dispatch_key(&msg);
 
-    let cli_result = run_cli(
+    let ap_attachments = super::agentproc_runner::to_agentproc_attachments(&attachments);
+    let cli_result = super::agentproc_runner::run_via_agentproc(
         profile,
         profile_name,
         &payload,
         &session_for_cli,
         &session_name_for_cli,
         &from_user,
-        &ctx,
-        &attachments,
+        &ap_attachments,
         partial_tx,
         Arc::clone(approval_broker),
         session_key,
@@ -328,7 +328,7 @@ pub(super) async fn handle_one_message(
 fn log_message_handled_success(
     profile_name: &str,
     session_name: &str,
-    summary: &CliRunSummary,
+    summary: &super::agentproc_runner::RunSummary,
     body_empty: bool,
     is_a2a: bool,
 ) {

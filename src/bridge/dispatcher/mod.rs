@@ -6,6 +6,7 @@ use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
 
+mod agentproc_runner;
 mod backoff;
 mod handle;
 mod send;
