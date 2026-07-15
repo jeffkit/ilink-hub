@@ -72,31 +72,11 @@ pub(crate) fn find_in_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Resolve the executable for built-in self-invocation (`ilink-hub-bridge profile …`).
-#[allow(dead_code)] // MIGRATION: only called by executor.rs run_cli (dead) + tests; remove in cleanup
-pub(super) fn resolve_spawn_command(command: &str) -> String {
-    if command == "ilink-hub-bridge" {
-        return resolve_bridge_executable().to_string_lossy().into_owned();
-    }
-    command.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
-
-    #[test]
-    fn resolve_spawn_command_uses_bridge_executable_for_self_invoke() {
-        let resolved = resolve_spawn_command("ilink-hub-bridge");
-        assert_eq!(resolved, resolve_bridge_executable().to_string_lossy());
-    }
-
-    #[test]
-    fn resolve_spawn_command_passthrough_other_commands() {
-        assert_eq!(resolve_spawn_command("claude"), "claude");
-    }
 
     #[test]
     fn resolve_bridge_executable_prefers_current_exe_when_already_bridge() {
