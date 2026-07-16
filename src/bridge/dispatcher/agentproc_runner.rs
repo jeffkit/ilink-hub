@@ -76,9 +76,11 @@ pub(super) fn to_agentproc_profile(p: &BridgeProfile) -> ApProfile {
 /// in-process executor (recursive has a bespoke loop and stays on spawn).
 fn executor_name_for_type(type_name: &str) -> Option<String> {
     match type_name {
-        "claude-code" | "codebuddy-code" | "codex" | "cursor" | "agy" => {
-            Some(type_name.to_string())
-        }
+        // agentproc registers the CodeBuddy executor as `codebuddy` (not
+        // `codebuddy-code`); the other built-ins share their ilink-hub type
+        // name with the agentproc executor name.
+        "claude-code" | "codex" | "cursor" | "agy" => Some(type_name.to_string()),
+        "codebuddy-code" => Some("codebuddy".to_string()),
         // recursive / unknown: no in-process executor; fall back to spawn.
         _ => None,
     }
@@ -397,6 +399,11 @@ mod tests {
             Some("claude-code".into())
         );
         assert_eq!(executor_name_for_type("codex"), Some("codex".into()));
+        // codebuddy-code type maps to agentproc's `codebuddy` executor name.
+        assert_eq!(
+            executor_name_for_type("codebuddy-code"),
+            Some("codebuddy".into())
+        );
         assert_eq!(executor_name_for_type("recursive"), None);
         assert_eq!(executor_name_for_type("custom"), None);
     }
