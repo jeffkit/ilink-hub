@@ -1,10 +1,8 @@
-//! CLI bridge: connect to iLink Hub as a virtual-token backend and run a local command per text message.
-//! Supports **single-profile YAML** (flat `command` / `args`) or **multi-profile YAML**
-//! (`profiles` + `routing`: `fixed` or `prefix`).
+//! CLI bridge: connect to iLink Hub as a virtual-token backend and run one
+//! agentproc profile (one YAML file == one profile) per text message.
 //!
 //! Used by the `ilink-hub-bridge` binary; see `docs/bridge/README.md`.
 
-mod approval;
 pub mod builtin;
 mod config;
 mod connection;
@@ -16,9 +14,7 @@ mod probe;
 pub mod protocol;
 pub mod vtoken_env;
 
-pub(crate) use approval::ApprovalBroker;
-
-pub use config::{BridgeApp, BridgeConfig, BridgeProfile, RoutingStrategy};
+pub use config::{BridgeApp, BridgeProfile};
 pub use connection::{
     default_auto_client_name, default_local_credential_path, hub_response_token_rejected,
     resolve_hub_connection, validate_hub_token,

@@ -287,26 +287,6 @@ pub enum PermissionBehavior {
     Deny,
 }
 
-/// The bridge's default action when a `permission_request` arrives.
-///
-/// `Ask` pauses the turn and prompts the user over WeChat to allow/deny the
-/// tool call (the interactive approval loop lives in the dispatcher's
-/// `ApprovalBroker` and the executor's ask handling).
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionDefaultPolicy {
-    /// Auto-approve every tool call. Equivalent to `--dangerously-skip-permissions`.
-    #[default]
-    Allow,
-    /// Deny every tool call with a reason; the agent must do without the tool.
-    Deny,
-    /// Log the request and deny (safe default for auditing without blocking).
-    DenyLogged,
-    /// Pause the turn and ask the user to approve/deny over WeChat. Falls back
-    /// to `Deny` if no interactive broker is wired up (e.g. in tests/probe).
-    Ask,
-}
-
 fn is_false(b: &bool) -> bool {
     !b
 }

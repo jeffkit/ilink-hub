@@ -1,6 +1,6 @@
 [package]
 name = "ilink-hub"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 description = "iLink-compatible multiplexer hub for WeChat ClawBot — route one WeChat account to multiple AI agent backends"
 license = "MIT"

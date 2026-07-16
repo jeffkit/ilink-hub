@@ -6,51 +6,90 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// How to pick a profile for each inbound text message (multi-profile YAML only).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum RoutingStrategy {
-    /// Always run `default_profile`; inbound text is passed unchanged to `{{MESSAGE}}`.
-    #[default]
-    Fixed,
-    /// First matching `prefix_rules` wins (order matters; put longer prefixes first).
-    /// The matched prefix is stripped from the string used for `{{MESSAGE}}` / stdin.
-    Prefix,
-}
-
+/// One bridge profile file == one agentproc profile, in spec-aligned hub form:
+/// a pure agentproc execution config nested under `agentproc:`, with ilink-hub
+/// metadata (`description`) and the `script:` shorthand as siblings.
+///
+/// ```yaml
+/// description: issue-keeper on MiniMax
+/// agentproc:
+///   executor: claude-code
+///   cwd: /path/to/project
+///   streaming: false
+///   env:
+///     ANTHROPIC_API_KEY: ${MINIMAX_API_KEY}
+///     CLAUDE_MODEL: MiniMax-M3
+/// ```
 #[derive(Debug, Deserialize)]
-pub struct PrefixRuleYaml {
-    pub prefix: String,
-    pub profile: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BridgeRoutingYaml {
+pub struct BridgeProfileFile {
+    /// Agent description (surfaced via the Hub MCP `list_agents` tool).
     #[serde(default)]
-    pub strategy: RoutingStrategy,
-    pub default_profile: String,
+    pub description: Option<String>,
+
+    /// Optional `script: <path>` shorthand — expanded into `agentproc.command`/
+    /// `args` by file extension. An explicit `agentproc.command` wins.
     #[serde(default)]
-    pub prefix_rules: Vec<PrefixRuleYaml>,
+    pub script: Option<String>,
+
+    /// The pure agentproc-spec execution config.
+    #[serde(default)]
+    pub agentproc: AgentprocBlock,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct BridgeMultiYaml {
-    #[serde(default = "default_true")]
-    pub skip_bot_messages: bool,
-    #[serde(default = "default_true")]
-    pub require_text: bool,
+/// The `agentproc:` block — field-for-field the agentproc profile spec
+/// (`executor`, `command`, `args`, `cwd`, `env`, `env_allowlist`,
+/// `timeout_secs`, `kill_grace_secs`, `max_reply_chars`, `truncation_suffix`,
+/// `include_stderr_in_reply`, `send_error_reply`, `streaming`, `permission`).
+/// Parsed into the flat [`BridgeProfile`] at load time.
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentprocBlock {
+    /// Optional in-process executor name (e.g. `claude-code`, `codex`,
+    /// `cursor`, `codebuddy`, `agy`). When set and recognised by the agentproc
+    /// SDK, the runner drives the CLI in-process; otherwise it falls back to
+    /// spawning `command`/`args`.
+    #[serde(default)]
+    pub executor: Option<String>,
+
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Restrict which `${VAR}` references the `env` block may expand against the
+    /// bridge's environment. Absent = expand against the full environment.
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_kill_grace_secs")]
+    pub kill_grace_secs: u64,
+    #[serde(default = "default_max_reply_chars")]
+    pub max_reply_chars: usize,
+    #[serde(default = "default_truncation_suffix")]
+    pub truncation_suffix: String,
+    #[serde(default)]
+    pub include_stderr_in_reply: bool,
+    /// Whether to surface CLI errors as a reply to the user. Spec field —
+    /// ilink-hub does not override it at a higher level.
     #[serde(default = "default_true")]
     pub send_error_reply: bool,
-    pub profiles: HashMap<String, BridgeProfile>,
-    /// Optional: if omitted, routing defaults to `fixed` with the profile named
-    /// `claude` (if present), then `default`, then the first alphabetically.
+    /// Enable partial streaming forwarding (bridge-side hint). Default `true`.
+    #[serde(default = "default_true")]
+    pub streaming: bool,
+    /// Enable the optional tool-permission channel (agentproc 0.4). Default
+    /// `false`. `true` keeps stdin open for `permission_request`/`response`.
     #[serde(default)]
-    pub routing: Option<BridgeRoutingYaml>,
+    pub permission: bool,
 }
 
-/// Per-profile CLI settings (multi-profile YAML) or the only profile (legacy single file).
-///
-/// **`type` shorthand**: set `type: claude-code` to use a built-in profile.
+/// Resolved bridge profile — the flat, ready-to-run form parsed from
+/// [`BridgeProfileFile`]. The `agentproc:` block fields are lifted onto this
+/// struct; `script:` (a file-level sibling) is expanded into `command`/`args`
+/// at load time. `executor` carries the agentproc in-process executor name
+/// directly (replacing the old `type:` shorthand).
 ///
 /// **`script` shorthand**: set `script: ./my-handler.py` (or `.js`, `.sh`, `.ts`, `.rb`) and
 /// bridge infers the runtime automatically:
@@ -61,78 +100,57 @@ pub struct BridgeMultiYaml {
 /// - `.rb`  → `ruby <script>`
 /// - other  → execute directly (must be chmod +x)
 ///
-/// An explicit `command` always wins over `type` / `script`.
-#[derive(Debug, Clone, Deserialize)]
+/// An explicit `agentproc.command` always wins over `script`.
+#[derive(Debug, Clone)]
 pub struct BridgeProfile {
-    /// Optional built-in type shorthand (e.g. `"claude-code"`).
-    /// When set and `command` is empty, the profile is expanded to the corresponding built-in.
-    #[serde(default, rename = "type")]
-    pub profile_type: Option<String>,
+    /// agentproc in-process executor name (e.g. `claude-code`, `codex`,
+    /// `cursor`, `codebuddy`, `agy`). `None` → spawn `command`/`args`.
+    pub executor: Option<String>,
 
-    /// Path to a script file. Bridge infers the runtime from the file extension.
-    /// Expanded to `command` + `args` at load time. An explicit `command` takes priority.
-    #[serde(default)]
+    /// Path to a script file. Expanded into `command`/`args` at load time;
+    /// an explicit `command` takes priority. Kept for diagnostics after expand.
     pub script: Option<String>,
 
-    #[serde(default)]
     pub command: String,
-    #[serde(default)]
     pub args: Vec<String>,
     /// Working directory for the agent process. Relative paths resolve against
     /// `{{PROFILE_DIR}}` (the profile file's directory); omitted defaults to the
     /// bridge's process cwd. `~` and placeholders are expanded.
-    #[serde(default)]
     pub cwd: Option<String>,
-    #[serde(default)]
     pub env: HashMap<String, String>,
     /// Restrict which `${VAR}` references the `env` block may expand against the
-    /// bridge's environment. Absent = expand against the full environment (profiles
-    /// are trusted input). Present = a `${VAR}` not in the list expands to empty
-    /// with a stderr warning. Names must match exactly (no globbing).
-    #[serde(default)]
+    /// bridge's environment. Absent = expand against the full environment
+    /// (profiles are trusted input). Present = a `${VAR}` not in the list
+    /// expands to empty with a stderr warning. Names must match exactly.
     pub env_allowlist: Option<Vec<String>>,
     /// CLI 主操作超时（秒），只覆盖 stdout 读取阶段。子进程退出后还有额外的
     /// 10s `child.wait()` 等待，因此最坏情况总耗时为 `timeout_secs + 10s`。
     /// 默认 1800s（30 分钟）。
-    #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
     /// SIGTERM → SIGKILL 宽限期（秒），默认 5。
-    #[serde(default = "default_kill_grace_secs")]
     pub kill_grace_secs: u64,
-    #[serde(default = "default_max_reply_chars")]
     pub max_reply_chars: usize,
-    #[serde(default = "default_truncation_suffix")]
     pub truncation_suffix: String,
-    #[serde(default)]
     pub include_stderr_in_reply: bool,
     /// 是否启用流式 partial 转发（bridge 侧 hint，不进 wire）。默认 `true`。
     /// 设为 `false` 时，agent 仍会输出 `{"type":"partial"}` 事件，但 bridge
     /// 不转发，只从 `{"type":"result"}` 事件取最终回复一次性发送。
-    #[serde(default = "default_true")]
     pub streaming: bool,
     /// 启用可选的 tool-permission 通道（agentproc 0.4）。默认 `false`，bridge
     /// 写完 turn 对象即关闭 stdin；`true` 时保持 stdin 开着，处理
     /// `{"type":"permission_request"}` 并写回 `{"type":"permission_response"}`。
-    #[serde(default)]
+    /// ilink-hub 对 permission_request 恒 allow（不再有 per-profile 策略）。
     pub permission: bool,
-    /// 当 permission 通道开启但没有交互式用户批准闭环时，bridge 对每个
-    /// permission_request 的默认动作。默认 `allow`（等价 skip-permissions）。
-    /// `ask` 暂停 turn，经微信问用户允许/拒绝。
-    #[serde(default)]
-    pub permission_default: super::protocol::PermissionDefaultPolicy,
-    /// `permission_default: ask` 时，等待用户微信回复的最长秒数；超时后
-    /// 自动 deny 并提示用户「授权超时已拒绝」。默认 600s（10 分钟）。
-    #[serde(default = "default_permission_ask_timeout_secs")]
-    pub permission_ask_timeout_secs: u64,
+    /// 是否把 CLI 失败回复给用户。agentproc 规范字段，ilink-hub 不在更高层覆盖。
+    pub send_error_reply: bool,
     /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
-    #[serde(default)]
     pub description: Option<String>,
 }
 
 impl Default for BridgeProfile {
     fn default() -> Self {
         Self {
-            profile_type: None,
+            executor: None,
             script: None,
             command: String::new(),
             args: Vec::new(),
@@ -146,8 +164,7 @@ impl Default for BridgeProfile {
             include_stderr_in_reply: false,
             streaming: true,
             permission: false,
-            permission_default: super::protocol::PermissionDefaultPolicy::default(),
-            permission_ask_timeout_secs: default_permission_ask_timeout_secs(),
+            send_error_reply: true,
             description: None,
         }
     }
@@ -169,89 +186,17 @@ fn default_truncation_suffix() -> String {
     "\n\n…(输出已截断)".to_string()
 }
 
-fn default_permission_ask_timeout_secs() -> u64 {
-    600
-}
-
 fn default_true() -> bool {
     true
 }
 
-/// Legacy flat YAML (one `command`, optional global flags).
-#[derive(Debug, Clone, Deserialize)]
-pub struct BridgeConfig {
-    pub command: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub env_allowlist: Option<Vec<String>>,
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_kill_grace_secs")]
-    pub kill_grace_secs: u64,
-    #[serde(default = "default_max_reply_chars")]
-    pub max_reply_chars: usize,
-    #[serde(default = "default_truncation_suffix")]
-    pub truncation_suffix: String,
-    #[serde(default = "default_true")]
-    pub skip_bot_messages: bool,
-    #[serde(default = "default_true")]
-    pub require_text: bool,
-    #[serde(default = "default_true")]
-    pub send_error_reply: bool,
-    #[serde(default)]
-    pub include_stderr_in_reply: bool,
-    #[serde(default = "default_true")]
-    pub streaming: bool,
-    #[serde(default)]
-    pub permission: bool,
-    #[serde(default)]
-    pub permission_default: super::protocol::PermissionDefaultPolicy,
-    #[serde(default = "default_permission_ask_timeout_secs")]
-    pub permission_ask_timeout_secs: u64,
-    /// Agent 描述（用于 Hub MCP list_agents 工具返回，让其他 Agent 了解此 Agent 的能力）。
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-impl BridgeConfig {
-    pub fn validate(&self) -> Result<()> {
-        if self.command.trim().is_empty() {
-            anyhow::bail!("`command` must not be empty");
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum BridgeFileRaw {
-    /// Must contain top-level `profiles` + `routing`.
-    Multi(BridgeMultiYaml),
-    Single(BridgeConfig),
-}
-
-#[derive(Debug, Clone)]
-enum RoutingState {
-    Fixed(String),
-    Prefix {
-        default: String,
-        rules: Vec<(String, String)>,
-    },
-}
-
-/// Loaded bridge configuration: either migrated from a single flat file or from multi-profile YAML.
+/// Loaded bridge configuration: exactly one resolved profile (one file == one
+/// profile). No routing, no multi-profile map — the bridge child registers
+/// with the Hub under a single name derived from the file.
 #[derive(Debug, Clone)]
 pub struct BridgeApp {
-    profiles: HashMap<String, BridgeProfile>,
-    routing: RoutingState,
-    pub skip_bot_messages: bool,
-    pub require_text: bool,
-    pub send_error_reply: bool,
+    name: String,
+    profile: BridgeProfile,
 }
 
 impl BridgeApp {
@@ -259,189 +204,89 @@ impl BridgeApp {
         let path = path.as_ref();
         let raw =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        Self::parse_yaml(&raw).with_context(|| format!("parse YAML {}", path.display()))
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("default")
+            .to_string();
+        Self::parse_yaml(&raw, stem).with_context(|| format!("parse YAML {}", path.display()))
     }
 
-    /// Parse YAML from a string (same as file body). Used by tests and for tooling.
-    pub fn parse_yaml(raw: &str) -> Result<Self> {
-        let file: BridgeFileRaw =
-            serde_norway::from_str(raw).context("serde_norway::from_str BridgeFileRaw")?;
-        match file {
-            BridgeFileRaw::Single(c) => Self::from_single(c),
-            BridgeFileRaw::Multi(m) => Self::from_multi(m),
-        }
+    /// Parse YAML from a string (same as file body). `name` is the profile
+    /// name (usually the file stem); used in errors and as the registered name.
+    pub fn parse_yaml(raw: &str, name: String) -> Result<Self> {
+        let file: BridgeProfileFile =
+            serde_norway::from_str(raw).context("serde_norway::from_str BridgeProfileFile")?;
+        Self::from_file(file, name)
     }
 
-    fn from_single(c: BridgeConfig) -> Result<Self> {
-        c.validate()?;
-        let profile = BridgeProfile {
-            profile_type: None,
-            script: None,
-            command: c.command.clone(),
-            args: c.args.clone(),
-            cwd: c.cwd.clone(),
-            env: c.env.clone(),
-            env_allowlist: c.env_allowlist.clone(),
-            timeout_secs: c.timeout_secs,
-            kill_grace_secs: c.kill_grace_secs,
-            max_reply_chars: c.max_reply_chars,
-            truncation_suffix: c.truncation_suffix.clone(),
-            include_stderr_in_reply: c.include_stderr_in_reply,
-            streaming: c.streaming,
-            permission: c.permission,
-            permission_default: c.permission_default,
-            permission_ask_timeout_secs: c.permission_ask_timeout_secs,
-            description: c.description,
+    fn from_file(file: BridgeProfileFile, name: String) -> Result<Self> {
+        let block = file.agentproc;
+        let mut profile = BridgeProfile {
+            executor: block.executor,
+            script: file.script,
+            command: block.command,
+            args: block.args,
+            cwd: block.cwd,
+            env: block.env,
+            env_allowlist: block.env_allowlist,
+            timeout_secs: block.timeout_secs,
+            kill_grace_secs: block.kill_grace_secs,
+            max_reply_chars: block.max_reply_chars,
+            truncation_suffix: block.truncation_suffix,
+            include_stderr_in_reply: block.include_stderr_in_reply,
+            streaming: block.streaming,
+            permission: block.permission,
+            send_error_reply: block.send_error_reply,
+            description: file.description,
         };
-        reject_shell_injection_risk(&profile, "default")?;
-        let mut profiles = HashMap::new();
-        profiles.insert("default".to_string(), profile);
-        Ok(Self {
-            profiles,
-            routing: RoutingState::Fixed("default".to_string()),
-            skip_bot_messages: c.skip_bot_messages,
-            require_text: c.require_text,
-            send_error_reply: c.send_error_reply,
-        })
-    }
 
-    fn from_multi(m: BridgeMultiYaml) -> Result<Self> {
-        if m.profiles.is_empty() {
-            anyhow::bail!("`profiles` must contain at least one profile");
-        }
-        // Expand script/type shortcuts before validation so `command` is filled in.
-        // Order matters: script → type (explicit command wins over both).
-        let profiles: HashMap<String, BridgeProfile> = m
-            .profiles
-            .into_iter()
-            .map(|(name, p)| {
-                let expanded = expand_script_field(p, &name)?;
-                let expanded = expand_profile_type(expanded, &name)?;
-                Ok((name, expanded))
-            })
-            .collect::<Result<_>>()?;
+        // Expand the `script:` sibling into command/args when no explicit
+        // command was set. An explicit `agentproc.command` always wins.
+        profile = expand_script_field(profile, &name)?;
 
-        for (name, p) in &profiles {
-            if p.command.trim().is_empty() {
-                anyhow::bail!(
-                    "profile `{name}`: `command` must not be empty \
-                     (set `command`, `script`, or use a recognized `type`)"
-                );
-            }
-            reject_shell_injection_risk(p, name)?;
-        }
-
-        // Resolve routing: if omitted, auto-detect fixed routing using a sensible default.
-        let routing_cfg = m.routing.unwrap_or_else(|| {
-            let default = if profiles.contains_key("claude") {
-                "claude".to_string()
-            } else if profiles.contains_key("default") {
-                "default".to_string()
-            } else {
-                let mut keys: Vec<&String> = profiles.keys().collect();
-                keys.sort();
-                keys[0].clone()
-            };
-            BridgeRoutingYaml {
-                strategy: RoutingStrategy::Fixed,
-                default_profile: default,
-                prefix_rules: vec![],
-            }
-        });
-
-        if !profiles.contains_key(&routing_cfg.default_profile) {
+        // An in-process executor with an empty command is valid (the runner
+        // drives the CLI directly). Without an executor, command is required.
+        let has_executor = profile
+            .executor
+            .as_deref()
+            .is_some_and(|e| !e.trim().is_empty());
+        if !has_executor && profile.command.trim().is_empty() {
             anyhow::bail!(
-                "routing.default_profile `{}` is not a key in `profiles`",
-                routing_cfg.default_profile
+                "profile `{name}`: `agentproc.command` must not be empty \
+                 (set `executor`, `command`, or `script`)"
             );
         }
-        for (i, rule) in routing_cfg.prefix_rules.iter().enumerate() {
-            if rule.prefix.is_empty() {
-                anyhow::bail!("routing.prefix_rules[{i}]: `prefix` must not be empty");
-            }
-            if !profiles.contains_key(&rule.profile) {
-                anyhow::bail!(
-                    "routing.prefix_rules[{i}]: unknown profile `{}`",
-                    rule.profile
-                );
-            }
-        }
-        if routing_cfg.strategy == RoutingStrategy::Prefix && routing_cfg.prefix_rules.is_empty() {
-            anyhow::bail!("routing.strategy: `prefix` requires at least one `prefix_rules` entry (or use `fixed`)");
-        }
+        reject_shell_injection_risk(&profile, &name)?;
 
-        let routing = match routing_cfg.strategy {
-            RoutingStrategy::Fixed => RoutingState::Fixed(routing_cfg.default_profile.clone()),
-            RoutingStrategy::Prefix => RoutingState::Prefix {
-                default: routing_cfg.default_profile.clone(),
-                rules: routing_cfg
-                    .prefix_rules
-                    .iter()
-                    .map(|r| (r.prefix.clone(), r.profile.clone()))
-                    .collect(),
-            },
-        };
-
-        Ok(Self {
-            profiles,
-            routing,
-            skip_bot_messages: m.skip_bot_messages,
-            require_text: m.require_text,
-            send_error_reply: m.send_error_reply,
-        })
+        Ok(Self { name, profile })
     }
 
-    /// Pick profile and payload text for CLI (after Hub routing; `text` is usually `msg.text()`).
+    /// Pick profile and payload text for CLI. Single-profile: the text is
+    /// passed through unchanged (no prefix routing).
     pub fn resolve<'a>(&'a self, text: &str) -> Result<(&'a str, &'a BridgeProfile, String)> {
-        match &self.routing {
-            RoutingState::Fixed(name) => {
-                let p = self
-                    .profiles
-                    .get(name)
-                    .with_context(|| format!("internal: missing profile `{name}`"))?;
-                Ok((name.as_str(), p, text.to_string()))
-            }
-            RoutingState::Prefix { default, rules } => {
-                for (prefix, pname) in rules {
-                    if text.starts_with(prefix) {
-                        let p = self.profiles.get(pname).with_context(|| {
-                            format!("internal: prefix rule references missing profile `{pname}`")
-                        })?;
-                        let rest = text[prefix.len()..].trim_start().to_string();
-                        return Ok((pname.as_str(), p, rest));
-                    }
-                }
-                let p = self
-                    .profiles
-                    .get(default)
-                    .with_context(|| format!("internal: missing default profile `{default}`"))?;
-                Ok((default.as_str(), p, text.to_string()))
-            }
-        }
+        Ok((self.name.as_str(), &self.profile, text.to_string()))
     }
 
     pub fn profile_names(&self) -> Vec<&str> {
-        let mut v: Vec<&str> = self.profiles.keys().map(|s| s.as_str()).collect();
-        v.sort();
-        v
+        vec![self.name.as_str()]
     }
 
-    pub fn profile(&self, name: &str) -> Option<&BridgeProfile> {
-        self.profiles.get(name)
+    pub fn profile(&self, _name: &str) -> Option<&BridgeProfile> {
+        Some(&self.profile)
     }
 
     pub fn default_profile_name(&self) -> &str {
-        match &self.routing {
-            RoutingState::Fixed(name) => name,
-            RoutingState::Prefix { default, .. } => default,
-        }
+        &self.name
     }
 
     pub fn routing_label(&self) -> &'static str {
-        match &self.routing {
-            RoutingState::Fixed(_) => "fixed",
-            RoutingState::Prefix { .. } => "prefix",
-        }
+        "fixed"
+    }
+
+    /// Whether CLI failures are surfaced to the user (spec `send_error_reply`).
+    pub fn send_error_reply(&self) -> bool {
+        self.profile.send_error_reply
     }
 }
 
@@ -514,52 +359,6 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
         "script: field expanded"
     );
     Ok(p)
-}
-
-/// Expand a `type: <shorthand>` profile into a full exec-mode profile.
-///
-/// All built-in types delegate to `ilink-hub-bridge profile <type>` so that
-/// the handler runs in the same binary with minimal external dependencies.
-///
-/// | `type:`       | CLI required  | Session resume | Extra env vars accepted              |
-/// |---------------|---------------|----------------|--------------------------------------|
-/// | `claude-code` | `claude`      | ✓              | `CLAUDE_MODEL`                       |
-/// | `codex`       | `codex`       | ✗              | `CODEX_MODEL`                        |
-/// | `cursor`      | `cursor`      | ✓ (optional)   | `CURSOR_MODEL`, `CURSOR_WORKSPACE`, `CURSOR_EXTRA_ARGS` |
-/// | `agy`         | `agy`         | ✓              | `AGY_MODEL`, `AGY_ADD_DIR`, `AGY_SANDBOX`, `AGY_EXTRA_ARGS` |
-/// | `recursive`   | `recursive`   | ✓              | `RECURSIVE_*` (see recursive bridge docs) |
-///
-/// If `profile_type` is `None` or the command is already set, returns the profile unchanged.
-fn expand_profile_type(p: BridgeProfile, name: &str) -> Result<BridgeProfile> {
-    let Some(ref pt) = p.profile_type.clone() else {
-        return Ok(p);
-    };
-    if !p.command.trim().is_empty() {
-        // Explicit command wins; type is informational only.
-        return Ok(p);
-    }
-
-    /// Build the standard ilink-hub-bridge self-invocation for built-in profile types.
-    /// Under agentproc 0.3 the bridge always writes the NDJSON turn object to the
-    /// child's stdin, so no per-profile stdin wiring is needed.
-    fn make_builtin(mut p: BridgeProfile, type_name: &str, _with_session: bool) -> BridgeProfile {
-        p.command = "ilink-hub-bridge".to_string();
-        p.args = vec!["profile".to_string(), type_name.to_string()];
-        p
-    }
-
-    match pt.as_str() {
-        "claude-code" => Ok(make_builtin(p, "claude-code", true)),
-        "codebuddy-code" => Ok(make_builtin(p, "codebuddy-code", true)),
-        "codex" => Ok(make_builtin(p, "codex", false)),
-        "cursor" => Ok(make_builtin(p, "cursor", true)),
-        "agy" => Ok(make_builtin(p, "agy", true)),
-        "recursive" => Ok(make_builtin(p, "recursive", true)),
-        other => anyhow::bail!(
-            "profile `{name}`: unknown `type: {other}`; \
-             supported built-in types: claude-code, codebuddy-code, codex, cursor, agy, recursive"
-        ),
-    }
 }
 
 /// Reject profiles with a dangerous shell-injection pattern:
@@ -842,82 +641,33 @@ fn location_prefix(profile: Option<&str>, field: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    fn parse(y: &str) -> Result<BridgeApp> {
+        BridgeApp::parse_yaml(y, "bot".to_string())
+    }
+
     #[test]
-    fn parse_legacy_flat_yaml() {
+    fn parse_agentproc_block_yaml() {
         let y = r#"
-command: echo
-args: ["{{MESSAGE}}"]
+agentproc:
+  command: echo
+  args: ["{{MESSAGE}}"]
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
-        assert_eq!(app.profile_names(), vec!["default"]);
-        let (_, p, payload) = app.resolve("hello").unwrap();
+        let app = parse(y).unwrap();
+        assert_eq!(app.profile_names(), vec!["bot"]);
+        let (n, p, payload) = app.resolve("hello").unwrap();
+        assert_eq!(n, "bot");
         assert_eq!(p.command, "echo");
         assert_eq!(payload, "hello");
     }
 
     #[test]
-    fn parse_multi_prefix_routing() {
-        let y = r#"
-profiles:
-  a:
-    command: echo
-    args: ["A", "{{MESSAGE}}"]
-    timeout_secs: 5
-  b:
-    command: echo
-    args: ["B", "{{MESSAGE}}"]
-    timeout_secs: 5
-routing:
-  strategy: prefix
-  default_profile: a
-  prefix_rules:
-    - prefix: "/b "
-      profile: b
-"#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
-        let (n, _, pay) = app.resolve("plain").unwrap();
-        assert_eq!(n, "a");
-        assert_eq!(pay, "plain");
-
-        let (n, _, pay) = app.resolve("/b hi").unwrap();
-        assert_eq!(n, "b");
-        assert_eq!(pay, "hi");
-    }
-
-    #[test]
-    fn parse_multi_fixed_two_profiles() {
-        let y = r#"
-profiles:
-  p1:
-    command: echo
-    args: ["1", "{{MESSAGE}}"]
-    timeout_secs: 3
-  p2:
-    command: echo
-    args: ["2", "{{MESSAGE}}"]
-    timeout_secs: 3
-routing:
-  strategy: fixed
-  default_profile: p2
-"#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
-        let (n, _, pay) = app.resolve("/b hello").unwrap();
-        assert_eq!(n, "p2");
-        assert_eq!(pay, "/b hello");
-    }
-
-    #[test]
     fn script_field_py_expands_to_python3() {
         let y = r#"
-profiles:
-  bot:
-    script: ./my_handler.py
-    timeout_secs: 60
-routing:
-  strategy: fixed
-  default_profile: bot
+script: ./my_handler.py
+agentproc:
+  timeout_secs: 60
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hello").unwrap();
         assert_eq!(p.command, "python3");
         assert_eq!(p.args, vec!["./my_handler.py"]);
@@ -926,14 +676,10 @@ routing:
     #[test]
     fn script_field_js_expands_to_node() {
         let y = r#"
-profiles:
-  bot:
-    script: ./handler.js
-routing:
-  strategy: fixed
-  default_profile: bot
+script: ./handler.js
+agentproc: {}
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "node");
         assert_eq!(p.args, vec!["./handler.js"]);
@@ -942,14 +688,10 @@ routing:
     #[test]
     fn script_field_ts_expands_to_npx_tsx() {
         let y = r#"
-profiles:
-  bot:
-    script: ./handler.ts
-routing:
-  strategy: fixed
-  default_profile: bot
+script: ./handler.ts
+agentproc: {}
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "npx");
         assert_eq!(p.args, vec!["tsx", "./handler.ts"]);
@@ -958,14 +700,10 @@ routing:
     #[test]
     fn script_field_sh_expands_to_bash() {
         let y = r#"
-profiles:
-  bot:
-    script: ./run.sh
-routing:
-  strategy: fixed
-  default_profile: bot
+script: ./run.sh
+agentproc: {}
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "bash");
         assert_eq!(p.args, vec!["./run.sh"]);
@@ -974,38 +712,80 @@ routing:
     #[test]
     fn explicit_command_wins_over_script() {
         let y = r#"
-profiles:
-  bot:
-    script: ./handler.py
-    command: /usr/bin/python3.11
-    args: ["./handler.py"]
-routing:
-  strategy: fixed
-  default_profile: bot
+script: ./handler.py
+agentproc:
+  command: /usr/bin/python3.11
+  args: ["./handler.py"]
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "/usr/bin/python3.11");
     }
 
     #[test]
-    fn multi_empty_profiles_errors() {
+    fn executor_without_command_is_valid() {
+        // An in-process executor drives the CLI directly; `command` may be empty.
         let y = r#"
-profiles: {}
-routing:
-  strategy: fixed
-  default_profile: x
+agentproc:
+  executor: claude-code
 "#;
-        assert!(BridgeApp::parse_yaml(y).is_err());
+        let app = parse(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.executor.as_deref(), Some("claude-code"));
+        assert_eq!(p.command, "");
+    }
+
+    #[test]
+    fn no_executor_and_no_command_errors() {
+        let y = r#"
+agentproc: {}
+"#;
+        let err = parse(y).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("command"), "{msg}");
+    }
+
+    #[test]
+    fn recursive_profile_uses_builtin_spawn_form() {
+        // recursive has no in-process executor; it spawns the bridge builtin.
+        let y = r#"
+agentproc:
+  command: ilink-hub-bridge
+  args: [profile, recursive]
+  cwd: ~/projects/recursive
+"#;
+        let app = parse(y).unwrap();
+        let (_, p, _) = app.resolve("hi").unwrap();
+        assert_eq!(p.command, "ilink-hub-bridge");
+        assert_eq!(p.args, vec!["profile", "recursive"]);
+    }
+
+    #[test]
+    fn send_error_reply_defaults_true_and_passes_through() {
+        let y = r#"
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert!(app.send_error_reply());
+
+        let y2 = r#"
+agentproc:
+  command: echo
+  send_error_reply: false
+"#;
+        let app2 = parse(y2).unwrap();
+        assert!(!app2.send_error_reply());
     }
 
     #[test]
     fn shell_c_with_message_placeholder_rejected() {
         let y = r#"
-command: bash
-args: ["-c", "echo {{MESSAGE}}"]
+agentproc:
+  command: bash
+  args: ["-c", "echo {{MESSAGE}}"]
 "#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let err = parse(y).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SECURITY") && msg.contains("MESSAGE"),
@@ -1014,33 +794,15 @@ args: ["-c", "echo {{MESSAGE}}"]
     }
 
     #[test]
-    fn shell_c_with_message_placeholder_rejected_multi_profile() {
-        let y = r#"
-profiles:
-  bot:
-    command: /bin/zsh
-    args: ["-c", "printf '%s' '{{MESSAGE}}'"]
-routing:
-  strategy: fixed
-  default_profile: bot
-"#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("SECURITY") && msg.contains("bot"),
-            "expected named-profile reject, got: {msg}"
-        );
-    }
-
-    #[test]
     fn shell_without_dash_c_still_loads() {
         // A shell running a script (no `-c`) is fine; the message travels via
-        // the stdin turn object under agentproc 0.3, never via argv.
+        // the stdin turn object, never via argv.
         let y = r#"
-command: bash
-args: ["./run.sh"]
+agentproc:
+  command: bash
+  args: ["./run.sh"]
 "#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
+        let app = parse(y).unwrap();
         let (_, p, _) = app.resolve("hi").unwrap();
         assert_eq!(p.command, "bash");
     }
@@ -1049,20 +811,22 @@ args: ["./run.sh"]
     fn shell_c_without_message_placeholder_still_loads() {
         // Only the dangerous combo (shell + -c + {{MESSAGE}}) is rejected.
         let y = r#"
-command: bash
-args: ["-c", "echo hello"]
+agentproc:
+  command: bash
+  args: ["-c", "echo hello"]
 "#;
-        assert!(BridgeApp::parse_yaml(y).is_ok());
+        assert!(parse(y).is_ok());
     }
 
     #[test]
     fn shell_lc_with_message_placeholder_rejected() {
         // Combined short options (-lc / -ic / -xc) must count as -c.
         let y = r#"
-command: bash
-args: ["-lc", "echo {{MESSAGE}}"]
+agentproc:
+  command: bash
+  args: ["-lc", "echo {{MESSAGE}}"]
 "#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let err = parse(y).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SECURITY") && msg.contains("MESSAGE"),
@@ -1074,12 +838,13 @@ args: ["-lc", "echo {{MESSAGE}}"]
     fn shell_c_with_message_in_env_rejected() {
         // MESSAGE via env + bash -c $MSG is the same RCE class as args.
         let y = r#"
-command: bash
-args: ["-c", "$MSG"]
-env:
-  MSG: "{{MESSAGE}}"
+agentproc:
+  command: bash
+  args: ["-c", "$MSG"]
+  env:
+    MSG: "{{MESSAGE}}"
 "#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let err = parse(y).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("SECURITY") && msg.contains("MESSAGE"),
@@ -1091,11 +856,12 @@ env:
     fn shell_long_option_color_not_treated_as_dash_c() {
         // `--color` must not false-positive as enabling -c.
         let y = r#"
-command: bash
-args: ["--color", "echo {{MESSAGE}}"]
+agentproc:
+  command: bash
+  args: ["--color", "echo {{MESSAGE}}"]
 "#;
         assert!(
-            BridgeApp::parse_yaml(y).is_ok(),
+            parse(y).is_ok(),
             "long option --color must not trigger -c reject"
         );
     }
@@ -1103,49 +869,14 @@ args: ["--color", "echo {{MESSAGE}}"]
     #[test]
     fn ksh_c_with_message_placeholder_rejected() {
         let y = r#"
-command: ksh
-args: ["-c", "echo {{MESSAGE}}"]
+agentproc:
+  command: ksh
+  args: ["-c", "echo {{MESSAGE}}"]
 "#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
+        let err = parse(y).unwrap_err();
         assert!(
             err.to_string().contains("SECURITY"),
             "ksh -c + MESSAGE must be rejected"
-        );
-    }
-
-    #[test]
-    fn type_recursive_expands_to_builtin_invocation() {
-        let y = r#"
-profiles:
-  rec:
-    type: recursive
-    cwd: ~/projects/recursive
-routing:
-  strategy: fixed
-  default_profile: rec
-"#;
-        let app = BridgeApp::parse_yaml(y).unwrap();
-        let (_, p, _) = app.resolve("hi").unwrap();
-        assert_eq!(p.command, "ilink-hub-bridge");
-        assert_eq!(p.args, vec!["profile", "recursive"]);
-    }
-
-    #[test]
-    fn type_unknown_errors() {
-        let y = r#"
-profiles:
-  x:
-    type: not-a-real-type
-routing:
-  strategy: fixed
-  default_profile: x
-"#;
-        let err = BridgeApp::parse_yaml(y).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("unknown `type: not-a-real-type`"), "{msg}");
-        assert!(
-            msg.contains("recursive"),
-            "supported list should include recursive: {msg}"
         );
     }
 

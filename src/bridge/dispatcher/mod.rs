@@ -15,8 +15,6 @@ mod session;
 use send::{GetUpdatesOutcome, HubClient};
 use session::SessionDispatcher;
 
-use crate::bridge::ApprovalBroker;
-
 #[cfg(test)]
 use backoff::{backoff_for, backoff_for_test, MAX_BACKOFF_SECS};
 #[cfg(test)]
@@ -60,7 +58,6 @@ pub async fn run_bridge_with_shutdown(
         Arc::clone(&app),
         stop_tx,
         shutdown.clone(),
-        ApprovalBroker::new(),
     ));
     let mut buf = String::new();
     let mut backoff_secs: u64 = 3;

@@ -114,7 +114,7 @@ mod tests {
             .take()
             .expect("sender present");
         tx.send(true).expect("receiver alive");
-        assert_eq!(*rx.borrow_and_update(), true);
+        assert!(*rx.borrow_and_update());
         assert!(!ctrl.is_running());
     }
 

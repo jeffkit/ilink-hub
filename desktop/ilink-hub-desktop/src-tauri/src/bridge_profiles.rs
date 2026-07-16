@@ -162,23 +162,21 @@ pub(crate) fn env_vars_yaml(env_vars: &[EnvVar], indent: usize) -> String {
     out
 }
 
-/// Build the minimal `claude-code` profile YAML.
-///
-/// Generates a single-profile file; routing is auto-detected by the parser when omitted.
+/// Build the minimal `claude-code` profile YAML (spec-aligned hub form).
 pub(crate) fn build_claude_profile_yaml(cwd: &str, env_vars: &[EnvVar]) -> Result<String, String> {
     let cwd = cwd.trim();
     if cwd.is_empty() {
         return Err("请填写项目目录".into());
     }
-    let env_section = env_vars_yaml(env_vars, 4);
+    let env_section = env_vars_yaml(env_vars, 2);
     Ok(format!(
-        "profiles:\n  claude:\n    type: claude-code\n    cwd: {cwd}\n{env_section}",
+        "agentproc:\n  executor: claude-code\n  cwd: {cwd}\n{env_section}",
         cwd = yaml_quote(cwd),
         env_section = env_section,
     ))
 }
 
-/// Build a minimal flat single-profile YAML for CLI tools (codex, cursor agent, gemini, …).
+/// Build a minimal single-profile YAML for CLI tools (codex, cursor agent, gemini, …).
 pub(crate) fn build_simple_command_yaml(
     command: &str,
     args: &[String],
@@ -192,9 +190,9 @@ pub(crate) fn build_simple_command_yaml(
     if command.trim().is_empty() {
         return Err("请填写命令".into());
     }
-    let env_section = env_vars_yaml(env_vars, 0);
+    let env_section = env_vars_yaml(env_vars, 2);
     Ok(format!(
-        "command: {command}\nargs: {args}\ncwd: {cwd}\nstdin: none\n{env_section}",
+        "agentproc:\n  command: {command}\n  args: {args}\n  cwd: {cwd}\n{env_section}",
         command = yaml_quote(command.trim()),
         args = yaml_string_array(args),
         cwd = yaml_quote(cwd),
@@ -270,21 +268,19 @@ pub(crate) fn build_bridge_profile_yaml(req: &SaveBridgeProfileRequest) -> Resul
 }
 
 pub(crate) fn detect_bridge_profile_template(app: &ilink_hub::bridge::BridgeApp) -> String {
-    if let Some(p) = app.profile("claude") {
-        if p.profile_type.as_deref() == Some("claude-code") || p.command == "ilink-hub-bridge" {
+    let p = app.profile(app.default_profile_name());
+    if let Some(p) = p {
+        if p.executor.as_deref() == Some("claude-code") || p.command == "ilink-hub-bridge" {
             return "claude".into();
         }
+        match p.command.as_str() {
+            "agent" => return "cursor".into(),
+            "codex" => return "codex".into(),
+            "gemini" => return "gemini".into(),
+            _ => {}
+        }
     }
-    let p = app.profile("default").or_else(|| {
-        let name = app.default_profile_name().to_string();
-        app.profile(&name)
-    });
-    match p.map(|p| p.command.as_str()) {
-        Some("agent") => "cursor".into(),
-        Some("codex") => "codex".into(),
-        Some("gemini") => "gemini".into(),
-        _ => "custom".into(),
-    }
+    "custom".into()
 }
 
 pub(crate) fn summarize_bridge_profile_file(
@@ -292,13 +288,10 @@ pub(crate) fn summarize_bridge_profile_file(
     path: PathBuf,
     yaml: String,
 ) -> DesktopBridgeProfileFile {
-    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml) {
+    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, id.clone()) {
         Ok(app) => {
             let template = detect_bridge_profile_template(&app);
-            let profile = app
-                .profile("claude")
-                .or_else(|| app.profile("default"))
-                .or_else(|| app.profile(app.default_profile_name()));
+            let profile = app.profile(app.default_profile_name());
             let env_vars = profile
                 .map(|p| {
                     let mut vars: Vec<EnvVar> = p
@@ -367,19 +360,28 @@ pub(crate) fn summarize_bridge_config(
     yaml: String,
     exists: bool,
 ) -> BridgeConfigPayload {
-    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml) {
+    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string()) {
         Ok(app) => {
             let profiles = app
                 .profile_names()
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            let claude_profile = app.profile("claude").map(|p| DesktopBridgeProfileView {
-                name: "claude".to_string(),
-                cwd: p.cwd.clone(),
-                timeout_secs: p.timeout_secs,
-                max_reply_chars: p.max_reply_chars,
-                model: p.env.get("CLAUDE_MODEL").cloned(),
+            let claude_profile = app.profile(app.default_profile_name()).and_then(|p| {
+                if p.executor.as_deref() == Some("claude-code")
+                    || p.command == "ilink-hub-bridge"
+                    || p.command == "claude"
+                {
+                    Some(DesktopBridgeProfileView {
+                        name: app.default_profile_name().to_string(),
+                        cwd: p.cwd.clone(),
+                        timeout_secs: p.timeout_secs,
+                        max_reply_chars: p.max_reply_chars,
+                        model: p.env.get("CLAUDE_MODEL").cloned(),
+                    })
+                } else {
+                    None
+                }
             });
             BridgeConfigPayload {
                 exists,
@@ -460,7 +462,8 @@ pub(crate) async fn bridge_save_claude_profile(
     };
     let env_vars = req.env_vars.unwrap_or_default();
     let yaml = build_claude_profile_yaml(&req.cwd, &env_vars)?;
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).map_err(|e| e.to_string())?;
+    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+        .map_err(|e| e.to_string())?;
     if let Some(parent) = ctrl.config_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -480,7 +483,8 @@ pub(crate) async fn bridge_save_yaml(
     let Some(ctrl) = app.try_state::<BridgeController>() else {
         return Err("Bridge 未初始化".into());
     };
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).map_err(|e| e.to_string())?;
+    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+        .map_err(|e| e.to_string())?;
     if let Some(parent) = ctrl.config_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -597,7 +601,8 @@ pub(crate) async fn bridge_save_profile(
     };
     let id = sanitize_profile_file_id(&req.id)?;
     let yaml = build_bridge_profile_yaml(&req)?;
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).map_err(|e| e.to_string())?;
+    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+        .map_err(|e| e.to_string())?;
     tokio::fs::create_dir_all(&ctrl.profiles_dir)
         .await
         .map_err(|e| format!("创建 profile 目录失败: {e}"))?;
@@ -868,13 +873,13 @@ mod tests {
     #[test]
     fn claude_profile_wizard_generates_minimal_yaml() {
         let yaml = build_claude_profile_yaml("/tmp/my project", &[]).unwrap();
-        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
+        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
 
         assert_eq!(app.default_profile_name(), "claude");
         assert_eq!(app.routing_label(), "fixed");
         let profile = app.profile("claude").unwrap();
+        assert_eq!(profile.executor.as_deref(), Some("claude-code"));
         assert_eq!(profile.cwd.as_deref(), Some("/tmp/my project"));
-        assert!(app.profile("claude_new").is_none());
     }
 
     #[test]
@@ -884,7 +889,8 @@ mod tests {
             value: "sonnet".into(),
         }];
         let yaml = build_claude_profile_yaml("/tmp/project", &env_vars).unwrap();
-        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
+        let app =
+            ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
         let profile = app.profile("claude").unwrap();
         assert_eq!(
             profile.env.get("CLAUDE_MODEL").map(String::as_str),
@@ -914,8 +920,12 @@ mod tests {
                 yaml: None,
             })
             .unwrap();
-            let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
-            let profile = app.profile("default").unwrap();
+            let app = ilink_hub::bridge::BridgeApp::parse_yaml(
+                &yaml,
+                format!("{template}-demo"),
+            )
+            .unwrap();
+            let profile = app.profile(app.default_profile_name()).unwrap();
             assert_eq!(profile.command, command);
             assert_eq!(profile.cwd.as_deref(), Some("/tmp/project"));
         }
@@ -936,8 +946,9 @@ mod tests {
             yaml: None,
         })
         .unwrap();
-        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
-        let profile = app.profile("default").unwrap();
+        let app =
+            ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "codex-demo".to_string()).unwrap();
+        let profile = app.profile(app.default_profile_name()).unwrap();
         assert_eq!(
             profile.env.get("MY_TOKEN").map(String::as_str),
             Some("abc123")

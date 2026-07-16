@@ -1035,9 +1035,9 @@ mod tests {
         fs::write(
             path,
             r#"
-command: echo
-args: ["ok"]
-stdin: none
+agentproc:
+  command: echo
+  args: ["ok"]
 "#,
         )
         .unwrap();

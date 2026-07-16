@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::sync::Arc;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -11,9 +10,8 @@ use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
 use super::backoff::{backoff_for, retry_budget};
 use super::send::{run_partial_forward_loop, sanitize_field, send_final_with_retry, HubClient};
-use super::session::{session_dispatch_key, HandleError};
+use super::session::HandleError;
 use super::BridgeStop;
-use crate::bridge::ApprovalBroker;
 
 pub(super) fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
     let Ok(flag) = std::env::var("ILINKHUB_BRIDGE_DUMP_MSG") else {
@@ -59,20 +57,21 @@ pub(super) async fn handle_one_message(
     app: &BridgeApp,
     msg: WeixinMessage,
     shutdown: CancellationToken,
-    approval_broker: &Arc<ApprovalBroker>,
 ) -> Result<(), HandleError> {
     dump_inbound_weixin_message_for_debug(&msg);
 
-    if app.skip_bot_messages && msg.message_type == Some(2) {
+    // Always ignore messages from other bots (message_type 2) to avoid loops.
+    if msg.message_type == Some(2) {
         return Ok(());
     }
 
+    // Always require a non-empty text body; inbound media/attachments without
+    // text are dropped at this layer.
     let text = match msg.text() {
         Some(t) => t.to_string(),
-        None if !app.require_text => String::new(),
         None => return Ok(()),
     };
-    if text.trim().is_empty() && app.require_text {
+    if text.trim().is_empty() {
         return Ok(());
     }
 
@@ -80,7 +79,7 @@ pub(super) async fn handle_one_message(
 
     let (profile_name, profile, payload) = app
         .resolve(&text)
-        .with_context(|| format!("route message for profile (text prefix): {text:?}"))?;
+        .with_context(|| format!("route message for profile: {text:?}"))?;
 
     let ctx = msg
         .context_token
@@ -145,11 +144,6 @@ pub(super) async fn handle_one_message(
 
     let retry_budget = retry_budget(profile.timeout_secs);
 
-    // Session-dispatch key for the `ask` permission strategy: when the agent
-    // emits a permission_request, the turn registers an approval inbox under
-    // this key and waits for the user's next message on the same session.
-    let session_key = session_dispatch_key(&msg);
-
     let ap_attachments = super::agentproc_runner::to_agentproc_attachments(&attachments);
     let cli_result = super::agentproc_runner::run_via_agentproc(
         profile,
@@ -160,8 +154,6 @@ pub(super) async fn handle_one_message(
         &from_user,
         &ap_attachments,
         partial_tx,
-        Arc::clone(approval_broker),
-        session_key,
     )
     .await;
 
@@ -284,7 +276,7 @@ pub(super) async fn handle_one_message(
         }
         Err(e) => {
             error!(error = %e, "CLI failed; sending error reply to user");
-            if app.send_error_reply {
+            if profile.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
                 let mut req = SendMessageRequest::reply(ctx, err_text, &from_user);
                 if let Some(ref mut msg) = req.msg {
