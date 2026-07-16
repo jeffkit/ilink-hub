@@ -2,36 +2,58 @@
 
 This document describes the configuration options for `ilink-hub-bridge`.
 
-## AgentProc 0.3 NDJSON Protocol
+## AgentProc 0.4 NDJSON Protocol
 
-Bridge 与 profile 进程之间采用 AgentProc 0.3 NDJSON 协议：bridge 向 profile stdin 写一行 turn 对象，profile 在 stdout 逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error` / `permission_request`）。环境变量仅用于密钥与配置。详见 [AgentProc 0.3 协议规范](/bridge/profile-spec)。
+Bridge writes one NDJSON turn object to the profile process stdin and reads NDJSON events (`partial` / `result` / `error` / `permission_request`) from stdout. Env vars are for secrets/config only. See [profile protocol](knowledge/bridges/profile-protocol.md).
 
-## Message Placeholder `{{MESSAGE}}`
+## YAML hub form（一文件一 profile）
 
-自定义 CLI profile 若需要把用户消息作为命令行参数传入，可在 `args` / `cwd` / `env` 值中使用占位符 `{{MESSAGE}}`（以及 `{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}`），bridge 会从 turn 对象中取值替换。
-
-Example configuration:
 ```yaml
-profiles:
-  claude:
-    command: claude
-    args: ["-p", "{{MESSAGE}}", "--continue"]
+description: optional
+script: ./handler.py          # optional; agentproc.command wins
+agentproc:
+  executor: claude-code       # or command/args for custom spawn
+  cwd: /path/to/project
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    CLAUDE_MODEL: sonnet
+  streaming: true
+  permission: false
+  send_error_reply: true
+  timeout_secs: 1800
+  max_reply_chars: 8000
 ```
-
-::: danger Security Warning
-Do NOT use `{{MESSAGE}}` as part of a shell `-c` parameter (e.g., `args: ["-c", "echo {{MESSAGE}}"]`), as this can lead to shell command injection vulnerabilities. The bridge rejects the dangerous combination of a shell command with `-c` and `{{MESSAGE}}` in args/env at config load time.
-:::
-
-## 0.3 新增字段
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `env_allowlist` | 无 | 限制 `env` 变量展开的允许名单；未列出的未知变量展开为空（POSIX 语义） |
-| `kill_grace_secs` | 见 `default_kill_grace_secs` | 超时后优雅退出宽限秒数 |
-| `permission` | `false` | 开启 permission 通道（stdin 保持开启以接收 `permission_response`） |
-| `permission_default` | `allow` | permission 默认策略：`allow` / `deny` / `deny_logged` / `ask`（`ask` 暂停 turn 走微信交互审批） |
-| `permission_ask_timeout_secs` | `600` | `ask` 策略等待用户回复秒数；超时自动 deny 并提示用户 |
-| `truncation_suffix` | `…(已截断)` | 超长回复截断后缀 |
-| `streaming` | `true` | bridge 侧 hint：是否转发 `partial` 事件 |
+| `agentproc.executor` | 无 | 内置 executor 名 |
+| `agentproc.command` / `args` | 空 | 自定义命令 |
+| `agentproc.cwd` | 进程 cwd | 工作目录 |
+| `agentproc.env` | `{}` | `${VAR}` 从 bridge 进程 env 展开 |
+| `agentproc.env_allowlist` | 无 | 限制可展开变量 |
+| `agentproc.timeout_secs` | `1800` | 超时秒数 |
+| `agentproc.kill_grace_secs` | `5` | 优雅退出宽限 |
+| `agentproc.max_reply_chars` | `8000` | 截断上限 |
+| `agentproc.truncation_suffix` | `…(输出已截断)` | 截断后缀 |
+| `agentproc.streaming` | `true` | 是否转发 `partial` |
+| `agentproc.permission` | `false` | permission 通道；请求恒 allow |
+| `agentproc.send_error_reply` | `true` | 错误是否回用户 |
+| `agentproc.include_stderr_in_reply` | `false` | 是否拼 stderr |
+| `description` / `script` | — | 文件级 sibling |
 
-> 0.2 的 `stdin`（`StdinMode`）与 `cli_session_first_line_prefix` 字段已移除；消息统一经 stdin NDJSON turn 传递。
+**已移除**：`profiles` / `routing` / `type` / `skip_bot_messages` / `require_text` / 顶层 `send_error_reply` / `permission_default` / `permission_ask_timeout_secs`。入站过滤（跳过 bot、要求文本）为固定逻辑。
+
+## Message Placeholder `{{MESSAGE}}`
+
+自定义 CLI 可在 `args` / `cwd` / `env` 值中使用 `{{MESSAGE}}` / `{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}`。
+
+```yaml
+description: echo with placeholder
+agentproc:
+  command: echo
+  args: ["{{MESSAGE}}"]
+```
+
+::: danger Security Warning
+Do NOT use `{{MESSAGE}}` as part of a shell `-c` parameter. The bridge rejects shell + `-c` + `{{MESSAGE}}` at load time.
+:::

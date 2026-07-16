@@ -4,7 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-###Breaking Change — profile 模型覆盖环境变量去掉 `ILINK_` 前缀
+### Breaking Change — Profile YAML 对齐 agentproc hub form（0.3.4）
+
+**⚠️ Breaking Change** — 一个 YAML 文件 = 一个 profile。执行配置嵌在 `agentproc:` 下；不再解析多 profile / 路由 / hub 私有策略字段。
+
+| 旧形态 | 新形态 |
+|--------|--------|
+| `profiles:` + `routing:` | 一文件一 profile；多后端用 manager 多文件 + Hub `/use` |
+| `type: claude-code` | `agentproc.executor: claude-code` |
+| `type: codebuddy-code` | `agentproc.executor: codebuddy` |
+| 顶层 `skip_bot_messages` / `require_text` | 内化为恒 true（不可配置） |
+| 顶层 `send_error_reply` | 仅 `agentproc.send_error_reply`（规范字段） |
+| `permission_default` / `permission_ask_timeout_secs` / WeChat ask | 已移除；`permission: true` 时请求恒 allow |
+
+示例：
+
+```yaml
+description: my agent
+agentproc:
+  executor: claude-code
+  cwd: /path/to/project
+  env:
+    ANTHROPIC_API_KEY: ${MINIMAX_API_KEY}
+    CLAUDE_MODEL: MiniMax-M2.5
+```
+
+详见 `docs/knowledge/bridges/profile-protocol.md`。
+
+### Breaking Change — profile 模型覆盖环境变量去掉 `ILINK_` 前缀
 
 `type: claude-code` / `codebuddy-code` / `codex` / `cursor` / `agy` profile 不再读取 `ILINK_*_MODEL` 系列
 变量，改为直接读取 CLI / agentproc executor 的原生变量名。这样 CLI 与 agentproc 的实现者无需理解

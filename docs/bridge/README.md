@@ -122,24 +122,24 @@ ilink-hub-bridge --config ./ilink-hub-bridge.yaml
 - 若引用元数据在 **`item_list` 某元素的 `extra`** 里，会单独打印出来。  
 - 若上游把引用放在 **消息顶层**、而 `WeixinMessage` 没有对应字段，则在进 Hub 反序列化时已被丢弃，**这里也看不到**（需要抓 Hub 收到上游后的原始 JSON 才能确认）。
 
-## 配置：单 Profile 与多 Profile
+## 配置：一文件一 Profile（agentproc hub form）
 
-### 单 Profile（默认，与旧版兼容）
+每个 YAML **恰好一个** profile。执行字段写在 `agentproc:` 下（与 agentproc 规范对齐）；`description` / `script` 为文件级 sibling。
 
-根级一个 `command`（必填）及下表字段即可；**不要**同时写顶层 `profiles`，否则会被识别为多 Profile 格式。
+```yaml
+description: Claude on my project
+agentproc:
+  executor: claude-code
+  cwd: /path/to/project
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    CLAUDE_MODEL: sonnet
+  streaming: true
+  send_error_reply: true
+```
 
-### 多 Profile（单进程、按前缀路由）
-
-顶层包含 **`profiles`** 与 **`routing`**。每个 profile 拥有一套与单文件相同的执行字段（`command`、`args`、`timeout_secs` 等）；根级可写 `skip_bot_messages` / `require_text` / `send_error_reply`，对**所有** profile 生效。
-
-| 字段 | 说明 |
-|------|------|
-| `profiles` | map：profile 名 → 该 profile 的执行配置（`command` 必填等，字段同下表） |
-| `routing.default_profile` | 未命中任何前缀时使用的 profile 名 |
-| `routing.strategy` | `fixed`：始终用 `default_profile`；`prefix`：按 `prefix_rules` 匹配（**先匹配先生效**，较长前缀请写在列表前面） |
-| `routing.prefix_rules` | 仅 `strategy: prefix` 时需要非空；每项 `prefix` + `profile`；命中后 **去掉前缀** 的余文作为 `{{MESSAGE}}` / stdin |
-
-完整示例：[multi-profile.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/multi-profile.example.yaml)。
+**已移除**：`profiles` / `routing` / `type` / `skip_bot_messages` / `require_text` / 顶层 `send_error_reply` / `permission_default`。  
+多后端请用 manager 多文件 + Hub `/use`。完整字段见 [profile-protocol](../knowledge/bridges/profile-protocol.md)。
 
 ### Profile 目录（manager 模式，每个文件一个 workspace）
 
@@ -178,28 +178,28 @@ manager 只做进程管理：它会为每个有效 YAML 启动一个真实的 `i
 
 注意：manager 模式会忽略 `--token` / `WEIXIN_TOKEN`、`--cred-file`、`--register-name` 和 `--pair`，避免多个 profile 意外共享同一个 workspace 身份。Hub 如开启管理鉴权，仍可通过 `ILINK_ADMIN_TOKEN` 让每个子 bridge 自动注册。
 
-## 配置字段（单 Profile 根级，或 `profiles.<name>` 内）
+## 配置字段（`agentproc:` 内，另加文件级 sibling）
 
 | 字段 | 类型 | 默认 | 说明 |
 |------|------|------|------|
-| `command` | string | （必填） | 可执行文件名或绝对路径 |
+| `description` | string | — | 文件级：Agent 描述（Hub MCP `list_agents`） |
+| `script` | string | — | 文件级：按扩展名推断 runtime；`agentproc.command` 优先 |
+| `executor` | string | — | 内置 executor：`claude-code` / `cursor` / `codex` / `codebuddy` / `agy` / `recursive` / `opencode` |
+| `command` | string | — | 可执行文件名或绝对路径（无 executor 或自定义 spawn） |
 | `args` | string 数组 | `[]` | 参数；支持占位符（见下） |
-| `cwd` | string | 不设置 | 子进程工作目录。可与 CLI 一样使用下方**占位符**（例如按 `{{SESSION_ID}}` 分目录；目录需已存在或由你的脚本创建） |
-| `env` | map | `{}` | 环境变量（仅密钥/配置；`${VAR}` 从 bridge 进程 env 按 POSIX 语义展开，未知变量展开为空） |
-| `env_allowlist` | string 数组 | 不设置 | 限制 `env` 可展开的变量名单；未列出的变量展开为空 |
+| `cwd` | string | 不设置 | 子进程工作目录；可用占位符 |
+| `env` | map | `{}` | 环境变量（仅密钥/配置；`${VAR}` 从 bridge 进程 env 展开） |
+| `env_allowlist` | string 数组 | 不设置 | 限制 `env` 可展开的变量名单 |
 | `timeout_secs` | number | `1800` | 单条消息等待子进程的最长时间（秒） |
-| `kill_grace_secs` | number | 见默认 | 超时后优雅退出宽限秒数 |
-| `max_reply_chars` | number | `8000` | 回复按 **Unicode 字符数** 截断上限 |
+| `kill_grace_secs` | number | `5` | 超时后优雅退出宽限秒数 |
+| `max_reply_chars` | number | `8000` | 回复按 Unicode 字符数截断上限 |
 | `truncation_suffix` | string | `…(输出已截断)` | 超长时在末尾追加的提示 |
-| `streaming` | bool | `true` | bridge 侧 hint：是否转发 `partial` 事件 |
-| `permission` | bool | `false` | 开启 permission 通道（stdin 保持开启以接收 `permission_response`） |
-| `permission_default` | `allow`/`deny`/`ask` | `deny` | permission 默认策略 |
-| `skip_bot_messages` | bool | `true` | 忽略 `message_type == 2`（机器人侧消息），避免回路 |
-| `require_text` | bool | `true` | 无文本时是否仍触发 CLI；`true` 则忽略纯图片/语音等 |
-| `send_error_reply` | bool | `true` | CLI 失败或收到 `error` 事件时，是否向用户发简短错误说明 |
-| `include_stderr_in_reply` | bool | `false` | 成功时是否把 stderr 拼在 stdout 后面一并发出 |
+| `streaming` | bool | `true` | bridge 侧 hint：是否转发 `partial` |
+| `permission` | bool | `false` | 开启 permission 通道；请求恒 allow |
+| `send_error_reply` | bool | `true` | CLI/`error` 是否回用户（agentproc 规范字段） |
+| `include_stderr_in_reply` | bool | `false` | 成功时是否把 stderr 拼在 stdout 后 |
 
-> **AgentProc 0.3 NDJSON**：bridge 向子进程 stdin 写一行 turn 对象（`message` / `session_id` / `attachments` 等），子进程在 stdout 逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error`）。非 NDJSON 的 stdout 行会被忽略。0.2 的 `stdin`（`StdinMode`）与 `cli_session_first_line_prefix` 字段已移除。
+> **AgentProc 0.4 NDJSON**：bridge 向子进程 stdin 写一行 turn，stdout 消费 `partial` / `result` / `error` / `permission_request`。入站恒跳过 bot 消息、恒要求文本正文。
 
 ### 占位符
 

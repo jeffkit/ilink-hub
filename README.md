@@ -212,17 +212,16 @@ let bot = WeChatBot::new(BotOptions {
 Run a **local** command (Claude Code, Cursor Agent, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Usage guide (Chinese):** [bridge/USAGE](https://jeffkit.github.io/ilink-hub/bridge/USAGE.html). **Quick echo path:** [5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
 
 ```yaml
-# Example bridge config (ilink-hub-bridge.yaml)
-profiles:
-  echo:
-    command: echo
-    args: ["{{MESSAGE}}"] # Placeholder replaced with user message
-    stdin: none
+# Example bridge config (ilink-hub-bridge.yaml) — one file == one profile
+description: echo demo
+agentproc:
+  command: echo
+  args: ["{{MESSAGE}}"] # Placeholder replaced with user message
 ```
 
 > [!WARNING]
 > **安全警告 / Security Warning**:
-> 绝不要将 `{{MESSAGE}}` 用于 shell `-c` 参数（例如 `args: ["-c", "run {{MESSAGE}}"]`），因为这会带来 shell 命令注入的安全隐患。推荐使用 `stdin: message` 模式，将消息内容通过标准输入安全地传递给子进程。
+> 绝不要将 `{{MESSAGE}}` 用于 shell `-c` 参数（例如 `args: ["-c", "run {{MESSAGE}}"]`），因为这会带来 shell 命令注入的安全隐患。用户消息默认经 stdin NDJSON turn 传递；`{{MESSAGE}}` 仅用于安全的 argv 占位。
 
 ```bash
 cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml

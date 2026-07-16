@@ -1,55 +1,20 @@
-# 多 Profile 示例：每个 profile 里可用的「变量」= 字符串占位符（写在 args / cwd / env 的值里）。
-# 占位符由 ilink-hub-bridge 在每条消息上替换，不经过 shell。
+# Claude Code 示例（一文件一 profile；旧 multi-profile 已移除）
 #
-# ┌──────────────────┬──────────────────────────────────────────────────────────────────┐
-# │ 占位符            │ 含义                                                              │
-# ├──────────────────┼──────────────────────────────────────────────────────────────────┤
-# │ {{MESSAGE}}      │ 用户本条文本（prefix 路由时会去掉匹配前缀后的余文）                │
-# │ {{SESSION_ID}}   │ Hub 存储的后端 session UUID（如 Claude --resume 目标）            │
-# │ {{SESSION_NAME}} │ Hub session 可读名称（如 "feature-a"，默认 "default"）           │
-# │ {{PROFILE_DIR}}  │ profile YAML 文件所在目录                                         │
-# └──────────────────┴──────────────────────────────────────────────────────────────────┘
+# 占位符（可用于 args / cwd / env 值）：
+#   {{MESSAGE}} / {{SESSION_ID}} / {{SESSION_NAME}} / {{PROFILE_DIR}}
 #
-# 每个 profile 还可配置（非占位符，字面量或 YAML 类型）：
-#   command, args, cwd, env, env_allowlist, timeout_secs, kill_grace_secs,
-#   max_reply_chars, truncation_suffix, streaming, permission, permission_default,
-#   include_stderr_in_reply
-#
-# 0.3 起：消息/session 经 stdin NDJSON turn 传入；profile stdout 必须是 NDJSON 事件
-# （partial / text / session / error）。直接调 Claude/Cursor/Codex CLI 需用内置
-# type 或自写包装脚本转换为 NDJSON 事件。
-#
-# 整文件顶层（多 profile 模式）：profiles, routing, 以及可选 skip_bot_messages /
-# require_text / send_error_reply（与 README 一致）。
+# agentproc 字段见 docs/knowledge/bridges/profile-protocol.md
 
-profiles:
-  # 推荐：内置 type 自动管理 --resume 并转换输出为 NDJSON 事件
-  claude_continue:
-    type: claude-code
-    cwd: /path/to/your/project
-    timeout_secs: 600
-    max_reply_chars: 8000
-    truncation_suffix: "\n\n…(输出已截断)"
-    include_stderr_in_reply: false
-    # env:
-    #   CLAUDE_MODEL: sonnet
-    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # 从 bridge 进程 env 展开，勿写明文
-
-  # 自写包装脚本：脚本负责把 Claude 输出转为 NDJSON 事件（partial/text/session）
-  claude_via_wrapper:
-    command: /path/to/ilink-claude-bridge.sh
-    args: ["{{MESSAGE}}"]
-    cwd: /path/to/your/project
-    timeout_secs: 600
-    max_reply_chars: 8000
-    env:
-      # 包装脚本可从 stdin turn 读 session_id，或经占位符传入
-      ILINK_CLI_SESSION: "{{SESSION_ID}}"
-
-routing:
-  strategy: fixed
-  default_profile: claude_continue
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
+description: Claude Code continue session
+agentproc:
+  executor: claude-code
+  cwd: /path/to/your/project
+  timeout_secs: 600
+  max_reply_chars: 8000
+  truncation_suffix: "\n\n…(输出已截断)"
+  include_stderr_in_reply: false
+  streaming: true
+  send_error_reply: true
+  # env:
+  #   CLAUDE_MODEL: sonnet
+  #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}

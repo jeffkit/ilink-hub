@@ -1,7 +1,8 @@
-# 调试用：把用户消息原样 echo 回去（0.3 起 stdout 必须是 NDJSON 事件）。
-# 从 stdin 读 turn，把 message 作为 {"type":"text",...} 事件回传。
-command: python3
-args:
-  - "-c"
-  - "import json,sys; t=json.loads(sys.stdin.readline()); print(json.dumps({'type':'text','text':t['message']}),flush=True)"
-timeout_secs: 10
+# Echo：验证 Hub ↔ bridge 链路（不调用大模型）
+description: echo demo
+agentproc:
+  command: echo
+  args: ["{{MESSAGE}}"]
+  timeout_secs: 30
+  max_reply_chars: 8000
+  send_error_reply: true

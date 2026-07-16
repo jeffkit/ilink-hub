@@ -98,26 +98,15 @@ INFO ilink_hub: iLink Hub listening on 127.0.0.1:8765
 新建 `~/ilink-claude.yaml`，把 `cwd` 改为你的项目目录：
 
 ```yaml
-# ~/ilink-claude.yaml
-profiles:
-  claude:
-    type: claude-code            # 内置处理器：自动管理 --resume、session 追踪
-    cwd: ~/your-project          # ← 改为你的项目目录（Claude 会在这里读写文件）
-    timeout_secs: 300
-
-  claude_new:                    # 可选：/new 前缀强制开新对话
-    type: claude-code
-    cwd: ~/your-project
-    env:
-      AGENT_SESSION_ID: ""       # 强制新会话
-
-routing:
-  strategy: prefix
-  default_profile: claude
-  prefix_rules:
-    - prefix: "/new "
-      profile: claude_new
+# ~/ilink-claude.yaml — 一文件一 profile
+description: Claude Code
+agentproc:
+  executor: claude-code          # 自动管理 --resume、session 追踪
+  cwd: ~/your-project            # ← 改为你的项目目录
+  timeout_secs: 300
 ```
+
+> Hub 级 `/new`、`/session` 仍可用，无需在 YAML 里做 prefix 路由。
 
 ::: tip 没有特定项目？
 `cwd` 设为任意目录都行，比如 `~`。Claude Code 会在该目录下工作。

@@ -7,7 +7,7 @@ description: >-
   "写一个 bridge", "发布 profile", "测试 profile", "bridge 配置", "用 Python/JS 写 profile",
   "自定义 profile", "ilink bridge profile", "create bridge profile", "add new bridge",
   "publish profile", "develop profile with SDK".
-version: 0.1.0
+version: 0.2.0
 source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 ---
 
@@ -22,8 +22,9 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 | 术语 | 说明 |
 |------|------|
 | **Profile YAML** | 描述 bridge 行为的配置文件，放在 `~/.ilink-hub-bridge/profiles/` 由 manager 自动发现 |
-| **AgentProc 0.3** | bridge 与 handler 间的通信协议：stdin 写一行 NDJSON turn，stdout 逐行输出 NDJSON 事件 |
-| **type: claude-code** | 内置类型，自动处理 Claude Code CLI 的 `--resume` 会话续接 |
+| **AgentProc 0.4** | bridge 与 handler 间的通信协议：stdin 写一行 NDJSON turn，stdout 逐行输出 NDJSON 事件 |
+| **executor: claude-code** | 内置 executor，自动处理 Claude Code CLI 的 `--resume` 会话续接 |
+| **agentproc:** | YAML 中嵌套的 agentproc 规范执行块（一文件一 profile） |
 | **script:** | 指定脚本路径，bridge 按扩展名自动推断运行时（.py/.js/.ts/.sh/.rb） |
 | **SDK** | `agentproc`（Python/Node.js），封装 0.4 NDJSON 协议样板代码 |
 
@@ -36,14 +37,14 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 1. **Profile 名称**（文件名 stem，如 `my-claude` → `my-claude.yaml`）
 2. **用途**：接 Claude Code、自定义脚本/SDK，还是其他 CLI（Cursor、Codex）？
 3. **项目目录** `cwd`：在哪个目录下执行？
-4. **路由**：是否需要前缀路由（`/new`、`/ask` 等不同 profile）？
+4. **多后端**：需要多个 CLI 时用 manager 多文件 + Hub `/use`（不再支持单文件 prefix 路由）
 5. **特殊 env**：API Key、BASE_URL、模型名等？**绝对不要把明文 key 写进 YAML**——见 [Secrets & 环境变量](#secrets--env-vars)。
 
 **快速路由：**
 - 接 Claude Code → [内置 claude-code YAML](#yaml-claude-code)
 - 接自定义 Python/JS 逻辑 → [SDK Handler 开发](#sdk-development)
 - 接其他 CLI（Cursor/Codex）→ [自定义 command YAML](#yaml-custom-cli)
-- 多前缀路由 → [prefix 路由模板](#yaml-prefix)
+- 多后端 → manager 目录多文件 + `/use`（见 [profile-protocol](../../../knowledge/bridges/profile-protocol.md)）
 
 ---
 
@@ -61,52 +62,13 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 
 ```yaml
 # ~/.ilink-hub-bridge/profiles/<name>.yaml
-profiles:
-  claude:
-    type: claude-code       # 内置：自动管理 --resume 续接上下文
-    cwd: /path/to/project   # ← 改为实际项目目录
-    # 可选：
-    # env:
-    #   CLAUDE_MODEL: sonnet
-    #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # 引用进程 env；不要写明文 key
-
-routing:
-  strategy: fixed
-  default_profile: claude
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
-```
-
----
-
-### 带前缀路由的 claude-code {#yaml-prefix}
-
-```yaml
-profiles:
-  claude:
-    type: claude-code
-    cwd: /path/to/project
-    env:
-      CLAUDE_MODEL: sonnet
-
-  claude_new:
-    type: claude-code
-    cwd: /path/to/project
-    # /new 是 Hub 级命令（强制新会话），无需在此设 env；
-    # 这里仅演示前缀路由到独立 profile。
-
-routing:
-  strategy: prefix
-  default_profile: claude
-  prefix_rules:
-    - prefix: "/ask "       # "/ask 帮我写函数" → MESSAGE = "帮我写函数"
-      profile: claude_new
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
+description: Claude Code on project
+agentproc:
+  executor: claude-code
+  cwd: /path/to/project
+  # env:
+  #   CLAUDE_MODEL: sonnet
+  #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
 
 ---
@@ -114,46 +76,32 @@ send_error_reply: true
 ### 自定义 CLI（Cursor / Codex / 任意命令） {#yaml-custom-cli}
 
 ```yaml
-profiles:
-  my-cli:
-    command: your-cli-command
-    args: ["-p", "{{MESSAGE}}"]
-    cwd: /path/to/project
-    timeout_secs: 300
-    max_reply_chars: 8000
-
-routing:
-  strategy: fixed
-  default_profile: my-cli
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
+description: custom CLI
+agentproc:
+  command: your-cli-command
+  args: ["-p", "{{MESSAGE}}"]
+  cwd: /path/to/project
+  timeout_secs: 300
+  max_reply_chars: 8000
+  send_error_reply: true
 ```
 
-> 自定义 CLI 默认通过 stdin 收到一行 NDJSON turn；若 CLI 需要消息作为命令行参数，用 `{{MESSAGE}}` 占位符（`{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}` 同样可用）。CLI 的 stdout 应逐行输出 NDJSON 事件（`partial` / `text` / `session` / `error`）；若只输出纯文本，bridge 会作为最终回复处理。
+> 自定义 CLI 默认通过 stdin 收到一行 NDJSON turn；若 CLI 需要消息作为命令行参数，用 `{{MESSAGE}}` 占位符。stdout 应输出 `partial` / `result` / `error`（0.4）。
 
 ---
 
 ### 自定义 SDK 脚本（Python/JS） {#yaml-script}
 
 ```yaml
-profiles:
-  my-bot:
-    script: /path/to/handler.py   # bridge 自动调用 python3 handler.py
-    # 或 script: /path/to/handler.js  → node handler.js
-    timeout_secs: 60
-    max_reply_chars: 8000
-    env:
-      MY_API_KEY: ${MY_API_KEY}    # 引用进程 env；不要写明文 key
-
-routing:
-  strategy: fixed
-  default_profile: my-bot
-
-skip_bot_messages: true
-require_text: true
-send_error_reply: true
+description: custom SDK handler
+script: /path/to/handler.py   # bridge 自动调用 python3 handler.py
+# 或 script: /path/to/handler.js
+agentproc:
+  timeout_secs: 60
+  max_reply_chars: 8000
+  send_error_reply: true
+  env:
+    MY_API_KEY: ${MY_API_KEY}
 ```
 
 **`script:` 运行时推断规则：**
@@ -173,22 +121,20 @@ send_error_reply: true
 
 | 字段 | 说明 |
 |------|------|
-| `type` | 内置类型：`claude-code` / `cursor` / `codex` / `codebuddy-code` / `agy` / `recursive` |
-| `script` | 脚本路径，自动推断运行时 |
-| `command` | 显式命令（优先级高于 script/type） |
-| `args` | 支持占位符 `{{MESSAGE}}` / `{{SESSION_ID}}` / `{{SESSION_NAME}}` / `{{PROFILE_DIR}}` |
-| `cwd` | 工作目录，支持 `~` 展开 |
-| `env` | 注入的环境变量（仅密钥/配置；业务字段走 stdin turn） |
-| `env_allowlist` | 限制 `env` 变量展开的允许名单（未列出的未知变量展开为空，POSIX 语义） |
-| `timeout_secs` | 超时（默认 60） |
-| `kill_grace_secs` | 超时后优雅退出宽限秒数 |
-| `max_reply_chars` | 回复最大字符数（默认 4000） |
-| `truncation_suffix` | 超长回复截断后缀（默认 `…(已截断)`） |
-| `streaming` | bridge 侧 hint：是否转发 `partial` 事件（默认 true） |
-| `permission` | 开启 permission 通道（默认 false） |
-| `permission_default` | permission 默认策略：`allow` / `deny` / `deny_logged` / `ask`（默认 allow；`ask` 走微信交互审批） |
-| `permission_ask_timeout_secs` | `ask` 策略等待用户回复秒数（默认 600）；超时自动 deny |
-| `include_stderr_in_reply` | 是否附加 stderr（默认 false） |
+| `description` | 文件级：Agent 描述 |
+| `script` | 文件级：脚本路径，自动推断运行时；`agentproc.command` 优先 |
+| `agentproc.executor` | `claude-code` / `cursor` / `codex` / `codebuddy` / `agy` / `recursive` / `opencode` |
+| `agentproc.command` / `args` | 自定义命令与参数；支持 `{{MESSAGE}}` 等占位符 |
+| `agentproc.cwd` | 工作目录，支持 `~` |
+| `agentproc.env` | 密钥/配置；`${VAR}` 从 bridge 进程 env 展开 |
+| `agentproc.env_allowlist` | 限制可展开变量 |
+| `agentproc.timeout_secs` | 超时（默认 1800） |
+| `agentproc.kill_grace_secs` | 优雅退出宽限 |
+| `agentproc.max_reply_chars` | 截断上限（默认 8000） |
+| `agentproc.streaming` | 是否转发 `partial`（默认 true） |
+| `agentproc.permission` | permission 通道（默认 false；请求恒 allow） |
+| `agentproc.send_error_reply` | 错误是否回用户（默认 true） |
+| `agentproc.include_stderr_in_reply` | 是否附加 stderr（默认 false） |
 
 ---
 
@@ -196,19 +142,19 @@ send_error_reply: true
 
 当内置类型不满足需求，需要调用 LLM API、自定义逻辑、多轮对话时，使用 SDK 编写 handler。
 
-### AgentProc 0.3 协议说明
+### AgentProc 0.4 协议说明
 
 bridge 向 handler 的 stdin 写一行 NDJSON turn 对象，handler 在 stdout 逐行输出 NDJSON 事件：
 
 **stdin turn 对象：**
 
 ```json
-{"type":"turn","message":"用户消息","session_id":"<uuid 或空>","from_user":"<user>","protocol_version":"0.3","session_name":"default","attachments":[...],"permission":false}
+{"type":"turn","message":"用户消息","session_id":"<uuid 或空>","from_user":"<user>","protocol_version":"0.4","session_name":"default","attachments":[...],"permission":false}
 ```
 
 | turn 字段 | 说明 |
 |-----------|------|
-| `message` | 用户消息文本（前缀路由后的净文本） |
+| `message` | 用户消息文本 |
 | `session_id` | Hub 持久化的 session UUID（空=新会话） |
 | `session_name` | session 可读名称（默认 `default`） |
 | `from_user` | 发送消息的用户 ID |
@@ -301,12 +247,12 @@ create_profile(handler)
 
 对应 YAML：
 ```yaml
-profiles:
-  my-bot:
-    script: /path/to/handler.py
-    timeout_secs: 60
-    env:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # 引用进程 env
+description: my agent
+script: /path/to/handler.py
+agentproc:
+  timeout_secs: 60
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
 
 ---
@@ -377,12 +323,12 @@ createProfile(async ({ message, sessionId }) => {
 
 对应 YAML：
 ```yaml
-profiles:
-  my-bot:
-    script: /path/to/handler.js
-    timeout_secs: 60
-    env:
-      OPENAI_API_KEY: ${OPENAI_API_KEY}    # 引用进程 env
+description: my agent
+script: /path/to/handler.js
+agentproc:
+  timeout_secs: 60
+  env:
+    OPENAI_API_KEY: ${OPENAI_API_KEY}
 ```
 
 ---
@@ -393,7 +339,7 @@ profiles:
 
 ```bash
 # 公共 turn 模板
-TURN='{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}'
+TURN='{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.4","session_name":"default","attachments":[]}'
 
 # 测试内置 claude-code
 echo "$TURN" | ilink-hub-bridge profile claude-code
@@ -406,8 +352,8 @@ echo "$TURN" | node /path/to/handler.js
 ```
 
 **验证输出（NDJSON 事件流）：**
-- 若管理 session，应有 `{"type":"session","id":"<uuid>"}`
-- 回复文本通过 `{"type":"text","text":...}` 事件输出（流式时另有 `partial` 事件）
+- 最终回复：`{"type":"result","text":...,"session_id":"..."}`
+- 流式：另有 `partial` 事件；session 经事件字段 `session_id`
 - 退出码 0 = 成功；`{"type":"error",...}` 事件 = turn 失败
 
 ---
@@ -456,11 +402,12 @@ INFO ilink_hub::bridge::manager: starting child bridge profile=<name> ...
 ### 推荐做法
 
 ```yaml
-profiles:
-  my-bot:
-    script: /path/to/handler.py
-    env:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+description: my agent
+script: /path/to/handler.py
+agentproc:
+  timeout_secs: 60
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
 
 启动 manager 之前先 export：
@@ -484,28 +431,24 @@ ANTHROPIC_API_KEY="sk-ant-..." ilink-hub-bridge manager
 限制可展开的变量，避免意外把敏感环境变量透传给子进程：
 
 ```yaml
-profiles:
-  my-bot:
-    script: /path/to/handler.py
-    env_allowlist: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
-    env:
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+description: my agent
+script: /path/to/handler.py
+agentproc:
+  env_allowlist: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
 
-### permission 通道与 `ask` 审批（可选）
+### permission 通道（可选）
 
-`permission: true` 开启工具授权通道：handler 发 `{"type":"permission_request",...}` 事件，bridge 按 `permission_default` 决策并经 stdin 回写 `{"type":"permission_response",...}`。`permission_default: ask` 会暂停 turn、经微信向用户提问「🔧 工具 X 请求授权…回复『允许』或『拒绝』」，用户在**同一 session** 的下一条消息被解析为审批回复（`允许`/`yes`/`1` → allow，`拒绝`/`no`/`0` → deny，未识别重提示最多 2 次后拒绝），超时（`permission_ask_timeout_secs`，默认 600s）自动拒绝。
+`agentproc.permission: true` 开启工具授权通道：handler 发 `permission_request`，bridge **恒 allow** 并回写 `permission_response`。WeChat ask / `permission_default` 已移除。
 
 ```yaml
-profiles:
-  claude:
-    type: claude-code
-    permission: true
-    permission_default: ask
-    permission_ask_timeout_secs: 600
+description: Claude with permission channel
+agentproc:
+  executor: claude-code
+  permission: true
 ```
-
-内置 `claude-code` 在 `permission: true` 时自动切换到 `claude --permission-prompt-tool stdio`，把 Claude 的 `control_request`/`control_response` 与 AgentProc permission 帧双向转译，从而把 Claude 工具授权接到微信 `ask` 闭环。
 
 ---
 

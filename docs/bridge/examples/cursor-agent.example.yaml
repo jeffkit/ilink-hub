@@ -1,16 +1,11 @@
-# Cursor Agent CLI：推荐使用内置 `type: cursor`（自动把 Cursor 的
-# stream-json 输出转换为 AgentProc 0.3 NDJSON 事件并管理 --resume）。
-#
-# PATH 中需有 `agent`（见 https://cursor.com/docs/cli/overview 安装）。
-# 认证：自动化常用环境变量 CURSOR_API_KEY；或先在本机执行 `agent login`。
-# 若需在无确认下允许改仓库文件，请查阅官方文档中的 `--force` / `--yolo` 等选项（有安全风险，仅用于可信目录）。
-#
-# 直接调 `agent -p` 的 stdout 是 Cursor 自有格式（非 NDJSON 事件），bridge 会
-# 忽略无法识别的行 → 用户收不到回复。直接 CLI 仅适合你自己写包装脚本的场景。
-command: agent
-args: ["-p", "{{MESSAGE}}"]
-cwd: /path/to/your/project
-timeout_secs: 1800
-max_reply_chars: 8000
-# env:
-#   CURSOR_API_KEY: "key-..."  # 建议仅在 shell 中 export，勿提交到 Git
+description: Cursor agent on project
+agentproc:
+  executor: cursor
+  cwd: /path/to/your/project
+  timeout_secs: 600
+  max_reply_chars: 8000
+  streaming: true
+  send_error_reply: true
+  # env:
+  #   CURSOR_MODEL: …
+  #   CURSOR_API_KEY: ${CURSOR_API_KEY}

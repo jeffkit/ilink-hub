@@ -1,5 +1,7 @@
 # 用 Node.js 开发 Bridge Profile
 
+> **2026-07-16**：Profile YAML 已改为 `agentproc:` hub form（一文件一 profile）。完整说明见 [profile-protocol](../knowledge/bridges/profile-protocol.md)。
+
 > 最后更新：2026-07-13
 
 本教程带你从零开始，用 Node.js 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。Profile 通过 **AgentProc 0.4 NDJSON 协议**与 bridge 通信：从 stdin 读一行 turn 对象，在 stdout 逐行输出 NDJSON 事件。
@@ -88,13 +90,10 @@ echo '{"type":"turn","message":"你好，介绍一下自己","session_id":"","fr
 创建 `profiles.yaml`：
 
 ```yaml
-profiles:
-  my-ai:
-    script: ./handler.js    # bridge 自动用 node 运行
-    timeout_secs: 60
-
-routing:
-  default_profile: my-ai
+description: my AI
+script: ./handler.js    # bridge 自动用 node 运行
+agentproc:
+  timeout_secs: 60
 ```
 
 启动 bridge：
@@ -169,15 +168,12 @@ createProfile(async ({ message }) => {
 `profiles.yaml`：
 
 ```yaml
-profiles:
-  gemini:
-    script: ./gemini-profile.js
-    env:
-      GEMINI_API_KEY: "your-api-key-here"
-    timeout_secs: 30
-
-routing:
-  default_profile: gemini
+description: my agent
+script: ./gemini-profile.js
+agentproc:
+  timeout_secs: 60
+  env:
+    GEMINI_API_KEY: "your-api-key-here"
 ```
 
 ---
@@ -210,9 +206,9 @@ npm publish
 其他用户安装后，在 YAML 中用 `command` 引用：
 
 ```yaml
-profiles:
-  my-ai:
-    command: my-ai-profile
+description: my AI package
+agentproc:
+  command: my-ai-profile
 ```
 
 ---

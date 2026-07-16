@@ -1,4 +1,4 @@
-//! Bridge YAML: single-profile (legacy) or multi-profile with routing.
+//! Bridge YAML: one file == one agentproc profile (hub form under `agentproc:`).
 
 use std::collections::HashMap;
 use std::path::Path;

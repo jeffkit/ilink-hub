@@ -1,59 +1,9 @@
-# Claude Code 接入示例（最简配置）
-#
-# 功能：
-#   · 连续对话  ── 同一 Hub session 内的消息通过 --resume <UUID> 保持 Claude 上下文
-#   · 多 session ── 微信里用 /session 命令在多个命名 Claude 会话间切换
-#   · 降级容错  ── session UUID 失效时自动降级为新会话，无需重启 bridge
-#
-# ─── 前提条件 ────────────────────────────────────────────────────────────────
-#
-#   1. 安装 Claude Code CLI：
-#        npm install -g @anthropic-ai/claude-code
-#
-#   2. 登录认证（任选一种）：
-#        claude login          # OAuth 登录（推荐）
-#        export ANTHROPIC_API_KEY=sk-ant-...  # 或直接用 API Key
-#
-#   3. 确认 claude 在 PATH 中：
-#        claude --version
-#
-#   4. 修改下方 cwd 为你的项目目录。
-#
-# ─── 快速开始 ─────────────────────────────────────────────────────────────────
-#
-#   ilink-hub-bridge --config claude-code-session.profiles.yaml
-#
-# ─── 微信里的用法 ─────────────────────────────────────────────────────────────
-#
-#   发送普通消息（使用默认 session "default"）：
-#     你: 帮我解释一下 src/lib.rs 里的 dispatch_message 函数
-#
-#   查看当前对话的所有 sessions：
-#     你: /session list
-#
-#   创建 & 切换 session（隔离不同任务上下文）：
-#     你: /session new feature-login
-#     你: /session use feature-login
-#     你: 我要做一个用户登录功能，帮我设计接口
-#
-#   切回之前的 session：
-#     你: /session use default
-#
-# ─── 测试 profile 是否工作 ────────────────────────────────────────────────────
-#
-#   不启动 bridge，直接在终端模拟一次调用（向 stdin 写一行 turn NDJSON）：
-#     echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
-#       | ilink-hub-bridge profile claude-code
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
-profiles:
-  claude:
-    type: claude-code       # 内置：自动管理 --resume
-    cwd: /path/to/your/project  # ← 改为你的项目目录
-    # streaming: true       # 默认 true，bridge 侧 hint：转发 partial 事件给用户
-                            # 设为 false 则不转发 partial，仅以最终 text 事件作为单条回复，适合调试
-    # 若需指定模型或注入 API Key，可添加 env：
-    # env:
-    #   CLAUDE_MODEL: sonnet
-    #   ANTHROPIC_API_KEY: "sk-ant-..."
+# Claude Code + Hub session 管理（/session、/new 等仍是 Hub 级命令）
+description: Claude Code with Hub sessions
+agentproc:
+  executor: claude-code
+  cwd: /path/to/your/project
+  timeout_secs: 600
+  max_reply_chars: 8000
+  streaming: true
+  send_error_reply: true

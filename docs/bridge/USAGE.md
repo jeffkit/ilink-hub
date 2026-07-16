@@ -58,25 +58,17 @@ ilink-hub-bridge --version  # 确认 bridge 已安装
 新建 `~/ilink-claude.yaml`：
 
 ```yaml
-# ~/ilink-claude.yaml
-profiles:
-  claude:
-    type: claude-code
-    cwd: /path/to/your/project   # ← 改为你的项目目录
-
-  claude_new:                    # 可选：/new 前缀强制开新对话
-    type: claude-code
-    cwd: /path/to/your/project
-    env:
-      AGENT_SESSION_ID: ""       # 覆盖自动注入，强制新会话
-
-routing:
-  strategy: prefix
-  default_profile: claude
-  prefix_rules:
-    - prefix: "/new "
-      profile: claude_new
+# ~/ilink-claude.yaml  — 一文件一 profile
+description: Claude Code
+agentproc:
+  executor: claude-code
+  cwd: /path/to/your/project   # ← 改为你的项目目录
+  # env:
+  #   CLAUDE_MODEL: sonnet
+  #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
 ```
+
+> Hub 级 `/new`、`/session` 命令仍可用；无需再在 YAML 里做 prefix 路由。
 
 完整注释版本：[claude-code-session.profiles.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/claude-code-session.profiles.yaml)
 
@@ -91,7 +83,7 @@ ilink-hub-bridge --config ~/ilink-claude.yaml
 #### 验证：不启动 bridge，直接测 profile
 
 ```bash
-echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
+echo '{"type":"turn","message":"你好","session_id":"","from_user":"test","protocol_version":"0.4","session_name":"default","attachments":[],"permission":false}' \
   | ilink-hub-bridge profile claude-code
 ```
 
@@ -120,39 +112,36 @@ Hub 内建 session 管理，可在同一微信对话里维护多个命名 Claude
                 └───────────────┤
                                 │ stdout: NDJSON 事件流
                                 │   {"type":"partial","text":...}  ← 实时分块
-                                │   {"type":"text","text":...}     ← 最终回复
-                                │   {"type":"session","id":...}    ← bridge 存入 Hub
+                                │   {"type":"result","text":...,"session_id":...}  ← 最终回复 + session
 ```
 
 Bridge 通过 stdin turn 对象传入 `message` / `session_id` / `session_name` / `attachments` 等，无需在 `env:` 段手动配置。
 
 #### 高级：直接调 claude CLI（完全自定义）
 
-不想用 `type: claude-code`，可以直接写 `command`，控制全部参数：
+不想用 `executor: claude-code`，可以直接写 `command`，控制全部参数：
 
 ```yaml
-profiles:
-  claude:
-    command: claude
-    args: ["-p", "{{MESSAGE}}", "--continue"]
-    cwd: /path/to/your/project
-    timeout_secs: 600
+description: raw claude CLI (not recommended)
+agentproc:
+  command: claude
+  args: ["-p", "{{MESSAGE}}", "--continue"]
+  cwd: /path/to/your/project
+  timeout_secs: 600
 ```
 
-> 注意：直接调 `claude -p` 时 stdout 是 Claude 自有格式（非 NDJSON 事件），bridge 会忽略无法识别的行。若需正确流式/回复，建议使用内置 `type: claude-code`（它会把 Claude 输出转换为 0.3 NDJSON 事件）。
-
-想要更深度定制（如指定工具权限、自定义 JSON 解析），可使用仓库 `scripts/ilink-claude-bridge.sh` 包装脚本。关于如何开发自定义 profile 和 SDK，见 [Profile 规范（AgentProc 0.3）](./profile-spec.md)。
+> 注意：直接调 `claude -p` 时 stdout 是 Claude 自有格式（非 NDJSON），bridge 会忽略无法识别的行。推荐 `executor: claude-code`。自定义 SDK 见 [Profile 规范](./profile-spec.md)。
 
 ### 4.2 Cursor Agent（`agent`）
 
-Cursor 提供的 CLI 命令名为 **`agent`**（安装后应在 PATH 中；安装见 [Cursor CLI 文档](https://cursor.com/docs/cli/overview)）。推荐用内置 `type: cursor`：
+Cursor 提供的 CLI 命令名为 **`agent`**（安装后应在 PATH 中；安装见 [Cursor CLI 文档](https://cursor.com/docs/cli/overview)）。推荐用内置 `executor: cursor`：
 
 ```yaml
-profiles:
-  cursor:
-    type: cursor
-    cwd: /path/to/your/project
-    timeout_secs: 600
+description: Cursor agent
+agentproc:
+  executor: cursor
+  cwd: /path/to/your/project
+  timeout_secs: 600
 ```
 
 完整模板：[cursor-agent.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/cursor-agent.example.yaml)。  
@@ -160,14 +149,14 @@ profiles:
 
 ### 4.3 OpenAI Codex（`codex`）
 
-推荐用内置 `type: codex`：
+推荐用内置 `executor: codex`：
 
 ```yaml
-profiles:
-  codex:
-    type: codex
-    cwd: /path/to/your/project
-    timeout_secs: 600
+description: Codex
+agentproc:
+  executor: codex
+  cwd: /path/to/your/project
+  timeout_secs: 600
 ```
 
 模板：[codex.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/codex.example.yaml)。
@@ -193,8 +182,8 @@ ilink-hub-bridge --register-name my-claude --config ./bridge-claude.yaml
 **做法 B — 多进程 + `/use` 切换**  
 为每个 CLI 各注册一个 Hub 客户端名，各跑一个 bridge 进程（各用不同 `WEIXIN_TOKEN` 或不同 `ILINKHUB_BRIDGE_CREDS`）。在微信里用 **`/use <名称>`** 切换当前对话走哪条链路。注意：未活跃进程仍会占用 Hub 连接，按需启停即可。
 
-**做法 C — 一份 YAML 多 Profile（单进程）**  
-在一份 YAML 里写 `profiles` + `routing`（`fixed` 或 `prefix`）。`strategy: prefix` 时按 `prefix_rules` 匹配，命中前缀会从 `{{MESSAGE}}` 中**剥掉**该前缀再交给对应 CLI。示例：[multi-profile.example.yaml](https://github.com/jeffkit/ilink-hub/blob/main/docs/bridge/examples/multi-profile.example.yaml)。仍与 Hub 上**一个**下游客户端、一条长轮询一致；与「多进程 + `/use`」可并存，按场景选用。
+**做法 C — manager 多文件（推荐于多后端）**  
+把多个 YAML 放进 `~/.ilink-hub-bridge/profiles/`，用 `ilink-hub-bridge manager` 各启一子进程；微信里 `/use <name>` 切换。单文件多 profile / `routing` **已移除**。
 
 ## 6. 自测清单
 
@@ -202,7 +191,7 @@ ilink-hub-bridge --register-name my-claude --config ./bridge-claude.yaml
 2. `ilink-hub-bridge --version` 与 Hub 版本符合预期。  
 3. 微信发 **`/list`**：你的 bridge 客户端显示为在线。  
 4. 发**非命令**普通文字，确认本机 CLI 被触发且微信收到 stdout 截断后的回复。  
-5. 故意触发一次 CLI 失败，确认是否收到错误回执（由 YAML `send_error_reply` 控制）。
+5. 故意触发一次 CLI 失败，确认是否收到错误回执（由 `agentproc.send_error_reply` 控制）。
 
 ## 7. 发版后维护者：更新 Homebrew formula
 

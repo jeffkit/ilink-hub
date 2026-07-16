@@ -1,5 +1,7 @@
 # 用 Python 开发 Bridge Profile
 
+> **2026-07-16**：Profile YAML 已改为 `agentproc:` hub form（一文件一 profile）。完整说明见 [profile-protocol](../knowledge/bridges/profile-protocol.md)。
+
 > 最后更新：2026-07-13
 
 本教程带你从零开始，用 Python 编写一个能接收微信消息、调用 AI API、返回回复的 Bridge Profile，并将它接入 iLink Hub Bridge。Profile 通过 **AgentProc 0.4 NDJSON 协议**与 bridge 通信：从 stdin 读一行 turn 对象，在 stdout 逐行输出 NDJSON 事件。
@@ -92,24 +94,20 @@ echo '{"type":"turn","message":"你好，介绍一下自己","session_id":"","fr
 创建 `profiles.yaml`：
 
 ```yaml
-profiles:
-  my-ai:
-    script: ./handler.py    # bridge 自动用 python3 运行
-    timeout_secs: 60
-
-routing:
-  default_profile: my-ai
+description: my AI
+script: ./handler.py    # bridge 自动用 python3 运行
+agentproc:
+  timeout_secs: 60
 ```
 
-> **使用虚拟环境时**：需要用 `command` 指定解释器路径：
+> **使用虚拟环境时**：在 `agentproc` 里用 `command` 指定解释器：
 >
 > ```yaml
-> profiles:
->   my-ai:
->     script: ./handler.py
->     command: ./.venv/bin/python3
->     args: ["./handler.py"]
->     timeout_secs: 60
+> description: my AI
+> agentproc:
+>   command: ./.venv/bin/python3
+>   args: ["./handler.py"]
+>   timeout_secs: 60
 > ```
 
 启动 bridge：
@@ -194,15 +192,12 @@ create_profile(handler)
 `profiles.yaml`：
 
 ```yaml
-profiles:
-  claude-api:
-    script: ./claude-profile.py
-    env:
-      ANTHROPIC_API_KEY: "your-api-key-here"
-    timeout_secs: 60
-
-routing:
-  default_profile: claude-api
+description: claude API handler
+script: ./claude-profile.py
+agentproc:
+  timeout_secs: 60
+  env:
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # 勿写明文 key
 ```
 
 ---
@@ -243,9 +238,9 @@ python -m twine upload dist/*
 其他用户安装后，在 YAML 中用 `command` 引用：
 
 ```yaml
-profiles:
-  my-ai:
-    command: agentproc-myai
+description: my AI package
+agentproc:
+  command: agentproc-myai
 ```
 
 ---

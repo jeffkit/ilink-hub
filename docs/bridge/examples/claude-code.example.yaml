@@ -1,26 +1,12 @@
-# Claude Code CLI（Anthropic）：推荐使用内置 `type: claude-code`（见
-# claude-code-session.profiles.yaml），它会自动把 Claude 的 stream-json 输出
-# 转换为 AgentProc 0.3 NDJSON 事件并管理 --resume。
-#
-# 若直接调 `claude -p`，其 stdout 是 Claude 自有格式（非 NDJSON 事件），
-# bridge 会忽略无法识别的行 → 用户收不到回复。直接 CLI 仅适合你自己写
-# 包装脚本把输出转为 NDJSON 事件的场景。
-#
-# 单轮 / 不要求接续上文：仅用 -p
-# command: claude
-# args: ["-p", "{{MESSAGE}}"]
-#
-# 同一微信会话内多轮、共用当前 cwd 下最近一次 Claude 会话：加 --continue（勿与 --no-session-persistence 同用）
-command: claude
-args: ["-p", "{{MESSAGE}}", "--continue"]
-cwd: /path/to/your/project
-timeout_secs: 600
-max_reply_chars: 8000
-# 需要「每个 Hub 会话线程一个工作区」时（与 {{SESSION_ID}} / ilink_hub_session_id 对齐）：
-# cwd: "/path/to/workspaces/{{SESSION_ID}}"
-# 目录需已存在或由你自己的脚本创建。
-# env:
-#   ILINK_HUB_SESSION: "{{SESSION_ID}}"
-# 认证通常依赖本机 `claude login` 或 ANTHROPIC_API_KEY 等；可用 env 块注入，勿把密钥提交到仓库。
-# env:
-#   ANTHROPIC_API_KEY: "sk-ant-..."
+# 内置 executor: claude-code
+description: Claude Code on project
+agentproc:
+  executor: claude-code
+  cwd: /path/to/your/project
+  timeout_secs: 600
+  max_reply_chars: 8000
+  streaming: true
+  send_error_reply: true
+  # env:
+  #   CLAUDE_MODEL: sonnet
+  #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
