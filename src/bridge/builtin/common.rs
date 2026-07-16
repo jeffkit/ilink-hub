@@ -303,11 +303,17 @@ impl StreamJsonEvent {
                 return Some(joined);
             }
         }
+        // `stop_sequence` is a normal model stop reason (the model hit a stop
+        // marker), not a user-visible error.  Exposing it verbatim confuses
+        // users (they see a bare "stop_sequence" reply).  Other stop_reason
+        // values such as "provider_stop:…" do carry useful diagnostic info and
+        // are kept.
         if let Some(reason) = self
             .stop_reason
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            .filter(|s| *s != "stop_sequence")
         {
             return Some(reason.to_string());
         }
@@ -432,6 +438,24 @@ mod tests {
         assert_eq!(
             event.result_error_message().as_deref(),
             Some("provider_stop:boom")
+        );
+    }
+
+    #[test]
+    fn result_error_message_suppresses_stop_sequence() {
+        // GLM (and other models via Anthropic-compat) emit stop_reason="stop_sequence"
+        // when the model hits a stop marker.  This is a normal stop, not a real
+        // error; the bridge must not forward it as a user-visible reply.
+        let json = r#"{"type":"result","is_error":true,"stop_reason":"stop_sequence","session_id":"sess-1"}"#;
+        let event: StreamJsonEvent = serde_json::from_str(json).unwrap();
+        assert!(
+            event.is_result_error(),
+            "is_error=true must still be detected as error"
+        );
+        assert_eq!(
+            event.result_error_message(),
+            None,
+            "stop_sequence must not produce a user-visible error message"
         );
     }
 

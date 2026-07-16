@@ -128,14 +128,28 @@ echo "==> 安装结果"
 
 if [[ "${ILINK_NO_RELOAD_LAUNCHD:-0}" != "1" ]]; then
   uid="$(id -u)"
-  PLIST="$HOME/Library/LaunchAgents/com.ilink-hub.bridge-manager.plist"
+  SERVICE="com.ilink-hub.bridge-manager"
+  PLIST="$HOME/Library/LaunchAgents/$SERVICE.plist"
   if [[ -f "$PLIST" ]]; then
-    echo "==> 重载 bridge-manager launchd（从磁盘 plist，使用 /opt/homebrew/bin）"
-    launchctl bootout "gui/$uid/com.ilink-hub.bridge-manager" 2>/dev/null || true
-    sleep 1
-    launchctl bootstrap "gui/$uid" "$PLIST"
-    echo "    已重载，等待 5s 后查看进程"
-    sleep 5
+    echo "==> 重载 bridge-manager launchd（kickstart 热换二进制，不卸载服务）"
+    # 先尝试 kickstart（服务已加载时热重启，不需要先 bootout）。
+    # 只有在服务完全未加载时才走 bootout+bootstrap，并在失败后回退到手动启动，
+    # 避免 bootstrap 失败导致服务彻底消失。
+    if launchctl kickstart -k "gui/$uid/$SERVICE" 2>/dev/null; then
+      echo "    kickstart 成功"
+    else
+      echo "    服务未加载，尝试 bootstrap..."
+      launchctl bootout "gui/$uid/$SERVICE" 2>/dev/null || true
+      sleep 1
+      if ! launchctl bootstrap "gui/$uid" "$PLIST" 2>/dev/null; then
+        echo "    bootstrap 失败，直接启动 bridge-manager..."
+        nohup /opt/homebrew/bin/ilink-hub-bridge manager \
+          >> "$HOME/ilink-logs/bridge-manager.log" \
+          2>> "$HOME/ilink-logs/bridge-manager-error.log" &
+      fi
+    fi
+    echo "    等待 3s 后查看进程"
+    sleep 3
     pgrep -fl "ilink-hub-bridge manager" || echo "!! bridge-manager 未起来，请检查 ~/ilink-logs/bridge-manager-error.log"
   else
     echo "!! 未找到 $PLIST，跳过 launchd 重载" >&2
