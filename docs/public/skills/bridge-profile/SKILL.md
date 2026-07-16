@@ -67,7 +67,7 @@ profiles:
     cwd: /path/to/project   # ← 改为实际项目目录
     # 可选：
     # env:
-    #   ILINK_CLAUDE_MODEL: sonnet
+    #   CLAUDE_MODEL: sonnet
     #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}    # 引用进程 env；不要写明文 key
 
 routing:
@@ -89,7 +89,7 @@ profiles:
     type: claude-code
     cwd: /path/to/project
     env:
-      ILINK_CLAUDE_MODEL: sonnet
+      CLAUDE_MODEL: sonnet
 
   claude_new:
     type: claude-code

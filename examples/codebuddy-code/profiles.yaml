@@ -36,7 +36,7 @@
 # ─── 终端模拟测试（不启动 bridge）─────────────────────────────────────────────
 #
 #   echo '{"type":"turn","message":"你好，简短介绍自己","session_id":"","from_user":"test","protocol_version":"0.3","session_name":"default","attachments":[]}' \
-#     | ILINK_CODEBUDDY_MODEL="glm-5.1-ioa" ilink-hub-bridge profile codebuddy-code
+#     | CODEBUDDY_MODEL="glm-5.1-ioa" ilink-hub-bridge profile codebuddy-code
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -48,9 +48,9 @@ profiles:
     max_reply_chars: 8000
     streaming: false
     env:
-      ILINK_CODEBUDDY_MODEL: "glm-5.1-ioa"      # ← 改模型从上方注释的列表中选
+      CODEBUDDY_MODEL: "glm-5.1-ioa"      # ← 改模型从上方注释的列表中选
       # 如需切换为 DeepSeek：
-      # ILINK_CODEBUDDY_MODEL: "deepseek-v3-2-volc-ioa"
+      # CODEBUDDY_MODEL: "deepseek-v3-2-volc-ioa"
 
 # 注：/new 是 Hub 级命令（强制开新会话），无需在此配置独立 profile。
 # session_id 由 Hub 通过 stdin turn 下发，env 无法覆盖。

@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+###Breaking Change — profile 模型覆盖环境变量去掉 `ILINK_` 前缀
+
+`type: claude-code` / `codebuddy-code` / `codex` / `cursor` / `agy` profile 不再读取 `ILINK_*_MODEL` 系列
+变量，改为直接读取 CLI / agentproc executor 的原生变量名。这样 CLI 与 agentproc 的实现者无需理解
+ilink-hub 私有的 `ILINK_*` 约定，profile env 与子进程实际消费的变量名一致。
+
+| 旧变量名（已废弃） | 新变量名 |
+|---|---|
+| `ILINK_CLAUDE_MODEL` | `CLAUDE_MODEL` |
+| `ILINK_CODEBUDDY_MODEL` | `CODEBUDDY_MODEL` |
+| `ILINK_CODEX_MODEL` | `CODEX_MODEL` |
+| `ILINK_CURSOR_MODEL` | `CURSOR_MODEL` |
+| `ILINK_CURSOR_WORKSPACE` | `CURSOR_WORKSPACE` |
+| `ILINK_CURSOR_EXTRA_ARGS` | `CURSOR_EXTRA_ARGS` |
+| `ILINK_AGY_MODEL` | `AGY_MODEL` |
+| `ILINK_AGY_ADD_DIR` | `AGY_ADD_DIR` |
+| `ILINK_AGY_SANDBOX` | `AGY_SANDBOX` |
+| `ILINK_AGY_EXTRA_ARGS` | `AGY_EXTRA_ARGS` |
+
+**迁移**：把现有 profile YAML `env:` 里的 `ILINK_*_MODEL` 等键名去掉 `ILINK_` 前缀即可。
+ilink-hub 自身的配置变量（`ILINK_ADMIN_TOKEN` / `ILINK_HUB_MASTER_KEY` / `ILINK_TOKEN` 等）不受影响，保持原样。
+
 ## [0.3.0] — 2026-07-14
 
 > **⚠️ 本版本含 Breaking Change**：bridge ↔ profile 协议从 agentproc wire 0.3 硬切换到 0.4。

@@ -32,7 +32,7 @@ profiles:
     truncation_suffix: "\n\n…(输出已截断)"
     include_stderr_in_reply: false
     # env:
-    #   ILINK_CLAUDE_MODEL: sonnet
+    #   CLAUDE_MODEL: sonnet
     #   ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}   # 从 bridge 进程 env 展开，勿写明文
 
   # 自写包装脚本：脚本负责把 Claude 输出转为 NDJSON 事件（partial/text/session）

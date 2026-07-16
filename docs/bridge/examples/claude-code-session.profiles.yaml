@@ -55,5 +55,5 @@ profiles:
                             # 设为 false 则不转发 partial，仅以最终 text 事件作为单条回复，适合调试
     # 若需指定模型或注入 API Key，可添加 env：
     # env:
-    #   ILINK_CLAUDE_MODEL: sonnet
+    #   CLAUDE_MODEL: sonnet
     #   ANTHROPIC_API_KEY: "sk-ant-..."

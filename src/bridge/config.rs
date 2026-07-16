@@ -523,10 +523,10 @@ fn expand_script_field(mut p: BridgeProfile, name: &str) -> Result<BridgeProfile
 ///
 /// | `type:`       | CLI required  | Session resume | Extra env vars accepted              |
 /// |---------------|---------------|----------------|--------------------------------------|
-/// | `claude-code` | `claude`      | ✓              | `ILINK_CLAUDE_MODEL`                 |
-/// | `codex`       | `codex`       | ✗              | `ILINK_CODEX_MODEL`                  |
-/// | `cursor`      | `cursor`      | ✓ (optional)   | `ILINK_CURSOR_MODEL`, `ILINK_CURSOR_WORKSPACE`, `ILINK_CURSOR_EXTRA_ARGS` |
-/// | `agy`         | `agy`         | ✓              | `ILINK_AGY_MODEL`, `ILINK_AGY_ADD_DIR`, `ILINK_AGY_SANDBOX`, `ILINK_AGY_EXTRA_ARGS` |
+/// | `claude-code` | `claude`      | ✓              | `CLAUDE_MODEL`                       |
+/// | `codex`       | `codex`       | ✗              | `CODEX_MODEL`                        |
+/// | `cursor`      | `cursor`      | ✓ (optional)   | `CURSOR_MODEL`, `CURSOR_WORKSPACE`, `CURSOR_EXTRA_ARGS` |
+/// | `agy`         | `agy`         | ✓              | `AGY_MODEL`, `AGY_ADD_DIR`, `AGY_SANDBOX`, `AGY_EXTRA_ARGS` |
 /// | `recursive`   | `recursive`   | ✓              | `RECURSIVE_*` (see recursive bridge docs) |
 ///
 /// If `profile_type` is `None` or the command is already set, returns the profile unchanged.

@@ -36,7 +36,7 @@ Sleep 200ms
 Type "export AGENT_SESSION_ID=''"
 Enter
 Sleep 200ms
-Type "export ILINK_CLAUDE_MODEL=sonnet"
+Type "export CLAUDE_MODEL=sonnet"
 Enter
 Sleep 200ms
 Type "ilink-hub-bridge profile claude-code"

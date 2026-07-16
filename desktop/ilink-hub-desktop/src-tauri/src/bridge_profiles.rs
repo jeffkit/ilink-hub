@@ -333,7 +333,7 @@ pub(crate) fn summarize_bridge_profile_file(
                 cwd: profile.and_then(|p| p.cwd.clone()),
                 timeout_secs: profile.map(|p| p.timeout_secs).unwrap_or(600),
                 max_reply_chars: profile.map(|p| p.max_reply_chars).unwrap_or(8000),
-                model: profile.and_then(|p| p.env.get("ILINK_CLAUDE_MODEL").cloned()),
+                model: profile.and_then(|p| p.env.get("CLAUDE_MODEL").cloned()),
                 command: profile.map(|p| p.command.clone()),
                 args: profile.map(|p| p.args.clone()).unwrap_or_default(),
                 env_vars,
@@ -379,7 +379,7 @@ pub(crate) fn summarize_bridge_config(
                 cwd: p.cwd.clone(),
                 timeout_secs: p.timeout_secs,
                 max_reply_chars: p.max_reply_chars,
-                model: p.env.get("ILINK_CLAUDE_MODEL").cloned(),
+                model: p.env.get("CLAUDE_MODEL").cloned(),
             });
             BridgeConfigPayload {
                 exists,
@@ -880,14 +880,14 @@ mod tests {
     #[test]
     fn claude_profile_with_env_vars() {
         let env_vars = vec![EnvVar {
-            key: "ILINK_CLAUDE_MODEL".into(),
+            key: "CLAUDE_MODEL".into(),
             value: "sonnet".into(),
         }];
         let yaml = build_claude_profile_yaml("/tmp/project", &env_vars).unwrap();
         let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml).unwrap();
         let profile = app.profile("claude").unwrap();
         assert_eq!(
-            profile.env.get("ILINK_CLAUDE_MODEL").map(String::as_str),
+            profile.env.get("CLAUDE_MODEL").map(String::as_str),
             Some("sonnet")
         );
     }

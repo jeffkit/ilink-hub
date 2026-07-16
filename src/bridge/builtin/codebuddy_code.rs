@@ -21,7 +21,7 @@
 //! fresh session so the user gets a response rather than a bare error.
 //!
 //! Supported env vars:
-//!   ILINK_CODEBUDDY_MODEL  — override the CodeBuddy model (e.g. claude-sonnet-4.6)
+//!   CODEBUDDY_MODEL  — override the CodeBuddy model (e.g. claude-sonnet-4.6)
 
 use anyhow::{Context, Result};
 use tokio::io::AsyncBufReadExt;
@@ -83,7 +83,7 @@ async fn stream_codebuddy(
         "AskUserQuestion".into(),
     ];
 
-    if let Ok(model) = std::env::var("ILINK_CODEBUDDY_MODEL") {
+    if let Ok(model) = std::env::var("CODEBUDDY_MODEL") {
         if !model.trim().is_empty() {
             args.push("--model".into());
             args.push(model.trim().to_string());

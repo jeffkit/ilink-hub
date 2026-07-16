@@ -97,7 +97,7 @@ async fn stream_claude(message: &str, session_id: &str) -> Result<Option<String>
         "AskUserQuestion".into(),
     ];
 
-    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
+    if let Ok(model) = std::env::var("CLAUDE_MODEL") {
         if !model.trim().is_empty() {
             args.push("--model".into());
             args.push(model.trim().to_string());
@@ -255,7 +255,7 @@ async fn stream_claude_permission(
         "AskUserQuestion".into(),
     ];
 
-    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
+    if let Ok(model) = std::env::var("CLAUDE_MODEL") {
         if !model.trim().is_empty() {
             args.push("--model".into());
             args.push(model.trim().to_string());
@@ -567,7 +567,7 @@ async fn stream_claude_multimodal(
         "AskUserQuestion".into(),
     ];
 
-    if let Ok(model) = std::env::var("ILINK_CLAUDE_MODEL") {
+    if let Ok(model) = std::env::var("CLAUDE_MODEL") {
         if !model.trim().is_empty() {
             args.push("--model".into());
             args.push(model.trim().to_string());
