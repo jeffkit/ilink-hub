@@ -6,6 +6,75 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// Which IM protocol the bridge speaks. Stage 2: only `ilink` is implemented;
+/// any other string loads a `NullTransport` placeholder to prove the transport
+/// seam is pluggable (real adapters land in later stages).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportKind(String);
+
+impl TransportKind {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    /// `ilink` is the only fully-implemented transport.
+    pub fn is_ilink(&self) -> bool {
+        self.0 == "ilink"
+    }
+}
+
+impl Default for TransportKind {
+    fn default() -> Self {
+        Self("ilink".to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for TransportKind {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Ok(Self(s))
+    }
+}
+
+/// How the bridge obtains credentials / where it points the transport.
+/// - `hub` (default): resolve a virtual token via the Hub (`/hub/register` / QR).
+/// - `direct`: connect straight to the real iLink upstream. Stage 2 only supports
+///   `direct` with an explicit `WEIXIN_TOKEN` + `WEIXIN_BASE_URL`; the QR / auto-
+///   register flow for direct lands in stage 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Via {
+    #[default]
+    Hub,
+    Direct,
+}
+
+impl Via {
+    pub fn is_hub(self) -> bool {
+        matches!(self, Self::Hub)
+    }
+    pub fn is_direct(self) -> bool {
+        matches!(self, Self::Direct)
+    }
+}
+
+impl<'de> Deserialize<'de> for Via {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hub" => Ok(Self::Hub),
+            "direct" => Ok(Self::Direct),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown `via: {other}` (expected `hub` or `direct`)"
+            ))),
+        }
+    }
+}
+
 /// One bridge profile file == one agentproc profile, in spec-aligned hub form:
 /// a pure agentproc execution config nested under `agentproc:`, with ilink-hub
 /// metadata (`description`) and the `script:` shorthand as siblings.
@@ -34,6 +103,18 @@ pub struct BridgeProfileFile {
     /// The pure agentproc-spec execution config.
     #[serde(default)]
     pub agentproc: AgentprocBlock,
+
+    /// Which IM protocol to speak. Default `ilink`; any other string loads a
+    /// `NullTransport` placeholder (stage 2 pluggability proof; real adapters
+    /// arrive in later stages).
+    #[serde(default)]
+    pub transport: TransportKind,
+
+    /// Credential resolution / connection target. Default `hub` (resolve a
+    /// virtual token via the Hub). `direct` connects to the real iLink upstream
+    /// — stage 2 only supports `direct` with an explicit `WEIXIN_TOKEN`.
+    #[serde(default)]
+    pub via: Via,
 }
 
 /// The `agentproc:` block — field-for-field the agentproc profile spec
@@ -197,6 +278,8 @@ fn default_true() -> bool {
 pub struct BridgeApp {
     name: String,
     profile: BridgeProfile,
+    transport: TransportKind,
+    via: Via,
 }
 
 impl BridgeApp {
@@ -259,7 +342,12 @@ impl BridgeApp {
         }
         reject_shell_injection_risk(&profile, &name)?;
 
-        Ok(Self { name, profile })
+        Ok(Self {
+            name,
+            profile,
+            transport: file.transport,
+            via: file.via,
+        })
     }
 
     /// Pick profile and payload text for CLI. Single-profile: the text is
@@ -287,6 +375,16 @@ impl BridgeApp {
     /// Whether CLI failures are surfaced to the user (spec `send_error_reply`).
     pub fn send_error_reply(&self) -> bool {
         self.profile.send_error_reply
+    }
+
+    /// Configured IM protocol (`transport:`). Default `ilink`.
+    pub fn transport(&self) -> &TransportKind {
+        &self.transport
+    }
+
+    /// Configured credential/connection mode (`via:`). Default `hub`.
+    pub fn via(&self) -> Via {
+        self.via
     }
 }
 
@@ -643,6 +741,61 @@ mod tests {
 
     fn parse(y: &str) -> Result<BridgeApp> {
         BridgeApp::parse_yaml(y, "bot".to_string())
+    }
+
+    #[test]
+    fn transport_and_via_default_to_ilink_hub() {
+        // No `transport:` / `via:` → stage-2 defaults: ilink via hub (no regression).
+        let y = r#"
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert!(app.transport().is_ilink());
+        assert_eq!(app.transport().as_str(), "ilink");
+        assert!(app.via().is_hub());
+    }
+
+    #[test]
+    fn transport_other_loads_as_placeholder_name() {
+        let y = r#"
+transport: telegram
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert!(!app.transport().is_ilink());
+        assert_eq!(app.transport().as_str(), "telegram");
+    }
+
+    #[test]
+    fn via_direct_parses() {
+        let y = r#"
+via: direct
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert!(app.via().is_direct());
+    }
+
+    #[test]
+    fn via_unknown_is_rejected() {
+        let y = r#"
+via: sideways
+agentproc:
+  command: echo
+"#;
+        let err = parse(y).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sideways"),
+            "expected unknown via in error: {msg}"
+        );
+        assert!(
+            msg.contains("via"),
+            "expected `via` context in error: {msg}"
+        );
     }
 
     #[test]

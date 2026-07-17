@@ -16,16 +16,18 @@
 //!
 //! 配置见 `docs/bridge/README.md`，内置 profile 规范见 `docs/bridge/profile-spec.md`。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
 use anyhow::Context;
+use ilink_hub::bridge::transport::{IlinkTransport, NullTransport, Transport};
 use ilink_hub::bridge::{
     builtin, default_local_credential_path, resolve_hub_connection, run_bridge_with_shutdown,
-    BridgeApp, BridgeStop,
+    validate_hub_token, BridgeApp, BridgeStop, Via,
 };
 use ilink_hub::paths::{
     default_bridge_config_path, default_bridge_manager_credentials_dir, default_bridge_profiles_dir,
@@ -137,6 +139,69 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+}
+
+/// Build the configured transport for the bridge run.
+///
+/// - `transport: ilink` + `via: hub` (default): resolve a virtual token via the Hub
+///   (`/hub/register` / QR) and point `IlinkTransport` at the Hub.
+/// - `transport: ilink` + `via: direct`: connect straight to the real iLink
+///   upstream. Stage 2 only supports an explicit `WEIXIN_TOKEN` + `WEIXIN_BASE_URL`;
+///   the QR / auto-register flow for direct lands in stage 3.
+/// - `transport: <other>`: load a `NullTransport` placeholder (stage 2 pluggability
+///   proof; real adapters arrive in later stages).
+async fn build_transport(
+    app: &BridgeApp,
+    cli: &Cli,
+    config_path: &Path,
+    description: Option<&str>,
+) -> Result<Arc<dyn Transport>> {
+    let transport = app.transport();
+    if !transport.is_ilink() {
+        let name = transport.as_str().to_string();
+        info!(transport = %name, "loading placeholder transport (no real adapter yet)");
+        return Ok(Arc::new(NullTransport::new(name)));
+    }
+
+    match app.via() {
+        Via::Hub => {
+            let (hub_url, token) = resolve_hub_connection(
+                &cli.hub_url,
+                explicit_token(cli),
+                cli.cred_file.as_deref(),
+                cli.pair,
+                cli.register_name.as_deref(),
+                cli.force_register,
+                Some(config_path),
+                description,
+            )
+            .await?;
+            info!(%hub_url, via = "hub", "using Hub base URL for downstream");
+            let t = IlinkTransport::new(hub_url, token).context("build iLink transport")?;
+            Ok(Arc::new(t))
+        }
+        Via::Direct => {
+            let base = cli.hub_url.trim().trim_end_matches('/').to_string();
+            match explicit_token(cli) {
+                Some(token) => {
+                    // Validate against the real iLink upstream (same /ilink/bot/getupdates
+                    // probe; both Hub and real upstream speak iLink). A failure means the
+                    // explicit token is not accepted by the upstream.
+                    validate_hub_token(&base, token).await.with_context(|| {
+                        format!("via: direct — token rejected by upstream {base}")
+                    })?;
+                    info!(base = %base, via = "direct", "connecting directly to iLink upstream with explicit token");
+                    let t = IlinkTransport::new(base, token.to_string())
+                        .context("build iLink transport (direct)")?;
+                    Ok(Arc::new(t))
+                }
+                None => anyhow::bail!(
+                    "via: direct 的自动注册 / QR 登录尚未实现（阶段 3）。请显式设置 WEIXIN_TOKEN \
+                     与 WEIXIN_BASE_URL 指向真实 iLink 上游，或在配置中改用 `via: hub`。"
+                ),
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -266,22 +331,10 @@ async fn main() -> Result<()> {
                     .profile(app.default_profile_name())
                     .and_then(|p| p.description.as_deref());
 
-                let (hub_url, token) = resolve_hub_connection(
-                    &cli.hub_url,
-                    explicit_token(&cli),
-                    cli.cred_file.as_deref(),
-                    cli.pair,
-                    cli.register_name.as_deref(),
-                    cli.force_register,
-                    Some(config_path.as_path()),
-                    description,
-                )
-                .await?;
-                info!(%hub_url, "using Hub base URL for downstream");
+                let transport = build_transport(&app, &cli, &config_path, description).await?;
 
                 let mut handle = tokio::spawn(run_bridge_with_shutdown(
-                    hub_url,
-                    token,
+                    transport,
                     app.clone(),
                     shutdown.clone(),
                 ));

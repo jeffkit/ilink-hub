@@ -8,26 +8,22 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
+use crate::bridge::transport::{InboundMessage, OutboundReply, SendOutcome, Transport};
 
 use super::handle::handle_one_message;
-use super::send::{sanitize_errmsg, HubClient, SendOutcome};
+use super::send::sanitize_errmsg;
 use super::BridgeStop;
 
-pub(super) fn session_dispatch_key(msg: &WeixinMessage) -> String {
+pub(super) fn session_dispatch_key(msg: &InboundMessage) -> String {
     let ctx = msg.context_token.as_deref().unwrap_or("");
-    let session_name = msg
-        .ilink_hub_ext
-        .as_ref()
-        .and_then(|e| e.session_name.as_deref())
-        .unwrap_or("default");
+    let session_name = msg.session_name.as_deref().unwrap_or("default");
     format!("{ctx}:{session_name}")
 }
 
 pub(super) async fn run_session_worker(
     key: String,
-    mut rx: mpsc::Receiver<WeixinMessage>,
-    client: HubClient,
+    mut rx: mpsc::Receiver<InboundMessage>,
+    client: Arc<dyn Transport>,
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
@@ -53,38 +49,26 @@ pub(super) async fn run_session_worker(
         // into `handle_one_message`, so that if the future is cancelled we can still send
         // feedback to the user.
         let ctx_for_err = msg.context_token.clone().unwrap_or_default();
-        let from_for_err = msg.from_user_id.clone().unwrap_or_default();
+        let from_for_err = msg.from_user.clone().unwrap_or_default();
         // Capture the session name so the shutdown error reply carries the same session in
         // its ilink_hub_ext. Without this the Hub appends the *current active* session to
         // the footer and registers the error message under that session in the quote_index,
         // causing any quote-reply to that "响应中断" message to be routed to the wrong session.
-        let session_name_for_err = msg
-            .ilink_hub_ext
-            .as_ref()
-            .and_then(|e| e.session_name.clone())
-            .filter(|s| !s.trim().is_empty());
+        let session_name_for_err = msg.session_name.clone().filter(|s| !s.trim().is_empty());
 
         let result = tokio::select! {
             biased;
             // Shutdown arrived while we were processing — cancel the AI call and tell user.
             _ = shutdown.cancelled() => {
                 if app.send_error_reply() && !ctx_for_err.is_empty() {
-                    let mut req = SendMessageRequest::reply(
-                        ctx_for_err,
-                        "⚠️ 响应中断（服务正在重启），请稍后重发消息".to_string(),
-                        &from_for_err,
-                    );
-                    // Attach the session name so Hub appends the correct session to the
-                    // footer and registers the error reply under the right session in the
-                    // quote_index. This prevents a quote-reply on this message from being
-                    // routed to whichever session happens to be active at shutdown time.
-                    if let Some(ref sn) = session_name_for_err {
-                        if let Some(ref mut msg) = req.msg {
-                            let ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                            ext.session_name = Some(sn.clone());
-                        }
-                    }
-                    match client.sendmessage(req).await {
+                    let reply = OutboundReply {
+                        context_token: ctx_for_err,
+                        text: "⚠️ 响应中断（服务正在重启），请稍后重发消息".to_string(),
+                        to_user: from_for_err,
+                        session_name: session_name_for_err,
+                        ..Default::default()
+                    };
+                    match client.send_reply(reply).await {
                         Ok(SendOutcome::Sent) => {}
                         Ok(SendOutcome::Throttled { ret, errmsg }) => {
                             // User did not receive the "service restarting,
@@ -152,8 +136,8 @@ const MAX_SESSION_WORKERS: usize = 512;
 pub(super) struct SessionDispatcher {
     // std::sync::Mutex is correct here: the critical section contains only synchronous
     // HashMap operations (retain/get/insert) with no await points.
-    pub(super) senders: std::sync::Mutex<HashMap<String, mpsc::Sender<WeixinMessage>>>,
-    client: HubClient,
+    pub(super) senders: std::sync::Mutex<HashMap<String, mpsc::Sender<InboundMessage>>>,
+    client: Arc<dyn Transport>,
     app: Arc<BridgeApp>,
     stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
     shutdown: CancellationToken,
@@ -165,7 +149,7 @@ pub(super) struct SessionDispatcher {
 
 impl SessionDispatcher {
     pub(super) fn new(
-        client: HubClient,
+        client: Arc<dyn Transport>,
         app: Arc<BridgeApp>,
         stop_tx: tokio::sync::watch::Sender<Option<BridgeStop>>,
         shutdown: CancellationToken,
@@ -180,7 +164,7 @@ impl SessionDispatcher {
         }
     }
 
-    pub(super) async fn dispatch(&self, msg: WeixinMessage) {
+    pub(super) async fn dispatch(&self, msg: InboundMessage) {
         let key = session_dispatch_key(&msg);
 
         // N-04 / F-M1-N04: match the poison-safe style used by

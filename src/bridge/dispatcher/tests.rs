@@ -1,11 +1,11 @@
 use super::{
-    backoff_for, backoff_for_test, classify_sendoutcome, parse_sendoutcome,
-    run_partial_forward_loop, sanitize_errmsg, send_final_with_retry, session_dispatch_key,
-    BridgeStop, HubClient, ReplySender, SendOutcome, SessionDispatcher, MAX_BACKOFF_SECS,
+    backoff_for, backoff_for_test, run_partial_forward_loop, sanitize_errmsg,
+    send_final_with_retry, session_dispatch_key, BridgeStop, SessionDispatcher, MAX_BACKOFF_SECS,
 };
 use crate::bridge::config::BridgeApp;
-use crate::ilink::types::{
-    HubExt, MessageItem, SendMessageRequest, SendMessageResponse, TextItem, WeixinMessage,
+use crate::bridge::transport::ilink::{parse_sendoutcome, IlinkTransport};
+use crate::bridge::transport::{
+    InboundMessage, OutboundReply, SendOutcome, Transport, TransportCapabilities,
 };
 use anyhow::Result;
 use futures_util::future::BoxFuture;
@@ -14,26 +14,18 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
-fn make_msg(ctx: &str, session_name: &str) -> WeixinMessage {
-    WeixinMessage {
+fn make_msg(ctx: &str, session_name: &str) -> InboundMessage {
+    InboundMessage {
         context_token: Some(ctx.into()),
-        ilink_hub_ext: Some(HubExt {
-            session_id: Some(String::new()),
-            session_name: Some(session_name.into()),
-            cli_session_id: None,
-            a2a_call_id: None,
-            a2a_depth: None,
-            usage: None,
-        }),
-        item_list: Some(std::sync::Arc::new(vec![MessageItem {
-            item_type: Some(1),
-            text_item: Some(TextItem {
-                text: Some("hello".into()),
-            }),
-            ..Default::default()
-        }])),
-        from_user_id: Some("user1".into()),
-        ..Default::default()
+        from_user: Some("user1".into()),
+        is_from_bot: false,
+        text: Some("hello".into()),
+        media: vec![],
+        session_id: Some(String::new()),
+        session_name: Some(session_name.into()),
+        a2a_call_id: None,
+        extra: serde_json::Value::Null,
+        raw: serde_json::Value::Null,
     }
 }
 
@@ -50,8 +42,8 @@ agentproc:
     .unwrap()
 }
 
-fn fake_client() -> HubClient {
-    HubClient::new("http://127.0.0.1:1".into(), "test-token".into()).expect("test http client")
+fn fake_transport() -> IlinkTransport {
+    IlinkTransport::new("http://127.0.0.1:1".into(), "test-token".into()).expect("test transport")
 }
 
 fn make_stop_tx() -> tokio::sync::watch::Sender<Option<BridgeStop>> {
@@ -68,9 +60,9 @@ fn key_combines_ctx_and_session_name() {
 
 #[test]
 fn key_defaults_session_name_when_ext_absent() {
-    let msg = WeixinMessage {
+    let msg = InboundMessage {
         context_token: Some("ctx-x".into()),
-        ilink_hub_ext: None,
+        session_name: None,
         ..Default::default()
     };
     assert_eq!(session_dispatch_key(&msg), "ctx-x:default");
@@ -78,9 +70,9 @@ fn key_defaults_session_name_when_ext_absent() {
 
 #[test]
 fn key_uses_empty_string_when_ctx_absent() {
-    let msg = WeixinMessage {
+    let msg = InboundMessage {
         context_token: None,
-        ilink_hub_ext: None,
+        session_name: None,
         ..Default::default()
     };
     assert_eq!(session_dispatch_key(&msg), ":default");
@@ -103,7 +95,7 @@ fn key_differs_for_different_ctx_tokens() {
 #[tokio::test]
 async fn same_key_reuses_single_sender() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -117,7 +109,7 @@ async fn same_key_reuses_single_sender() {
 #[tokio::test]
 async fn different_ctx_tokens_get_separate_senders() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -130,7 +122,7 @@ async fn different_ctx_tokens_get_separate_senders() {
 #[tokio::test]
 async fn different_session_names_get_separate_senders() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -146,7 +138,7 @@ async fn different_session_names_get_separate_senders() {
 #[tokio::test]
 async fn three_distinct_sessions_create_three_senders() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -163,7 +155,7 @@ async fn three_distinct_sessions_create_three_senders() {
 #[tokio::test]
 async fn repeated_same_key_does_not_grow_sender_map() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -178,7 +170,7 @@ async fn repeated_same_key_does_not_grow_sender_map() {
 #[tokio::test]
 async fn dead_sender_triggers_new_worker_on_next_dispatch() {
     let disp = SessionDispatcher::new(
-        fake_client(),
+        Arc::new(fake_transport()),
         Arc::new(make_fast_app()),
         make_stop_tx(),
         CancellationToken::new(),
@@ -391,32 +383,9 @@ fn sanitize_preserves_printable_unicode() {
 }
 
 // ─── classify_sendoutcome (additional M1F-006 helper) ──────────────
-
-#[test]
-fn classify_three_categories() {
-    let none_resp = SendMessageResponse {
-        ret: None,
-        errmsg: None,
-    };
-    let zero_resp = SendMessageResponse {
-        ret: Some(0),
-        errmsg: None,
-    };
-    let tmo_resp = SendMessageResponse {
-        ret: Some(-2),
-        errmsg: Some("rl".into()),
-    };
-    assert_eq!(classify_sendoutcome(None), SendOutcome::Sent);
-    assert_eq!(classify_sendoutcome(Some(&none_resp)), SendOutcome::Sent);
-    assert_eq!(classify_sendoutcome(Some(&zero_resp)), SendOutcome::Sent);
-    assert_eq!(
-        classify_sendoutcome(Some(&tmo_resp)),
-        SendOutcome::Throttled {
-            ret: -2,
-            errmsg: Some("rl".into())
-        }
-    );
-}
+//
+// Moved into `src/bridge/transport/ilink.rs` so the dispatcher test module
+// does not depend on iLink wire types.
 
 #[test]
 fn outcome_clone_works() {
@@ -578,21 +547,21 @@ impl ScriptedSender {
     }
 }
 
-impl ReplySender for ScriptedSender {
-    fn send_reply(
-        &self,
-        _ctx: &str,
-        text: &str,
-        _from_user: &str,
-        _session_name: &str,
-    ) -> BoxFuture<'_, Result<SendOutcome>> {
-        let next = self.record_and_next(text.to_string());
+impl Transport for ScriptedSender {
+    fn next_inbound<'a>(
+        &'a self,
+        _buf: &'a mut String,
+    ) -> BoxFuture<'a, Result<crate::bridge::transport::InboundOutcome>> {
+        Box::pin(async { Ok(crate::bridge::transport::InboundOutcome::Messages(vec![])) })
+    }
+
+    fn send_reply<'a>(&'a self, reply: OutboundReply) -> BoxFuture<'a, Result<SendOutcome>> {
+        let next = self.record_and_next(reply.text);
         Box::pin(async move { next })
     }
 
-    fn send_request(&self, _req: SendMessageRequest) -> BoxFuture<'_, Result<SendOutcome>> {
-        let next = self.record_and_next("<request>".to_string());
-        Box::pin(async move { next })
+    fn capabilities(&self) -> TransportCapabilities {
+        TransportCapabilities::default()
     }
 }
 
@@ -602,8 +571,8 @@ impl ReplySender for ScriptedSender {
 /// throttles happen in a row.
 ///
 /// Returns (tx, shutdown_token, handle).
-fn spawn_test_loop<S: ReplySender>(
-    sender: S,
+fn spawn_test_loop(
+    sender: Arc<dyn Transport>,
 ) -> (
     watch::Sender<Option<String>>,
     CancellationToken,
@@ -626,8 +595,8 @@ fn test_backoff(attempt: u32) -> Duration {
 
 /// Same as [`spawn_test_loop`] but with a caller-controlled M4 retry
 /// budget so give-up behavior can be exercised with a tiny window.
-fn spawn_test_loop_with_budget<S: ReplySender>(
-    sender: S,
+fn spawn_test_loop_with_budget(
+    sender: Arc<dyn Transport>,
     max_total: Duration,
 ) -> (
     watch::Sender<Option<String>>,
@@ -681,7 +650,7 @@ async fn partial_three_throttles_then_success_delivers_latest_content() {
         Ok(SendOutcome::Sent),
         Ok(SendOutcome::Sent),
     ]);
-    let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     // Push 3 chunks while the hub is throttling.
@@ -759,7 +728,7 @@ async fn partial_single_chunk_throttled_then_success_buffers_until_clear() {
         }),
         Ok(SendOutcome::Sent),
     ]);
-    let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, _shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     tx.send(Some("hello".into())).unwrap();
@@ -820,7 +789,7 @@ async fn partial_chunk_overwritten_during_backoff_drops_stale_fragment() {
         Ok(SendOutcome::Sent),
         Ok(SendOutcome::Sent),
     ]);
-    let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, _shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     tx.send(Some("v1".into())).unwrap();
@@ -914,7 +883,7 @@ async fn partial_persistent_throttle_caps_retry_at_max_backoff() {
         ret: -2,
         errmsg: None,
     });
-    let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     // Send 3 chunks during the persistent throttle. Each arrives
@@ -1008,7 +977,7 @@ async fn partial_err_drops_buffer_and_continues_serving_new_chunks() {
         Err(anyhow::anyhow!("hub down")),
         Ok(SendOutcome::Sent),
     ]);
-    let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, _shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     tx.send(Some("first".into())).unwrap();
@@ -1043,7 +1012,7 @@ async fn partial_shutdown_during_backoff_exits_cleanly() {
         ret: -2,
         errmsg: None,
     });
-    let (tx, shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     tx.send(Some("stuck".into())).unwrap();
@@ -1079,7 +1048,7 @@ async fn partial_chunks_arrived_after_sender_continues_normal_path() {
         Ok(SendOutcome::Sent),
         Ok(SendOutcome::Sent),
     ]);
-    let (tx, _shutdown, handle) = spawn_test_loop(scripted.clone());
+    let (tx, _shutdown, handle) = spawn_test_loop(Arc::new(scripted.clone()));
     let probe = scripted.clone();
 
     for i in 0..3 {
@@ -1102,24 +1071,27 @@ async fn partial_chunks_arrived_after_sender_continues_normal_path() {
     assert_eq!(texts, vec!["c0", "c1", "c2"]);
 }
 
-// ─── HubClient ReplySender impl smoke (M2) ────────────────────────
+// ─── IlinkTransport Transport impl smoke (M2) ────────────────────
 //
-// We don't have a real hub here, but we can confirm the impl
-// compiles and that the impl does the right thing on the
-// construction of the request (session_name attachment).
+// We don't have a real hub here, but we can confirm the impl compiles.
 #[test]
-fn reply_sender_impl_attaches_session_name_to_hub_ext() {
+fn transport_impl_compiles_for_ilink_transport() {
     // Compile-time check is the load-bearing part. Runtime
     // behavior (HTTP-level) is covered by e2e tests in M5.
-    fn assert_reply_sender<S: ReplySender>(_: &S) {}
-    let client = fake_client();
-    assert_reply_sender(&client);
+    fn assert_transport<T: Transport>(_: &T) {}
+    let client = fake_transport();
+    assert_transport(&client);
 }
 
 // ─── send_final_with_retry (M3) + give-up budget (M4) ─────────────
 
-fn dummy_req() -> SendMessageRequest {
-    SendMessageRequest::reply("ctx".to_string(), "final".to_string(), "user")
+fn dummy_reply() -> OutboundReply {
+    OutboundReply {
+        context_token: "ctx".into(),
+        text: "final".into(),
+        to_user: "user".into(),
+        ..Default::default()
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -1145,7 +1117,7 @@ async fn final_reply_throttled_thrice_then_delivered() {
     let shutdown = CancellationToken::new();
     let res = send_final_with_retry(
         &scripted,
-        dummy_req(),
+        dummy_reply(),
         test_backoff,
         Duration::from_secs(3600),
         &shutdown,
@@ -1174,7 +1146,7 @@ async fn final_reply_transport_error_retried_then_succeeds() {
     let shutdown = CancellationToken::new();
     let res = send_final_with_retry(
         &scripted,
-        dummy_req(),
+        dummy_reply(),
         test_backoff,
         Duration::from_secs(3600),
         &shutdown,
@@ -1203,7 +1175,7 @@ async fn final_reply_transport_error_budget_exhausted_gives_up() {
     // so the budget check always triggers after the first failure.
     let res = send_final_with_retry(
         &scripted,
-        dummy_req(),
+        dummy_reply(),
         test_backoff,
         Duration::ZERO,
         &shutdown,
@@ -1236,7 +1208,7 @@ async fn final_reply_persistent_throttle_gives_up_within_budget() {
         Duration::from_secs(5),
         send_final_with_retry(
             &scripted,
-            dummy_req(),
+            dummy_reply(),
             test_backoff,
             Duration::from_millis(30),
             &shutdown,
@@ -1272,7 +1244,7 @@ async fn final_reply_shutdown_during_backoff_returns_promptly() {
     let task = tokio::spawn(async move {
         send_final_with_retry(
             &scripted,
-            dummy_req(),
+            dummy_reply(),
             test_backoff,
             Duration::from_secs(3600),
             &shutdown_for_task,
@@ -1302,7 +1274,7 @@ async fn partial_persistent_throttle_gives_up_then_serves_new_chunk() {
         errmsg: None,
     });
     let (tx, shutdown, handle) =
-        spawn_test_loop_with_budget(scripted.clone(), Duration::from_millis(30));
+        spawn_test_loop_with_budget(Arc::new(scripted.clone()), Duration::from_millis(30));
     let probe = scripted.clone();
 
     tx.send(Some("chunk-0".to_string())).unwrap();

@@ -2,26 +2,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::bridge::config::BridgeApp;
+use crate::bridge::transport::{IlinkTransport, InboundOutcome, Transport};
 
 mod agentproc_runner;
 mod backoff;
 mod handle;
-mod send;
+pub(crate) mod send;
 mod session;
 
-use send::{GetUpdatesOutcome, HubClient};
 use session::SessionDispatcher;
 
 #[cfg(test)]
 use backoff::{backoff_for, backoff_for_test, MAX_BACKOFF_SECS};
 #[cfg(test)]
-use send::{
-    classify_sendoutcome, parse_sendoutcome, run_partial_forward_loop, sanitize_errmsg,
-    send_final_with_retry, ReplySender, SendOutcome,
-};
+use send::{run_partial_forward_loop, sanitize_errmsg, send_final_with_retry};
 #[cfg(test)]
 use session::session_dispatch_key;
 
@@ -42,15 +39,11 @@ pub enum BridgeStop {
 /// Pass a [`CancellationToken`] to request graceful shutdown: in-flight AI calls are
 /// cancelled and the user receives an error notification before the function returns.
 pub async fn run_bridge_with_shutdown(
-    hub_url: String,
-    token: String,
+    transport: Arc<dyn Transport>,
     app: BridgeApp,
     shutdown: CancellationToken,
 ) -> BridgeStop {
-    let client = match HubClient::new(hub_url, token) {
-        Ok(c) => c,
-        Err(e) => return BridgeStop::FatalCliError(e.to_string()),
-    };
+    let client = transport;
     let app = Arc::new(app);
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(None::<BridgeStop>);
     let dispatcher = Arc::new(SessionDispatcher::new(
@@ -100,7 +93,7 @@ pub async fn run_bridge_with_shutdown(
             }
         }
 
-        let getupdates_fut = client.getupdates(&mut buf);
+        let getupdates_fut = client.next_inbound(&mut buf);
         let resp = tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
@@ -109,11 +102,11 @@ pub async fn run_bridge_with_shutdown(
                 return BridgeStop::Shutdown;
             }
             r = getupdates_fut => match r {
-                Ok(GetUpdatesOutcome::Ok(r)) => {
+                Ok(InboundOutcome::Messages(msgs)) => {
                     backoff_secs = 3;
-                    r
+                    msgs
                 }
-                Ok(GetUpdatesOutcome::TokenRejected) => return BridgeStop::TokenRejected,
+                Ok(InboundOutcome::TokenRejected) => return BridgeStop::TokenRejected,
                 Err(e) => {
                     error!(error = %e, backoff_secs, "getupdates failed; retrying with backoff");
                     let sleep = tokio::time::sleep(Duration::from_secs(backoff_secs));
@@ -131,16 +124,7 @@ pub async fn run_bridge_with_shutdown(
             },
         };
 
-        if resp.ret != Some(0) {
-            warn!(
-                ret = ?resp.ret,
-                errcode = ?resp.errcode,
-                errmsg = ?resp.errmsg,
-                "getupdates returned non-zero ret"
-            );
-        }
-
-        for msg in resp.msgs.unwrap_or_default() {
+        for msg in resp {
             dispatcher.dispatch(msg).await;
         }
     }
@@ -151,7 +135,14 @@ pub async fn run_bridge_with_shutdown(
 /// Returns when Hub signals a stop condition (token rejected or fatal CLI auth error).
 /// For graceful shutdown support (SIGTERM / Ctrl-C), use [`run_bridge_with_shutdown`].
 pub async fn run_bridge(hub_url: String, token: String, app: BridgeApp) -> BridgeStop {
-    run_bridge_with_shutdown(hub_url, token, app, CancellationToken::new()).await
+    // Legacy convenience entrypoint: assumes the stage-1 default (ilink via Hub).
+    // Callers that need transport/via selection use `run_bridge_with_shutdown`
+    // with a self-built `Arc<dyn Transport>` (see `ilink-hub-bridge` binary).
+    let transport = match IlinkTransport::new(hub_url, token) {
+        Ok(t) => Arc::new(t) as Arc<dyn Transport>,
+        Err(e) => return BridgeStop::FatalCliError(e.to_string()),
+    };
+    run_bridge_with_shutdown(transport, app, CancellationToken::new()).await
 }
 
 #[cfg(test)]

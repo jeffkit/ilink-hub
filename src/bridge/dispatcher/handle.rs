@@ -1,19 +1,22 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::bridge::config::BridgeApp;
-use crate::bridge::executor::{build_attachments, split_into_parts};
+use crate::bridge::executor::split_into_parts;
+use crate::bridge::protocol::Attachment;
+use crate::bridge::transport::{InboundMessage, MediaRef, OutboundReply, Transport};
 use crate::bridge::AUTH_ERROR_KEYWORDS;
-use crate::ilink::types::{HubExt, SendMessageRequest, WeixinMessage};
 
 use super::backoff::{backoff_for, retry_budget};
-use super::send::{run_partial_forward_loop, sanitize_field, send_final_with_retry, HubClient};
+use super::send::{sanitize_field, send_final_with_retry};
 use super::session::HandleError;
 use super::BridgeStop;
 
-pub(super) fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
+pub(super) fn dump_inbound_message_for_debug(msg: &InboundMessage) {
     let Ok(flag) = std::env::var("ILINKHUB_BRIDGE_DUMP_MSG") else {
         return;
     };
@@ -22,46 +25,55 @@ pub(super) fn dump_inbound_weixin_message_for_debug(msg: &WeixinMessage) {
         return;
     }
 
-    let full = serde_json::to_string_pretty(msg)
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialize WeixinMessage: {e}\"}}"));
-    eprintln!("========== ILINKHUB_BRIDGE_DUMP_MSG: full WeixinMessage (JSON) ==========");
+    let full = serde_json::to_string_pretty(&msg.raw)
+        .unwrap_or_else(|e| format!("{{\"error\": \"serialize raw message: {e}\"}}"));
+    eprintln!("========== ILINKHUB_BRIDGE_DUMP_MSG: full inbound (JSON) ==========");
     eprintln!("{full}");
     eprintln!("========== end full message ==========");
 
-    if let Some(items) = msg.item_list.as_ref() {
-        for (i, item) in items.iter().enumerate() {
-            let extra = serde_json::to_string_pretty(&item.extra)
-                .unwrap_or_else(|_| "\"<extra serialize error>\"".to_string());
-            eprintln!("---------- item_list[{i}] ----------");
-            eprintln!("  type (item_type): {:?}", item.item_type);
-            eprintln!("  text_item: {:?}", item.text_item);
-            eprintln!("  extra (flattened fields from iLink, not in text_item):");
-            eprintln!("{extra}");
-        }
-        eprintln!("========== end item_list dump ==========");
-    } else {
-        eprintln!("========== item_list: <none> ==========");
+    eprintln!("---------- media ----------");
+    for (i, m) in msg.media.iter().enumerate() {
+        eprintln!(
+            "  media[{i}]: kind={} url={} filename={:?}",
+            m.kind, m.url, m.filename
+        );
     }
+    eprintln!("========== end media dump ==========");
+}
+
+/// Map generic [`MediaRef`]s to the bridge-internal [`Attachment`] shape that
+/// `to_agentproc_attachments` consumes. Field-for-field identical.
+fn media_to_attachments(media: &[MediaRef]) -> Vec<Attachment> {
+    media
+        .iter()
+        .map(|m| Attachment {
+            kind: m.kind.clone(),
+            url: m.url.clone(),
+            filename: m.filename.clone(),
+            mime_type: m.mime_type.clone(),
+            size: m.size,
+        })
+        .collect()
 }
 
 #[tracing::instrument(
     skip_all,
     fields(
-        from    = msg.from_user_id.as_deref().unwrap_or("?"),
+        from    = msg.from_user.as_deref().unwrap_or("?"),
         ctx     = msg.context_token.as_deref().unwrap_or("(none)"),
         profile = tracing::field::Empty,
     )
 )]
 pub(super) async fn handle_one_message(
-    client: &HubClient,
+    client: &Arc<dyn Transport>,
     app: &BridgeApp,
-    msg: WeixinMessage,
+    msg: InboundMessage,
     shutdown: CancellationToken,
 ) -> Result<(), HandleError> {
-    dump_inbound_weixin_message_for_debug(&msg);
+    dump_inbound_message_for_debug(&msg);
 
     // Always ignore messages from other bots (message_type 2) to avoid loops.
-    if msg.message_type == Some(2) {
+    if msg.is_from_bot {
         return Ok(());
     }
 
@@ -75,7 +87,7 @@ pub(super) async fn handle_one_message(
         return Ok(());
     }
 
-    let attachments = build_attachments(&msg);
+    let attachments = media_to_attachments(&msg.media);
 
     let (profile_name, profile, payload) = app
         .resolve(&text)
@@ -86,27 +98,12 @@ pub(super) async fn handle_one_message(
         .clone()
         .filter(|s| !s.is_empty())
         .context("inbound message missing context_token")?;
-    let from_user = msg.from_user_id.clone().unwrap_or_default();
-    let session_for_cli = msg
-        .ilink_hub_ext
-        .as_ref()
-        .and_then(|e| e.session_id.as_deref())
-        .unwrap_or("")
-        .to_string();
-    let session_name_for_cli = sanitize_field(
-        msg.ilink_hub_ext
-            .as_ref()
-            .and_then(|e| e.session_name.as_deref()),
-        128,
-    )
-    .unwrap_or_else(|| "default".to_string());
+    let from_user = msg.from_user.clone().unwrap_or_default();
+    let session_for_cli = msg.session_id.clone().unwrap_or_default();
+    let session_name_for_cli =
+        sanitize_field(msg.session_name.as_deref(), 128).unwrap_or_else(|| "default".to_string());
     // Echoed on outbound sendmessage so Hub can resolve the MCP `call_agent` waiter.
-    let a2a_call_id = msg
-        .ilink_hub_ext
-        .as_ref()
-        .and_then(|e| e.a2a_call_id.as_deref())
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string);
+    let a2a_call_id = msg.a2a_call_id.clone().filter(|s| !s.trim().is_empty());
     let is_a2a_inbound = a2a_call_id.is_some();
 
     tracing::Span::current().record("profile", profile_name);
@@ -130,7 +127,7 @@ pub(super) async fn handle_one_message(
         let fwd_session_name = session_name_for_cli.clone();
         let fwd_shutdown = shutdown.clone();
         let retry_budget = retry_budget(profile.timeout_secs);
-        Some(tokio::spawn(run_partial_forward_loop(
+        Some(tokio::spawn(super::send::run_partial_forward_loop(
             fwd_client,
             partial_rx,
             fwd_ctx,
@@ -186,21 +183,18 @@ pub(super) async fn handle_one_message(
                 // Empty body: only send if we need to persist a cli_session_id.
                 if let Some(sid) = cli_session {
                     if !sid.trim().is_empty() {
-                        let mut req = SendMessageRequest::reply_text(
-                            ctx,
-                            String::new(),
-                            &from_user,
-                            Some(sid),
-                        );
-                        attach_outbound_hub_ext(
-                            &mut req,
-                            &session_name_for_cli,
-                            a2a_call_id.as_deref(),
-                            summary.usage.as_ref(),
-                        );
+                        let reply = OutboundReply {
+                            context_token: ctx,
+                            text: String::new(),
+                            to_user: from_user,
+                            cli_session_id: Some(sid),
+                            session_name: Some(session_name_for_cli),
+                            a2a_call_id,
+                            usage: summary.usage.clone(),
+                        };
                         if let Err(e) = send_final_with_retry(
-                            client,
-                            req,
+                            &**client,
+                            reply,
                             backoff_for,
                             retry_budget,
                             &shutdown,
@@ -217,17 +211,18 @@ pub(super) async fn handle_one_message(
             if is_a2a_inbound {
                 // Single sendmessage with a2a_call_id; Hub suppresses upstream
                 // delivery and resolves the caller's MCP waiter instead.
-                let mut req =
-                    SendMessageRequest::reply_text(ctx, effective_body, &from_user, cli_session);
-                attach_outbound_hub_ext(
-                    &mut req,
-                    &session_name_for_cli,
-                    a2a_call_id.as_deref(),
-                    summary.usage.as_ref(),
-                );
+                let reply = OutboundReply {
+                    context_token: ctx,
+                    text: effective_body,
+                    to_user: from_user,
+                    cli_session_id: cli_session,
+                    session_name: Some(session_name_for_cli),
+                    a2a_call_id,
+                    usage: summary.usage.clone(),
+                };
                 send_final_with_retry(
-                    client,
-                    req,
+                    &**client,
+                    reply,
                     backoff_for,
                     retry_budget,
                     &shutdown,
@@ -254,17 +249,18 @@ pub(super) async fn handle_one_message(
                 let is_last = i + 1 == total;
                 // cli_session_id is attached only to the last part so it is persisted once.
                 let session_id = if is_last { cli_session.clone() } else { None };
-                let mut req =
-                    SendMessageRequest::reply_text(ctx.clone(), part, &from_user, session_id);
-                attach_outbound_hub_ext(
-                    &mut req,
-                    &session_name_for_cli,
-                    None,
-                    summary.usage.as_ref(),
-                );
+                let reply = OutboundReply {
+                    context_token: ctx.clone(),
+                    text: part,
+                    to_user: from_user.clone(),
+                    cli_session_id: session_id,
+                    session_name: Some(session_name_for_cli.clone()),
+                    a2a_call_id: None,
+                    usage: summary.usage.clone(),
+                };
                 send_final_with_retry(
-                    client,
-                    req,
+                    &**client,
+                    reply,
                     backoff_for,
                     retry_budget,
                     &shutdown,
@@ -278,11 +274,15 @@ pub(super) async fn handle_one_message(
             error!(error = %e, "CLI failed; sending error reply to user");
             if profile.send_error_reply {
                 let err_text = format!("（本地 CLI 失败）\n{e:#}");
-                let mut req = SendMessageRequest::reply(ctx, err_text, &from_user);
-                if let Some(ref mut msg) = req.msg {
-                    let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-                    hub_ext.session_name = Some(session_name_for_cli.clone());
-                }
+                let reply = OutboundReply {
+                    context_token: ctx,
+                    text: err_text,
+                    to_user: from_user,
+                    cli_session_id: None,
+                    session_name: Some(session_name_for_cli.clone()),
+                    a2a_call_id: None,
+                    usage: None,
+                };
                 // Use an independent (never-cancelled) token rather than
                 // `&shutdown` so a concurrent bridge restart does not
                 // silently drop the error reply before it is sent.  The
@@ -292,8 +292,8 @@ pub(super) async fn handle_one_message(
                 // wall-clock time spent here, and `main()` will abort
                 // the task after its 3 s grace period if needed.
                 if let Err(send_e) = send_final_with_retry(
-                    client,
-                    req,
+                    &**client,
+                    reply,
                     backoff_for,
                     retry_budget,
                     &CancellationToken::new(),
@@ -344,24 +344,5 @@ fn log_message_handled_success(
             duration_ms = summary.duration_ms,
             "message handled: a2a final reply"
         );
-    }
-}
-
-/// Attach session metadata (and optional A2A call-id) to an outbound sendmessage.
-pub(super) fn attach_outbound_hub_ext(
-    req: &mut SendMessageRequest,
-    session_name: &str,
-    a2a_call_id: Option<&str>,
-    usage: Option<&serde_json::Value>,
-) {
-    if let Some(ref mut msg) = req.msg {
-        let hub_ext = msg.ilink_hub_ext.get_or_insert_with(HubExt::default);
-        hub_ext.session_name = Some(session_name.to_string());
-        if let Some(id) = a2a_call_id.filter(|s| !s.is_empty()) {
-            hub_ext.a2a_call_id = Some(id.to_string());
-        }
-        if let Some(u) = usage {
-            hub_ext.usage = Some(u.clone());
-        }
     }
 }
