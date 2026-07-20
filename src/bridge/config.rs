@@ -112,9 +112,17 @@ pub struct BridgeProfileFile {
 
     /// Credential resolution / connection target. Default `hub` (resolve a
     /// virtual token via the Hub). `direct` connects to the real iLink upstream
-    /// — stage 2 only supports `direct` with an explicit `WEIXIN_TOKEN`.
+    /// — stage 3 supports QR login against the real upstream, a saved direct
+    /// credential file, or an explicit `WEIXIN_TOKEN`.
     #[serde(default)]
     pub via: Via,
+
+    /// Base URL of the real iLink upstream for `via: direct`
+    /// (e.g. `https://ilinkai.weixin.qq.com`). When set, overrides `--hub-url` /
+    /// `WEIXIN_BASE_URL` for this profile — lets a bridge manager mix hub and
+    /// direct profiles against different upstreams. Ignored when `via: hub`.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 /// The `agentproc:` block — field-for-field the agentproc profile spec
@@ -280,6 +288,7 @@ pub struct BridgeApp {
     profile: BridgeProfile,
     transport: TransportKind,
     via: Via,
+    direct_base_url: Option<String>,
 }
 
 impl BridgeApp {
@@ -347,6 +356,7 @@ impl BridgeApp {
             profile,
             transport: file.transport,
             via: file.via,
+            direct_base_url: file.base_url,
         })
     }
 
@@ -385,6 +395,16 @@ impl BridgeApp {
     /// Configured credential/connection mode (`via:`). Default `hub`.
     pub fn via(&self) -> Via {
         self.via
+    }
+
+    /// Optional `base_url:` override for `via: direct` — points the transport at
+    /// a specific real iLink upstream, overriding `--hub-url` / `WEIXIN_BASE_URL`
+    /// for this profile. `None` when unset (fall back to the CLI/env URL).
+    pub fn direct_base_url(&self) -> Option<&str> {
+        self.direct_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 }
 
@@ -777,6 +797,28 @@ agentproc:
 "#;
         let app = parse(y).unwrap();
         assert!(app.via().is_direct());
+    }
+
+    #[test]
+    fn base_url_override_parses_for_direct() {
+        let y = r#"
+via: direct
+base_url: https://ilinkai.weixin.qq.com
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert_eq!(app.direct_base_url(), Some("https://ilinkai.weixin.qq.com"));
+    }
+
+    #[test]
+    fn base_url_default_is_none() {
+        let y = r#"
+agentproc:
+  command: echo
+"#;
+        let app = parse(y).unwrap();
+        assert!(app.direct_base_url().is_none());
     }
 
     #[test]

@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use crate::client::{HubPairingClient, HubPairingCredentials, HubPairingOptions};
+use crate::ilink::login::LoginClient;
 use crate::ilink::types::{BaseInfo, GetUpdatesRequest, GetUpdatesResponse};
 
 /// Default path for cached downstream credentials (same JSON shape as Hub pairing).
@@ -27,10 +28,21 @@ pub fn default_local_credential_path() -> PathBuf {
     crate::paths::default_bridge_credentials_path()
 }
 
+/// Default path for cached `via: direct` credentials (bridge → real iLink upstream).
+pub fn default_direct_credential_path() -> PathBuf {
+    crate::paths::default_direct_credentials_path()
+}
+
 fn credential_path(cred_file: Option<&str>) -> PathBuf {
     cred_file
         .map(PathBuf::from)
         .unwrap_or_else(default_local_credential_path)
+}
+
+fn direct_credential_path(cred_file: Option<&str>) -> PathBuf {
+    cred_file
+        .map(PathBuf::from)
+        .unwrap_or_else(default_direct_credential_path)
 }
 
 enum LocalCredState {
@@ -54,21 +66,23 @@ async fn local_credential_state(path: &Path) -> Result<LocalCredState> {
     }
 }
 
-async fn write_credentials(
+async fn write_creds_file(
     path: &Path,
-    hub_url: &str,
-    vtoken: &str,
+    base_url: &str,
+    token: &str,
     client_name: &str,
+    account_id: &str,
+    user_id: &str,
 ) -> Result<()> {
     let saved_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| format!("{}Z", d.as_secs()))
         .unwrap_or_default();
     let creds = HubPairingCredentials {
-        token: vtoken.to_string(),
-        base_url: hub_url.trim().trim_end_matches('/').to_string(),
-        account_id: "ilink-hub@hub.local".to_string(),
-        user_id: "hub-client".to_string(),
+        token: token.to_string(),
+        base_url: base_url.trim().trim_end_matches('/').to_string(),
+        account_id: account_id.to_string(),
+        user_id: user_id.to_string(),
         saved_at: Some(saved_at),
         client_name: Some(client_name.to_string()),
     };
@@ -87,6 +101,42 @@ async fn write_credentials(
             .with_context(|| format!("chmod 0600 {}", path.display()))?;
     }
     Ok(())
+}
+
+async fn write_credentials(
+    path: &Path,
+    hub_url: &str,
+    vtoken: &str,
+    client_name: &str,
+) -> Result<()> {
+    write_creds_file(
+        path,
+        hub_url,
+        vtoken,
+        client_name,
+        "ilink-hub@hub.local",
+        "hub-client",
+    )
+    .await
+}
+
+/// Write a `via: direct` credential file (same JSON shape as Hub pairing, but
+/// labelled for the real iLink upstream so the two modes never share a file).
+async fn write_direct_credentials(
+    path: &Path,
+    base_url: &str,
+    bot_token: &str,
+    client_name: &str,
+) -> Result<()> {
+    write_creds_file(
+        path,
+        base_url,
+        bot_token,
+        client_name,
+        "ilink@direct",
+        "direct-client",
+    )
+    .await
 }
 
 /// Returns `true` when Hub rejects the virtual token (HTTP 401 or `ret == 401`).
@@ -436,6 +486,110 @@ pub async fn resolve_hub_connection(
     }
 }
 
+/// Resolve `(base_url, bot_token)` for `via: direct` (bridge → real iLink upstream).
+///
+/// Order: explicit token (`WEIXIN_TOKEN` / `--token`) → `--pair` QR login against
+/// the real upstream → saved direct credential file.
+///
+/// Unlike [`resolve_hub_connection`], there is **no** `/hub/register` and no
+/// `ILINK_ADMIN_TOKEN`: the real iLink upstream issues a `bot_token` directly via
+/// QR login (the same `get_bot_qrcode` / `get_qrcode_status` flow the Hub server
+/// uses to bootstrap its own context). `validate_hub_token` is a generic iLink
+/// `/ilink/bot/getupdates` probe, so it works against the real upstream too.
+///
+/// `force_register`: if the credential file exists but is unusable, delete it and
+/// run QR login again. Does not affect a **valid** saved file.
+#[allow(clippy::too_many_arguments)]
+pub async fn resolve_direct_connection(
+    base_url: &str,
+    explicit_token: Option<&str>,
+    cred_file: Option<&str>,
+    force_pair: bool,
+    force_register: bool,
+    config_path: Option<&Path>,
+) -> Result<(String, String)> {
+    let base = base_url.trim().trim_end_matches('/').to_string();
+
+    if let Some(tok) = explicit_token.map(str::trim).filter(|s| !s.is_empty()) {
+        validate_hub_token(&base, tok).await.with_context(|| {
+            format!("via: direct — WEIXIN_TOKEN / --token 未被上游 {base} 接受（未注册或已失效）")
+        })?;
+        return Ok((base, tok.to_string()));
+    }
+
+    let path = direct_credential_path(cred_file.map(|s| s.trim()).filter(|s| !s.is_empty()));
+
+    if force_pair {
+        let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+        return Ok((base, token));
+    }
+
+    match local_credential_state(&path).await? {
+        LocalCredState::Valid(creds) => {
+            // Validate the saved token against the current base URL (not the
+            // possibly-stale one stored in the file).
+            if let Err(e) = validate_hub_token(&base, &creds.token).await {
+                warn!(
+                    error = %e,
+                    path = %path.display(),
+                    "saved direct token rejected by upstream; removing credentials and re-logging in"
+                );
+                let _ = tokio::fs::remove_file(&path).await;
+                let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+                return Ok((base, token));
+            }
+            let stored_base = creds.base_url.trim().trim_end_matches('/');
+            if stored_base != base.trim_end_matches('/') {
+                let name = creds.client_name.as_deref().unwrap_or("");
+                let _ = write_direct_credentials(&path, &base, &creds.token, name).await;
+            }
+            Ok((base, creds.token))
+        }
+        LocalCredState::Missing => {
+            let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+            Ok((base, token))
+        }
+        LocalCredState::ExistsUnusable => {
+            if force_register {
+                let _ = tokio::fs::remove_file(&path).await;
+                let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+                Ok((base, token))
+            } else {
+                anyhow::bail!(
+                    "direct 凭证文件 {} 已存在但无法使用（内容损坏或 token 为空）。\
+                     为避免静默覆盖已有文件，已停止。请删除该文件、设置 WEIXIN_TOKEN、\
+                     使用 `--pair`，或加上 `--force-register` 删除该文件后重新扫码登录。",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// Run the iLink QR login flow against the real upstream and persist the
+/// resulting `bot_token` to the direct credential file.
+async fn qr_login_and_save_direct(
+    path: &Path,
+    base: &str,
+    config_path: Option<&Path>,
+) -> Result<String> {
+    let client_name = default_auto_client_name(config_path);
+    let login = LoginClient::new(Some(base.to_string()))
+        .context("build iLink login client for direct QR")?;
+    let token = login.login_with_qr().await.context(
+        "via: direct — 扫码登录真实 iLink 上游失败。请确认 WEIXIN_BASE_URL / base_url 指向可达的真实上游，\
+         或改用显式 WEIXIN_TOKEN。",
+    )?;
+    write_direct_credentials(path, base, &token, &client_name).await?;
+    info!(
+        path = %path.display(),
+        base = %base,
+        client = %client_name,
+        "direct: QR login against real iLink upstream succeeded; saved direct credentials"
+    );
+    Ok(token)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +630,155 @@ mod tests {
             "custom"
         );
         assert_eq!(auto_client_name(None, Some("saved"), None), "saved");
+    }
+
+    // ─── via: direct credential resolution (stage 3) ───────────────────────
+
+    use mockito::Server;
+
+    /// explicit token + upstream accepts → returns (base, token) without touching cred file.
+    #[tokio::test]
+    async fn direct_explicit_token_accepted_returns_base_and_token() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ret":0,"errmsg":null}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        let (base, token) = resolve_direct_connection(
+            &server.url(),
+            Some("my-bot-token"),
+            Some(cred.to_str().unwrap()),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("explicit token should be accepted");
+        assert_eq!(token, "my-bot-token");
+        assert_eq!(base, server.url());
+        // No cred file should be written for the explicit-token path.
+        assert!(!cred.exists());
+    }
+
+    /// explicit token rejected by upstream (401) → Err, no cred file written.
+    #[tokio::test]
+    async fn direct_explicit_token_rejected_returns_err() {
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ret":401,"errmsg":"token rejected"}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        let err = resolve_direct_connection(
+            &server.url(),
+            Some("bad-token"),
+            Some(cred.to_str().unwrap()),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect_err("rejected token must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("via: direct"),
+            "error should mention via: direct: {msg}"
+        );
+        assert!(!cred.exists());
+    }
+
+    /// no explicit token, no cred file → QR login against the real upstream, save cred, return token.
+    #[tokio::test]
+    async fn direct_no_token_qr_logs_in_and_saves_cred() {
+        let mut server = Server::new_async().await;
+        let _m_qr = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode?bot_type=3")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"qrcode":"qr-key","qrcode_img_content":"https://wx.qq.com/qr.png"}"#,
+            )
+            .create_async()
+            .await;
+        let _m_status = server
+            .mock("GET", "/ilink/bot/get_qrcode_status?qrcode=qr-key")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"ret":0,"status":"confirmed","bot_token":"direct-bot-token","baseurl":null,"ilink_bot_id":null,"ilink_user_id":null}"#,
+            )
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        let (base, token) = resolve_direct_connection(
+            &server.url(),
+            None,
+            Some(cred.to_str().unwrap()),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("QR login should succeed");
+        assert_eq!(token, "direct-bot-token");
+        assert_eq!(base, server.url());
+        // Cred file must be persisted with the bot_token.
+        assert!(cred.exists(), "direct cred file should be written");
+        let saved = tokio::fs::read_to_string(&cred).await.unwrap();
+        assert!(
+            saved.contains("direct-bot-token"),
+            "saved cred must contain token: {saved}"
+        );
+    }
+
+    /// saved direct cred file with a still-valid token is reused (no QR login).
+    #[tokio::test]
+    async fn direct_saved_valid_token_is_reused_without_qr() {
+        let mut server = Server::new_async().await;
+        // Only the validate probe is hit; no QR endpoints should be called.
+        let _m = server
+            .mock("POST", "/ilink/bot/getupdates")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"ret":0,"errmsg":null}"#)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        // Pre-write a valid direct cred file (same shape as HubPairingCredentials).
+        tokio::fs::write(
+            &cred,
+            r#"{"token":"saved-direct-token","base_url":"https://example.com","account_id":"ilink@direct","user_id":"direct-client","saved_at":"0Z","client_name":"local-test"}"#,
+        )
+        .await
+        .unwrap();
+
+        let (base, token) = resolve_direct_connection(
+            &server.url(),
+            None,
+            Some(cred.to_str().unwrap()),
+            false,
+            false,
+            None,
+        )
+        .await
+        .expect("saved valid token should be reused");
+        assert_eq!(token, "saved-direct-token");
+        assert_eq!(base, server.url());
     }
 
     // ─── Adversarial tests for M4 review findings ─────────────────────────

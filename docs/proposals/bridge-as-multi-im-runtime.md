@@ -182,13 +182,20 @@ pub struct InboundMessage {
 - `transport.rs` 新增 `NullTransport`（`#[derive(Clone)]`，实现 `Transport`），`IlinkTransport::new` 由 `pub(crate)` 改 `pub` 供 bin 构造。
 - 验收：`via: hub` 行为与阶段 1 完全一致（默认值，无回归）；`via: direct` 配置可解析、显式 token 可探活、缺失 token 给出阶段 3 指引；`transport: telegram` 等可加载 `NullTransport` 证明可插拔；新增 4 个 config 单测覆盖默认值/other/direct/未知 via 拒绝。
 
-### 阶段 3 — direct 模式落地 + 短生命周期进程（走向 D1，本提案占位）
+### 阶段 3 — direct 模式凭证落地 ✅ 已落地（2026-07-20）
 
-- 落地 `via: direct` 的 iLink 鉴权与连接生命周期：复用现有 `client::HubPairingClient` 的 QR/凭证逻辑，改为对接真实 iLink 上游。
-- 设计短生命周期进程模型：一个 bridge 进程只服务一个 IM 渠道，按需启停、做完即关闭（对齐 `profile` 子命令的 exec 协议形态）。long-poll 类 IM（iLink/Telegram）的"持续监听 + 按消息派发短任务"外层 listener 在此阶段定型。
-- 阶段 3 涉及 iLink 鉴权与连接生命周期，单独立提案推进，不在本提案范围。
+- 落地 `via: direct` 的 iLink 鉴权与连接生命周期。**纠正原认知**：原以为"复用 `client::HubPairingClient` 的 QR 配对"，但 `HubPairingClient` 是 Hub 下游配对（QR 编码 `ilinkhub.ai` 中继 URL、走 `/hub/register` 拿 vtoken），与直连真实上游不是一回事。真实 iLink 上游的 QR 登录是 `ilink::login::LoginClient`（`get_bot_qrcode` / `get_qrcode_status` → `bot_token`），此前只被 Hub 服务端用于引导自身 context。阶段 3 把 `LoginClient` 复用给 bridge 直连路径。
+- 新增 `resolve_direct_connection(base_url, explicit_token, cred_file, force_pair, force_register, config_path)`（`src/bridge/transport/connection.rs`）：解析顺序 **显式 `WEIXIN_TOKEN` → `--pair` QR 登录真实上游 → 已存 direct 凭证文件**。无 `/hub/register`、无 `ILINK_ADMIN_TOKEN`；`validate_hub_token` 是通用 `/ilink/bot/getupdates` 探针，对真实上游同样适用。
+- direct 专用凭证文件 `~/.ilink-hub/direct-credentials.json`（`paths::default_direct_credentials_path`），与 Hub 的 `bridge-credentials.json` 分离，避免 `via: hub ↔ direct` 切换互相覆盖（vtoken 与 bot_token 是不同凭证）。
+- `BridgeProfileFile` 新增可选 `base_url:`（`BridgeApp::direct_base_url()`）：`via: direct` 时覆盖 `--hub-url` / `WEIXIN_BASE_URL`，使 bridge manager 可在同一 manager 下混用 hub 与 direct profile 指向不同上游。manager 子进程已传 `--config`/`--cred-file`，child 自读 YAML 的 `via:`/`base_url:`，**manager 无需改动**。
+- bin `build_transport` 的 `Via::Direct` 分支接入 `resolve_direct_connection`；重连循环的 `cred_path` 与 `TokenRejected` 文案改为 via 感知（direct 失效删 direct 凭证文件后重走 QR 登录）。
+- 进程模型：**不引入 ephemeral bridge 进程**。long-poll IM（iLink/Telegram）必须长驻 listener（"做完即关"与维持 `getupdates` cursor 矛盾）。当前"外层长驻 listener + 内层按消息派发短任务（session worker / agentproc turn）"即目标形态；`Transport::next_inbound` 抽象本身就是 ephemeral 的 seam——未来 webhook 型 IM 可由不同 transport 形态承载，不在阶段 3 实现。
+- 已知缺口（留 seam，未实现）：direct 模式 CLI 会话续接。`via: hub` 时 Hub 回显 `session_id`（上次 `cli_session_id`）使 bridge 能 resume CLI；真实上游不回显该 HubExt 字段，direct 模式每条消息起新 CLI 会话。恢复续接需本机 store 按 `(context_token, session_name) → cli_session_id` 持久化（`handle.rs` 已留 TODO seam）。
+- 验收：4 个 mockito 单测覆盖 direct 凭证解析（显式 token 接受 / 显式 token 拒绝 / 无 token QR 登录并存盘 / 已存有效 token 复用免 QR）；2 个 config 单测覆盖 `base_url:` 解析与默认 None；`paths` 单测覆盖 direct 凭证路径。`via: hub` 行为无回归。
 
 > 注：原评估误以为阶段 3 需要"搬迁 Hub 上游逻辑"。纠正后：bridge 本就说 iLink 协议，直连只是换 base URL + 自管凭证，不搬迁 Hub。
+>
+> 运维注意：bridge 直连 QR 登录会从真实上游拿到一个 bot_token；若同一微信号已有 Hub 持有 bot_token，二者可能冲突。direct 模式适合"无 Hub、bridge 直接顶上"的部署，不建议与 Hub 同时登录同一微信号。
 
 ## 9. 风险与缓解
 
@@ -198,7 +205,9 @@ pub struct InboundMessage {
 | 桌面端 Tauri API 兼容性被破坏 | **高** | 阶段 1 保持公共导出签名不变；改路径/改名放阶段 2 且需同步改桌面端 |
 | 新旧 transport 并存期出现双实现 bug | 中 | 阶段 1 完成后立即删旧路径，不留并存 |
 | `client`（扫码配对）搬迁破坏 QR 流程 | 中 | **不搬 `crate::client`**：它被 Hub 服务端 `ilink/login.rs` 共享，搬进 bridge 会破坏 Hub。仅把 iLink-via-Hub 专属的 `connection.rs` 归入 `transport/`，`bridge::` 公共再导出签名不变 |
-| 直连 iLink（阶段 3）凭证生命周期与现有 Hub QR 流程不一致 | 中 | 复用 `client::pairing` 逻辑，阶段 3 单独立提案时再细化 |
+| 直连 iLink（阶段 3）凭证生命周期与现有 Hub QR 流程不一致 | 中 | **已纠正**：不复用 `HubPairingClient`（Hub 下游配对专用），改复用 `ilink::login::LoginClient`（真实上游 QR 登录）。direct 专用凭证文件与 Hub vtoken 文件分离 |
+| direct 模式 CLI 会话无法续接（真实上游不回显 `session_id`） | 中 | 阶段 3 留 seam（`handle.rs` TODO）：未来加本机 `(context_token, session_name) → cli_session_id` store 恢复 resume；当前 direct 每条消息起新 CLI 会话 |
+| bridge 直连与 Hub 同时登录同一微信号导致 bot_token 冲突 | 中 | 文档注明：direct 适合"无 Hub"部署，不建议与 Hub 同时登录同一微信号 |
 | `paths` 中 `~/.ilink-hub` 与 `~/.ilink-hub-bridge` 路径错位 | 低 | 搬迁时逐函数对照现有常量，保留测试 `bridge_defaults_live_under_data_dir` 等 |
 | 阶段 2 默认 `via` 与提案初稿（`direct`）不一致导致回归 | 中 | **已采纳 `默认 via: hub`**：阶段 2 不回归现有 Hub 自动注册部署；`direct` 留待阶段 3 完成凭证流程后切换。`run_bridge` 旧签名保留，桌面端无感 |
 

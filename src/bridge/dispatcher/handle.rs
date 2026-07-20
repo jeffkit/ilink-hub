@@ -99,6 +99,14 @@ pub(super) async fn handle_one_message(
         .filter(|s| !s.is_empty())
         .context("inbound message missing context_token")?;
     let from_user = msg.from_user.clone().unwrap_or_default();
+    // CLI session id to resume. In `via: hub`, the Hub persists the last
+    // `cli_session_id` we sent and echoes it back here as `session_id` on the
+    // next message of the same session — enabling CLI resume across messages.
+    // In `via: direct`, the real iLink upstream does NOT echo this HubExt
+    // field, so `session_id` is None and every message starts a fresh CLI
+    // session. Restoring resume in direct mode needs a local store keyed by
+    // (context_token, session_name) → last cli_session_id (stage 3 seam, not
+    // yet implemented).
     let session_for_cli = msg.session_id.clone().unwrap_or_default();
     let session_name_for_cli =
         sanitize_field(msg.session_name.as_deref(), 128).unwrap_or_else(|| "default".to_string());

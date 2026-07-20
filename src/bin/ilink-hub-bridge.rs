@@ -26,8 +26,9 @@ use tracing::{info, warn};
 use anyhow::Context;
 use ilink_hub::bridge::transport::{IlinkTransport, NullTransport, Transport};
 use ilink_hub::bridge::{
-    builtin, default_local_credential_path, resolve_hub_connection, run_bridge_with_shutdown,
-    validate_hub_token, BridgeApp, BridgeStop, Via,
+    builtin, default_direct_credential_path, default_local_credential_path,
+    resolve_direct_connection, resolve_hub_connection, run_bridge_with_shutdown, BridgeApp,
+    BridgeStop, Via,
 };
 use ilink_hub::paths::{
     default_bridge_config_path, default_bridge_manager_credentials_dir, default_bridge_profiles_dir,
@@ -146,8 +147,10 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
 /// - `transport: ilink` + `via: hub` (default): resolve a virtual token via the Hub
 ///   (`/hub/register` / QR) and point `IlinkTransport` at the Hub.
 /// - `transport: ilink` + `via: direct`: connect straight to the real iLink
-///   upstream. Stage 2 only supports an explicit `WEIXIN_TOKEN` + `WEIXIN_BASE_URL`;
-///   the QR / auto-register flow for direct lands in stage 3.
+///   upstream. Stage 3 resolves credentials via: explicit `WEIXIN_TOKEN` →
+///   `--pair` QR login against the real upstream → saved direct cred file.
+///   The upstream base URL is `base_url:` from the YAML when set, else
+///   `--hub-url` / `WEIXIN_BASE_URL`.
 /// - `transport: <other>`: load a `NullTransport` placeholder (stage 2 pluggability
 ///   proof; real adapters arrive in later stages).
 async fn build_transport(
@@ -181,25 +184,25 @@ async fn build_transport(
             Ok(Arc::new(t))
         }
         Via::Direct => {
-            let base = cli.hub_url.trim().trim_end_matches('/').to_string();
-            match explicit_token(cli) {
-                Some(token) => {
-                    // Validate against the real iLink upstream (same /ilink/bot/getupdates
-                    // probe; both Hub and real upstream speak iLink). A failure means the
-                    // explicit token is not accepted by the upstream.
-                    validate_hub_token(&base, token).await.with_context(|| {
-                        format!("via: direct — token rejected by upstream {base}")
-                    })?;
-                    info!(base = %base, via = "direct", "connecting directly to iLink upstream with explicit token");
-                    let t = IlinkTransport::new(base, token.to_string())
-                        .context("build iLink transport (direct)")?;
-                    Ok(Arc::new(t))
-                }
-                None => anyhow::bail!(
-                    "via: direct 的自动注册 / QR 登录尚未实现（阶段 3）。请显式设置 WEIXIN_TOKEN \
-                     与 WEIXIN_BASE_URL 指向真实 iLink 上游，或在配置中改用 `via: hub`。"
-                ),
-            }
+            // YAML `base_url:` overrides the CLI/env URL for this profile, so a
+            // bridge manager can mix hub and direct profiles against different
+            // upstreams.
+            let base = app
+                .direct_base_url()
+                .map(str::to_string)
+                .unwrap_or_else(|| cli.hub_url.trim().trim_end_matches('/').to_string());
+            let (base, token) = resolve_direct_connection(
+                &base,
+                explicit_token(cli),
+                cli.cred_file.as_deref(),
+                cli.pair,
+                cli.force_register,
+                Some(config_path),
+            )
+            .await?;
+            info!(base = %base, via = "direct", "connecting directly to iLink upstream");
+            let t = IlinkTransport::new(base, token).context("build iLink transport (direct)")?;
+            Ok(Arc::new(t))
         }
     }
 }
@@ -313,7 +316,10 @@ async fn main() -> Result<()> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(default_local_credential_path);
+                .unwrap_or_else(|| match app.via() {
+                    Via::Direct => default_direct_credential_path(),
+                    Via::Hub => default_local_credential_path(),
+                });
             let using_explicit_token = explicit_token(&cli).is_some();
 
             // Shared shutdown token — cancelled by Ctrl-C or SIGTERM so that
@@ -373,15 +379,24 @@ async fn main() -> Result<()> {
                     result = &mut handle => {
                         match result {
                             Ok(BridgeStop::TokenRejected) if using_explicit_token => {
+                                let via = app.via();
+                                let where_ = if via.is_direct() { "上游" } else { "Hub" };
                                 anyhow::bail!(
-                                    "Hub 拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
-                                     请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
+                                    "{where_}拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
+                                     请重新执行 `ilink-hub register`、`ilink-hub-bridge --force-register`，\
+                                     或在 `via: direct` 下重新 `--pair` 扫码登录。"
                                 );
                             }
                             Ok(BridgeStop::TokenRejected) => {
+                                let via = app.via();
+                                let what = if via.is_direct() {
+                                    "direct token"
+                                } else {
+                                    "hub token"
+                                };
                                 warn!(
                                     path = %cred_path.display(),
-                                    "hub token revoked at runtime; removing credentials and re-registering"
+                                    "{what} revoked at runtime; removing credentials and reconnecting"
                                 );
                                 let _ = tokio::fs::remove_file(&cred_path).await;
                                 continue 'reconnect;

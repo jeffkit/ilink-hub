@@ -24,8 +24,9 @@ pub(crate) mod connection;
 pub(crate) mod ilink;
 
 pub use connection::{
-    default_auto_client_name, default_local_credential_path, hub_response_token_rejected,
-    resolve_hub_connection, validate_hub_token,
+    default_auto_client_name, default_direct_credential_path, default_local_credential_path,
+    hub_response_token_rejected, resolve_direct_connection, resolve_hub_connection,
+    validate_hub_token,
 };
 
 /// Placeholder transport used when `transport:` names a protocol that has no

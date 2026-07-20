@@ -28,6 +28,16 @@ pub fn default_bridge_credentials_path() -> PathBuf {
     data_dir().join("bridge-credentials.json")
 }
 
+/// Default credentials JSON for `via: direct` (bridge → real iLink upstream):
+/// `~/.ilink-hub/direct-credentials.json`.
+///
+/// Kept separate from [`default_bridge_credentials_path`] so switching
+/// `via: hub` ↔ `via: direct` does not clobber the other mode's saved token
+/// (a Hub vtoken and a real-upstream bot_token are different credentials).
+pub fn default_direct_credentials_path() -> PathBuf {
+    data_dir().join("direct-credentials.json")
+}
+
 /// Root for the bridge manager plugin-style profile layout: `~/.ilink-hub-bridge`.
 pub fn bridge_manager_dir() -> PathBuf {
     dirs::home_dir()
@@ -253,6 +263,10 @@ mod tests {
         assert_eq!(
             default_bridge_credentials_path(),
             base.join("bridge-credentials.json")
+        );
+        assert_eq!(
+            default_direct_credentials_path(),
+            base.join("direct-credentials.json")
         );
     }
 
