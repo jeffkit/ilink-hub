@@ -577,6 +577,22 @@ mod tests {
     }
 
     #[test]
+    fn no_interactive_bare_flag_parses_true() {
+        // N1 regression guard: `--no-interactive` must be a bare SetTrue flag
+        // (the manager passes it bare to children). The env form only accepts
+        // "true"/"false", so the manager must NOT inject "1" via env.
+        let cli = Cli::parse_from([
+            "ilink-hub-bridge",
+            "--no-interactive",
+            "--hub-url",
+            "http://x",
+        ]);
+        assert!(cli.no_interactive);
+        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://x"]);
+        assert!(!cli.no_interactive);
+    }
+
+    #[test]
     fn build_transport_direct_bails_without_base_url() {
         // End-to-end-ish: build_transport on a via: direct profile with no base_url
         // and the default hub-url bails at the M2 gate before any network call.

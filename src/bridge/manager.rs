@@ -1021,6 +1021,11 @@ fn bridge_child_args(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> V
     if opts.force_register {
         args.push("--force-register".to_string());
     }
+    // N1: manager children are non-interactive supervisors — they must never
+    // block on a QR login prompt. Pass `--no-interactive` as a bare flag (the
+    // env form only accepts "true"/"false", not "1"), so a via: direct child
+    // with missing/revoked credentials bails fast instead of QR-polling.
+    args.push("--no-interactive".to_string());
     args
 }
 
@@ -1043,11 +1048,6 @@ fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> 
             cmd.env("ILINK_ADMIN_TOKEN", admin);
         }
     }
-    // N1: manager children are non-interactive supervisors — they must never block
-    // on a QR login prompt. Force `--no-interactive` via env so a via: direct
-    // child with missing/revoked credentials bails fast (and the manager's
-    // credential guard parks it) instead of QR-polling ~30min and restart-looping.
-    cmd.env("ILINKHUB_BRIDGE_NON_INTERACTIVE", "1");
     cmd.kill_on_drop(true);
 
     cmd.spawn().context("spawn bridge child")
@@ -1599,6 +1599,7 @@ via: direct
                 "--config",
                 "/profiles/claude.yaml",
                 "--force-register",
+                "--no-interactive",
             ]
         );
     }
