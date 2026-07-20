@@ -198,11 +198,19 @@ pub struct InboundMessage {
 
 - **H1（manager + via: direct 凭证引导）**：manager 对 `via: direct` profile 在 spawn 前预检凭证文件可用性；不可用则**拒绝 spawn** 并打清晰日志（指引先手动 `ilink-hub-bridge --config … --cred-file … --pair`），按 scan 周期复检——避免 headless supervisor 下 QR 阻塞 ~30min 后重启风暴。`BridgeProcessSpec` 新增 `via_direct` 字段。
 - **M2（direct 强制 base_url）**：`via: direct` 缺 `base_url:` 且 `--hub-url`/`WEIXIN_BASE_URL` 仍是默认 localhost Hub 地址时直接 bail，禁止静默对 Hub/localhost 发 `get_bot_qrcode`。抽纯函数 `resolve_direct_base_url` 便于单测。
-- **M5（manager cred 路径按 via 隔离）**：direct profile 的 manager 凭证文件用 `{id}.direct.json` 后缀，与 hub 的 `{id}.json` 分离；via 切换时旧凭证随 fingerprint 变更被清理，不再互相覆盖。
-- **M6（capabilities seam 接线）**：启动 direct transport 时 `info!` 打印 `TransportCapabilities`（`media_upload`），使 seam 可观测。
+- **M5（manager cred 路径按 via 隔离）**：direct profile 的 manager 凭证文件用 `{id}.direct.json` 后缀，与 hub 的 `{id}.json` 分离；via 翻转时旧后缀文件作为孤儿被清理（见 N2），不再互相覆盖。
+- **M6（capabilities seam 接线）**：`build_transport` 在 hub/direct 公共出口 `info!` 打印 `TransportCapabilities`（`media_upload`），使 seam 可观测。
 - **L3/L4/L5/L6**：TokenRejected 日志/bail 文案改为 via 感知（去掉 hub-only 措辞）；非 ilink `transport:` 未加 `--allow-null-transport` 时启动 fail-fast（占位 NullTransport 不再永久退避成僵尸）；`config.rs` `Via` 注释刷新为 stage 3 已落地；启动 direct 时 INFO 提示无 CLI resume。
 - **L2**：移除死代码 `classify_sendoutcome`（与 `parse_sendoutcome` 语义不一致且全程 `#[allow(dead_code)]`），其测试改为覆盖在线函数 `parse_sendoutcome`。
 - 新增测试：manager（direct 后缀 / 凭证可用性判定 / 守卫 / 拒绝 spawn 无凭证）+ bin（`resolve_direct_base_url` 四路径 / `build_transport` M2 bail / L4 bail）。
+
+**复审二轮加固（2026-07-20，review §10 N1–N4）**：
+
+- **N1（运行时 TokenRejected→子进程内 QR，建议必做）**：`resolve_direct_connection` / `qr_login_and_save_direct` 新增 `interactive` 参数；非交互环境（manager 注入 `ILINKHUB_BRIDGE_NON_INTERACTIVE=1`、`--no-interactive`、或 stdout 非 TTY）下，任何 QR 路径（`--pair` / Missing / 运行时被拒重登 / `ExistsUnusable+force_register`）在打印二维码**之前**直接 bail，把控制交回 manager 的凭证守卫。manager 在 `spawn_bridge_child` 对所有 child 注入 `ILINKHUB_BRIDGE_NON_INTERACTIVE=1`。运行时 token 被撤销时：子进程删 cred → 重连 bail（非 QR 阻塞）→ 退出 → manager 下次 scan 由 `direct_spec_blocker` 见凭证缺失而 park，不再重启风暴。
+- **N2（via 翻转清理旧凭证）**：`stop_removed_or_changed` 在 fingerprint 变更且 `via_direct` 翻转时，删除旧后缀 cred 文件（`.json`↔`.direct.json` 路径不同，绝不误删新文件），避免孤儿与日后翻转回退时复用错误类型的 token。注：via 翻转**不**自动 deregister 旧 hub client（deregister 仅在 profile 删除时触发）——属已知缺口，操作员可手动 `ilink-hub` 清理。
+- **N3（manager 预检 base_url）**：`direct_spec_blocker`（取代原 `direct_spec_needs_credentials`）对 `via_direct` profile 同时预检 YAML `base_url:` 非空与凭证可用；缺 `base_url:` 同样 park（manager 转发的 `--hub-url` 是 Hub 地址，direct 不能用它），避免子进程命中 M2 bail 后有界退避重启循环。
+- **N4（capabilities 日志覆盖 hub）**：capabilities 日志从 direct 分支移到 hub/direct 公共出口（见 M6）。
+- 新增测试：connection.rs（非交互 + 无 cred bail / 非交互 + `--pair` bail，均不触达 QR 端点）+ manager（`direct_spec_blocker` base_url 与凭证双预检 / via 翻转清理孤儿 cred）。
 - **M4（partial/final 去重可能静默丢尾部）**：评估为重构前既有行为、非阻塞，未在本轮改动；后续宜用「成功发送计数」驱动去重或 partial 失败时不抑制 final。
 - **L1（`InboundMessage.extra` 恒 Null）**：预留 seam，非 bug，维持现状。
 
@@ -223,7 +231,9 @@ pub struct InboundMessage {
 | bridge 直连与 Hub 同时登录同一微信号导致 bot_token 冲突 | 中 | 文档注明：direct 适合"无 Hub"部署，不建议与 Hub 同时登录同一微信号 |
 | manager 托管 `via: direct` 在 headless 下 QR 阻塞 → 重启风暴 | **高** | **已缓解（review H1）**：manager spawn 前预检 direct 凭证可用性，不可用则拒绝 spawn 并按 scan 复检，不进入 QR 阻塞 + 重启循环 |
 | `via: direct` 缺 `base_url:` 静默回退 localhost Hub | 中 | **已缓解（review M2）**：direct 缺 `base_url:` 且 base 仍是默认 localhost Hub 地址时 fail-fast，禁止对 Hub 发 `get_bot_qrcode` |
-| manager 共用 cred 路径致 hub↔direct 切换踩旧凭证 | 中 | **已缓解（review M5）**：direct 凭证用 `{id}.direct.json` 后缀与 hub 分离；via 切换随 fingerprint 变更清理旧凭证 |
+| manager 共用 cred 路径致 hub↔direct 切换踩旧凭证 | 中 | **已缓解（review M5 + N2）**：direct 凭证用 `{id}.direct.json` 后缀与 hub 分离；via 翻转时 `stop_removed_or_changed` 删除旧后缀孤儿文件（不 deregister，见已知缺口） |
+| 运行时 token 被撤销 → direct 子进程 QR 阻塞 + 重启风暴 | **高** | **已缓解（review N1）**：`resolve_direct_connection` 非交互环境 bail 而非 QR；manager 注入 `ILINKHUB_BRIDGE_NON_INTERACTIVE=1`；子进程退出后由 `direct_spec_blocker` park |
+| manager 托管 direct 缺 `base_url:` → M2 bail 重启循环 | 中 | **已缓解（review N3）**：`direct_spec_blocker` 预检 YAML `base_url:` 非空，缺失则 park（与缺凭证同等处理） |
 | 非 ilink `transport:` 占位 NullTransport 永久退避成僵尸 | 低 | **已缓解（review L4）**：未加 `--allow-null-transport` 时启动 fail-fast |
 | `paths` 中 `~/.ilink-hub` 与 `~/.ilink-hub-bridge` 路径错位 | 低 | 搬迁时逐函数对照现有常量，保留测试 `bridge_defaults_live_under_data_dir` 等 |
 | 阶段 2 默认 `via` 与提案初稿（`direct`）不一致导致回归 | 中 | **已采纳 `默认 via: hub`**：阶段 2 不回归现有 Hub 自动注册部署；`direct` 留待阶段 3 完成凭证流程后切换。`run_bridge` 旧签名保留，桌面端无感 |

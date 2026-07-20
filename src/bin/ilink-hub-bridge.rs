@@ -23,6 +23,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{info, warn};
 
+use std::io::IsTerminal;
+
 use anyhow::Context;
 use ilink_hub::bridge::transport::{IlinkTransport, NullTransport, Transport};
 use ilink_hub::bridge::{
@@ -81,6 +83,19 @@ struct Cli {
         global = true
     )]
     allow_null_transport: bool,
+
+    /// Disable interactive flows (QR login prompts). When set (or when stdout
+    /// is not a TTY), `via: direct` bails instead of printing a QR code — a
+    /// headless supervisor cannot confirm a phone scan. The bridge manager
+    /// injects this env into its children so they fail fast and let the
+    /// manager's credential guard park the profile.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "ILINKHUB_BRIDGE_NON_INTERACTIVE",
+        global = true
+    )]
+    no_interactive: bool,
 
     /// Path to bridge YAML (command, args, timeout, …). Used only in bridge (default) mode.
     /// Defaults to `~/.ilink-hub/ilink-hub-bridge.yaml`.
@@ -204,6 +219,7 @@ async fn build_transport(
     cli: &Cli,
     config_path: &Path,
     description: Option<&str>,
+    interactive: bool,
 ) -> Result<Arc<dyn Transport>> {
     let transport = app.transport();
     if !transport.is_ilink() {
@@ -218,7 +234,7 @@ async fn build_transport(
         return Ok(Arc::new(NullTransport::new(name)));
     }
 
-    match app.via() {
+    let t: Arc<dyn Transport> = match app.via() {
         Via::Hub => {
             let (hub_url, token) = resolve_hub_connection(
                 &cli.hub_url,
@@ -232,8 +248,7 @@ async fn build_transport(
             )
             .await?;
             info!(%hub_url, via = "hub", "using Hub base URL for downstream");
-            let t = IlinkTransport::new(hub_url, token).context("build iLink transport")?;
-            Ok(Arc::new(t))
+            Arc::new(IlinkTransport::new(hub_url, token).context("build iLink transport")?)
         }
         Via::Direct => {
             // YAML `base_url:` overrides the CLI/env URL for this profile, so a
@@ -249,6 +264,7 @@ async fn build_transport(
                 cli.pair,
                 cli.force_register,
                 Some(config_path),
+                interactive,
             )
             .await?;
             info!(base = %base, via = "direct", "connecting directly to iLink upstream");
@@ -258,17 +274,14 @@ async fn build_transport(
                 "via: direct 不支持跨消息 CLI 会话续接（真实上游不回显 session_id）；每条消息起新 CLI 会话。"
             );
             let t = IlinkTransport::new(base, token).context("build iLink transport (direct)")?;
-            // Log capabilities so the seam is observable (review M6): media upload
-            // is not implemented for the iLink transport today.
-            let caps = t.capabilities();
-            info!(
-                via = "direct",
-                media_upload = caps.media_upload,
-                "transport capabilities"
-            );
-            Ok(Arc::new(t))
+            Arc::new(t)
         }
-    }
+    };
+    // N4: log capabilities at the common exit so both hub and direct paths are
+    // observable (review M6). media_upload is not implemented for iLink today.
+    let caps = t.capabilities();
+    info!(media_upload = caps.media_upload, "transport capabilities");
+    Ok(t)
 }
 
 #[tokio::main]
@@ -386,6 +399,12 @@ async fn main() -> Result<()> {
                 });
             let using_explicit_token = explicit_token(&cli).is_some();
 
+            // Interactive flows (QR login) require a TTY for stdout and must not
+            // be disabled via --no-interactive / ILINKHUB_BRIDGE_NON_INTERACTIVE
+            // (the manager injects the latter so its children fail fast instead
+            // of QR-blocking headless — review N1).
+            let interactive = !cli.no_interactive && std::io::stdout().is_terminal();
+
             // Shared shutdown token — cancelled by Ctrl-C or SIGTERM so that
             // in-flight AI calls are gracefully cancelled and users are notified.
             let shutdown = tokio_util::sync::CancellationToken::new();
@@ -401,7 +420,8 @@ async fn main() -> Result<()> {
                     .profile(app.default_profile_name())
                     .and_then(|p| p.description.as_deref());
 
-                let transport = build_transport(&app, &cli, &config_path, description).await?;
+                let transport =
+                    build_transport(&app, &cli, &config_path, description, interactive).await?;
 
                 let mut handle = tokio::spawn(run_bridge_with_shutdown(
                     transport,
@@ -568,7 +588,7 @@ mod tests {
         let app = BridgeApp::load(&cfg).unwrap();
         let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None)) {
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
             Ok(_) => panic!("expected M2 bail, got transport"),
             Err(e) => e,
         };
@@ -590,7 +610,7 @@ mod tests {
         let app = BridgeApp::load(&cfg).unwrap();
         let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None)) {
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None, true)) {
             Ok(_) => panic!("expected L4 bail, got transport"),
             Err(e) => e,
         };

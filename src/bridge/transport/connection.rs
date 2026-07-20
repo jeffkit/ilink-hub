@@ -507,6 +507,7 @@ pub async fn resolve_direct_connection(
     force_pair: bool,
     force_register: bool,
     config_path: Option<&Path>,
+    interactive: bool,
 ) -> Result<(String, String)> {
     let base = base_url.trim().trim_end_matches('/').to_string();
 
@@ -520,7 +521,7 @@ pub async fn resolve_direct_connection(
     let path = direct_credential_path(cred_file.map(|s| s.trim()).filter(|s| !s.is_empty()));
 
     if force_pair {
-        let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+        let token = qr_login_and_save_direct(&path, &base, config_path, interactive).await?;
         return Ok((base, token));
     }
 
@@ -535,7 +536,8 @@ pub async fn resolve_direct_connection(
                     "saved direct token rejected by upstream; removing credentials and re-logging in"
                 );
                 let _ = tokio::fs::remove_file(&path).await;
-                let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+                let token =
+                    qr_login_and_save_direct(&path, &base, config_path, interactive).await?;
                 return Ok((base, token));
             }
             let stored_base = creds.base_url.trim().trim_end_matches('/');
@@ -546,13 +548,14 @@ pub async fn resolve_direct_connection(
             Ok((base, creds.token))
         }
         LocalCredState::Missing => {
-            let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+            let token = qr_login_and_save_direct(&path, &base, config_path, interactive).await?;
             Ok((base, token))
         }
         LocalCredState::ExistsUnusable => {
             if force_register {
                 let _ = tokio::fs::remove_file(&path).await;
-                let token = qr_login_and_save_direct(&path, &base, config_path).await?;
+                let token =
+                    qr_login_and_save_direct(&path, &base, config_path, interactive).await?;
                 Ok((base, token))
             } else {
                 anyhow::bail!(
@@ -568,11 +571,30 @@ pub async fn resolve_direct_connection(
 
 /// Run the iLink QR login flow against the real upstream and persist the
 /// resulting `bot_token` to the direct credential file.
+///
+/// When `interactive` is false (manager-managed child, `--no-interactive`, or
+/// non-TTY stdout) this bails **before** printing a QR code — a headless
+/// supervisor cannot confirm a phone scan, so blocking ~30min on QR polling
+/// would only restart-loop. Control returns to the caller (and ultimately the
+/// manager's credential guard) to park the profile until credentials exist.
 async fn qr_login_and_save_direct(
     path: &Path,
     base: &str,
     config_path: Option<&Path>,
+    interactive: bool,
 ) -> Result<String> {
+    if !interactive {
+        anyhow::bail!(
+            "via: direct 需要扫码登录真实上游 {base}，但当前为非交互环境（manager 托管 / \
+             `--no-interactive` / 非 TTY），无法完成扫码。请先在交互终端手动执行一次：\n  \
+             ilink-hub-bridge --config {cfg} --cred-file {cred} --pair\n\
+             完成扫码并存盘后，再交由 manager 托管或重启 bridge。",
+            cfg = config_path
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "<bridge.yaml>".into()),
+            cred = path.display(),
+        );
+    }
     let client_name = default_auto_client_name(config_path);
     let login = LoginClient::new(Some(base.to_string()))
         .context("build iLink login client for direct QR")?;
@@ -657,6 +679,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await
         .expect("explicit token should be accepted");
@@ -687,6 +710,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await
         .expect_err("rejected token must error");
@@ -730,6 +754,7 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await
         .expect("QR login should succeed");
@@ -774,11 +799,82 @@ mod tests {
             false,
             false,
             None,
+            true,
         )
         .await
         .expect("saved valid token should be reused");
         assert_eq!(token, "saved-direct-token");
         assert_eq!(base, server.url());
+    }
+
+    /// N1: non-interactive (manager / --no-interactive / non-TTY) + no cred →
+    /// bail **before** any QR endpoint is hit. A headless supervisor cannot
+    /// confirm a phone scan, so blocking ~30min on QR polling would only
+    /// restart-loop; control returns to the caller / manager credential guard.
+    #[tokio::test]
+    async fn direct_non_interactive_without_cred_bails_no_qr() {
+        let mut server = Server::new_async().await;
+        // If the bail is missing, the QR flow would hit GET /ilink/bot/get_bot_qrcode.
+        // We deliberately do NOT mock it — any hit fails the request, but more
+        // importantly we assert on the bail message rather than a network error.
+        let _no_qr = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        let err = resolve_direct_connection(
+            &server.url(),
+            None,
+            Some(cred.to_str().unwrap()),
+            false,
+            false,
+            None,
+            false,
+        )
+        .await
+        .expect_err("non-interactive + no cred must bail, not QR");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("非交互环境"),
+            "expected non-interactive bail message: {msg}"
+        );
+        // No cred file written, no QR polling started.
+        assert!(!cred.exists());
+    }
+
+    /// N1: non-interactive + `--pair` also bails (force_pair must not bypass
+    /// the headless guard).
+    #[tokio::test]
+    async fn direct_non_interactive_pair_bails_no_qr() {
+        let mut server = Server::new_async().await;
+        let _no_qr = server
+            .mock("GET", "/ilink/bot/get_bot_qrcode")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cred = dir.path().join("direct-cred.json");
+        let err = resolve_direct_connection(
+            &server.url(),
+            None,
+            Some(cred.to_str().unwrap()),
+            true, // force_pair
+            false,
+            None,
+            false, // non-interactive
+        )
+        .await
+        .expect_err("--pair under non-interactive must bail, not QR");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("非交互环境"),
+            "expected non-interactive bail message: {msg}"
+        );
+        assert!(!cred.exists());
     }
 
     // ─── Adversarial tests for M4 review findings ─────────────────────────

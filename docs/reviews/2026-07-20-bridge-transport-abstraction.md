@@ -5,11 +5,11 @@
 | 分支 | `refactor/bridge-transport-abstraction` |
 | Worktree | `.worktrees/refactor-bridge-transport-abstraction` |
 | 对比基线 | `main` (`1f4cb24`) |
-| Commits | `3c8e861` stages 1–2 · `777691d` stage 3 (`via: direct`) |
-| 审查日期 | 2026-07-20 |
-| 审查范围 | `src/bridge/transport*`、`config`、`dispatcher/*`、`executor`、`bin/ilink-hub-bridge`、`paths`、提案 `docs/proposals/bridge-as-multi-im-runtime.md` |
-| 单测快照 | bridge 相关 **219 passed / 0 failed / 1 ignored**（审查时） |
-| 总体风险 | **中低** — `via: hub` 路径质量高、可合入；`via: direct` 在 manager/缺 `base_url` 场景有可用性与运维陷阱 |
+| Commits | `3c8e861` stages 1–2 · `777691d` stage 3 · `a6a3863` review 加固 |
+| 审查日期 | 2026-07-20（初审） / 2026-07-20（复审） |
+| 审查范围 | `src/bridge/transport*`、`config`、`dispatcher/*`、`executor`、`bin/ilink-hub-bridge`、`paths`、`manager`、提案 |
+| 单测快照 | 初审 219 passed；复审 **223 passed / 0 failed / 1 ignored**，clippy `-D warnings` 干净 |
+| 总体风险 | **低**（复审后）— 上轮 H1/M2/M3/M5 主路径已闭环；残留 N1（运行时 TokenRejected→子进程内 QR）建议合入前补 |
 
 ---
 
@@ -201,15 +201,15 @@ Manager 始终把 `--cred-file` 指到 `credentials_dir/{id}.json`（hub vtoken 
 
 ---
 
-## 7. 合入前检查清单
+## 7. 合入前检查清单（初审）
 
-- [ ] **H1**：manager 对 `via: direct` fail-fast 或预检凭证
-- [ ] **M2**：direct 强制/校验 `base_url`（禁止静默打 localhost Hub）
-- [ ] **M3**：提案 Q1/§3/进程模型 与实现、§8 stage 3 叙述对齐
-- [ ] （建议）**M5**：manager cred 路径按 via 隔离
-- [ ] （建议）启动 direct 时 INFO 提示无 CLI resume（L6）
-- [ ] 刷新过期注释（L5）与 TokenRejected 文案（L3）
-- [ ] 合入前在本分支重跑 `cargo fmt` / `clippy -D warnings` / 相关测试（质量门）
+- [x] **H1**：manager 对 `via: direct` fail-fast 或预检凭证（主路径已修；见复审 N1）
+- [x] **M2**：direct 强制/校验 `base_url`（禁止静默打 localhost Hub）
+- [x] **M3**：提案 Q1/§3/进程模型 与实现、§8 stage 3 叙述对齐
+- [x] **M5**：manager cred 路径按 via 隔离（防覆盖已修；清理表述见复审 N2）
+- [x] 启动 direct 时 INFO 提示无 CLI resume（L6）
+- [x] 刷新过期注释（L5）与 TokenRejected 文案（L3）
+- [x] `cargo clippy -D warnings` / `cargo test … bridge::`（复审时绿）
 
 ---
 
@@ -222,6 +222,68 @@ Manager 始终把 `--cred-file` 指到 `credentials_dir/{id}.json`（hub vtoken 
 
 ---
 
-## 9. 审查人备注
+## 9. 审查人备注（初审）
 
 净判断：**架构方向正确，hub 路径可放心；direct 路径差「运维闭环」最后一公里。** 优先修 H1/M2，避免用户在 manager 或漏配 `base_url` 时踩坑；M3 文档对齐可防止后续误改默认值。
+
+---
+
+## 10. 复审（2026-07-20，`a6a3863`）
+
+针对提交 `a6a3863 fix(bridge): close via: direct ops loop (review H1/M2/M5 + hardening)` 的二次审查。
+
+### 10.1 上轮 findings 状态
+
+| 编号 | 状态 | 证据 |
+|------|------|------|
+| **H1** | **Partial** | `direct_spec_needs_credentials`（`manager.rs:1048`）；spawn（`:527-546`）与 restart（`:451-463`）均拒绝无凭证；测试 `start_new_children_refuses_direct_without_credentials`。**运行时撤销路径未堵 → 见 N1** |
+| **M2** | **Fixed** | `resolve_direct_base_url`（`ilink-hub-bridge.rs:168-187`）拒绝默认 localhost；多测覆盖 |
+| **M3** | **Fixed** | 提案 §3 / §11 Q1 改为默认 `via: hub`，并注明与初稿差异 |
+| **M4** | **Deferred** | 提案 §8 明确记为既有非阻塞项，本轮未改 |
+| **M5** | **Fixed（防覆盖）** | `cred_filename` → `{id}.direct.json`；「via 切换清理」表述夸大 → 见 N2 |
+| **M6** | **Addressed（最低限度）** | direct 启动 `info!` 打 capabilities；hub 分支未打 → 见 N4 |
+| **L2** | **Mostly Fixed** | 删除 `classify_sendoutcome`；二次 JSON parse 仍在（可接受） |
+| **L3–L6** | **Fixed** | via 感知文案 / `--allow-null-transport` fail-fast / 注释刷新 / resume INFO |
+| **L1 / L7** | **Open/Deferred** | 符合预期，非阻塞 |
+
+### 10.2 复审新发现
+
+#### 🟠 N1 — H1 只堵了 spawn/restart；运行时 TokenRejected 仍会在子进程内 QR
+
+Manager 守卫在**父进程**。已 Running 的 direct 子进程若上游运行时撤销 token：
+
+1. `BridgeStop::TokenRejected` 且非 explicit token（manager 从不传 token）→ **删 cred_file** + `continue 'reconnect'`（`ilink-hub-bridge.rs:456-468`）
+2. 重连 → `resolve_direct_connection` 见 Missing → `qr_login_and_save_direct` → `login_with_qr()` 在 headless 子进程阻塞 ~30min
+
+上轮 H1 想消掉的失败模式换了触发点仍可达。Manager 只有等子进程最终退出后才会 park。
+
+**建议**：`qr_login_and_save_direct`（或 `resolve_direct_connection`）在非交互环境（非 TTY / `--no-interactive` / manager 注入的 env）直接 bail，把控制交回 manager 的凭证守卫；勿在 headless 下发起 QR。
+
+#### 🟡 N2 — M5「切换时清理旧凭证」是提案/提交信息夸大
+
+`stop_removed_or_changed`（`manager.rs:294+`）仅在 profile **删除**时 `remove_file`；fingerprint **变更**（含 hub↔direct）只停子进程、不删旧 cred。hub→direct 后旧 `{id}.json` 会成孤儿文件；hub client 也可能未 deregister（changed 不走注销）。功能上不覆盖（文件名已隔离），但提案 §8/§9 写「via 切换随 fingerprint 清理」不实。
+
+**建议**：修正文档表述，或在 via 翻转时清理旧后缀文件 + 按需 deregister。
+
+#### 🟡 N3 — Manager 守卫只查凭证，不预检 base_url
+
+有可用 cred 但缺 `base_url:` 且 manager `--hub-url` 仍是默认时：过 H1 守卫 → 子进程命中 M2 bail → 退出 → manager 有界退避重启循环。有清晰日志，不是紧密风暴，但仍可避免。
+
+**建议**：manager 对 `via_direct` 同时预检 YAML `base_url:` 非空（或可解析），与缺凭证一样 park。
+
+#### ⚪ N4 — capabilities 日志仅 Direct 分支
+
+`build_transport` 只在 `Via::Direct` 打印 capabilities（`:263-268`），默认 hub 路径不打。把日志移到两分支公共出口即可。
+
+### 10.3 复审结论
+
+- 修复提交质量高：上轮合入阻塞项基本落地，测试与提案同步扎实。
+- 净风险：**中低 → 低**。
+- **合入建议：可以合入**；强烈建议合入前补 **N1**（成本低：非交互 fail-fast）。N2–N4 可 follow-up。
+
+### 10.4 复审后合入清单
+
+- [ ] **N1（建议必做）**：direct QR / 重连在非交互环境下 fail-fast
+- [ ] **N2**：修正「via 切换清理旧凭证」表述，或真实现清理
+- [ ] **N3**：manager 对 direct 预检 `base_url`
+- [ ] **N4**：capabilities 日志覆盖 hub 分支
