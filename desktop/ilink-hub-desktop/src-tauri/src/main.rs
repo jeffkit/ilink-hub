@@ -21,7 +21,7 @@ fn run_builtin_profile(profile_type: String) {
         .build()
         .expect("build tokio runtime for built-in profile");
 
-    if let Err(e) = runtime.block_on(ilink_hub::bridge::builtin::run_builtin_profile(
+    if let Err(e) = runtime.block_on(im_agentproc::bridge::builtin::run_builtin_profile(
         &profile_type,
     )) {
         eprintln!("{e:#}");

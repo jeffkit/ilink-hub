@@ -1,7 +1,10 @@
 //! Canonical user data paths under `~/.ilink-hub/`.
 //!
-//! Hub and bridge default to these locations so behavior does not depend on the
-//! process current working directory.
+//! Hub defaults to these locations so behavior does not depend on the
+//! process current working directory. Bridge path helpers
+//! (`default_bridge_*`, `desktop_bridge_*`, `expand_user_path`, …) moved to
+//! the `im-agentproc` crate as part of the bridge extraction (2026-07-20); see
+//! `docs/proposals/bridge-as-multi-im-runtime.md` Appendix A.
 
 use std::path::PathBuf;
 
@@ -16,89 +19,6 @@ pub fn data_dir() -> PathBuf {
 pub fn default_database_url() -> String {
     let db = data_dir().join("ilink-hub.db");
     format!("sqlite:{}", db.display())
-}
-
-/// Default bridge YAML config: `~/.ilink-hub/ilink-hub-bridge.yaml`.
-pub fn default_bridge_config_path() -> PathBuf {
-    data_dir().join("ilink-hub-bridge.yaml")
-}
-
-/// Default bridge credentials JSON: `~/.ilink-hub/bridge-credentials.json`.
-pub fn default_bridge_credentials_path() -> PathBuf {
-    data_dir().join("bridge-credentials.json")
-}
-
-/// Default credentials JSON for `via: direct` (bridge → real iLink upstream):
-/// `~/.ilink-hub/direct-credentials.json`.
-///
-/// Kept separate from [`default_bridge_credentials_path`] so switching
-/// `via: hub` ↔ `via: direct` does not clobber the other mode's saved token
-/// (a Hub vtoken and a real-upstream bot_token are different credentials).
-pub fn default_direct_credentials_path() -> PathBuf {
-    data_dir().join("direct-credentials.json")
-}
-
-/// Root for the bridge manager plugin-style profile layout: `~/.ilink-hub-bridge`.
-pub fn bridge_manager_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ilink-hub-bridge")
-}
-
-/// Default bridge manager profiles directory: `~/.ilink-hub-bridge/profiles`.
-pub fn default_bridge_profiles_dir() -> PathBuf {
-    bridge_manager_dir().join("profiles")
-}
-
-/// Default bridge manager credentials directory: `~/.ilink-hub-bridge/credentials`.
-pub fn default_bridge_manager_credentials_dir() -> PathBuf {
-    bridge_manager_dir().join("credentials")
-}
-
-/// Root for the desktop app's own bridge data: `~/.ilink-hub/desktop-bridge`.
-///
-/// Kept under `~/.ilink-hub/` (alongside `desktop-port.json` and the hub DB)
-/// so all desktop-app state lives in one place and does not collide with a
-/// simultaneously-running CLI bridge manager under `~/.ilink-hub-bridge/`.
-pub fn desktop_bridge_dir() -> PathBuf {
-    data_dir().join("desktop-bridge")
-}
-
-/// Desktop bridge manager profiles directory: `~/.ilink-hub/desktop-bridge/profiles`.
-pub fn desktop_bridge_profiles_dir() -> PathBuf {
-    desktop_bridge_dir().join("profiles")
-}
-
-/// Desktop bridge manager credentials directory: `~/.ilink-hub/desktop-bridge/credentials`.
-pub fn desktop_bridge_credentials_dir() -> PathBuf {
-    desktop_bridge_dir().join("credentials")
-}
-
-/// Expand a leading `~` or `$HOME` in a config path (YAML `cwd`, `script`, etc.).
-/// Returns the input unchanged when home is unavailable or no expansion applies.
-pub fn expand_user_path(path: &str) -> String {
-    let path = path.trim();
-    if path == "~" {
-        return dirs::home_dir()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
-    }
-    if let Some(rest) = path.strip_prefix("$HOME/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).to_string_lossy().into_owned();
-        }
-    }
-    if path == "$HOME" {
-        return dirs::home_dir()
-            .map(|h| h.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string());
-    }
-    path.to_string()
 }
 
 /// Default port used when `WEIXIN_BASE_URL` is a bare host with no port
@@ -251,56 +171,5 @@ mod tests {
         assert!(url.starts_with("sqlite:"));
         assert!(url.contains(".ilink-hub"));
         assert!(url.ends_with("ilink-hub.db"));
-    }
-
-    #[test]
-    fn bridge_defaults_live_under_data_dir() {
-        let base = data_dir();
-        assert_eq!(
-            default_bridge_config_path(),
-            base.join("ilink-hub-bridge.yaml")
-        );
-        assert_eq!(
-            default_bridge_credentials_path(),
-            base.join("bridge-credentials.json")
-        );
-        assert_eq!(
-            default_direct_credentials_path(),
-            base.join("direct-credentials.json")
-        );
-    }
-
-    #[test]
-    fn bridge_manager_defaults_live_under_manager_dir() {
-        let base = bridge_manager_dir();
-        assert_eq!(default_bridge_profiles_dir(), base.join("profiles"));
-        assert_eq!(
-            default_bridge_manager_credentials_dir(),
-            base.join("credentials")
-        );
-    }
-
-    #[test]
-    fn desktop_bridge_paths_live_under_data_dir() {
-        let base = data_dir();
-        assert_eq!(desktop_bridge_dir(), base.join("desktop-bridge"));
-        assert_eq!(
-            desktop_bridge_profiles_dir(),
-            base.join("desktop-bridge").join("profiles")
-        );
-        assert_eq!(
-            desktop_bridge_credentials_dir(),
-            base.join("desktop-bridge").join("credentials")
-        );
-    }
-
-    #[test]
-    fn expand_user_path_tilde() {
-        let home = dirs::home_dir().expect("home");
-        assert_eq!(
-            expand_user_path("~/foo"),
-            home.join("foo").to_string_lossy()
-        );
-        assert_eq!(expand_user_path("~"), home.to_string_lossy());
     }
 }

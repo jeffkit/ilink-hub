@@ -8,6 +8,8 @@ timestamp: 2026-07-16T14:30:00+08:00
 
 # Bridge 概览
 
+> **仓库迁移（2026-07-20）**：Bridge 代码已从 `ilink-hub` 的 `src/bridge/` 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本文档仍描述 Bridge 架构（概念不变），代码位置以 im-agentproc 为准。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+
 Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 工具通信，将微信消息转发给对应的 AI 后端并把回复传回用户。Bridge 与 profile 进程之间采用 **AgentProc 0.4** NDJSON 协议（见 [P0 协议与 Profile](profile-protocol.md)）。
 
 ## 内置 Executor

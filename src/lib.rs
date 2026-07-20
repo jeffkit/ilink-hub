@@ -1,4 +1,3 @@
-pub mod bridge;
 pub mod client;
 pub mod error;
 pub mod hub;

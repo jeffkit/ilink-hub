@@ -1,6 +1,6 @@
 [package]
 name = "ilink-hub"
-version = "0.3.5"
+version = "0.4.0"
 edition = "2021"
 description = "iLink-compatible multiplexer hub for WeChat ClawBot — route one WeChat account to multiple AI agent backends"
 license = "MIT"
@@ -20,10 +20,6 @@ path = "src/main.rs"
 [[bin]]
 name = "ilink-relay"
 path = "src/bin/ilink-relay.rs"
-
-[[bin]]
-name = "ilink-hub-bridge"
-path = "src/bin/ilink-hub-bridge.rs"
 
 [lib]
 name = "ilink_hub"
@@ -96,15 +92,8 @@ futures-util = "0.3"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 subtle = "2.6.1"
 arc-swap = "1"
-serde_norway = "0.9.42"
 url = "2"
 percent-encoding = "2.3.2"
-
-# AgentProc SDK — protocol layer (turn object, NDJSON events, in-process
-# executor registry, run()). Replaces ilink-hub's bridge/protocol.rs +
-# executor.rs + builtin/*.rs. Pinned to a commit until agentproc-rs publishes
-# to crates.io.
-agentproc = { git = "https://github.com/jeffkit/agentproc.git", rev = "dbe2b21" }
 
 [dev-dependencies]
 tokio-test = "0.4"

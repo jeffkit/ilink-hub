@@ -25,6 +25,8 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 发布部署 | `docs/knowledge/ops/release-and-deploy.md` | brew 发布三档路径、远程 Hub 部署 |
 | 部署加固 | `docs/knowledge/ops/deployment-hardening.md` | 生产部署安全清单 |
 
+> **Bridge 代码已拆出**：`src/bridge/` 于 2026-07-20 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本仓库仅保留 Hub 服务本体；desktop 通过 git dep 引用 `im-agentproc` 获取 bridge。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+
 ## 活跃执行计划
 
 见 `docs/exec-plans/active/` 目录。每次对话开始前读取对应 feature 的 `status.md` 恢复上下文。

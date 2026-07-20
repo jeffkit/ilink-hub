@@ -17,6 +17,7 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 ilink-hub = { path = "../../../" }
+im-agentproc = { git = "https://github.com/jeffkit/im-agentproc.git", rev = "1e9304e" }
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking Change — Bridge 拆分到独立仓库 `im-agentproc`
+
+**⚠️ Breaking Change** — `src/bridge/` 子树（含 `ilink-hub-bridge` bin、`ilink::types`/`ilink::login`、`client::pairing`、bridge 路径函数、裁剪版 `error`）物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc` 0.1.0，bin `im-agentproc`）。
+
+- `ilink-hub` 不再包含 bridge 代码与 `ilink-hub-bridge` bin；`Cargo.toml` 移除 `agentproc` / `serde_norway` 依赖与 `[[bin]] ilink-hub-bridge`。
+- desktop 改为双依赖：`ilink-hub`（path，Hub 服务）+ `im-agentproc`（git rev `1e9304e`，bridge）。
+- `scripts/deploy-local-brew.sh` 精简为只部署 `ilink-hub`；bridge 部署改属 im-agentproc。
+- `examples/smoke_agentproc.rs` 移至 im-agentproc。
+- 共享协议类型按 duplicate 策略两边各持一份；`paths` 拆为 hub-paths（留）与 bridge-paths（随 im-agentproc）。
+- 详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+
 ### Breaking Change — Profile YAML 对齐 agentproc hub form（0.3.4）
 
 **⚠️ Breaking Change** — 一个 YAML 文件 = 一个 profile。执行配置嵌在 `agentproc:` 下；不再解析多 profile / 路由 / hub 私有策略字段。

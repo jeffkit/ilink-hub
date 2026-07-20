@@ -889,10 +889,10 @@ async fn restart_hub(app: tauri::AppHandle) -> Result<(), String> {
 /// migration is not fatal; the user will simply start with an empty
 /// profile list and need to re-register.
 fn migrate_bridge_dir_once() {
-    let new_profiles = ilink_hub::paths::desktop_bridge_profiles_dir();
-    let new_creds = ilink_hub::paths::desktop_bridge_credentials_dir();
-    let old_profiles = ilink_hub::paths::default_bridge_profiles_dir();
-    let old_creds = ilink_hub::paths::default_bridge_manager_credentials_dir();
+    let new_profiles = im_agentproc::paths::desktop_bridge_profiles_dir();
+    let new_creds = im_agentproc::paths::desktop_bridge_credentials_dir();
+    let old_profiles = im_agentproc::paths::default_bridge_profiles_dir();
+    let old_creds = im_agentproc::paths::default_bridge_manager_credentials_dir();
 
     // Only run when the new directory has never been created.
     if new_profiles.exists() {
@@ -1031,9 +1031,9 @@ pub fn run() {
                 // Use desktop-specific directories so the desktop bridge
                 // manager does not collide with a simultaneously-running CLI
                 // bridge manager under ~/.ilink-hub-bridge/.
-                config_path: ilink_hub::paths::default_bridge_config_path(),
-                profiles_dir: ilink_hub::paths::desktop_bridge_profiles_dir(),
-                credentials_dir: ilink_hub::paths::desktop_bridge_credentials_dir(),
+                config_path: im_agentproc::paths::default_bridge_config_path(),
+                profiles_dir: im_agentproc::paths::desktop_bridge_profiles_dir(),
+                credentials_dir: im_agentproc::paths::desktop_bridge_credentials_dir(),
             });
 
             Ok(())

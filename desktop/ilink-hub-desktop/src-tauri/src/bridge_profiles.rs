@@ -17,7 +17,7 @@ pub(crate) struct BridgeRuntime {
 
 pub(crate) struct BridgeController {
     pub(crate) task: Mutex<Option<JoinHandle<()>>>,
-    pub(crate) manager: Mutex<Option<ilink_hub::bridge::manager::BridgeManagerHandle>>,
+    pub(crate) manager: Mutex<Option<im_agentproc::bridge::manager::BridgeManagerHandle>>,
     pub(crate) runtime: Arc<Mutex<BridgeRuntime>>,
     pub(crate) config_path: PathBuf,
     pub(crate) profiles_dir: PathBuf,
@@ -56,7 +56,7 @@ pub struct BridgeStatusPayload {
     pub state: String,
     pub running: bool,
     pub error: Option<String>,
-    pub manager: Option<ilink_hub::bridge::manager::BridgeManagerStatus>,
+    pub manager: Option<im_agentproc::bridge::manager::BridgeManagerStatus>,
 }
 
 #[derive(serde::Deserialize)]
@@ -267,7 +267,7 @@ pub(crate) fn build_bridge_profile_yaml(req: &SaveBridgeProfileRequest) -> Resul
     }
 }
 
-pub(crate) fn detect_bridge_profile_template(app: &ilink_hub::bridge::BridgeApp) -> String {
+pub(crate) fn detect_bridge_profile_template(app: &im_agentproc::bridge::BridgeApp) -> String {
     let p = app.profile(app.default_profile_name());
     if let Some(p) = p {
         if p.executor.as_deref() == Some("claude-code") || p.command == "ilink-hub-bridge" {
@@ -288,7 +288,7 @@ pub(crate) fn summarize_bridge_profile_file(
     path: PathBuf,
     yaml: String,
 ) -> DesktopBridgeProfileFile {
-    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, id.clone()) {
+    match im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, id.clone()) {
         Ok(app) => {
             let template = detect_bridge_profile_template(&app);
             let profile = app.profile(app.default_profile_name());
@@ -307,7 +307,7 @@ pub(crate) fn summarize_bridge_profile_file(
                 })
                 .unwrap_or_default();
             let probe_error = profile
-                .and_then(|p| ilink_hub::bridge::probe_profile_light(p).err())
+                .and_then(|p| im_agentproc::bridge::probe_profile_light(p).err())
                 .map(|e| e.to_string());
             DesktopBridgeProfileFile {
                 id,
@@ -360,7 +360,7 @@ pub(crate) fn summarize_bridge_config(
     yaml: String,
     exists: bool,
 ) -> BridgeConfigPayload {
-    match ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string()) {
+    match im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string()) {
         Ok(app) => {
             let profiles = app
                 .profile_names()
@@ -462,7 +462,7 @@ pub(crate) async fn bridge_save_claude_profile(
     };
     let env_vars = req.env_vars.unwrap_or_default();
     let yaml = build_claude_profile_yaml(&req.cwd, &env_vars)?;
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+    im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
         .map_err(|e| e.to_string())?;
     if let Some(parent) = ctrl.config_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -483,7 +483,7 @@ pub(crate) async fn bridge_save_yaml(
     let Some(ctrl) = app.try_state::<BridgeController>() else {
         return Err("Bridge 未初始化".into());
     };
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+    im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
         .map_err(|e| e.to_string())?;
     if let Some(parent) = ctrl.config_path.parent() {
         tokio::fs::create_dir_all(parent)
@@ -601,7 +601,7 @@ pub(crate) async fn bridge_save_profile(
     };
     let id = sanitize_profile_file_id(&req.id)?;
     let yaml = build_bridge_profile_yaml(&req)?;
-    ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
+    im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "bridge".to_string())
         .map_err(|e| e.to_string())?;
     tokio::fs::create_dir_all(&ctrl.profiles_dir)
         .await
@@ -667,7 +667,7 @@ pub(crate) async fn bridge_test_profile(
     };
     let config_path =
         existing_profile_path(&ctrl, &id)?.ok_or_else(|| format!("未找到 profile `{id}`"))?;
-    let app_cfg = ilink_hub::bridge::BridgeApp::load(&config_path)
+    let app_cfg = im_agentproc::bridge::BridgeApp::load(&config_path)
         .map_err(|e| format!("加载配置失败: {e}"))?;
     let profile_name = app_cfg.default_profile_name();
     let profile = app_cfg
@@ -676,7 +676,7 @@ pub(crate) async fn bridge_test_profile(
 
     // For safety, hardcode the probe message to "ping" to prevent command injection/RCE.
     let msg = "ping";
-    match ilink_hub::bridge::dry_run_profile(profile, msg).await {
+    match im_agentproc::bridge::dry_run_profile(profile, msg).await {
         Ok(stdout) => Ok(ProbeResult {
             success: true,
             error_type: None,
@@ -688,8 +688,8 @@ pub(crate) async fn bridge_test_profile(
             let error_type = e.error_type().to_string();
             let error_message = e.to_string();
             let (stdout, stderr) = match &e {
-                ilink_hub::bridge::ProbeError::Unauthenticated(detail)
-                | ilink_hub::bridge::ProbeError::ExecutionError(detail) => {
+                im_agentproc::bridge::ProbeError::Unauthenticated(detail)
+                | im_agentproc::bridge::ProbeError::ExecutionError(detail) => {
                     (None, Some(detail.clone()))
                 }
                 _ => (None, None),
@@ -796,13 +796,13 @@ pub(crate) fn start_bridge_task(app: &tauri::AppHandle) -> Result<(), String> {
     let credentials_dir = ctrl.credentials_dir.clone();
     let runtime = Arc::clone(&ctrl.runtime);
     set_bridge_runtime_arc(&runtime, "starting", None);
-    let mut opts = ilink_hub::bridge::manager::BridgeManagerOptions::new(
+    let mut opts = im_agentproc::bridge::manager::BridgeManagerOptions::new(
         hub_url,
         profiles_dir,
         credentials_dir,
     );
     opts.scan_interval = std::time::Duration::from_secs(3);
-    let (manager_handle, manager_task) = ilink_hub::bridge::manager::spawn_bridge_manager(opts);
+    let (manager_handle, manager_task) = im_agentproc::bridge::manager::spawn_bridge_manager(opts);
     if let Ok(mut guard) = ctrl.manager.lock() {
         *guard = Some(manager_handle);
     }
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn claude_profile_wizard_generates_minimal_yaml() {
         let yaml = build_claude_profile_yaml("/tmp/my project", &[]).unwrap();
-        let app = ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
+        let app = im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
 
         assert_eq!(app.default_profile_name(), "claude");
         assert_eq!(app.routing_label(), "fixed");
@@ -890,7 +890,7 @@ mod tests {
         }];
         let yaml = build_claude_profile_yaml("/tmp/project", &env_vars).unwrap();
         let app =
-            ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
+            im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "claude".to_string()).unwrap();
         let profile = app.profile("claude").unwrap();
         assert_eq!(
             profile.env.get("CLAUDE_MODEL").map(String::as_str),
@@ -920,7 +920,7 @@ mod tests {
                 yaml: None,
             })
             .unwrap();
-            let app = ilink_hub::bridge::BridgeApp::parse_yaml(
+            let app = im_agentproc::bridge::BridgeApp::parse_yaml(
                 &yaml,
                 format!("{template}-demo"),
             )
@@ -947,7 +947,7 @@ mod tests {
         })
         .unwrap();
         let app =
-            ilink_hub::bridge::BridgeApp::parse_yaml(&yaml, "codex-demo".to_string()).unwrap();
+            im_agentproc::bridge::BridgeApp::parse_yaml(&yaml, "codex-demo".to_string()).unwrap();
         let profile = app.profile(app.default_profile_name()).unwrap();
         assert_eq!(
             profile.env.get("MY_TOKEN").map(String::as_str),

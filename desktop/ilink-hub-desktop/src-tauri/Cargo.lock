@@ -2091,9 +2091,8 @@ dependencies = [
 
 [[package]]
 name = "ilink-hub"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
- "agentproc",
  "anyhow",
  "arc-swap",
  "async-trait",
@@ -2117,7 +2116,6 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "serde_norway",
  "sqlx",
  "subtle",
  "thiserror 2.0.18",
@@ -2138,6 +2136,7 @@ version = "0.1.11"
 dependencies = [
  "anyhow",
  "ilink-hub",
+ "im-agentproc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -2147,6 +2146,32 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "im-agentproc"
+version = "0.1.0"
+source = "git+https://github.com/jeffkit/im-agentproc.git?rev=1e9304e#1e9304ea48b27c97651018651597aab43592dbff"
+dependencies = [
+ "agentproc",
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "dirs 5.0.1",
+ "futures-util",
+ "libc",
+ "qrcode",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_norway",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
