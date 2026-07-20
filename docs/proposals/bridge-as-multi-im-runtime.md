@@ -5,7 +5,7 @@
 | 状态 | **Draft — 关键决策已定，待实施评审** |
 | 作者 | jeffkit |
 | 创建 | 2026-07-16 |
-| 更新 | 2026-07-16 |
+| 更新 | 2026-07-20（增补附录 A：物理拆分计划） |
 | 关联 | `docs/proposals/project-aware-backends.md`（Backend/Project 分层）、`agentproc` crate（AI CLI 适配层） |
 
 ---
@@ -344,3 +344,51 @@ d=2  ├─ bridge_start                            (desktop/bridge_profiles.rs)
 3. 验证 `executor:` + known 走 in-process、unknown 回退 spawn 的四象限行为。
 
 此为独立重构，单独立提案推进，不在本提案范围。
+
+---
+
+## 附录 A：物理拆分独立仓库计划（2026-07-20 增补）
+
+本提案原定「阶段 0–2 全部在 crate 内完成，不物理拆仓库」。本附录记录拆分前置门槛与执行清单，待 in-crate 解耦补完后按此落地。
+
+### A.1 拆分目标与定位
+
+- 新仓库名：**`im-agentproc`**（暂名，已确认）。定位为「agentproc 生态的 IM 侧」——IM 消息进，喂给 agentproc profile。与 `agentproc/` 在 `~/projects/infra4agent/` 下并列。
+- 落位：`~/projects/infra4agent/im-agentproc`，独立远端 `jeffkit/im-agentproc`。
+- 与 `agentproc` 关系：仍以 git rev pin 引用 `agentproc`（沿用现 `ilink-hub` Cargo.toml 的依赖模式）。
+
+### A.2 已定的拆分策略决策
+
+| # | 议题 | 决定 |
+|---|------|------|
+| S1 | 拆分时机 | **later**——先按本提案补完 in-crate Transport 解耦，再物理拆分。**不立即执行。** |
+| S2 | 共享协议类型（`ilink::types`）安置 | **duplicate**——两边各拷一份 `ilink::types`，暂不抽共享 crate。后续若维护成本上升再升级为独立 `ilink-protocol` crate（对齐 agentproc 演进路径）。 |
+| S3 | bridge 二进制去向 | **full**——`src/bin/ilink-hub-bridge.rs` 一并搬走，重命名为 `im-agentproc` bin；`ilink-hub` 不再保留任何 bridge 代码与 bin。 |
+| S4 | 仓库名 | `im-agentproc`（暂名）。 |
+
+### A.3 拆分前置门槛（in-crate 必须先完成）
+
+物理拆分是机械动作的前提是：`src/bridge/` 对 `ilink-hub` lib 的依赖收敛到「仅 `ilink::types`（待拷贝）+ agentproc（git dep）」。为此先在 crate 内完成以下 5 条：
+
+1. **Transport 抽象收尾**：补完本提案 stage 3+ 剩余项，确保 `IlinkTransport` 是 bridge 唯一接触 iLink wire 协议的边界（`stages 1-2` 已合入）。
+2. **切断 bridge 对 `ilink::login` 的直接依赖**：QR 登录/配对收口进 `Transport` 或 `PairingClient` trait，bridge 核心不再 `use crate::ilink::login::LoginClient`。
+3. **切断 bridge 对 `client::pairing` 的直接依赖**：同上，经 trait 暴露。
+4. **`paths` 子集独立**：把 bridge 用到的 `expand_user_path` 等抽成无 `crate::` 依赖的小模块，便于整块搬走。
+5. **`error::HubError` 裁剪**：bridge 只需 `UpstreamHttp` / `UpstreamParse` 等少量 variant；定义 bridge 自己的错误类型，不再 `use crate::error::HubError`。
+
+> 注：`ilink::upstream`（唯一 `use crate::store::Store` 的模块）**不被 bridge 依赖**，因此拆 bridge 不需要拖上 DB/store 层——边界比直觉更干净。
+
+### A.4 拆分执行清单（时机成熟后按序）
+
+1. 在 `~/projects/infra4agent/` 下 `git init im-agentproc`，建独立远端 `jeffkit/im-agentproc`。
+2. 搬入：`src/bridge/**`、`src/bin/ilink-hub-bridge.rs`（重命名为 `im-agentproc` bin）、`paths` 子集、裁剪版 `error`。
+3. **拷贝** `src/ilink/types.rs` 到新 crate（按 S2 duplicate 策略），两边各自维护。
+4. 新 crate `Cargo.toml`：`agentproc` 走 git rev pin（同现模式），其余依赖从 `ilink-hub` 的 `[dependencies]` 拆出 bridge 真正用到的子集。
+5. `ilink-hub` 侧清理：删 `src/bridge/`、`src/bin/ilink-hub-bridge.rs`、`src/lib.rs` 的 `pub mod bridge`；`Cargo.toml` 删 `[[bin]] ilink-hub-bridge` 与仅 bridge 用的依赖。
+6. 同步外围：`scripts/deploy-local-brew.sh`、`Dockerfile`、`docs/bridge/`、`CHANGELOG.md`、`AGENTS.md` 知识库导航里 bridge 相关路径。
+7. 版本：`ilink-hub` bump minor（破坏性，移除 bridge）；`im-agentproc` 从 `0.1.0` 起步。
+
+### A.5 兼容性约束（沿用 §13 结论）
+
+- 拆分后桌面端 `desktop/ilink-hub-desktop/src-tauri/src/bridge_profiles.rs` 是唯一跨 crate 消费方，需改为依赖 `im-agentproc` crate 的公共导出面（`BridgeApp` / `probe_*` / `dry_run_profile` / `manager::*` / `run_bridge*`）。签名与语义尽量保持不变，降低 desktop 改动面。
+- 拆分即破坏性变更，按 CLAUDE.md 在 main 外以 feature worktree 隔离推进，提交前跑 `gitnexus_detect_changes()` 与质量门。
