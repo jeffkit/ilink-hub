@@ -31,23 +31,6 @@ pub(crate) enum GetUpdatesOutcome {
     TokenRejected,
 }
 
-/// Pure mapping from a parsed `SendMessageResponse` to a [`SendOutcome`].
-#[allow(dead_code)]
-pub(crate) fn classify_sendoutcome(parsed: Option<&SendMessageResponse>) -> SendOutcome {
-    match parsed {
-        None => SendOutcome::Sent,
-        Some(v) => match v.ret {
-            Some(0) => SendOutcome::Sent,
-            Some(-2) => SendOutcome::Throttled {
-                ret: -2,
-                errmsg: v.errmsg.clone(),
-            },
-            Some(_other) => SendOutcome::Sent,
-            None => SendOutcome::Sent,
-        },
-    }
-}
-
 /// Map the raw HTTP response body of `sendmessage` into a [`SendOutcome`].
 ///
 /// Empty bodies are treated as `Sent`. When the body parses as JSON and `ret`
@@ -125,7 +108,7 @@ impl HubClient {
             warn!(
                 status = %status,
                 errmsg = ?out.errmsg,
-                "hub rejected virtual token during getupdates"
+                "token rejected during getupdates (hub or direct upstream returned 401)"
             );
             return Ok(GetUpdatesOutcome::TokenRejected);
         }
@@ -358,28 +341,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn classify_three_categories() {
-        let none_resp = SendMessageResponse {
-            ret: None,
-            errmsg: None,
-        };
-        let zero_resp = SendMessageResponse {
-            ret: Some(0),
-            errmsg: None,
-        };
-        let tmo_resp = SendMessageResponse {
-            ret: Some(-2),
-            errmsg: Some("rl".into()),
-        };
-        assert_eq!(classify_sendoutcome(None), SendOutcome::Sent);
-        assert_eq!(classify_sendoutcome(Some(&none_resp)), SendOutcome::Sent);
-        assert_eq!(classify_sendoutcome(Some(&zero_resp)), SendOutcome::Sent);
+    fn parse_sendoutcome_three_categories() {
+        // empty body → Sent (legacy fallback for servers that reply 200 + no body)
+        assert_eq!(parse_sendoutcome("").unwrap(), SendOutcome::Sent);
+        assert_eq!(parse_sendoutcome("   ").unwrap(), SendOutcome::Sent);
+
+        // ret == 0 → Sent
         assert_eq!(
-            classify_sendoutcome(Some(&tmo_resp)),
+            parse_sendoutcome(r#"{"ret":0}"#).unwrap(),
+            SendOutcome::Sent
+        );
+
+        // ret == -2 → Throttled
+        assert_eq!(
+            parse_sendoutcome(r#"{"ret":-2,"errmsg":"rl"}"#).unwrap(),
             SendOutcome::Throttled {
                 ret: -2,
-                errmsg: Some("rl".into())
+                errmsg: Some("rl".into()),
             }
         );
+
+        // any other non-zero ret → Err carrying (ret, errmsg)
+        let err = parse_sendoutcome(r#"{"ret":-7,"errmsg":"boom"}"#).unwrap_err();
+        assert_eq!(err.0, -7);
+        assert_eq!(err.1, Some("boom".into()));
+
+        // unparseable non-empty body → Sent (legacy fallback)
+        assert_eq!(parse_sendoutcome("not json").unwrap(), SendOutcome::Sent);
     }
 }

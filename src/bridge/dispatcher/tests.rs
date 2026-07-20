@@ -382,10 +382,10 @@ fn sanitize_preserves_printable_unicode() {
     assert_eq!(sanitize_errmsg(Some(s)).as_deref(), Some(s));
 }
 
-// ─── classify_sendoutcome (additional M1F-006 helper) ──────────────
+// ─── SendOutcome derives ───────────────────────────────────────────
 //
-// Moved into `src/bridge/transport/ilink.rs` so the dispatcher test module
-// does not depend on iLink wire types.
+// `SendOutcome` lives in `src/bridge/transport.rs`; the dispatcher test module
+// pins its derives here without depending on iLink wire types.
 
 #[test]
 fn outcome_clone_works() {

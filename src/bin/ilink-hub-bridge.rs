@@ -71,6 +71,17 @@ struct Cli {
     #[arg(long, default_value_t = false, global = true)]
     force_register: bool,
 
+    /// Allow a non-`ilink` `transport:` to load its placeholder adapter. Without
+    /// this flag a non-ilink transport fails fast at startup (it would otherwise
+    /// back off forever as a zombie). Intended for pluggability smoke-tests only.
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "ILINKHUB_BRIDGE_ALLOW_NULL_TRANSPORT",
+        global = true
+    )]
+    allow_null_transport: bool,
+
     /// Path to bridge YAML (command, args, timeout, …). Used only in bridge (default) mode.
     /// Defaults to `~/.ilink-hub/ilink-hub-bridge.yaml`.
     #[arg(long)]
@@ -142,6 +153,39 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
         .filter(|s| !s.is_empty())
 }
 
+/// The localhost Hub URL used as the CLI default when `WEIXIN_BASE_URL` is unset.
+/// `via: direct` refusing to fall back to this value prevents silently pointing
+/// a direct bridge at a Hub/localhost (review M2).
+const DEFAULT_HUB_URL: &str = "http://127.0.0.1:8765";
+
+/// Resolve the iLink upstream base URL for a `via: direct` profile (review M2).
+///
+/// - A YAML `base_url:` always wins (lets a manager mix hub/direct profiles
+///   against different upstreams).
+/// - Otherwise the CLI/env `--hub-url` / `WEIXIN_BASE_URL` is used — but the
+///   localhost Hub default is rejected, so a direct bridge never silently
+///   targets a Hub/localhost and fires `get_bot_qrcode` at the wrong server.
+fn resolve_direct_base_url(direct_base_url: Option<&str>, cli_hub_url: &str) -> Result<String> {
+    if let Some(b) = direct_base_url {
+        let trimmed = b.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!(
+                "via: direct profile has empty `base_url:`; set it to the real iLink upstream"
+            );
+        }
+        return Ok(trimmed.trim_end_matches('/').to_string());
+    }
+    let cli_base = cli_hub_url.trim().trim_end_matches('/').to_string();
+    if cli_base == DEFAULT_HUB_URL {
+        anyhow::bail!(
+            "via: direct 需要显式 `base_url:`（YAML）或非默认 `WEIXIN_BASE_URL` 指向真实 iLink 上游。\
+             当前 base 仍是默认 localhost Hub 地址 ({DEFAULT_HUB_URL})，直接对它发 get_bot_qrcode \
+             语义错误。若确实要连本机 Hub，请改用 `via: hub`。"
+        );
+    }
+    Ok(cli_base)
+}
+
 /// Build the configured transport for the bridge run.
 ///
 /// - `transport: ilink` + `via: hub` (default): resolve a virtual token via the Hub
@@ -149,10 +193,12 @@ fn explicit_token(cli: &Cli) -> Option<&str> {
 /// - `transport: ilink` + `via: direct`: connect straight to the real iLink
 ///   upstream. Stage 3 resolves credentials via: explicit `WEIXIN_TOKEN` →
 ///   `--pair` QR login against the real upstream → saved direct cred file.
-///   The upstream base URL is `base_url:` from the YAML when set, else
-///   `--hub-url` / `WEIXIN_BASE_URL`.
-/// - `transport: <other>`: load a `NullTransport` placeholder (stage 2 pluggability
-///   proof; real adapters arrive in later stages).
+///   The upstream base URL is `base_url:` from the YAML when set, else a
+///   non-default `--hub-url` / `WEIXIN_BASE_URL` (a localhost/default URL is
+///   rejected to avoid silently targeting a Hub — review M2).
+/// - `transport: <other>`: load a `NullTransport` placeholder only when
+///   `--allow-null-transport` is set; otherwise fail fast (the placeholder would
+///   otherwise back off forever as a zombie — review L4).
 async fn build_transport(
     app: &BridgeApp,
     cli: &Cli,
@@ -162,7 +208,13 @@ async fn build_transport(
     let transport = app.transport();
     if !transport.is_ilink() {
         let name = transport.as_str().to_string();
-        info!(transport = %name, "loading placeholder transport (no real adapter yet)");
+        if !cli.allow_null_transport {
+            anyhow::bail!(
+                "transport `{name}` 没有真实适配器（占位 NullTransport 会永久退避成僵尸进程）。\
+                 如仅为可插拔冒烟测试，请加 `--allow-null-transport` 显式开启占位。"
+            );
+        }
+        info!(transport = %name, "loading placeholder transport (allow_null_transport)");
         return Ok(Arc::new(NullTransport::new(name)));
     }
 
@@ -186,11 +238,10 @@ async fn build_transport(
         Via::Direct => {
             // YAML `base_url:` overrides the CLI/env URL for this profile, so a
             // bridge manager can mix hub and direct profiles against different
-            // upstreams.
-            let base = app
-                .direct_base_url()
-                .map(str::to_string)
-                .unwrap_or_else(|| cli.hub_url.trim().trim_end_matches('/').to_string());
+            // upstreams. Without `base_url:`, require a non-default `--hub-url` /
+            // `WEIXIN_BASE_URL` — refusing the localhost Hub default avoids
+            // silently pointing a direct bridge at a Hub (review M2).
+            let base = resolve_direct_base_url(app.direct_base_url(), &cli.hub_url)?;
             let (base, token) = resolve_direct_connection(
                 &base,
                 explicit_token(cli),
@@ -201,7 +252,20 @@ async fn build_transport(
             )
             .await?;
             info!(base = %base, via = "direct", "connecting directly to iLink upstream");
+            // direct mode cannot resume CLI sessions across messages (the real
+            // upstream does not echo the HubExt session_id the Hub persists).
+            info!(
+                "via: direct 不支持跨消息 CLI 会话续接（真实上游不回显 session_id）；每条消息起新 CLI 会话。"
+            );
             let t = IlinkTransport::new(base, token).context("build iLink transport (direct)")?;
+            // Log capabilities so the seam is observable (review M6): media upload
+            // is not implemented for the iLink transport today.
+            let caps = t.capabilities();
+            info!(
+                via = "direct",
+                media_upload = caps.media_upload,
+                "transport capabilities"
+            );
             Ok(Arc::new(t))
         }
     }
@@ -380,11 +444,13 @@ async fn main() -> Result<()> {
                         match result {
                             Ok(BridgeStop::TokenRejected) if using_explicit_token => {
                                 let via = app.via();
-                                let where_ = if via.is_direct() { "上游" } else { "Hub" };
+                                let hint = if via.is_direct() {
+                    "via: direct 下请重新 `--pair` 扫码登录真实上游，或更换为有效的 WEIXIN_TOKEN。"
+                                } else {
+                    "via: hub 下请重新执行 `ilink-hub register` 或 `ilink-hub-bridge --force-register`。"
+                                };
                                 anyhow::bail!(
-                                    "{where_}拒绝了 WEIXIN_TOKEN / --token（未注册或已失效）。\
-                                     请重新执行 `ilink-hub register`、`ilink-hub-bridge --force-register`，\
-                                     或在 `via: direct` 下重新 `--pair` 扫码登录。"
+                                    "WEIXIN_TOKEN / --token 被拒绝（未注册或已失效）。{hint}"
                                 );
                             }
                             Ok(BridgeStop::TokenRejected) => {
@@ -443,4 +509,95 @@ fn get_hub_url_default() -> String {
         }
     }
     "http://127.0.0.1:8765".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_yaml(dir: &Path, content: &str) -> PathBuf {
+        let p = dir.join("profile.yaml");
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    #[test]
+    fn resolve_direct_base_url_rejects_default_hub_url_without_base_url() {
+        // M2: via: direct, no `base_url:`, CLI hub-url at the localhost default → bail.
+        let err = resolve_direct_base_url(None, "http://127.0.0.1:8765").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("via: direct") && msg.contains("base_url"),
+            "expected M2 bail mentioning via: direct + base_url: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_direct_base_url_accepts_non_default_cli_url() {
+        // A non-default --hub-url / WEIXIN_BASE_URL is acceptable for direct.
+        let base = resolve_direct_base_url(None, "https://ilinkai.weixin.qq.com/").unwrap();
+        assert_eq!(base, "https://ilinkai.weixin.qq.com");
+    }
+
+    #[test]
+    fn resolve_direct_base_url_yaml_overrides_cli() {
+        // `base_url:` in YAML wins even if the CLI url is the localhost default.
+        let base = resolve_direct_base_url(
+            Some("https://ilinkai.weixin.qq.com"),
+            "http://127.0.0.1:8765",
+        )
+        .unwrap();
+        assert_eq!(base, "https://ilinkai.weixin.qq.com");
+    }
+
+    #[test]
+    fn resolve_direct_base_url_rejects_empty_yaml_base_url() {
+        let err = resolve_direct_base_url(Some("   "), "https://up.example.com").unwrap_err();
+        assert!(format!("{err:#}").contains("empty"));
+    }
+
+    #[test]
+    fn build_transport_direct_bails_without_base_url() {
+        // End-to-end-ish: build_transport on a via: direct profile with no base_url
+        // and the default hub-url bails at the M2 gate before any network call.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\nvia: direct\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None)) {
+            Ok(_) => panic!("expected M2 bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("via: direct") && msg.contains("base_url"),
+            "expected M2 bail: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_transport_non_ilink_transport_bails_without_allow_flag() {
+        // L4: a non-ilink transport fails fast unless --allow-null-transport is set.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = write_yaml(
+            dir.path(),
+            "agentproc:\n  command: echo\n  args: [\"ok\"]\ntransport: wecom\n",
+        );
+        let app = BridgeApp::load(&cfg).unwrap();
+        let cli = Cli::parse_from(["ilink-hub-bridge", "--hub-url", "http://127.0.0.1:8765"]);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = match rt.block_on(build_transport(&app, &cli, &cfg, None)) {
+            Ok(_) => panic!("expected L4 bail, got transport"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wecom") && msg.contains("--allow-null-transport"),
+            "expected L4 bail mentioning transport + flag: {msg}"
+        );
+    }
 }

@@ -39,10 +39,16 @@ impl<'de> Deserialize<'de> for TransportKind {
 }
 
 /// How the bridge obtains credentials / where it points the transport.
-/// - `hub` (default): resolve a virtual token via the Hub (`/hub/register` / QR).
-/// - `direct`: connect straight to the real iLink upstream. Stage 2 only supports
-///   `direct` with an explicit `WEIXIN_TOKEN` + `WEIXIN_BASE_URL`; the QR / auto-
-///   register flow for direct lands in stage 3.
+/// - `hub` (default): resolve a virtual token via the Hub — programmatic
+///   `POST /hub/register` (default, no scan), `--pair` Hub pairing QR, or an
+///   explicit `WEIXIN_TOKEN`.
+/// - `direct`: connect straight to the real iLink upstream — an explicit
+///   `WEIXIN_TOKEN` (pre-provisioned bot_token) or a QR login against the real
+///   upstream (`--pair` / first run with no saved cred). There is **no**
+///   programmatic register for direct (the real upstream does not issue
+///   bot_tokens without a WeChat QR login). Requires `base_url:` (or a
+///   non-default `WEIXIN_BASE_URL`) so the bridge does not silently point at a
+///   Hub/localhost URL.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Via {
     #[default]

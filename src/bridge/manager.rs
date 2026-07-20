@@ -109,6 +109,11 @@ pub struct BridgeProcessSpec {
     pub config_path: PathBuf,
     pub cred_path: PathBuf,
     pub register_name: String,
+    /// True when the profile is `via: direct` — the manager keeps direct
+    /// credentials in a separate file (`{id}.direct.json`) and refuses to spawn
+    /// until a usable saved credential exists (interactive QR login is unsafe
+    /// under a non-interactive manager).
+    pub via_direct: bool,
     fingerprint: FileFingerprint,
 }
 
@@ -443,6 +448,19 @@ impl BridgeManager {
             if let Some(mut managed) = self.children.remove(&id) {
                 stop_managed_child(&mut managed).await;
                 let spec = managed.spec.clone();
+                // via: direct under a non-interactive manager cannot QR-login;
+                // re-wait for credentials instead of restart-looping a QR block.
+                if direct_spec_needs_credentials(&spec) {
+                    let err = direct_cred_wait_error(&spec);
+                    error!(profile = %id, error = %err, "refusing to restart via: direct child without credentials");
+                    managed.restart_attempts = managed.restart_attempts.saturating_add(1);
+                    managed.state = ManagedBridgeState::Restarting {
+                        restart_at: Instant::now() + self.opts.scan_interval,
+                        last_error: err,
+                    };
+                    self.children.insert(id, managed);
+                    continue;
+                }
                 match spawn_bridge_child(&self.opts, &spec) {
                     Ok(child) => {
                         info!(profile = %id, "restarted bridge child");
@@ -499,6 +517,27 @@ impl BridgeManager {
                         restart_attempts: 1,
                         state: ManagedBridgeState::Restarting {
                             restart_at: Instant::now() + delay,
+                            last_error: err,
+                        },
+                    },
+                );
+                continue;
+            }
+
+            // via: direct under a non-interactive manager cannot QR-login; refuse
+            // to spawn until a usable saved credential exists (recheck each scan).
+            if direct_spec_needs_credentials(&spec) {
+                let err = direct_cred_wait_error(&spec);
+                error!(profile = %id, error = %err, "refusing to spawn via: direct child without credentials");
+                self.children.insert(
+                    id.clone(),
+                    ManagedBridge {
+                        spec,
+                        child: None,
+                        last_start: Instant::now(),
+                        restart_attempts: 1,
+                        state: ManagedBridgeState::Restarting {
+                            restart_at: Instant::now() + self.opts.scan_interval,
                             last_error: err,
                         },
                     },
@@ -764,11 +803,19 @@ async fn discover_profile_specs(
         if !metadata.is_file() || !is_yaml_file(&path) {
             continue;
         }
-        if let Err(e) = BridgeApp::load(&path) {
-            warn!(path = %path.display(), error = %e, "skip invalid bridge profile YAML");
-            continue;
-        }
-        out.push(spec_from_profile_file(path, metadata, credentials_dir));
+        let via_direct = match BridgeApp::load(&path) {
+            Ok(app) => app.via().is_direct(),
+            Err(e) => {
+                warn!(path = %path.display(), error = %e, "skip invalid bridge profile YAML");
+                continue;
+            }
+        };
+        out.push(spec_from_profile_file(
+            path,
+            metadata,
+            credentials_dir,
+            via_direct,
+        ));
     }
 
     out.sort_by(|a, b| a.config_path.cmp(&b.config_path));
@@ -794,7 +841,7 @@ fn disambiguate_duplicate_ids(specs: &mut [BridgeProcessSpec], credentials_dir: 
         );
         spec.id = unique.clone();
         spec.register_name = unique.clone();
-        spec.cred_path = credentials_dir.join(format!("{unique}.json"));
+        spec.cred_path = credentials_dir.join(cred_filename(&unique, spec.via_direct));
         seen.insert(unique);
     }
 }
@@ -826,19 +873,29 @@ fn unique_profile_id(base: &str, path: &Path, seen: &HashSet<String>) -> String 
     candidate
 }
 
+fn cred_filename(id: &str, via_direct: bool) -> String {
+    if via_direct {
+        format!("{id}.direct.json")
+    } else {
+        format!("{id}.json")
+    }
+}
+
 fn spec_from_profile_file(
     config_path: PathBuf,
     metadata: std::fs::Metadata,
     credentials_dir: &Path,
+    via_direct: bool,
 ) -> BridgeProcessSpec {
     let id = profile_id_from_path(&config_path);
-    let cred_path = credentials_dir.join(format!("{id}.json"));
+    let cred_path = credentials_dir.join(cred_filename(&id, via_direct));
     let handler_modified = handler_mtimes(&config_path);
     BridgeProcessSpec {
         id: id.clone(),
         config_path,
         cred_path,
         register_name: id,
+        via_direct,
         fingerprint: FileFingerprint {
             len: metadata.len(),
             modified: metadata.modified().ok(),
@@ -965,6 +1022,45 @@ fn spawn_bridge_child(opts: &BridgeManagerOptions, spec: &BridgeProcessSpec) -> 
     cmd.spawn().context("spawn bridge child")
 }
 
+/// True when `cred_path` exists and contains a non-empty `token` field.
+///
+/// Used by the manager to decide whether a `via: direct` child can be spawned
+/// without falling back to interactive QR login (which is unsafe under a
+/// non-interactive supervisor: the QR blocks ~30 min, then the child exits and
+/// the manager restart-loops it).
+fn cred_file_has_token(path: &Path) -> bool {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return false;
+    };
+    v.get("token")
+        .and_then(|t| t.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// True when `spec` is a `via: direct` profile whose saved credential file is
+/// not yet usable — i.e. spawning the child now would trigger interactive QR
+/// login. The manager refuses to spawn in that case and waits for the operator
+/// to provision credentials (e.g. `ilink-hub-bridge --config <yaml> --cred-file
+/// <path> --pair`), rechecking each scan cycle.
+fn direct_spec_needs_credentials(spec: &BridgeProcessSpec) -> bool {
+    spec.via_direct && !cred_file_has_token(&spec.cred_path)
+}
+
+fn direct_cred_wait_error(spec: &BridgeProcessSpec) -> String {
+    format!(
+        "via: direct profile has no usable saved credential at {}; refusing to spawn \
+         (interactive QR login is unsafe under the manager). Run once: \
+         `ilink-hub-bridge --config {} --cred-file {} --pair` to provision, then this \
+         profile starts automatically on the next scan.",
+        spec.cred_path.display(),
+        spec.config_path.display(),
+        spec.cred_path.display(),
+    )
+}
+
 /// Call `DELETE /hub/clients/{name}?force=true` on the Hub to remove an offline bridge.
 ///
 /// Uses `force=true` so the request succeeds even when the Hub has not yet had time to
@@ -1073,6 +1169,154 @@ agentproc:
         assert_eq!(specs[1].cred_path, creds.join("codex.json"));
     }
 
+    fn write_direct_profile(path: &Path) {
+        fs::write(
+            path,
+            r#"
+agentproc:
+  command: echo
+  args: ["ok"]
+via: direct
+base_url: https://ilinkai.weixin.qq.com
+"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn discover_specs_direct_profile_uses_direct_suffix() {
+        // M5: manager keeps direct credentials in a separate file so hub↔direct
+        // switches on the same profile id do not clobber each other.
+        let profiles = temp_dir("profiles-direct");
+        let creds = temp_dir("creds-direct");
+        write_profile(&profiles.join("claude.yaml"));
+        write_direct_profile(&profiles.join("codex.yaml"));
+
+        let specs = discover_profile_specs(&profiles, &creds).await.unwrap();
+        let by_id: HashMap<&str, &BridgeProcessSpec> =
+            specs.iter().map(|s| (s.id.as_str(), s)).collect();
+
+        let claude = by_id["claude"];
+        assert!(!claude.via_direct);
+        assert_eq!(claude.cred_path, creds.join("claude.json"));
+
+        let codex = by_id["codex"];
+        assert!(codex.via_direct);
+        assert_eq!(codex.cred_path, creds.join("codex.direct.json"));
+    }
+
+    #[test]
+    fn cred_file_has_token_detects_usable_credential() {
+        let dir = temp_dir("cred-token");
+        let path = dir.join("cred.json");
+
+        // missing file → not usable
+        assert!(!cred_file_has_token(&path));
+
+        // empty token → not usable
+        fs::write(&path, r#"{"token":"  "}"#).unwrap();
+        assert!(!cred_file_has_token(&path));
+
+        // real token → usable
+        fs::write(&path, r#"{"token":"abc123"}"#).unwrap();
+        assert!(cred_file_has_token(&path));
+
+        // unparseable → not usable
+        fs::write(&path, "not json").unwrap();
+        assert!(!cred_file_has_token(&path));
+    }
+
+    #[test]
+    fn direct_spec_needs_credentials_guard() {
+        let dir = temp_dir("guard");
+        let cred = dir.join("x.direct.json");
+        let hub_cred = dir.join("y.json");
+
+        let direct_no_cred = BridgeProcessSpec {
+            id: "x".into(),
+            config_path: PathBuf::from("/x.yaml"),
+            cred_path: cred.clone(),
+            register_name: "x".into(),
+            via_direct: true,
+            fingerprint: FileFingerprint {
+                len: 0,
+                modified: None,
+                handler_modified: vec![],
+            },
+        };
+        // no cred file yet → needs credentials (would QR-block under manager)
+        assert!(direct_spec_needs_credentials(&direct_no_cred));
+
+        // provision a usable token → guard clears
+        fs::write(&cred, r#"{"token":"abc"}"#).unwrap();
+        assert!(!direct_spec_needs_credentials(&direct_no_cred));
+
+        // hub profiles never need the direct guard regardless of cred file
+        let hub = BridgeProcessSpec {
+            id: "y".into(),
+            config_path: PathBuf::from("/y.yaml"),
+            cred_path: hub_cred.clone(),
+            register_name: "y".into(),
+            via_direct: false,
+            fingerprint: FileFingerprint {
+                len: 0,
+                modified: None,
+                handler_modified: vec![],
+            },
+        };
+        assert!(!direct_spec_needs_credentials(&hub));
+    }
+
+    #[tokio::test]
+    async fn start_new_children_refuses_direct_without_credentials() {
+        // H1: a via: direct profile with no saved credential must NOT spawn a
+        // child (which would QR-block ~30min and restart-loop). It is parked in
+        // Restarting with a credential-wait error and rechecked each scan.
+        let profiles = temp_dir("refuse-profiles");
+        let creds = temp_dir("refuse-creds");
+        let config_path = profiles.join("direct.yaml");
+        write_direct_profile(&config_path);
+
+        let spec = spec_from_profile_file(
+            config_path.clone(),
+            std::fs::metadata(&config_path).unwrap(),
+            &creds,
+            true,
+        );
+        let id = spec.id.clone();
+        let mut desired: HashMap<String, BridgeProcessSpec> = HashMap::new();
+        desired.insert(id.clone(), spec);
+
+        let mut manager = BridgeManager::new(
+            BridgeManagerOptions::new("http://127.0.0.1:8765".into(), profiles, creds),
+            Arc::new(RwLock::new(BridgeManagerStatus::default())),
+        )
+        .expect("test http client");
+
+        manager.start_new_children(desired);
+
+        let managed = manager
+            .children
+            .get(&id)
+            .expect("direct profile should be tracked without spawning");
+        assert!(
+            managed.child.is_none(),
+            "must not spawn a QR-blocking child"
+        );
+        match &managed.state {
+            ManagedBridgeState::Restarting { last_error, .. } => {
+                assert!(
+                    last_error.contains("via: direct"),
+                    "error should explain via: direct credential gap: {last_error}"
+                );
+            }
+            other => panic!(
+                "expected Restarting, got variant {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn stop_removed_profile_cleans_up_credentials() {
         let profiles = temp_dir("cleanup-profiles");
@@ -1096,6 +1340,7 @@ agentproc:
             config_path: profiles.join("old-profile.yaml"),
             cred_path: cred_file.clone(),
             register_name: "old-profile".into(),
+            via_direct: false,
             fingerprint,
         };
         let mut manager = BridgeManager::new(
@@ -1171,6 +1416,7 @@ agentproc:
             config_path: PathBuf::from("/profiles/claude.yaml"),
             cred_path: PathBuf::from("/creds/claude.json"),
             register_name: "claude".into(),
+            via_direct: false,
             fingerprint: FileFingerprint {
                 len: 1,
                 modified: None,
@@ -1284,6 +1530,7 @@ args: ["1"]
             config_path: profile_path,
             cred_path: temp_dir.join("test-profile.json"),
             register_name: "test-profile".into(),
+            via_direct: false,
             fingerprint: FileFingerprint {
                 len: 0,
                 modified: None,

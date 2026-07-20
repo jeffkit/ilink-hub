@@ -61,18 +61,19 @@ sendmessage →  Json<SendMessageRequest> →  Json<SendMessageResponse>
 
 bridge 直连各 IM；Hub 保持 iLink 透明中转定位不变，作为 iLink Transport 的**可选后端**。配置项 `via`：
 
-- **`via: direct`（默认，已定）**：`IlinkTransport` 直连真实 iLink 上游。direct 是更通用的形态，适用面比 hub 广，故设为默认。
-- `via: hub`：仍经 Hub，换取 session/A2A/多端复用（`HubExt` 在此模式下生效）。
+- **`via: hub`（默认，已定）**：`IlinkTransport` 经 Hub，换取 session/A2A/多端复用（`HubExt` 在此模式下生效）。默认值避免现网 Hub 自动注册部署回归。
+- **`via: direct`（显式 opt-in）**：`IlinkTransport` 直连真实 iLink 上游。direct 适用面更广（无 Hub 部署），但需显式开启并自管凭证，故不作为默认。
+  > 与初稿 D1 的差异：初稿曾把 direct 设为默认。落地阶段 2/3 时为避免现网回归改为默认 `hub`，direct 改为显式 opt-in。本节据此同步，避免后续实现者按初稿「纠正」默认值造成回归。
 
-**进程模型（已定）**：一个 bridge 进程只服务一个 IM 渠道。各渠道上来的消息**独立启用一个 bridge 来响应，做完即关闭**——即 bridge 是按需启停的短生命周期进程，而非长驻 long-poll 守护。这使 bridge 更接近 webhook / 一次性 handler 的形态，与现有 `profile` 子命令（P0 exec 协议：读 `AGENT_*` 环境变量、写 stdout 后退出）一脉相承。
+**进程模型（已定，阶段 3 纠正）**：一个 bridge 进程只服务一个 IM 渠道。**不引入 ephemeral（做完即关）bridge 进程**——long-poll 类 IM（iLink、Telegram）必须长驻 listener 才能维持 `getupdates` cursor，"做完即关"与之矛盾。当前形态为「外层长驻 listener + 内层按消息派发短任务（session worker / agentproc turn）」，`Transport::next_inbound` 抽象本身即是未来 webhook 型 IM 的 ephemeral seam。初稿 D1 设想的"按需启停短生命周期进程"仅适配 webhook 类 IM，不在本提案落地。
 
 这样：
 - 不需要搬迁 Hub 上游逻辑（纠正了原评估的最大风险项）；
 - 多 IM 扩展点单一明确：`src/bridge/transport/` 下加一个 adapter；
 - Hub 零改动即可继续服务现有 iLink 多端复用场景（`via: hub`）；
-- direct 默认 + 短生命周期进程，天然适配 webhook 类 IM（飞书等），也契合"做完就关闭"的资源模型。
+- direct 作为 opt-in + 长驻 listener，既覆盖无 Hub 部署，又不破坏现网 Hub 默认行为。
 
-> 待细化（阶段设计时定，不阻塞提案）：long-poll 类 IM（iLink、Telegram）在 direct 模式下的"持续监听 + 按消息派发短任务"生命周期如何组织——是外层长驻 listener 拉取后 fork 短 bridge，还是 bridge 自身长驻。这是阶段 3 的设计细节。
+> 已细化（阶段 3 定）：long-poll 类 IM 在 direct 模式下采用「外层长驻 listener 拉取 + 内层按消息派发短任务」，bridge 自身长驻；webhook 型 IM 的 ephemeral 形态留待后续 transport 承载。
 
 ## 4. 当前耦合盘点（bridge → crate 其余部分）
 
@@ -113,8 +114,8 @@ agentproc = { git = "https://github.com/jeffkit/agentproc.git", rev = "dbe2b21" 
 ┌─────────────────────────── bridge 运行时（IM 无关）───────────────────────────┐
 │                                                                                │
 │  Transport trait        ← IM 协议抽象（收消息流 / 发回复 / 可选媒体上传）        │
-│   ├─ IlinkTransport     ← iLink 协议客户端；via:direct（默认，直连真实上游）或     │
-│  │                        via:hub（经 Hub，拿 session/A2A/复用）                    │
+│   ├─ IlinkTransport     ← iLink 协议客户端；via:hub（默认，经 Hub 拿 session/A2A/复用）或 │
+│  │                        via:direct（opt-in，直连真实上游，自管凭证）              │
 │   ├─ FeishuTransport    ← 预留（阶段 3+，直连飞书）                                │
 │   └─ TelegramTransport  ← 预留（阶段 3+，直连 Telegram）                          │
 │                                                                                │
@@ -193,6 +194,18 @@ pub struct InboundMessage {
 - 已知缺口（留 seam，未实现）：direct 模式 CLI 会话续接。`via: hub` 时 Hub 回显 `session_id`（上次 `cli_session_id`）使 bridge 能 resume CLI；真实上游不回显该 HubExt 字段，direct 模式每条消息起新 CLI 会话。恢复续接需本机 store 按 `(context_token, session_name) → cli_session_id` 持久化（`handle.rs` 已留 TODO seam）。
 - 验收：4 个 mockito 单测覆盖 direct 凭证解析（显式 token 接受 / 显式 token 拒绝 / 无 token QR 登录并存盘 / 已存有效 token 复用免 QR）；2 个 config 单测覆盖 `base_url:` 解析与默认 None；`paths` 单测覆盖 direct 凭证路径。`via: hub` 行为无回归。
 
+**Review 驱动加固（2026-07-20，`docs/reviews/2026-07-20-bridge-transport-abstraction.md`）**：
+
+- **H1（manager + via: direct 凭证引导）**：manager 对 `via: direct` profile 在 spawn 前预检凭证文件可用性；不可用则**拒绝 spawn** 并打清晰日志（指引先手动 `ilink-hub-bridge --config … --cred-file … --pair`），按 scan 周期复检——避免 headless supervisor 下 QR 阻塞 ~30min 后重启风暴。`BridgeProcessSpec` 新增 `via_direct` 字段。
+- **M2（direct 强制 base_url）**：`via: direct` 缺 `base_url:` 且 `--hub-url`/`WEIXIN_BASE_URL` 仍是默认 localhost Hub 地址时直接 bail，禁止静默对 Hub/localhost 发 `get_bot_qrcode`。抽纯函数 `resolve_direct_base_url` 便于单测。
+- **M5（manager cred 路径按 via 隔离）**：direct profile 的 manager 凭证文件用 `{id}.direct.json` 后缀，与 hub 的 `{id}.json` 分离；via 切换时旧凭证随 fingerprint 变更被清理，不再互相覆盖。
+- **M6（capabilities seam 接线）**：启动 direct transport 时 `info!` 打印 `TransportCapabilities`（`media_upload`），使 seam 可观测。
+- **L3/L4/L5/L6**：TokenRejected 日志/bail 文案改为 via 感知（去掉 hub-only 措辞）；非 ilink `transport:` 未加 `--allow-null-transport` 时启动 fail-fast（占位 NullTransport 不再永久退避成僵尸）；`config.rs` `Via` 注释刷新为 stage 3 已落地；启动 direct 时 INFO 提示无 CLI resume。
+- **L2**：移除死代码 `classify_sendoutcome`（与 `parse_sendoutcome` 语义不一致且全程 `#[allow(dead_code)]`），其测试改为覆盖在线函数 `parse_sendoutcome`。
+- 新增测试：manager（direct 后缀 / 凭证可用性判定 / 守卫 / 拒绝 spawn 无凭证）+ bin（`resolve_direct_base_url` 四路径 / `build_transport` M2 bail / L4 bail）。
+- **M4（partial/final 去重可能静默丢尾部）**：评估为重构前既有行为、非阻塞，未在本轮改动；后续宜用「成功发送计数」驱动去重或 partial 失败时不抑制 final。
+- **L1（`InboundMessage.extra` 恒 Null）**：预留 seam，非 bug，维持现状。
+
 > 注：原评估误以为阶段 3 需要"搬迁 Hub 上游逻辑"。纠正后：bridge 本就说 iLink 协议，直连只是换 base URL + 自管凭证，不搬迁 Hub。
 >
 > 运维注意：bridge 直连 QR 登录会从真实上游拿到一个 bot_token；若同一微信号已有 Hub 持有 bot_token，二者可能冲突。direct 模式适合"无 Hub、bridge 直接顶上"的部署，不建议与 Hub 同时登录同一微信号。
@@ -208,6 +221,10 @@ pub struct InboundMessage {
 | 直连 iLink（阶段 3）凭证生命周期与现有 Hub QR 流程不一致 | 中 | **已纠正**：不复用 `HubPairingClient`（Hub 下游配对专用），改复用 `ilink::login::LoginClient`（真实上游 QR 登录）。direct 专用凭证文件与 Hub vtoken 文件分离 |
 | direct 模式 CLI 会话无法续接（真实上游不回显 `session_id`） | 中 | 阶段 3 留 seam（`handle.rs` TODO）：未来加本机 `(context_token, session_name) → cli_session_id` store 恢复 resume；当前 direct 每条消息起新 CLI 会话 |
 | bridge 直连与 Hub 同时登录同一微信号导致 bot_token 冲突 | 中 | 文档注明：direct 适合"无 Hub"部署，不建议与 Hub 同时登录同一微信号 |
+| manager 托管 `via: direct` 在 headless 下 QR 阻塞 → 重启风暴 | **高** | **已缓解（review H1）**：manager spawn 前预检 direct 凭证可用性，不可用则拒绝 spawn 并按 scan 复检，不进入 QR 阻塞 + 重启循环 |
+| `via: direct` 缺 `base_url:` 静默回退 localhost Hub | 中 | **已缓解（review M2）**：direct 缺 `base_url:` 且 base 仍是默认 localhost Hub 地址时 fail-fast，禁止对 Hub 发 `get_bot_qrcode` |
+| manager 共用 cred 路径致 hub↔direct 切换踩旧凭证 | 中 | **已缓解（review M5）**：direct 凭证用 `{id}.direct.json` 后缀与 hub 分离；via 切换随 fingerprint 变更清理旧凭证 |
+| 非 ilink `transport:` 占位 NullTransport 永久退避成僵尸 | 低 | **已缓解（review L4）**：未加 `--allow-null-transport` 时启动 fail-fast |
 | `paths` 中 `~/.ilink-hub` 与 `~/.ilink-hub-bridge` 路径错位 | 低 | 搬迁时逐函数对照现有常量，保留测试 `bridge_defaults_live_under_data_dir` 等 |
 | 阶段 2 默认 `via` 与提案初稿（`direct`）不一致导致回归 | 中 | **已采纳 `默认 via: hub`**：阶段 2 不回归现有 Hub 自动注册部署；`direct` 留待阶段 3 完成凭证流程后切换。`run_bridge` 旧签名保留，桌面端无感 |
 
@@ -227,10 +244,10 @@ pub struct InboundMessage {
 
 | # | 议题 | 决定 |
 |---|------|------|
-| Q1 | `via` 默认值 + 进程模型 | **默认 `via: direct`**（direct 比 hub 通用、适用面广）。一个 bridge 进程只服务一个 IM 渠道；各渠道消息独立启用一个 bridge 响应、做完即关闭（短生命周期进程，对齐 `profile` exec 协议形态）。不允许多 IM 共进程。 |
+| Q1 | `via` 默认值 + 进程模型 | **默认 `via: hub`**（避免现网 Hub 自动注册部署回归；`direct` 为显式 opt-in，适用无 Hub 部署）。一个 bridge 进程只服务一个 IM 渠道；long-poll IM 采用「外层长驻 listener + 内层按消息派发短任务」，不引入 ephemeral（做完即关）进程——`Transport::next_inbound` 即未来 webhook 型 IM 的 ephemeral seam。不允许多 IM 共进程。（与初稿差异：初稿默认 direct + 短生命周期进程，落地时为避免回归改为默认 hub + 长驻 listener。） |
 | Q2 | 通用 DTO 字段边界 | **需要** `extra: serde_json::Value`，承载各 IM 适配器私有字段，避免主 DTO 膨胀。 |
 | Q3 | `HubExt` 归属 | **选项 a**：`HubExt` 归 `IlinkTransport` 能力选项，仅 `via: hub` 时存在；直连时 session 连续性（`cli_session_id`）退化为本机记录。不进通用 DTO 主干。 |
-| Q4 | 媒体上传能力 | **可选**，`TransportCapabilities::media_upload`（默认 false）。当前媒体能力尚未启用，dispatcher 探测能力，不支持则降级。 |
+| Q4 | 媒体上传能力 | **可选**，`TransportCapabilities::media_upload`（默认 false）。当前媒体能力尚未启用；启动时打印 capabilities 使 seam 可观测（review M6），dispatcher 后续按能力探测降级。 |
 | Q5 | typing / 已读 / 撤回 等状态 | **暂不做**。`TransportCapabilities` 阶段 1 仅含 `media_upload`；其余 IM 状态能力待有实际 IM 用到再加。 |
 | Q6 | 与 `project-aware-backends` 叠加 | **正交**。turn 对象里 `project`（cwd，来自 `#project` 语法）与 `transport`（IM 来源）是两个独立字段，互不干涉，在 bridge 端各自解析。 |
 
