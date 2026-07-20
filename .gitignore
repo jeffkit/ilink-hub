@@ -45,6 +45,9 @@ package-lock.json
 .claude/worktrees/
 .claude/settings.local.json
 
+# workbuddy local session memory (不入库)
+.workbuddy/
+
 # cargo-mutants 输出目录（本地运行结果，不入库）
 mutants-output/
 mutants.out/
