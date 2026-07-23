@@ -44,11 +44,10 @@ iLink Hub ← 唯一和微信通信的程序
 
 | 使用方式 | 需要的技术基础 |
 |----------|--------------|
-| 桌面应用（图形界面） | 不需要，双击安装即可 |
 | 命令行部署（本机） | 需要会打开终端、执行命令 |
 | 服务器部署（Docker） | 需要了解基础 Linux 命令 |
 
-如果你只是想在微信里和 Claude 聊天，推荐从**桌面应用**开始，最简单。
+如果你只是想在微信里和 Claude 聊天，推荐从[快速开始](/guide/getting-started)入手。
 
 ---
 
@@ -100,6 +99,5 @@ Hub 需要一直运行才能转发消息。可以是：
 → 直接看[快速开始](/guide/getting-started)，里面有分步指引。
 :::
 
-- [下载桌面版](/guide/installation#desktop) — 最简单的方式，无需终端
 - [快速开始（命令行）](/guide/getting-started) — 10 分钟完成部署
 - [接入 Claude Code](/guide/claude-code) — 直接对话 Claude Code 的完整教程

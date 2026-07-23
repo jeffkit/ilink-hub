@@ -5,16 +5,10 @@ hero:
   name: iLink Hub
   text: 一个微信账号，连接多个 AI 助手
   tagline: 让 Claude Code、Recursive、OpenClaw 等多个 AI 工具同时接入同一个微信，随时切换，互不干扰。
-  image:
-    src: /logo.png
-    alt: iLink Hub
   actions:
     - theme: brand
       text: 让 AI 帮我安装 ✨
       link: /guide/ai-install
-    - theme: alt
-      text: 下载桌面版
-      link: /guide/installation#desktop
     - theme: alt
       text: 命令行快速开始
       link: /guide/getting-started
@@ -29,9 +23,6 @@ features:
   - icon: 🔒
     title: 凭证安全
     details: 你的真实微信 Token 只留在 Hub 里，各 AI 工具拿到的是 Hub 颁发的虚拟凭证，互相隔离。
-  - icon: 🖥️
-    title: 桌面应用
-    details: 提供 macOS / Windows / Linux 桌面版，双击安装，扫码登录，无需终端。也提供命令行版本供服务器部署。
   - icon: 💬
     title: 微信命令控制
     details: 在微信中发送 /list 查看所有 AI、/use <名称> 切换活跃 AI、/broadcast 向全部 AI 广播消息。
@@ -69,7 +60,6 @@ AI 会引导你确认操作系统、芯片型号、微信是否已开启 ClawBot
 
 | 我的情况 | 推荐路径 |
 |----------|---------|
-| 不想用终端，想要图形界面 | [下载桌面版](/guide/installation#desktop) |
 | 熟悉终端，想快速部署 | [快速开始](/guide/getting-started) |
 | 想把微信接到本机 CLI（Claude Code 等） | [Bridge → im-agentproc](https://github.com/jeffkit/im-agentproc)（独立项目） |
 | 想把微信接到 Claude Code | [接入 Claude Code](/guide/claude-code) |

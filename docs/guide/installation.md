@@ -1,41 +1,8 @@
 # 安装
 
-::: tip 不想用终端？
-**[桌面应用](#桌面应用-tauri)** 是最简单的方式，双击安装，无需命令行。直接跳到页面底部查看。
-:::
-
 ---
 
-## 方式一：桌面应用（推荐新手）{#desktop}
-
-与命令行版本功能相同，提供图形界面，首次绑定微信时会弹出二维码窗口。
-
-### 下载
-
-在 **[GitHub Releases](https://github.com/jeffkit/ilink-hub/releases)** 最新版本的 Assets 里，找到以 `ilink-hub-desktop-` 开头的文件：
-
-| 文件 | 适用系统 |
-|------|---------|
-| `ilink-hub-desktop-macos-aarch64.dmg` | macOS Apple Silicon（M1/M2/M3/M4） |
-| `ilink-hub-desktop-macos-x86_64.dmg` | macOS Intel |
-| `ilink-hub-desktop-windows-x86_64.msi` | Windows 10/11 64 位 |
-| `ilink-hub-desktop-linux-x86_64.deb` | Ubuntu / Debian 等 |
-
-**不知道自己是哪种 Mac？** 点击苹果菜单 → 「关于本机」，芯片栏写 Apple M* 选 aarch64，写 Intel 选 x86_64。
-
-### 安装注意
-
-- **macOS**：当前版本未做 Apple 公证。首次打开若被拦截，请右键点击应用 → 「打开」，或前往「系统设置 → 隐私与安全性」允许运行。
-- **Windows**：按 MSI 向导安装；若 SmartScreen 提示未知发布者，选「仍要运行」。
-- **Linux**：`sudo apt install ./ilink-hub-desktop-linux-x86_64.deb`
-
-### 使用桌面版时接 Bridge
-
-桌面版只负责在本机运行 Hub（默认监听 `127.0.0.1:8765`）。如果你还想接 Claude Code / Codex 等命令行工具，需要另外安装独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)（原 `ilink-hub-bridge`），参考其仓库文档，并设置 `WEIXIN_BASE_URL=http://127.0.0.1:8765`。
-
----
-
-## 方式二：Homebrew（macOS 命令行推荐）
+## 方式一：Homebrew（macOS 命令行推荐）
 
 ```bash
 brew tap jeffkit/tap
@@ -60,7 +27,7 @@ brew upgrade ilink-hub
 
 ---
 
-## 方式三：预编译二进制（无需 Rust）
+## 方式二：预编译二进制（无需 Rust）
 
 直接下载对应平台的可执行文件，不需要安装任何运行环境。
 
@@ -99,7 +66,7 @@ ilink-hub --version
 
 ---
 
-## 方式四：Docker
+## 方式三：Docker
 
 ```bash
 docker pull ghcr.io/jeffkit/ilink-hub:latest
@@ -115,7 +82,7 @@ docker run -it --rm \
 
 ---
 
-## 方式五：Cargo（需要 Rust 工具链）
+## 方式四：Cargo（需要 Rust 工具链）
 
 默认仅启用 SQLite 支持以减少编译耗时。若需要启用 PostgreSQL 或 MySQL 驱动支持，需要显式指定 `--features` 参数：
 
@@ -134,7 +101,7 @@ cargo install ilink-hub --features mysql
 
 ---
 
-## 方式六：从源码编译
+## 方式五：从源码编译
 
 ```bash
 git clone https://github.com/jeffkit/ilink-hub.git

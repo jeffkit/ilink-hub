@@ -2,10 +2,6 @@
 
 本指南带你完成 iLink Hub 的安装、启动和客户端接入。
 
-::: tip 不想用终端？
-直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。桌面端内嵌 Hub 服务；如需接本机 CLI（Claude Code 等），另装独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)（原 `ilink-hub-bridge`）。
-:::
-
 ::: warning 使用前确认
 你需要在微信中开启 **ClawBot（龙虾插件）**。更新微信到最新版，进入「我 → 设置 → 插件」开启即可，无需申请审核。
 :::
