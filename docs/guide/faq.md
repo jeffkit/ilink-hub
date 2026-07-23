@@ -102,11 +102,14 @@ xattr -rd com.apple.quarantine /usr/local/bin/ilink-hub
 
 通常是 `context_token` 过期（微信的会话令牌有时间限制）。这是正常现象，用户重新发消息后 Hub 会自动生成新的映射。
 
-### Q: `ilink-hub-bridge` 一直在线但微信发文字没反应 {#bridge-no-msg}
+### Q: bridge 一直在线但微信发文字没反应 {#bridge-no-msg}
+
+> bridge（原 `ilink-hub-bridge`）已拆到独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)，
+> 下列排查思路通用，具体命令以 im-agentproc 文档为准。
 
 1. 确认已对该后端执行 `/use <注册时用的名称>`，且 `/list` 里该客户端为**在线**
 2. 查看 bridge 终端：是否有报错、或超时日志
-3. 配置里 `require_text: true` 时，纯图片/语音不会触发 CLI；先发纯文本测试
+3. 先发纯文本测试（图片/语音等是否触发取决于 profile 配置）
 4. Hub 地址和 Token 是否与注册时输出的一致（注意不要多空格）
 
 ### Q: 注册时提示「name already exists」

@@ -41,7 +41,7 @@ RUST_TEST_THREADS=1 cargo mutants -j 2 --output mutants-output/full
 | Bridge / MCP / Server | paths / dispatcher / config / executor / manager / probe / builtin / mcp/* / sse_ticket / routes | P2 |
 | I/O 密集 | `ilink/login` / `relay/client` / `ilink/upstream` | P2（async 路径可 timeout） |
 
-完整列表见 [`.cargo/mutants.toml`](../../.cargo/mutants.toml)。
+完整列表见 [`.cargo/mutants.toml`](https://github.com/jeffkit/ilink-hub/blob/main/.cargo/mutants.toml)。
 
 ## 基准结果
 

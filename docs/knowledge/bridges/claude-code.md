@@ -2,12 +2,14 @@
 type: Bridge
 title: Claude Code Bridge
 description: 内置 Bridge，包装 Anthropic Claude Code CLI，支持会话续传、流式输出与多模态附件（AgentProc 0.4）。
-resource: src/bridge/builtin/claude_code.rs
+resource: https://github.com/jeffkit/im-agentproc
 tags: [bridge, claude, builtin, streaming, agentproc]
 timestamp: 2026-07-16T14:30:00+08:00
 ---
 
 # Claude Code Bridge
+
+> **仓库迁移（2026-07-20）**：Bridge 代码已从 `ilink-hub` 的 `src/bridge/` 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本文档仍描述 Claude Code Bridge 实现（概念不变），代码位置以 im-agentproc 为准。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
 
 内置 Bridge，包装 **`claude` CLI**（Anthropic Claude Code），实现会话连续性、流式输出与多模态附件。采用 AgentProc 0.4 NDJSON 协议。
 

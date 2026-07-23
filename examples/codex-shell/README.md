@@ -1,10 +1,14 @@
 # Codex Bridge Profile（Shell 版）
 
-用纯 Shell 脚本把 OpenAI Codex CLI 接入 iLink Hub Bridge，支持多轮对话。采用 AgentProc 0.3 NDJSON 协议与 bridge 通信。
+> **Bridge 已迁出**：bridge（原 `ilink-hub-bridge`）已拆到独立项目
+> [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)，二进制改名为 `im-agentproc`。
+> 本示例的 profile 协议与 handler 思路不变，命令以 im-agentproc 为准。
+
+用纯 Shell 脚本把 OpenAI Codex CLI 接入 iLink Hub Bridge，支持多轮对话。采用 AgentProc 0.4 NDJSON 协议与 bridge 通信。
 
 ## 前提条件
 
-- [iLink Hub Bridge](https://github.com/jeffkit/ilink-hub) 已安装
+- [iLink Hub](https://github.com/jeffkit/ilink-hub)（Hub 服务）与 [im-agentproc](https://github.com/jeffkit/im-agentproc)（bridge）已安装
 - Codex CLI 已安装并登录
 
 ```bash
@@ -42,7 +46,7 @@ echo '{"type":"turn","message":"你好，用一句话介绍你自己","session_i
 2. 启动 bridge：
 
 ```bash
-ilink-hub-bridge --config profiles.yaml
+im-agentproc --config profiles.yaml
 ```
 
 3. 在微信里发消息，就能和 Codex 对话了

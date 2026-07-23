@@ -25,35 +25,30 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             asset_name: ilink-hub-linux-x86_64
-            bridge_asset: ilink-hub-bridge-linux-x86_64
             use_cross: true
 
           - name: linux-aarch64
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             asset_name: ilink-hub-linux-aarch64
-            bridge_asset: ilink-hub-bridge-linux-aarch64
             use_cross: true
 
           - name: macos-x86_64
             os: macos-latest
             target: x86_64-apple-darwin
             asset_name: ilink-hub-macos-x86_64
-            bridge_asset: ilink-hub-bridge-macos-x86_64
             use_cross: false
 
           - name: macos-aarch64
             os: macos-latest
             target: aarch64-apple-darwin
             asset_name: ilink-hub-macos-aarch64
-            bridge_asset: ilink-hub-bridge-macos-aarch64
             use_cross: false
 
           - name: windows-x86_64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_name: ilink-hub-windows-x86_64.exe
-            bridge_asset: ilink-hub-bridge-windows-x86_64.exe
             use_cross: false
 
     steps:
@@ -95,19 +90,6 @@ jobs:
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" `
                     "${{ matrix.asset_name }}"
 
-      - name: Rename bridge (Unix)
-        if: matrix.os != 'windows-latest'
-        run: |
-          cp "target/${{ matrix.target }}/release/ilink-hub-bridge" "${{ matrix.bridge_asset }}"
-          chmod +x "${{ matrix.bridge_asset }}"
-
-      - name: Rename bridge (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Copy-Item "target/${{ matrix.target }}/release/ilink-hub-bridge.exe" `
-                    "${{ matrix.bridge_asset }}"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -115,19 +97,13 @@ jobs:
           path: ${{ matrix.asset_name }}
           retention-days: 1
 
-      - name: Upload bridge artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.bridge_asset }}
-          path: ${{ matrix.bridge_asset }}
-          retention-days: 1
-
   # ─── Desktop (Tauri) installers ───────────────────────────────────────────
   build-desktop:
     name: Desktop (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     # Desktop (Tauri) installers are intentionally skipped for the 0.3.0 release:
-    # this release ships hub + bridge + manager only (no desktop). Re-enable by
+    # this release ships the hub only (no desktop, no bridge — bridge now lives
+    # in im-agentproc). Re-enable by
     # removing the `if: false` below. The job remains best-effort
     # (continue-on-error) and is NOT a dependency of create-release /
     # update-homebrew-tap, so even when enabled it cannot block the release.
@@ -279,10 +255,11 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    # Only require the native hub/bridge binaries + crates publish. The desktop
+    # Only require the native hub binaries + crates publish. The desktop
     # (Tauri) build is best-effort and intentionally NOT a dependency, so a desktop
     # failure can no longer skip the release and starve the Homebrew tap update
-    # (which is what kept brew stuck on an old version).
+    # (which is what kept brew stuck on an old version). The bridge ships from
+    # the separate jeffkit/im-agentproc repository.
     needs: [build-native, publish-crates]
     steps:
       - uses: actions/checkout@v4
@@ -304,7 +281,9 @@ jobs:
           body: |
             ## Install
 
-            > This release ships **hub + bridge + manager** only (no desktop app).
+            > This release ships **hub only**. The bridge (`ilink-hub-bridge`) has been
+            > extracted into a separate project — [im-agentproc](https://github.com/jeffkit/im-agentproc).
+            > Install the bridge from its own repository / Homebrew formula.
 
             ### Linux / macOS — download binary
 
@@ -331,17 +310,6 @@ jobs:
             cargo install ilink-hub
             ```
 
-            ### ilink-hub-bridge (per platform)
-
-            Same release tag includes `ilink-hub-bridge-*` assets. Example (macOS arm64):
-
-            ```bash
-            curl -LO "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/ilink-hub-bridge-macos-aarch64"
-            chmod +x ilink-hub-bridge-macos-aarch64 && sudo mv ilink-hub-bridge-macos-aarch64 /usr/local/bin/ilink-hub-bridge
-            ```
-
-            Omit `--token` and scan the Hub pairing QR on first run; credentials default to `~/.ilink-hub/bridge-credentials.json`.
-
             ## Quick Start
 
             ```bash
@@ -360,18 +328,14 @@ jobs:
         run: |
           VERSION="${{ github.ref_name }}"
           BASE="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
-          curl -fsSLo ilink-hub-macos-aarch64        "${BASE}/ilink-hub-macos-aarch64"
-          curl -fsSLo ilink-hub-macos-x86_64         "${BASE}/ilink-hub-macos-x86_64"
-          curl -fsSLo ilink-hub-bridge-macos-aarch64 "${BASE}/ilink-hub-bridge-macos-aarch64"
-          curl -fsSLo ilink-hub-bridge-macos-x86_64  "${BASE}/ilink-hub-bridge-macos-x86_64"
+          curl -fsSLo ilink-hub-macos-aarch64 "${BASE}/ilink-hub-macos-aarch64"
+          curl -fsSLo ilink-hub-macos-x86_64  "${BASE}/ilink-hub-macos-x86_64"
 
       - name: Compute SHA256
         id: sha
         run: |
-          echo "arm64=$(sha256sum ilink-hub-macos-aarch64        | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "x86=$(sha256sum   ilink-hub-macos-x86_64         | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "arm64_bridge=$(sha256sum ilink-hub-bridge-macos-aarch64 | awk '{print $1}')" >> $GITHUB_OUTPUT
-          echo "x86_bridge=$(sha256sum   ilink-hub-bridge-macos-x86_64  | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "arm64=$(sha256sum ilink-hub-macos-aarch64 | awk '{print $1}')" >> $GITHUB_OUTPUT
+          echo "x86=$(sha256sum   ilink-hub-macos-x86_64  | awk '{print $1}')" >> $GITHUB_OUTPUT
 
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
@@ -383,10 +347,8 @@ jobs:
       - name: Update Formula
         env:
           VERSION: ${{ github.ref_name }}
-          ARM64:        ${{ steps.sha.outputs.arm64 }}
-          X86:          ${{ steps.sha.outputs.x86 }}
-          ARM64_BRIDGE: ${{ steps.sha.outputs.arm64_bridge }}
-          X86_BRIDGE:   ${{ steps.sha.outputs.x86_bridge }}
+          ARM64: ${{ steps.sha.outputs.arm64 }}
+          X86: ${{ steps.sha.outputs.x86 }}
         run: |
           VER="${VERSION#v}"
           FORMULA="homebrew-tap/Formula/ilink-hub.rb"
@@ -394,6 +356,9 @@ jobs:
           # typed: false
           # frozen_string_literal: true
 
+          # ilink-hub formula — Hub service only.
+          # The bridge (formerly ilink-hub-bridge) now ships from the separate
+          # jeffkit/im-agentproc repository / its own formula.
           class IlinkHub < Formula
             desc "iLink-compatible multiplexer hub for WeChat ClawBot — connect one WeChat account to multiple AI agent backends"
             homepage "https://jeffkit.github.io/ilink-hub/"
@@ -404,77 +369,22 @@ jobs:
               if Hardware::CPU.arm?
                 url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-macos-aarch64"
                 sha256 "${ARM64}"
-
-                resource "ilink_hub_bridge" do
-                  url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-bridge-macos-aarch64"
-                  sha256 "${ARM64_BRIDGE}"
-                end
               else
                 url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-macos-x86_64"
                 sha256 "${X86}"
-
-                resource "ilink_hub_bridge" do
-                  url "https://github.com/jeffkit/ilink-hub/releases/download/${VERSION}/ilink-hub-bridge-macos-x86_64"
-                  sha256 "${X86_BRIDGE}"
-                end
               end
             end
 
             def install
               if OS.mac? && Hardware::CPU.arm?
                 bin.install "ilink-hub-macos-aarch64" => "ilink-hub"
-                resource("ilink_hub_bridge").stage do
-                  bin.install "ilink-hub-bridge-macos-aarch64" => "ilink-hub-bridge"
-                end
               elsif OS.mac?
                 bin.install "ilink-hub-macos-x86_64" => "ilink-hub"
-                resource("ilink_hub_bridge").stage do
-                  bin.install "ilink-hub-bridge-macos-x86_64" => "ilink-hub-bridge"
-                end
               end
-            end
-
-            # brew services start jeffkit/tap/ilink-hub
-            # Runs ilink-hub-bridge in manager mode; manages all bridge profiles automatically.
-            #
-            # Required after install:
-            #   Edit ~/Library/LaunchAgents/homebrew.mxcl.ilink-hub.plist and add:
-            #     WEIXIN_BASE_URL  → your Hub URL (e.g. http://your-server:8765)
-            #     ILINK_ADMIN_TOKEN → admin token from Hub config
-            service do
-              run [opt_bin/"ilink-hub-bridge", "manager"]
-              keep_alive true
-              log_path var/"log/ilink-hub-bridge-manager.log"
-              error_log_path var/"log/ilink-hub-bridge-manager-error.log"
-              environment_variables(
-                RUST_LOG:        "info,ilink_hub_bridge=debug",
-                HOME:            Dir.home,
-                WEIXIN_BASE_URL: "http://your-hub-server:8765",
-                PATH:            "#{HOMEBREW_PREFIX}/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
-              )
-            end
-
-            def caveats
-              <<~EOS
-                After starting the service, edit the LaunchAgent plist to set your Hub URL and admin token:
-                  #{Dir.home}/Library/LaunchAgents/homebrew.mxcl.ilink-hub.plist
-
-                Required environment variables:
-                  WEIXIN_BASE_URL   → your Hub URL (e.g. http://your-server:8765)
-                  ILINK_ADMIN_TOKEN → admin token from Hub config
-
-                Then restart the service:
-                  brew services restart jeffkit/tap/ilink-hub
-
-                Bridge profiles and credentials are stored in:
-                  ~/.ilink-hub-bridge/profiles/
-                  ~/.ilink-hub-bridge/credentials/
-              EOS
             end
 
             test do
               assert_match "ilink-hub", shell_output("#{bin}/ilink-hub --version")
-              assert_match "ilink-hub-bridge", shell_output("#{bin}/ilink-hub-bridge --version")
             end
           end
           RUBY
@@ -485,5 +395,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/ilink-hub.rb
-          git diff --cached --quiet || git commit -m "chore: bump ilink-hub to ${{ github.ref_name }}"
+          git diff --cached --quiet || git commit -m "chore: bump ilink-hub to ${{ github.ref_name }} (hub-only)"
           git push

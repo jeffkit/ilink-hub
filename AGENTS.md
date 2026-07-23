@@ -16,8 +16,8 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 项目概览 | `docs/knowledge/project/overview.md` | 仓库结构、技术栈 |
 | 质量门 | `docs/knowledge/project/quality-gates.md` | CI 检查项与修复方式 |
 | 代码规范 | `docs/knowledge/project/conventions.md` | Rust 规范、并发约定 |
-| Bridge 概览 | `docs/knowledge/bridges/overview.md` | Bridge 架构与内置实现 |
-| P0 协议 | `docs/knowledge/bridges/profile-protocol.md` | 环境变量契约、流式格式 |
+| Bridge 概览 | `docs/knowledge/bridges/overview.md` | Bridge 架构与内置实现（概念；代码已迁 im-agentproc） |
+| P0 协议 | `docs/knowledge/bridges/profile-protocol.md` | 环境变量契约、流式格式（概念；代码已迁 im-agentproc） |
 | 微信命令 | `docs/knowledge/api/commands.md` | /list /use @name 等 |
 | 环境变量 | `docs/knowledge/api/configuration.md` | DATABASE_URL 等配置 |
 | force-dev | `docs/knowledge/dev-workflow/force-dev.md` | 启动/续跑 feature 分支 |
@@ -25,7 +25,7 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 发布部署 | `docs/knowledge/ops/release-and-deploy.md` | brew 发布三档路径、远程 Hub 部署 |
 | 部署加固 | `docs/knowledge/ops/deployment-hardening.md` | 生产部署安全清单 |
 
-> **Bridge 代码已拆出**：`src/bridge/` 于 2026-07-20 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本仓库仅保留 Hub 服务本体；desktop 通过 git dep 引用 `im-agentproc` 获取 bridge。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+> **Bridge 代码已拆出**：`src/bridge/` 于 2026-07-20 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本仓库仅保留 Hub 服务本体；desktop 通过 crates.io 引用 `im-agentproc`（0.1.0）获取 bridge。bridge 的部署、发布、Homebrew formula 由 im-agentproc 仓库自行管理。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
 
 ## 活跃执行计划
 
@@ -37,7 +37,7 @@ docs/knowledge/index.md    ← 入口，先读这里
 - 特性开发**禁止**在 main 分支直接提交，通过 force-dev worktree 隔离
 - commit **禁止**添加 `Co-authored-by` 信息
 - Rust 生产路径**禁止**裸 `unwrap()`，用 `thiserror` + `?` 传播
-- 本地部署 hub/bridge **必须经 brew**（`/opt/homebrew/bin`）并**递增版本号**，**禁止** `deploy-local-mac.sh` 裸拷 `~/.local/bin` 覆盖。日常调试用 `scripts/deploy-local-brew.sh`（方案 2），patch 对外用 `v*-mac` tag（方案 1），minor/major 走完整 `release.yml`。详见[发布与部署规范](docs/knowledge/ops/release-and-deploy.md)
+- 本地部署 hub **必须经 brew**（`/opt/homebrew/bin`）并**递增版本号**。日常调试用 `scripts/deploy-local-brew.sh`（方案 2），patch 对外用 `v*-mac` tag（方案 1），minor/major 走完整 `release.yml`。bridge 的本地部署与发布已归 im-agentproc 仓库，不在本仓库范围。详见[发布与部署规范](docs/knowledge/ops/release-and-deploy.md)
 
 ## 提交前检查清单
 

@@ -2,16 +2,18 @@
 type: Reference
 title: AgentProc 0.4 协议与 Bridge Profile
 description: Bridge 与 profile 进程之间的 AgentProc 0.4 通信契约：NDJSON turn 输入、NDJSON 事件输出；YAML 采用 agentproc hub form（agentproc: 嵌套）。
-resource: docs/bridge/profile-spec.md
+resource: https://github.com/jeffkit/im-agentproc
 tags: [bridge, profile, protocol, agentproc, ndjson]
 timestamp: 2026-07-16T14:30:00+08:00
 ---
 
 # AgentProc 0.4 协议与 Bridge Profile
 
+> **仓库迁移（2026-07-20）**：Bridge 代码已从 `ilink-hub` 的 `src/bridge/` 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本文档仍描述 Bridge 协议（概念不变），代码与 profile 规范以 im-agentproc 为准。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+
 ilink-hub 的 Bridge 与 profile 进程之间采用 **AgentProc 0.4** 协议：以 **NDJSON**（Newline Delimited JSON）作为双向底层载体，**零 SDK 依赖**，跨平台。
 
-协议常量：`PROTOCOL_VERSION = "0.4"`（定义在 `src/bridge/protocol.rs`）。
+协议常量：`PROTOCOL_VERSION = "0.4"`（原定义在 `src/bridge/protocol.rs`，现已随 bridge 迁入 im-agentproc）。
 
 **YAML 形态**：一个文件 = 一个 Hub 客户端 = 一个 agentproc profile。执行配置嵌在 `agentproc:` 下（与 agentproc 规范字段对齐）；`description` / `script` 作为文件级 sibling。不再支持 `profiles:` 多 profile 映射、`routing`、`permission_default` / WeChat ask 审批。
 

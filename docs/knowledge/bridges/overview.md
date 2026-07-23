@@ -24,7 +24,7 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 | `recursive` | [Recursive Bridge](recursive.md) |
 | `opencode` | OpenCode CLI |
 
-实现位于 `src/bridge/builtin/`；运行时优先经 `agentproc::run` 驱动（见 `dispatcher/agentproc_runner.rs`）。
+实现原位于 `ilink-hub` 的 `src/bridge/builtin/`，现已随 bridge 拆分迁入 [`im-agentproc`](https://github.com/jeffkit/im-agentproc)；运行时优先经 `agentproc::run` 驱动。
 
 ## Bridge 的工作方式
 
@@ -38,10 +38,13 @@ Bridge 是 ilink-hub 的**客户端适配层**：Hub 通过 Bridge 与各种 AI 
 **一个 YAML 文件 = 一个 Hub 客户端 = 一个 agentproc profile。**  
 执行配置嵌在 `agentproc:` 下；详见 [P0 协议与 Profile](profile-protocol.md)。多后端请用 manager 多文件 + Hub `/use`，不再在单文件内做 prefix 路由。
 
-## Bridge 模块结构
+## Bridge 模块结构（历史，已迁入 im-agentproc）
+
+> 以下为拆分前 `ilink-hub` 内的 `src/bridge/` 结构，现已整体迁入
+> [`im-agentproc`](https://github.com/jeffkit/im-agentproc)，路径以 im-agentproc 为准。
 
 ```
-src/bridge/
+src/bridge/   （现 im-agentproc 仓库内）
 ├── mod.rs                 # 模块入口
 ├── protocol.rs            # AgentProc 0.4 wire：TurnObject / AgentEvent / PermissionResponse
 ├── executor.rs            # 进程编排（legacy spawn 路径）

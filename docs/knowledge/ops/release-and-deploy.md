@@ -1,20 +1,18 @@
 ---
 type: Guide
 title: 发布与部署规范
-description: ilink-hub / ilink-hub-bridge 的发布与部署规范——三档路径（本机 brew 快速调试 / mac-fast patch 发布 / 完整多平台发布）及远程 Hub 部署。
+description: ilink-hub（Hub 服务本体）的发布与部署规范——三档路径（本机 brew 快速调试 / mac-fast patch 发布 / 完整多平台发布）及远程 Hub 部署。bridge 的发布与部署已归独立仓库 im-agentproc。
 resource: docs/knowledge/ops/release-and-deploy.md
 tags: [ops, release, deploy, brew, ci]
-timestamp: 2026-06-21T19:42:00+08:00
+timestamp: 2026-07-23T16:45:00+08:00
 ---
 
 # 发布与部署规范
 
-> **铁律**：本地 hub/bridge 部署**必须经 brew 管理**（`/opt/homebrew/bin`），并**递增版本号**。
-> **禁止**用 `deploy-local-mac.sh` 把二进制裸拷到 `~/.local/bin` 覆盖运行 —— 那会与
-> launchd / brew services 指向的 brew 路径脱节，且无版本可追溯。
-
-launchd 服务 `com.ilink-hub.bridge-manager` 的 plist 指向 `/opt/homebrew/bin/ilink-hub-bridge`
-（brew 安装路径），因此任何本地部署都要落到这个 brew 路径上，重载后才会生效。
+> **铁律**：本地 hub 部署**必须经 brew 管理**（`/opt/homebrew/bin`），并**递增版本号**。
+> 自 `0.4.0` 起，bridge（原 `ilink-hub-bridge`）已拆到独立仓库
+> [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)，其部署、发布、
+> Homebrew formula 由 im-agentproc 仓库自行管理，不在本文范围。
 
 ## 三档路径
 
@@ -24,6 +22,7 @@ launchd 服务 `com.ilink-hub.bridge-manager` 的 plist 指向 `/opt/homebrew/bi
 | patch「发出去」（需他人/多机可用） | 方案 1 | `release-mac-fast.yml`（`v*-mac` tag 或手动 dispatch） | ~5 min | GitHub `mac-latest` 预发布 + 公共 tap |
 | minor / major 正式发布 | 完整 | `release.yml`（`vX.Y.0` tag） | 30+ min | 全平台 GitHub Release + crates.io + 公共 tap + Docker |
 
+> 三档路径均只发布 **Hub 服务本体**（`ilink-hub`）。bridge 由 im-agentproc 仓库独立发布。
 > 选择原则：第 3 位（patch）变更日常调试走方案 2；需要推给其他机器或公共 tap 时走方案 1；
 > 含破坏性变更或对外版本走完整发布。
 
@@ -31,14 +30,15 @@ launchd 服务 `com.ilink-hub.bridge-manager` 的 plist 指向 `/opt/homebrew/bi
 
 ```bash
 # 1. 递增 Cargo.toml 的 version（patch 位）
-# 2. 本地构建并经 brew 安装到 /opt/homebrew/bin，默认重载 bridge-manager launchd
+# 2. 本地构建 ilink-hub 并经 brew 安装到 /opt/homebrew/bin
 scripts/deploy-local-brew.sh
-# 想只换二进制不动服务：ILINK_NO_RELOAD_LAUNCHD=1 scripts/deploy-local-brew.sh
 ```
+
+> 脚本只部署 `ilink-hub`（Hub 服务本体）。bridge 的本地部署见 im-agentproc 仓库。
 
 脚本流程：本地 `cargo build --release` → ad-hoc 重签（避免 macOS AMFI `killed: 9`）→
 临时把 `jeffkit/tap` 的 formula 改成 `file://` 指向本地产物 → `brew reinstall` → 还原 formula。
-产物只在本机，公共 tap 不受影响。
+产物只在本机，公共 tap 不受影响。脚本只部署 `ilink-hub`（Hub 服务本体）。
 
 ### 方案 1：mac-fast 轻量 CI（patch 规范发布）
 
@@ -48,7 +48,7 @@ git tag v0.2.2-mac && git push origin v0.2.2-mac
 # 或在 GitHub Actions 手动运行 "Release (mac-fast)"，填 version
 ```
 
-只构建 macOS（arm64+x86）的 hub+bridge，上传到滚动预发布 `mac-latest`，并更新公共 tap。
+只构建 macOS（arm64+x86）的 `ilink-hub`，上传到滚动预发布 `mac-latest`，并更新公共 tap。
 用固定 tag `mac-latest`（非 `v*`），**不会**触发完整 `release.yml`。安装：
 
 ```bash
@@ -62,7 +62,8 @@ brew update && brew upgrade jeffkit/tap/ilink-hub
 git tag v0.3.0 && git push origin v0.3.0
 ```
 
-全平台 hub+bridge 二进制、crates.io、GitHub Release、自动更新公共 tap、Docker（独立 workflow）。
+全平台 `ilink-hub` 二进制、crates.io、GitHub Release、自动更新公共 tap、Docker（独立 workflow）。
+bridge 由 im-agentproc 仓库独立发布，不在本 workflow 范围。
 
 > **CI 解耦**：`create-release` 与 `update-homebrew-tap` 只依赖 `build-native` + `publish-crates`，
 > **不再**依赖 `build-desktop`（Tauri）。Desktop 安装包为 best-effort（`continue-on-error`），
@@ -163,8 +164,9 @@ sudo systemctl start ilink-hub
 ## 提交前检查清单（部署相关）
 
 - [ ] 已递增 `Cargo.toml` 的 `version`，并 `cargo build` 同步 `Cargo.lock`
-- [ ] 本机调试用方案 2（brew），**绝不**裸拷到 `~/.local/bin`
+- [ ] 本机调试用方案 2（brew），递增版本号
 - [ ] patch 对外用方案 1（`v*-mac`），minor/major 用完整 `release.yml`（`vX.Y.Z`）
+- [ ] bridge 的发布/部署不在本仓库，归 im-agentproc
 - [ ] 远程 Hub 部署前已备份生产 SQLite 库
 - [ ] **不要**用 `cross` 或 `musl` 交叉编译 Hub，改为 rsync 源码到服务器直接编译
 - [ ] `systemd` service 文件包含所有必需的 `Environment=` 变量（见上方清单）

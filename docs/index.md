@@ -57,7 +57,7 @@ AI 时代不用自己逐条看文档。把下面这句话**直接发给你的 AI
 
 </div>
 
-AI 会引导你确认操作系统、芯片型号、微信是否已开启 ClawBot，然后自动完成安装、扫码绑定、启动 bridge 的全部步骤——无需你查任何文档。
+AI 会引导你确认操作系统、芯片型号、微信是否已开启 ClawBot，然后自动完成安装、扫码绑定、启动 Hub 服务的全部步骤——无需你查任何文档。
 
 → [查看更多 AI 安装方式（Cursor / 本地安装 / 典型对话示例）](/guide/ai-install)
 
@@ -71,7 +71,7 @@ AI 会引导你确认操作系统、芯片型号、微信是否已开启 ClawBot
 |----------|---------|
 | 不想用终端，想要图形界面 | [下载桌面版](/guide/installation#desktop) |
 | 熟悉终端，想快速部署 | [快速开始](/guide/getting-started) |
-| 想先试试效果，再决定怎么部署 | [5 分钟上手（echo）](/bridge/quick-try) |
+| 想把微信接到本机 CLI（Claude Code 等） | [Bridge → im-agentproc](https://github.com/jeffkit/im-agentproc)（独立项目） |
 | 想把微信接到 Claude Code | [接入 Claude Code](/guide/claude-code) |
 
 </div>

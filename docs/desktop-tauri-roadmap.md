@@ -116,7 +116,7 @@ ilink-hub/
 | `src/runtime/serve.rs` | `ServeOptions`、`run_serve`；内部含 `resolve_token`、`load_clients_from_db`、`build_queue_backend` |
 | `src/main.rs` | `Cli` / `Commands`；`Serve` 分支创建 `watch::channel`、注册 Ctrl+C、`run_serve(...).await` |
 | `src/lib.rs` | `pub mod runtime`；`pub use runtime::serve::{run_serve, ServeOptions}` |
-| `src/bridge/mod.rs` | `ilink-hub-bridge`：以虚拟 token 连接 Hub，对每条文本消息执行配置的本地 CLI（见 `docs/bridge/README.md`） |
+| `src/bridge/mod.rs` | ~~`ilink-hub-bridge`：以虚拟 token 连接 Hub，对每条文本消息执行配置的本地 CLI~~ **已于 0.4.0 拆出到 [im-agentproc](https://github.com/jeffkit/im-agentproc)，本仓库不再包含** |
 
 桌面/Tauri：`ilink_hub = { path = ".." }`，在 `setup` 中 `tokio::spawn` 调用 `run_serve`，并保留 `shutdown_tx` 供菜单「退出」触发停机。
 

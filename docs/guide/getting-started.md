@@ -3,7 +3,7 @@
 本指南带你完成 iLink Hub 的安装、启动和客户端接入。
 
 ::: tip 不想用终端？
-直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。桌面端的「Bridge」页也可以创建 Claude Code Profile、启动 / 停止 Bridge，并沿用 `~/.ilink-hub/ilink-hub-bridge.yaml`。
+直接[下载桌面版](/guide/installation#desktop)，双击安装，无需任何命令行操作。桌面端内嵌 Hub 服务；如需接本机 CLI（Claude Code 等），另装独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)（原 `ilink-hub-bridge`）。
 :::
 
 ::: warning 使用前确认
@@ -234,6 +234,6 @@ iLink Hub 状态：1/1 个客户端在线
 ## 下一步
 
 - [接入 Claude Code](/guide/claude-code) — 完整教程：从安装到对话
-- [5 分钟上手（echo）](/bridge/quick-try) — 先用 echo 命令验证完整链路
+- [Bridge 项目 im-agentproc](https://github.com/jeffkit/im-agentproc) — 本地 CLI bridge（原 `ilink-hub-bridge`）的安装与 profile 配置
 - [Docker 部署](/deployment/docker) — 服务器上 7×24 小时稳定运行
 - [常见问题 FAQ](/guide/faq) — 遇到问题先查这里

@@ -2,10 +2,8 @@
 # deploy-local-brew.sh — 方案 2：本地构建 → 通过 brew 安装到 /opt/homebrew/bin，零 CI。
 #
 # 用途：本机快速调试 patch 级改动。**产物仅在本机**，不上传 GitHub，公共 tap 不变。
-# 与 deploy-local-mac.sh 的区别：不再把二进制裸拷到 ~/.local/bin，而是经 brew 管理
-# （/opt/homebrew/bin），因此 launchd / brew services 指向的 brew 路径会拿到新二进制。
-#
-# 注意：bridge（原 ilink-hub-bridge bin）已拆出到独立仓库 jeffkit/im-agentproc，
+# 经 brew 管理（/opt/homebrew/bin），launchd / brew services 指向的 brew 路径会拿到新二进制。
+# 注：bridge（原 ilink-hub-bridge bin）已拆出到独立仓库 jeffkit/im-agentproc，
 # 本脚本只部署 ilink-hub（Hub 服务本体）。bridge 的本地部署见 im-agentproc 仓库。
 #
 # 流程：

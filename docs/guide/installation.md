@@ -31,7 +31,7 @@
 
 ### 使用桌面版时接 Bridge
 
-桌面版只负责在本机运行 Hub（默认监听 `127.0.0.1:8765`）。如果你还想接 Claude Code / Codex 等命令行工具，需要另外安装 `ilink-hub-bridge`，参考[本地 CLI Bridge 使用指引](/bridge/USAGE)，并设置 `WEIXIN_BASE_URL=http://127.0.0.1:8765`。
+桌面版只负责在本机运行 Hub（默认监听 `127.0.0.1:8765`）。如果你还想接 Claude Code / Codex 等命令行工具，需要另外安装独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)（原 `ilink-hub-bridge`），参考其仓库文档，并设置 `WEIXIN_BASE_URL=http://127.0.0.1:8765`。
 
 ---
 
@@ -42,20 +42,15 @@ brew tap jeffkit/tap
 brew install ilink-hub
 ```
 
-验证安装（会同时安装 `ilink-hub` 和 `ilink-hub-bridge` 两个命令）：
+验证安装：
 
 ```bash
 ilink-hub --version
-ilink-hub-bridge --version
 ```
 
-::: details 安装后找不到 `ilink-hub-bridge`？
-先更新 Homebrew 再升级：
-```bash
-brew update
-brew upgrade ilink-hub
-```
-:::
+> 自 `0.4.0` 起，`jeffkit/tap/ilink-hub` formula 仅安装 Hub 服务本体（`ilink-hub`）。
+> bridge（原 `ilink-hub-bridge`）已拆到独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)，
+> 由其独立的 Homebrew formula 提供。
 
 升级到新版本：
 
@@ -100,7 +95,6 @@ sudo mv ilink-hub /usr/local/bin/
 
 ```bash
 ilink-hub --version
-ilink-hub-bridge --version
 ```
 
 ---
@@ -136,7 +130,7 @@ cargo install ilink-hub --features postgres
 cargo install ilink-hub --features mysql
 ```
 
-安装后两个命令（`ilink-hub` 与 `ilink-hub-bridge`）都在 `~/.cargo/bin/`，确保该目录在 PATH 中。
+安装后 `ilink-hub` 在 `~/.cargo/bin/`，确保该目录在 PATH 中。bridge（原 `ilink-hub-bridge`）已拆到独立项目 [im-agentproc](https://github.com/jeffkit/im-agentproc)，如需本地 CLI bridge 请单独安装它。
 
 ---
 
@@ -155,7 +149,7 @@ cargo build --release --features mysql
 # 或启用所有驱动支持
 cargo build --release --all-features
 
-# 二进制在 target/release/ilink-hub 和 target/release/ilink-hub-bridge
+# 二进制在 target/release/ilink-hub（bridge 已拆到独立项目 im-agentproc）
 ```
 
 ---

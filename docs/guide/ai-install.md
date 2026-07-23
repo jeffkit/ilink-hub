@@ -10,12 +10,15 @@
 
 Skill 是一段结构化的操作手册，AI 读取后可以自主完成多步骤任务——安装软件、生成配置文件、测试、发布——无需你逐条查阅文档。
 
-iLink Hub 提供两个官方 Skill：
+iLink Hub 提供官方 Skill：
 
 | Skill | 用途 | 原始文件 |
 |-------|------|---------|
-| **ilink-hub-setup** | 安装 Hub、绑定微信、启动 bridge manager | [SKILL.md](https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md) |
-| **bridge-profile** | 创建/测试/发布 Profile，用 Python/JS SDK 开发自定义 handler | [SKILL.md](https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md) |
+| **ilink-hub-setup** | 安装 Hub、绑定微信、启动 Hub 服务 | [SKILL.md](https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md) |
+
+> 本地 CLI bridge（原 `ilink-hub-bridge`，现 `im-agentproc`）的安装与 profile 开发已随
+> bridge 拆分到独立项目 [jeffkit/im-agentproc](https://github.com/jeffkit/im-agentproc)，
+> 相关 Skill 请到该仓库查阅。
 
 ---
 
@@ -40,22 +43,12 @@ AI 会获取最新的 Skill 内容，引导你完成全部步骤。
 mkdir -p ~/.claude/skills/ilink-hub-setup
 curl -Lo ~/.claude/skills/ilink-hub-setup/SKILL.md \
   https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
-
-mkdir -p ~/.claude/skills/bridge-profile
-curl -Lo ~/.claude/skills/bridge-profile/SKILL.md \
-  https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 ```
 
 安装后在 Claude Code 中输入：
 
 ```
 /ilink-hub-setup
-```
-
-或者
-
-```
-/bridge-profile
 ```
 
 ---
@@ -77,10 +70,6 @@ curl -Lo ~/.claude/skills/bridge-profile/SKILL.md \
 mkdir -p ~/.cursor/skills-cursor/ilink-hub-setup
 curl -Lo ~/.cursor/skills-cursor/ilink-hub-setup/SKILL.md \
   https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md
-
-mkdir -p ~/.cursor/skills-cursor/bridge-profile
-curl -Lo ~/.cursor/skills-cursor/bridge-profile/SKILL.md \
-  https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 ```
 
 ---
@@ -93,17 +82,9 @@ curl -Lo ~/.cursor/skills-cursor/bridge-profile/SKILL.md \
 >
 > AI：（读取 Skill 后）我来帮你完成安装。首先确认你的环境……
 
-**创建一个接 Claude Code 的 bridge profile：**
-
-> 你：帮我创建一个 bridge profile，接 Claude Code，项目目录是 ~/projects/myapp
->
-> AI：（读取 Skill 后）好的，我来生成配置文件……
-
-**用 Python SDK 开发自定义 handler：**
-
-> 你：我想用 Python 写一个接 OpenAI 的 bridge profile，支持多轮对话
->
-> AI：（读取 Skill 后）我来创建 handler.py 和对应的 YAML……
+> 本地 CLI bridge（接 Claude Code / Cursor / Codex 等）的安装与 profile 开发已随
+> bridge 拆分到独立项目 [jeffkit/im-agentproc](https://github.com/jeffkit/im-agentproc)，
+> 相关 Skill 与示例请到该仓库查阅。
 
 ---
 
@@ -112,6 +93,5 @@ curl -Lo ~/.cursor/skills-cursor/bridge-profile/SKILL.md \
 如果你的 AI 工具支持直接读取 URL，可以把以下链接粘贴给它：
 
 - **安装配置**：`https://jeffkit.github.io/ilink-hub/skills/ilink-hub-setup/SKILL.md`
-- **Profile 开发**：`https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md`
 
 Skill 文件随版本更新，始终与最新文档保持同步。

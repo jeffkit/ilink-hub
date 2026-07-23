@@ -26,10 +26,9 @@ export default defineConfig({
       { text: '让 AI 帮我安装 ✨', link: '/guide/ai-install' },
       { text: '下载桌面版', link: '/guide/installation#desktop' },
       { text: '快速开始', link: '/guide/getting-started' },
-      { text: 'Bridge', link: '/bridge/' },
       { text: '常见问题', link: '/guide/faq' },
       {
-        text: 'v0.1.20',
+        text: 'v0.4.0',
         items: [
           { text: '更新日志', link: 'https://github.com/jeffkit/ilink-hub/releases' },
           { text: '贡献指南', link: 'https://github.com/jeffkit/ilink-hub/blob/main/CONTRIBUTING.md' },
@@ -46,28 +45,14 @@ export default defineConfig({
           { text: '快速开始（命令行）', link: '/guide/getting-started' },
           { text: '所有安装方式', link: '/guide/installation' },
           { text: '什么是 iLink Hub？', link: '/guide/what-is-ilink-hub' },
+          { text: '接入 Claude Code（bridge）', link: '/guide/claude-code' },
         ],
       },
       {
-        text: 'ilink-hub-bridge',
+        text: 'Bridge（已独立）',
         collapsed: false,
         items: [
-          { text: '什么是 bridge？', link: '/bridge/' },
-          { text: '5 分钟上手（echo 验证）', link: '/bridge/quick-try' },
-          { text: '接入 Claude Code ✨', link: '/guide/claude-code' },
-          { text: '使用指引（多 CLI / 多项目）', link: '/bridge/USAGE' },
-          { text: '功能与配置参考', link: '/bridge/README' },
-          { text: '连接远程 Hub（SSH / launchd）', link: '/bridge/remote-hub' },
-          {
-            text: '开发自定义 Profile',
-            collapsed: true,
-            items: [
-              { text: 'Profile 协议规范', link: '/bridge/profile-spec' },
-              { text: 'Node.js 开发教程', link: '/bridge/develop-nodejs' },
-              { text: 'Python 开发教程', link: '/bridge/develop-python' },
-              { text: '完整示例（Claude/Cursor/Codex）', link: '/bridge/sdk-examples' },
-            ],
-          },
+          { text: 'Bridge 已迁出 → im-agentproc', link: '/bridge/' },
         ],
       },
       {

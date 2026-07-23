@@ -1,9 +1,0 @@
-# Claude Code + Hub session 管理（/session、/new 等仍是 Hub 级命令）
-description: Claude Code with Hub sessions
-agentproc:
-  executor: claude-code
-  cwd: /path/to/your/project
-  timeout_secs: 600
-  max_reply_chars: 8000
-  streaming: true
-  send_error_reply: true

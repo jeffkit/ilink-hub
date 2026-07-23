@@ -8,6 +8,8 @@ timestamp: 2026-07-16T14:30:00+08:00
 
 # Recursive Bridge
 
+> **仓库迁移（2026-07-20）**：Bridge 代码已从 `ilink-hub` 的 `src/bridge/` 物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。本文档仍描述 Recursive Bridge 实现（概念不变），代码位置以 im-agentproc 为准。详见 `docs/proposals/bridge-as-multi-im-runtime.md` 附录 A。
+
 内置 `recursive` executor，包装 [`recursive`](https://github.com/jeffkit/recursive) agent CLI，支持 session 持久化与 resume。采用 AgentProc 0.4 NDJSON 协议。
 
 ## 前置条件

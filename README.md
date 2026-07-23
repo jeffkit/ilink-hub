@@ -46,8 +46,9 @@ iLink Hub is a **transparent iLink proxy**:
 - **Friendly fallback** — when all backends are offline, WeChat users get an instant reply
 - **Pre-built binaries** — download from GitHub Releases (Linux/macOS/Windows), no Rust required
 - **Health checks** — auto-marks offline clients after 90s idle
-- **CLI bridge (`ilink-hub-bridge`)** — connect as a Hub backend and run a local CLI per message ([`docs/bridge/README.md`](docs/bridge/README.md))
 - **Docker support** — single-command deployment, multi-arch image (amd64 + arm64)
+
+> **Bridge 已独立**：本地 CLI bridge（原 `ilink-hub-bridge`）已拆分到独立项目 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)（crate `im-agentproc`，bin `im-agentproc`）。如需"微信消息 → 本机 CLI"能力，请前往 im-agentproc 仓库安装。本仓库仅保留 Hub 服务本体。
 
 ### Desktop app (Tauri)
 
@@ -207,29 +208,15 @@ let bot = WeChatBot::new(BotOptions {
 }
 ```
 
-### ilink-hub-bridge (local CLI)
+### 本地 CLI bridge（已独立为 im-agentproc）
 
-Run a **local** command (Claude Code, Cursor Agent, Codex, etc.) for each routed WeChat text message — same iLink virtual-token flow as other backends. **Usage guide (Chinese):** [bridge/USAGE](https://jeffkit.github.io/ilink-hub/bridge/USAGE.html). **Quick echo path:** [5-minute try](https://jeffkit.github.io/ilink-hub/bridge/quick-try.html). Full options: [`docs/bridge/README.md`](docs/bridge/README.md) and [`docs/bridge/examples/`](docs/bridge/examples/).
+"微信消息 → 本机命令（Claude Code / Cursor / Codex 等）" 的 bridge 能力已从本仓库拆分到独立项目 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)：
 
-```yaml
-# Example bridge config (ilink-hub-bridge.yaml) — one file == one profile
-description: echo demo
-agentproc:
-  command: echo
-  args: ["{{MESSAGE}}"] # Placeholder replaced with user message
-```
+- 仓库：<https://github.com/jeffkit/im-agentproc>
+- crate：`im-agentproc`（crates.io），bin：`im-agentproc`
+- 安装与使用指引见 im-agentproc 仓库 README / 文档站
 
-> [!WARNING]
-> **安全警告 / Security Warning**:
-> 绝不要将 `{{MESSAGE}}` 用于 shell `-c` 参数（例如 `args: ["-c", "run {{MESSAGE}}"]`），因为这会带来 shell 命令注入的安全隐患。用户消息默认经 stdin NDJSON turn 传递；`{{MESSAGE}}` 仅用于安全的 argv 占位。
-
-```bash
-cp docs/bridge/examples/echo.example.yaml ./ilink-hub-bridge.yaml
-# Default — no WEIXIN_TOKEN and no cred file yet: POST /hub/register, saves ~/.ilink-hub/bridge-credentials.json (ILINK_ADMIN_TOKEN if Hub requires it). If the file exists but is corrupt/empty, bridge errors instead of overwriting — use --force-register or delete the file.
-WEIXIN_BASE_URL=http://127.0.0.1:8765 ilink-hub-bridge --config ./ilink-hub-bridge.yaml
-# Optional — Hub client QR pairing instead: add --pair
-# Optional — explicit vtoken: WEIXIN_TOKEN=vhub_xxx …
-```
+Hub 侧只需照常 `ilink-hub register` 注册一个后端，bridge 作为又一个虚拟 Token 客户端接入即可。
 
 ---
 

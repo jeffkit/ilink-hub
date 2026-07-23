@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.0] — 2026-07-23
+
+> **本版本是破坏性版本**：bridge 物理拆分到独立仓库 `im-agentproc`，`ilink-hub` 不再包含 bridge 代码与 `ilink-hub-bridge` bin。
+> bridge 现由 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc) 独立发布与维护（crate `im-agentproc` 0.1.0，bin `im-agentproc`，独立 Homebrew formula）。
+> Homebrew `jeffkit/tap/ilink-hub` formula 自本版本起改为 **hub-only**，不再安装 `ilink-hub-bridge`。
 
 ### Breaking Change — Bridge 拆分到独立仓库 `im-agentproc`
 
