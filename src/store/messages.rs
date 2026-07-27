@@ -119,6 +119,12 @@ impl Store {
     /// `create_time_ms` timestamp is available).
     ///
     /// Returns `(vtoken, session_name)` of the closest matching row, or `None`.
+    ///
+    /// `created_at` is stored as TEXT `"YYYY-MM-DD HH:MM:SS"` (UTC) on all three drivers.
+    /// Converting a TEXT timestamp to a Unix integer differs by driver:
+    /// - SQLite:   `CAST(strftime('%s', created_at) AS INTEGER)`
+    /// - Postgres: `EXTRACT(EPOCH FROM CAST(created_at AS TIMESTAMP))::BIGINT`
+    /// - MySQL:    `UNIX_TIMESTAMP(STR_TO_DATE(created_at, '%Y-%m-%d %H:%i:%s'))`
     pub async fn find_assistant_message_by_timestamp(
         &self,
         peer_user_id: &str,
@@ -127,20 +133,35 @@ impl Store {
     ) -> Result<Option<(String, Option<String>)>> {
         let lo = ref_unix_secs - window_secs;
         let hi = ref_unix_secs + window_secs;
-        // SQLite stores created_at as "YYYY-MM-DD HH:MM:SS" (UTC). Cast via unixepoch().
-        let row = sqlx::query(
+
+        // Build driver-specific SQL for converting the stored TEXT timestamp to a
+        // Unix epoch integer.  Using a runtime branch is cleaner than a macro and
+        // avoids adding a new migration just to normalise the column type.
+        let ts_expr = match self.kind {
+            super::DatabaseKind::Sqlite => "CAST(strftime('%s', created_at) AS INTEGER)",
+            super::DatabaseKind::Postgres => {
+                "EXTRACT(EPOCH FROM CAST(created_at AS TIMESTAMP))::BIGINT"
+            }
+            super::DatabaseKind::MySql => {
+                "UNIX_TIMESTAMP(STR_TO_DATE(created_at, '%Y-%m-%d %H:%i:%s'))"
+            }
+        };
+
+        let sql = format!(
             "SELECT vtoken, session_name FROM messages \
              WHERE peer_user_id = $1 AND role = 'assistant' \
-               AND CAST(strftime('%s', created_at) AS INTEGER) BETWEEN $2 AND $3 \
-             ORDER BY ABS(CAST(strftime('%s', created_at) AS INTEGER) - $4) ASC \
-             LIMIT 1",
-        )
-        .bind(peer_user_id)
-        .bind(lo)
-        .bind(hi)
-        .bind(ref_unix_secs)
-        .fetch_optional(&self.rpool)
-        .await?;
+               AND {ts_expr} BETWEEN $2 AND $3 \
+             ORDER BY ABS({ts_expr} - $4) ASC \
+             LIMIT 1"
+        );
+
+        let row = sqlx::query(&sql)
+            .bind(peer_user_id)
+            .bind(lo)
+            .bind(hi)
+            .bind(ref_unix_secs)
+            .fetch_optional(&self.rpool)
+            .await?;
         Ok(row.map(|r| {
             let vtoken: Option<String> = r.get("vtoken");
             let session_name: String = r.get("session_name");

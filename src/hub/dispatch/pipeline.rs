@@ -194,30 +194,15 @@ pub(super) async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessag
                     .and_then(|e| e.session_name.as_deref())
                     .unwrap_or("default")
                     .to_string();
-                let store = state.store.clone();
-                let (vctx3, vtoken3, peer3) = (vctx.clone(), vtoken.clone(), peer_user_id.clone());
-                let sem = state.persist_sem.clone();
-                let metrics = Arc::clone(&state.metrics);
-                tokio::spawn(async move {
-                    let Ok(_permit) = sem.try_acquire() else {
-                        metrics
-                            .messages_persist_dropped
-                            .fetch_add(1, Ordering::Relaxed);
-                        return;
-                    };
-                    if let Err(e) = store
-                        .save_message(
-                            &vctx3,
-                            Some(&vtoken3),
-                            &session_name,
-                            &peer3,
-                            "user",
-                            &content,
-                        )
-                        .await
-                    {
-                        warn!(error = %e, "failed to save user message to history");
-                    }
+                spawn_persist_user_message(PersistParams {
+                    store: state.store.clone(),
+                    sem: state.persist_sem.clone(),
+                    metrics: Arc::clone(&state.metrics),
+                    vctx: vctx.clone(),
+                    vtoken: vtoken.clone(),
+                    session_name,
+                    peer_user_id: peer_user_id.clone(),
+                    content,
                 });
             }
 
@@ -346,4 +331,47 @@ pub(super) async fn handle_broadcast(state: Arc<HubState>, msg: WeixinMessage) {
         )
         .await;
     }
+}
+
+/// Parameters for [`spawn_persist_user_message`].
+struct PersistParams {
+    store: Arc<crate::store::Store>,
+    sem: Arc<tokio::sync::Semaphore>,
+    metrics: Arc<crate::hub::Metrics>,
+    vctx: String,
+    vtoken: String,
+    session_name: String,
+    peer_user_id: String,
+    content: String,
+}
+
+/// Fire-and-forget: spawn a task that persists a user message to the history table.
+///
+/// Uses a semaphore to cap the number of concurrent in-flight persist tasks; when
+/// the semaphore is exhausted the task is dropped and `messages_persist_dropped`
+/// is incremented.  Extracted from `dispatch_message` to eliminate the `vctx3` /
+/// `vtoken3` / `peer3` naming workaround and give the logic a clear home.
+fn spawn_persist_user_message(p: PersistParams) {
+    tokio::spawn(async move {
+        let Ok(_permit) = p.sem.try_acquire() else {
+            p.metrics
+                .messages_persist_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        if let Err(e) = p
+            .store
+            .save_message(
+                &p.vctx,
+                Some(&p.vtoken),
+                &p.session_name,
+                &p.peer_user_id,
+                "user",
+                &p.content,
+            )
+            .await
+        {
+            warn!(error = %e, "failed to save user message to history");
+        }
+    });
 }

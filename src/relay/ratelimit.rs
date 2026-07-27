@@ -56,8 +56,12 @@ impl RateLimiter {
         }
         bucket.count += 1;
 
-        // Evict stale keys to bound memory growth.
-        if inner.buckets.len() > 10_000 {
+        // Evict stale keys to bound memory growth.  Each entry is at most one
+        // IP address string plus a small Bucket struct, so 1 000 active keys is
+        // plenty for legitimate traffic (relay serves a single Hub fleet, not
+        // the open internet).  Triggering at 80 % capacity (800) gives the
+        // retain() pass time to shrink the map before it hits the hard ceiling.
+        if inner.buckets.len() > 1_000 {
             inner
                 .buckets
                 .retain(|_, b| now.duration_since(b.window_start) < self.window);
@@ -109,20 +113,20 @@ mod tests {
         assert!(!limiter.allow("1.2.3.4"));
     }
 
-    /// Cover the eviction branch: inserting > 10_000 distinct keys triggers
+    /// Cover the eviction branch: inserting > 1_000 distinct keys triggers
     /// `buckets.retain(...)` which prunes stale entries.
     ///
     /// Using `window_secs = 0` makes every bucket immediately stale, so the
     /// retain predicate removes all of them. Afterwards the limiter must still
-    /// function correctly, proving both the `> 10_000` threshold comparison and
+    /// function correctly, proving both the `> 1_000` threshold comparison and
     /// the `< self.window` filter comparison are exercised.
     #[test]
     fn evicts_stale_keys_when_over_limit() {
         // window = 0 → every bucket expires immediately after creation.
         let limiter = RateLimiter::new(1, 0);
 
-        // Push past the 10_000-key eviction threshold.
-        for i in 0..=10_000usize {
+        // Push past the 1_000-key eviction threshold.
+        for i in 0..=1_000usize {
             limiter.allow(&i.to_string());
         }
 
@@ -133,23 +137,23 @@ mod tests {
         );
     }
 
-    /// M2: eviction must trigger only when len is strictly > 10_000.
+    /// Eviction must trigger only when len is strictly > 1_000.
     #[test]
-    fn eviction_threshold_is_strict_greater_than_10000() {
+    fn eviction_threshold_is_strict_greater_than_1000() {
         // window=0 → each bucket immediately expires
         let limiter = RateLimiter::new(1_000_000, 0);
 
-        // Insert exactly 10_000 distinct keys
-        for i in 0..10_000usize {
+        // Insert exactly 1_000 distinct keys
+        for i in 0..1_000usize {
             limiter.allow(&i.to_string());
         }
 
-        // Assert: 10_000 buckets exist (eviction threshold is > 10_000, not >=)
+        // Assert: 1_000 buckets exist (eviction threshold is > 1_000, not >=)
         let inner = limiter.inner.lock().unwrap();
         assert_eq!(
             inner.buckets.len(),
-            10_000,
-            "eviction must not trigger at exactly 10,000 buckets (threshold is strictly > 10_000)"
+            1_000,
+            "eviction must not trigger at exactly 1,000 buckets (threshold is strictly > 1_000)"
         );
     }
 

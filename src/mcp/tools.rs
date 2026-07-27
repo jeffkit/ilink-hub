@@ -173,25 +173,48 @@ pub async fn call_agent(
     )
     .await;
 
-    // 8. Wait for the target's reply (or timeout).
-    let reply = match tokio::time::timeout(CALL_AGENT_TIMEOUT, reply_rx).await {
-        Ok(Ok(text)) => text,
-        Ok(Err(_)) => {
-            // Sender dropped — target probably went offline.
+    // 8. Wait for the target's reply, timeout, or Hub shutdown.
+    //    Monitoring shutdown prevents the Tokio task from blocking for up to
+    //    CALL_AGENT_TIMEOUT when the Hub receives SIGTERM — particularly
+    //    important with MAX_A2A_DEPTH=5 where a full call-chain could hold
+    //    5 × 120s = 600s of tasks alive across all layers.
+    let mut shutdown = state.ilink.shutdown.clone();
+    let reply = tokio::select! {
+        biased;
+        // Prefer shutdown so the process exits promptly.
+        _ = async {
+            loop {
+                if *shutdown.borrow() { return; }
+                if shutdown.changed().await.is_err() { return; }
+            }
+        } => {
             state.a2a_waiter.cancel(&call_id);
             return error_content(format!(
-                "Agent '{}' disconnected before replying.",
+                "Hub is shutting down; A2A call to '{}' cancelled.",
                 target_name
             ));
         }
-        Err(_) => {
-            // Timeout.
-            state.a2a_waiter.cancel(&call_id);
-            return error_content(format!(
-                "Agent '{}' did not reply within {} seconds.",
-                target_name,
-                CALL_AGENT_TIMEOUT.as_secs()
-            ));
+        result = tokio::time::timeout(CALL_AGENT_TIMEOUT, reply_rx) => {
+            match result {
+                Ok(Ok(text)) => text,
+                Ok(Err(_)) => {
+                    // Sender dropped — target probably went offline.
+                    state.a2a_waiter.cancel(&call_id);
+                    return error_content(format!(
+                        "Agent '{}' disconnected before replying.",
+                        target_name
+                    ));
+                }
+                Err(_) => {
+                    // Timeout.
+                    state.a2a_waiter.cancel(&call_id);
+                    return error_content(format!(
+                        "Agent '{}' did not reply within {} seconds.",
+                        target_name,
+                        CALL_AGENT_TIMEOUT.as_secs()
+                    ));
+                }
+            }
         }
     };
 
