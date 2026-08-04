@@ -35,8 +35,11 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Build
-        run: cargo build --all-features
+      - name: Build (lib + bins, populate CARGO_BIN_EXE_*)
+        run: cargo build --all-features --bins
+
+      - name: Build all bins (force ilink-hub-bridge artifact)
+        run: cargo build --bins --all-features
 
       - name: Run tests
         run: cargo test --all-features
