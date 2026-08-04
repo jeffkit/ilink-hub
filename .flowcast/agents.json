@@ -1,0 +1,30 @@
+{
+  "//": "ilink-hub agent pool（项目级）。从 .flowx/config.json 的 agents 段迁移。provider 网关名对齐 ~/.flowcast/providers 配置。",
+  "agents": {
+    "claude-minimax": {
+      "executor": "claude",
+      "provider": "anthropic-minimax",
+      "timeout": 1800000,
+      "extraArgs": ["--dangerously-skip-permissions"]
+    },
+    "agy": {
+      "executor": "agy",
+      "timeout": 1800000,
+      "extraArgs": ["--dangerously-skip-permissions"]
+    },
+    "claude-deepseek": {
+      "executor": "claude",
+      "provider": "anthropic-deepseek",
+      "timeout": 1800000,
+      "extraArgs": ["--dangerously-skip-permissions"]
+    },
+    "claude-reviewer": {
+      "_comment": "reviewer profile：Rust 安全与并发专家视角，用于 evaluator 角色。",
+      "executor": "claude",
+      "provider": "anthropic-minimax",
+      "timeout": 600000,
+      "extraArgs": ["--dangerously-skip-permissions"],
+      "extraPromptPrefix": "你是一名 Rust 安全与并发专家，重点审查：内存安全、data race、tokio 异步陷阱、OWASP 安全问题。"
+    }
+  }
+}

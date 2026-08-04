@@ -1,0 +1,39 @@
+{
+  "_comment": "ilink-hub 质量门（flowcast 格式）。从 .flowx/config.json + docs/knowledge/project/quality-gates.md + .github/workflows/ci.yml 对齐而来。每次代码变更必须全部通过。门命令对齐 CI（ci.yml）的 --all-features。",
+  "gates": {
+    "fmt": {
+      "cmd": "cargo fmt --all -- --check",
+      "onFail": "autofix",
+      "autofixCmd": "cargo fmt --all"
+    },
+    "clippy": {
+      "_comment": "零 warning 容忍。对齐 CI：--all-targets --all-features -D warnings",
+      "cmd": "cargo clippy --all-targets --all-features -- -D warnings",
+      "onFail": "resume-fix",
+      "timeout": 300000
+    },
+    "test": {
+      "_comment": "DB 集成测试有状态依赖，必须串行 + 内存 SQLite。对齐 CI 的 --all-features。",
+      "cmd": "DATABASE_URL=sqlite::memory: cargo test --all-features -- --test-threads=1",
+      "onFail": "resume-fix",
+      "timeout": 600000
+    },
+    "build": {
+      "cmd": "cargo build --all-features",
+      "onFail": "rollback",
+      "timeout": 300000
+    },
+    "desktop-frontend": {
+      "_comment": "Tauri 桌面端前端构建。node_modules 可能不在 desktop 目录下，用 ln 兜底（沿用 .flowx/config.json 的做法）。",
+      "cmd": "cd desktop/ilink-hub-desktop && { [ -e node_modules ] || ln -s /Users/kongjie/projects/ilink-hub/desktop/ilink-hub-desktop/node_modules node_modules; } && npm run build",
+      "onFail": "resume-fix",
+      "timeout": 300000
+    },
+    "desktop-tauri": {
+      "_comment": "桌面端 Rust 侧只 check（不 build），速度快。",
+      "cmd": "cargo check --manifest-path desktop/ilink-hub-desktop/src-tauri/Cargo.toml",
+      "onFail": "resume-fix",
+      "timeout": 300000
+    }
+  }
+}
