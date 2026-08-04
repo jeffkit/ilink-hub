@@ -38,6 +38,22 @@ async fn make_state() -> Arc<HubState> {
     )
 }
 
+/// Resolve the `ilink-hub-bridge` binary, or `None` when it isn't available.
+///
+/// The bridge runtime was extracted into the `im-agentproc` repo during the
+/// 0.4.0 release, so this crate no longer builds an `ilink-hub-bridge` bin and
+/// Cargo never populates `CARGO_BIN_EXE_ilink-hub-bridge`. Bridge tests skip
+/// (instead of failing the whole suite) when the binary is absent.
+fn bridge_bin_path() -> Option<String> {
+    if let Ok(p) = std::env::var("CARGO_BIN_EXE_ilink-hub-bridge") {
+        if std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+    let p = "./target/release/ilink-hub-bridge".to_string();
+    std::path::Path::new(&p).is_file().then_some(p)
+}
+
 // ─── S-01: Admin endpoint auth ───────────────────────────────────────────────
 //
 // BREAKING CHANGE: Previously, when ILINK_ADMIN_TOKEN was unset, all admin
@@ -590,8 +606,12 @@ fn test_cli_hub_url_env_fallback() {
 
 #[test]
 fn test_bridge_hub_url_env_fallback() {
-    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub-bridge")
-        .unwrap_or_else(|_| "./target/release/ilink-hub-bridge".to_string());
+    let Some(bin_path) = bridge_bin_path() else {
+        eprintln!(
+            "SKIP: ilink-hub-bridge binary not available (bridge moved to im-agentproc in 0.4.0)"
+        );
+        return;
+    };
 
     // Case 1: WEIXIN_BASE_URL is set
     let output = std::process::Command::new(&bin_path)
@@ -685,8 +705,12 @@ fn test_cli_deprecation_warnings() {
 
 #[test]
 fn test_bridge_deprecation_warnings() {
-    let bin_path = std::env::var("CARGO_BIN_EXE_ilink-hub-bridge")
-        .unwrap_or_else(|_| "./target/release/ilink-hub-bridge".to_string());
+    let Some(bin_path) = bridge_bin_path() else {
+        eprintln!(
+            "SKIP: ilink-hub-bridge binary not available (bridge moved to im-agentproc in 0.4.0)"
+        );
+        return;
+    };
 
     // Case 1: Only ILINK_HUB_ADDR is set, warning should be present.
     let output = std::process::Command::new(&bin_path)
