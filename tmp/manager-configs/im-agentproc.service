@@ -1,0 +1,18 @@
+[Unit]
+Description=im-agentproc bridge manager (supervises one bridge per profile in ~/.ilink-hub-bridge/profiles)
+After=network.target ilink-hub.service
+Wants=ilink-hub.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+EnvironmentFile=/home/ubuntu/.ilink-hub/bridge.env
+EnvironmentFile=/home/ubuntu/.ilink-hub/claude.env
+ExecStart=/usr/local/bin/im-agentproc manager
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

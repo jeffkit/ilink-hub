@@ -16,8 +16,6 @@ docs/knowledge/index.md    ← 入口，先读这里
 | 项目概览 | `docs/knowledge/project/overview.md` | 仓库结构、技术栈 |
 | 质量门 | `docs/knowledge/project/quality-gates.md` | CI 检查项与修复方式 |
 | 代码规范 | `docs/knowledge/project/conventions.md` | Rust 规范、并发约定 |
-| Bridge 概览 | `docs/knowledge/bridges/overview.md` | Bridge 架构与内置实现（概念；代码已迁 im-agentproc） |
-| P0 协议 | `docs/knowledge/bridges/profile-protocol.md` | 环境变量契约、流式格式（概念；代码已迁 im-agentproc） |
 | 微信命令 | `docs/knowledge/api/commands.md` | /list /use @name 等 |
 | 环境变量 | `docs/knowledge/api/configuration.md` | DATABASE_URL 等配置 |
 | force-dev | `docs/knowledge/dev-workflow/force-dev.md` | 启动/续跑 feature 分支 |
