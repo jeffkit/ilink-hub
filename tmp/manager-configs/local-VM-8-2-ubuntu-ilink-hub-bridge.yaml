@@ -1,0 +1,10 @@
+# ~/.ilink-hub-bridge/profiles/local-VM-8-2-ubuntu-ilink-hub-bridge.yaml
+# Manager child: claude-code bridge on tcloud_gz -> local ilink-hub (127.0.0.1:8765)
+# Filename stem == previous single-bridge register_name, so the Hub backend name is unchanged.
+agentproc:
+  executor: claude-code
+  env:
+    ANTHROPIC_BASE_URL: "${ANTHROPIC_BASE_URL}"
+    ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+    CLAUDE_MODEL: "${CLAUDE_MODEL}"
+  # cwd: /home/ubuntu/projects

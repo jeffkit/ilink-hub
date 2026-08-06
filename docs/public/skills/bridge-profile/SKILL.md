@@ -21,7 +21,13 @@ source: https://jeffkit.github.io/ilink-hub/skills/bridge-profile/SKILL.md
 
 ## 你应该做什么
 
-请引导用户前往 **<https://github.com/jeffkit/im-agentproc>** 查阅：
+请引导用户使用 **`agentproc-profile` skill**（已随 im-agentproc 发布）：
+
+```
+https://jeffkit.github.io/im-agentproc/skills/agentproc-profile/SKILL.md
+```
+
+或前往 **<https://github.com/jeffkit/im-agentproc>** 查阅：
 
 - profile YAML 规范（`agentproc:` hub form）
 - 内置 executor（claude-code / cursor / codex / codebuddy / agy / recursive / opencode）
