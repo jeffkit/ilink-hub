@@ -103,10 +103,9 @@ impl UpstreamSink for MockUpstream {
         _req: GetUploadUrlRequest,
     ) -> anyhow::Result<GetUploadUrlResponse> {
         Ok(GetUploadUrlResponse {
-            ret: 0,
-            upload_url: None,
-            media_id: None,
-            errmsg: None,
+            ret: Some(0),
+            upload_full_url: Some("https://cdn.example.test/upload?sig=test".to_string()),
+            ..Default::default()
         })
     }
     fn polls_ok(&self) -> u64 {

@@ -18,11 +18,28 @@ pub struct BaseInfo {
 impl Default for BaseInfo {
     fn default() -> Self {
         Self {
-            channel_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            // 对齐官方 @tencent-weixin/openclaw-weixin SDK 的 channel_version。
+            // 服务端按 channel_version 做能力门控：上报 Hub 自己的 0.x 版本号
+            // 会导致媒体消息（图片/视频/文件）sendmessage 返回 ret=-2
+            // "prepare failed"（文字不受影响）。
+            channel_version: Some(ILINK_CHANNEL_VERSION.to_string()),
             bot_agent: Some(format!("ilink-hub/{}", env!("CARGO_PKG_VERSION"))),
         }
     }
 }
+
+/// 上游协议渠道版本。与官方 SDK（openclaw-weixin v2.4.6）保持一致，
+/// 避免被服务端按老版本门控媒体能力。
+pub const ILINK_CHANNEL_VERSION: &str = "2.4.6";
+
+/// `iLink-App-ClientVersion` 请求头的编码：0x00MMNNPP
+/// （major<<16 | minor<<8 | patch），与官方 SDK 的 buildClientVersion 一致。
+pub const fn pack_client_version(major: u32, minor: u32, patch: u32) -> u32 {
+    ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff)
+}
+
+/// 由 ILINK_CHANNEL_VERSION 编码的客户端版本号（编译期计算）。
+pub const ILINK_APP_CLIENT_VERSION: u32 = pack_client_version(2, 4, 6);
 
 // ─── Login / QR Code ────────────────────────────────────────────────────────
 
@@ -82,9 +99,40 @@ pub struct VoiceItem {
     pub text: Option<String>,
 }
 
+/// CDN 媒体引用（AES-128-ECB 加密上传后的引用参数）。
+/// 对齐 openclaw-weixin SDK 的 `CDNMedia`。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CDNMedia {
+    /// CDN 上传响应头 x-encrypted-param 返回的加密参数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypt_query_param: Option<String>,
+    /// base64(hex(aes_key)) —— 注意是 hex 字符串再 base64
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aes_key: Option<String>,
+    /// 固定 1（AES 加密标记）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encrypt_type: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_url: Option<String>,
+}
+
 /// Image content inside a MessageItem (type=2).
+///
+/// 出站（发图）走 openclaw-weixin 协议：`media: CDNMedia` + `mid_size`（密文大小）。
+/// 旧字段（cdn_url/md5/media_id）保留做入站兼容。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ImageItem {
+    /// 加密上传后的 CDN 引用（发送图片必需）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media: Option<CDNMedia>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_media: Option<CDNMedia>,
+    /// 密文字节数（发送时必须与上传的密文一致）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mid_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_size: Option<u64>,
+    // ── 旧字段（入站兼容保留，出站不再使用）──
     /// CDN URL for the image.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cdn_url: Option<String>,
@@ -741,17 +789,101 @@ pub struct SendTypingRequest {
 
 // ─── Media Upload ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+/// 获取 CDN 上传地址的请求（透明转发到上游腾讯 iLink）。
+///
+/// 字段对齐 openclaw-weixin SDK 的 `GetUploadUrlReq`（该 SDK 经过实战验证）。
+/// 注意：Hub 对该请求体做「反序列化 → 重新序列化 → 转发」，serde 会丢弃
+/// 未声明的字段——所以这里的字段集必须与上游期望完全一致。
+/// （2026-08 之前曾用臆造的 file_type/file_size/file_md5 schema，导致上游
+/// 恒返回 ret=-2，已废弃。）
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GetUploadUrlRequest {
-    pub file_type: String,
-    pub file_size: u64,
-    pub file_md5: Option<String>,
+    /// 随机 filekey（客户端生成，hex）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filekey: Option<String>,
+    /// 媒体类型：1=image 2=video 3=file 4=voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_user_id: Option<String>,
+    /// 原始文件字节数
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rawsize: Option<u64>,
+    /// 原始文件 MD5（hex）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rawfilemd5: Option<String>,
+    /// AES-128-ECB 加密后密文大小
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filesize: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_rawsize: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_rawfilemd5: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_filesize: Option<u64>,
+    /// 图片可传 true 省略缩略图
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_need_thumb: Option<bool>,
+    /// AES key 的 hex 字符串
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aeskey: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// 获取 CDN 上传地址的响应（上游透传）。
+///
+/// 字段对齐 openclaw-weixin SDK 的 `GetUploadUrlResp`：
+/// 优先用 `upload_full_url`（完整预签名 URL）；缺失时用 `upload_param`
+/// 拼 CDN URL。错误时上游返回 ret/errmsg。
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GetUploadUrlResponse {
-    pub ret: i32,
-    pub upload_url: Option<String>,
-    pub media_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub errmsg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb_upload_param: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_full_url: Option<String>,
+}
+
+#[cfg(test)]
+mod wire_roundtrip_tests {
+    use super::*;
+
+    /// 复现 hitl-server 发来的图片消息 JSON，验证 Hub 反序列化→再序列化后
+    /// image_item.media（encrypt_query_param/aes_key/encrypt_type/mid_size）
+    /// 完整保留、不丢字段。
+    #[test]
+    fn image_item_media_roundtrip_preserved() {
+        let incoming = serde_json::json!({
+            "context_token": "vctx_test",
+            "to_user_id": "u@im.wechat",
+            "from_user_id": "",
+            "message_type": 2,
+            "message_state": 2,
+            "client_id": "hil-abc",
+            "item_list": [{
+                "type": 2,
+                "image_item": {
+                    "media": {
+                        "encrypt_query_param": "pTn5z8BzIftZM_ACTFzglK_test_eqp",
+                        "aes_key": "MzJjaGFyc0hleFRlc3RLZXk=",
+                        "encrypt_type": 1
+                    },
+                    "mid_size": 9616
+                }
+            }]
+        });
+        let msg: WeixinMessage = serde_json::from_value(incoming.clone()).unwrap();
+        let out = serde_json::to_value(&msg).unwrap();
+        println!("ROUNDTRIP OUT: {out}");
+        let img = &out["item_list"][0]["image_item"];
+        assert_eq!(img["media"]["encrypt_query_param"], "pTn5z8BzIftZM_ACTFzglK_test_eqp");
+        assert_eq!(img["media"]["aes_key"], "MzJjaGFyc0hleFRlc3RLZXk=");
+        assert_eq!(img["media"]["encrypt_type"], 1);
+        assert_eq!(img["mid_size"], 9616);
+        assert_eq!(out["item_list"][0]["type"], 2);
+    }
 }

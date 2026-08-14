@@ -181,6 +181,13 @@ impl UpstreamClient {
             HeaderValue::from_str(&format!("Bearer {}", token.as_str()))?,
         );
         headers.insert("X-WECHAT-UIN", HeaderValue::from_str(&self.random_uin())?);
+        // 对齐官方 SDK（openclaw-weixin）：每个请求都带 app 标识与客户端版本。
+        // 缺失时媒体消息（图片/文件/视频）sendmessage 返回 ret=-2 "prepare failed"。
+        headers.insert("iLink-App-Id", HeaderValue::from_static("bot"));
+        headers.insert(
+            "iLink-App-ClientVersion",
+            HeaderValue::from_str(&crate::ilink::types::ILINK_APP_CLIENT_VERSION.to_string())?,
+        );
         Ok(headers)
     }
 

@@ -773,10 +773,9 @@ pub async fn getuploadurl(
 ) -> Json<GetUploadUrlResponse> {
     let Some(vtoken) = extract_vtoken(&headers) else {
         return Json(GetUploadUrlResponse {
-            ret: 401,
-            upload_url: None,
-            media_id: None,
+            ret: Some(401),
             errmsg: Some("Missing Authorization".to_string()),
+            ..Default::default()
         });
     };
     {
@@ -784,10 +783,9 @@ pub async fn getuploadurl(
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getuploadurl rejected: unknown virtual token");
             return Json(GetUploadUrlResponse {
-                ret: 401,
-                upload_url: None,
-                media_id: None,
+                ret: Some(401),
                 errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+                ..Default::default()
             });
         }
     }
@@ -795,10 +793,9 @@ pub async fn getuploadurl(
     match state.ilink.upstream.get_upload_url(req).await {
         Ok(resp) => Json(resp),
         Err(e) => Json(GetUploadUrlResponse {
-            ret: 500,
-            upload_url: None,
-            media_id: None,
+            ret: Some(500),
             errmsg: Some(format!("upstream error: {e}")),
+            ..Default::default()
         }),
     }
 }

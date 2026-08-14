@@ -83,10 +83,9 @@ impl crate::ilink::UpstreamSink for MockUpstream {
         _req: crate::ilink::types::GetUploadUrlRequest,
     ) -> anyhow::Result<crate::ilink::types::GetUploadUrlResponse> {
         Ok(crate::ilink::types::GetUploadUrlResponse {
-            ret: 0,
-            upload_url: None,
-            media_id: None,
-            errmsg: None,
+            ret: Some(0),
+            upload_full_url: Some("https://cdn.example.test/upload?sig=test".to_string()),
+            ..Default::default()
         })
     }
     /// Reused as a send_message call counter for observability in tests.
