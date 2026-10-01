@@ -23,9 +23,13 @@ cargo build                         # 全量构建
 
 ```bash
 cargo build --features postgres     # 启用 PostgreSQL 支持
-cargo build --features mysql        # 启用 MySQL 支持
+cargo build --features mysql        # ⚠️ mysql feature 可编译，但运行期不受支持（见下）
 cargo build --all-features          # 启用所有数据库驱动
 ```
+
+> ⚠️ **MySQL 运行期不支持**：`--features mysql` 能通过编译，但运行期 SQL 全部使用
+> `$N` 占位符，sqlx 的 `Any` 驱动不会为 MySQL 重写成 `?`，实际执行会失败。
+> 生产请使用 SQLite（默认）或 PostgreSQL，详见[环境变量与数据库配置](../api/configuration.md)。
 
 ## 桌面端命令
 

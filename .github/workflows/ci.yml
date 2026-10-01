@@ -38,7 +38,7 @@ jobs:
       - name: Build (lib + bins, populate CARGO_BIN_EXE_*)
         run: cargo build --all-features --bins
 
-      - name: Build all bins (force ilink-hub-bridge artifact)
+      - name: Build all bins
         run: cargo build --bins --all-features
 
       - name: Run tests

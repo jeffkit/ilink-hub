@@ -281,10 +281,14 @@ ilink-hub/
 │   │   ├── router.rs     — Message routing + WeChat command parser
 │   │   ├── queue.rs      — Per-client queues + context_token mapping
 │   │   └── health.rs     — Background health checker
-│   ├── server/
-│   │   └── routes.rs     — iLink-compatible HTTP handlers
-│   ├── store/
-│   │   └── mod.rs        — sqlx database layer (SQLite/PostgreSQL)
+│   ├── server/           — iLink-compatible HTTP handlers (Axum routes)
+│   ├── store/            — sqlx database layer (SQLite/PostgreSQL): clients,
+│   │                       sessions, messages, credentials, context, migrations
+│   ├── runtime/          — serve orchestration + AES-256-GCM static encryption
+│   ├── relay/            — Public pairing relay (auth, rate limit, device registry)
+│   ├── mcp/              — MCP adapter (protocol, tools, router)
+│   ├── client/           — AI-backend pairing helpers for connecting to the Hub
+│   ├── bin/              — Standalone binaries (ilink-relay)
 │   └── main.rs           — CLI: serve / login / register / clients
 ├── Dockerfile             — Multi-stage build
 └── .github/workflows/ci.yml

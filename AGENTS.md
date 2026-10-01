@@ -1,7 +1,7 @@
 # AGENTS.md — ilink-hub
 
 ilink-hub 是一个 Rust 实现的 iLink 多端 Hub 服务，支持多 AI 客户端复用、桌面 Tauri 应用。
-技术栈：Rust + SQLite/MySQL + Tokio + Tauri + TypeScript（桌面前端）。
+技术栈：Rust + SQLite（默认）/ PostgreSQL + Tokio + Tauri + TypeScript（桌面前端）。
 
 ## 知识库（OKF Bundle）
 
