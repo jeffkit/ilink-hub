@@ -40,7 +40,7 @@ enum Commands {
         /// Examples:
         ///   sqlite:///path/to/db.sqlite
         ///   postgres://user:pass@localhost/ilink_hub
-        ///   mysql://user:pass@localhost/ilink_hub
+        /// (MySQL is compile-time only — NOT supported at runtime, see docs/knowledge/api/configuration.md)
         #[arg(long, default_value_t = default_database_url(), env = "DATABASE_URL")]
         database_url: String,
     },
