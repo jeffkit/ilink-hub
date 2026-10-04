@@ -774,11 +774,14 @@ async fn a2a_disconnect_releases_the_grant() {
 /// 验收 B2-2（超时出口）：目标在 `CALL_AGENT_TIMEOUT` 内没有回复时，本次调用的一次性
 /// 授权同样必须回收。
 ///
-/// 120s 的 `CALL_AGENT_TIMEOUT` 不能真等：等调用确实进入等待后，用
-/// `tokio::time::pause()` + `advance()` 把时钟推到 deadline 之后。（不用
+/// 120s 的 `CALL_AGENT_TIMEOUT` 不能真等：等调用进入等待后 `tokio::time::pause()`
+/// 冻结时钟，再以固定步长推进，直到这次调用走到它自己的超时出口；推进结束后立刻
+/// `resume()`，让所有真实连接断言跑在墙上时钟上。（不用
 /// `#[tokio::test(start_paused = true)]`：冻结的时钟会让 sqlx 连接池自身的超时被
-/// 自动推进，store 还没建起来就 `PoolTimedOut`。）外层 600s 同样是虚拟时间，只用来
-/// 在释放逻辑卡住时把测试打挂而不是挂死。
+/// 自动推进，store 还没建起来就 `PoolTimedOut`；同一个自动推进在断言期会把健康查询
+/// 打进池的 `acquire_timeout`，即 #40 的 `pool timed out while waiting for an open
+/// connection`。）步进而非一次 `advance`：每次 park 的自动推进被队列里唯一的定时器
+/// 上限住，因此不依赖「120s 死线此刻是否已注册」。
 #[tokio::test]
 async fn a2a_timeout_releases_the_grant() {
     let mut setup = spawn_a2a_call(None).await;
@@ -788,12 +791,24 @@ async fn a2a_timeout_releases_the_grant() {
         wait_for_a2a_call_id(&setup.state, &setup.target_hash, Duration::from_secs(10)).await;
 
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(121)).await;
+    // Step the frozen clock until the call reaches its own timeout exit: the
+    // 120s deadline is created *after* the queue push this test waits on, so a
+    // single `advance` cannot know whether it already exists. Each `sleep` is
+    // the only timer queued, which bounds every auto-advance to one step.
+    let mut result = None;
+    for _ in 0..40 {
+        if let Ok(done) = tokio::time::timeout(Duration::ZERO, &mut setup.call).await {
+            result = Some(done.expect("call_agent task"));
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+    // Every real-connection assertion below runs on the wall clock: on a frozen
+    // clock the pool's own timers (30s acquire_timeout, 600s idle reaper) are
+    // auto-advanced, which is what turns a healthy query into a `PoolTimedOut`.
+    tokio::time::resume();
 
-    let result = tokio::time::timeout(Duration::from_secs(600), &mut setup.call)
-        .await
-        .expect("call_agent must time out")
-        .expect("call_agent task");
+    let result = result.expect("call_agent must reach its timeout exit");
     assert_eq!(
         result["isError"],
         serde_json::json!(true),
