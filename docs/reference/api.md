@@ -81,6 +81,27 @@ iLink Hub 暴露两类 HTTP 端点：**兼容 iLink 协议的客户端端点**�
 
 获取媒体文件 CDN 上传地址。
 
+### 出站限流（sendmessage / sendtyping / getconfig / getuploadurl / MCP call_agent）
+
+所有租户共用同一个真实微信账号与同一条上游连接池，因此上游配额是**全局**的，
+但虚拟 Token 是**按租户**签发的。为避免单个租户（或泄漏的 Token）打满共享配额、
+殃及其他租户，Hub 对这五条出站路径按 vtoken 做**令牌桶**限流：
+
+- 五条路径**共用同一个桶**——不能靠切换路由绕过自己的配额。
+- 认证在限流之前：未注册/无效 Token 的请求不会创建桶。
+- 被限流时返回 **HTTP 429**，响应体为 `{"ret": 429, "errmsg": "rate limit exceeded; retry after Ns"}`；
+  MCP `call_agent` 则以 JSON-RPC error 返回同一句话。
+
+默认值与调优（均为启动时读取的环境变量，改后需重启）：
+
+| 环境变量 | 默认 | 含义 |
+|----------|------|------|
+| `ILINK_BOT_RATE_LIMIT_PER_SEC` | `20` | 每租户持续速率（请求/秒） |
+| `ILINK_BOT_RATE_LIMIT_BURST` | `40` | 每租户突发容量（请求） |
+
+观测：`GET /metrics` 导出每租户的 `ilink_hub_ratelimit_tokens`（剩余配额）、
+`ilink_hub_ratelimit_burst`（桶容量）与 `ilink_hub_ratelimit_rejected_total`（被拒次数）。
+
 ---
 
 ## Hub 管理端点

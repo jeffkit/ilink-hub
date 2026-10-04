@@ -7,16 +7,39 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 use super::auth::{extract_vtoken, AdminGuard, UNKNOWN_VTOKEN_MSG};
 use super::wait::wait_notify_or_shutdown;
-use crate::hub::{HubState, MAX_CONCURRENT_POLLS_PER_VTOKEN};
+use crate::hub::{HubState, RateLimitOutcome, MAX_CONCURRENT_POLLS_PER_VTOKEN};
 use crate::ilink::types::*;
 use crate::redact_token;
 use crate::server::pairing::register_client_in_hub;
 
 type HistoGuard<'a> = crate::hub::LatencyGuard<'a>;
+
+// ─── Per-vtoken outbound rate limiting ────────────────────────────────────────
+
+/// Charge one token from the caller's per-vtoken bucket, shared by every
+/// outbound bot route and by the MCP `call_agent` tool.
+///
+/// Returns `None` when the request may proceed, or `Some(retry_after)` when it
+/// must be rejected with HTTP 429. **Call this only after the registry check**:
+/// anonymous requests must not be able to allocate buckets, otherwise the
+/// limiter's map becomes an unauthenticated memory sink.
+pub(crate) fn check_outbound_rate_limit(state: &HubState, vtoken: &str) -> Option<Duration> {
+    match state.clients.rate_limiter.check(vtoken) {
+        RateLimitOutcome::Allowed { .. } => None,
+        RateLimitOutcome::Denied { retry_after } => Some(retry_after),
+    }
+}
+
+/// Whole seconds to advertise in `retry_after` / the error body, rounded up so
+/// a client that waits exactly this long is guaranteed to find a token.
+pub(crate) fn retry_after_secs(retry_after: Duration) -> u64 {
+    (retry_after.as_millis() as u64).div_ceil(1000).max(1)
+}
 
 // ─── Registration (Hub-specific, non-iLink) ───────────────────────────────────
 
@@ -366,7 +389,7 @@ pub async fn sendmessage(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     Json(mut req): Json<SendMessageRequest>,
-) -> Json<SendMessageResponse> {
+) -> (StatusCode, Json<SendMessageResponse>) {
     state
         .metrics
         .sendmessage_total
@@ -377,10 +400,13 @@ pub async fn sendmessage(
             .metrics
             .sendmessage_errors
             .fetch_add(1, Ordering::Relaxed);
-        return Json(SendMessageResponse::err(
-            401,
-            "Missing Authorization header",
-        ));
+        return (
+            StatusCode::OK,
+            Json(SendMessageResponse::err(
+                401,
+                "Missing Authorization header",
+            )),
+        );
     };
     tracing::Span::current().record("vtoken", redact_token(&vtoken));
 
@@ -392,15 +418,46 @@ pub async fn sendmessage(
                 .metrics
                 .sendmessage_errors
                 .fetch_add(1, Ordering::Relaxed);
-            return Json(SendMessageResponse::err(401, UNKNOWN_VTOKEN_MSG));
+            return (
+                StatusCode::OK,
+                Json(SendMessageResponse::err(401, UNKNOWN_VTOKEN_MSG)),
+            );
         }
+    }
+
+    // Per-vtoken fair-share gate. Checked after auth so only registered
+    // clients allocate a bucket. sendmessage is the most expensive call on the
+    // shared upstream, so it is charged the same single token as the cheap
+    // routes rather than a penalty weight — the goal is fairness between
+    // tenants, not throughput shaping.
+    if let Some(retry_after) = check_outbound_rate_limit(&state, &vtoken) {
+        let secs = retry_after_secs(retry_after);
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            retry_after_secs = secs,
+            "sendmessage rejected: per-vtoken rate limit exceeded"
+        );
+        state
+            .metrics
+            .sendmessage_errors
+            .fetch_add(1, Ordering::Relaxed);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(SendMessageResponse::err(
+                429,
+                format!("rate limit exceeded; retry after {secs}s"),
+            )),
+        );
     }
 
     // Extract context_token from req.msg
     let vctx = match req.msg.as_ref().and_then(|m| m.context_token.as_deref()) {
         Some(ctx) if !ctx.is_empty() => ctx.to_string(),
         _ => {
-            return Json(SendMessageResponse::err(400, "Missing msg.context_token"));
+            return (
+                StatusCode::OK,
+                Json(SendMessageResponse::err(400, "Missing msg.context_token")),
+            );
         }
     };
 
@@ -422,17 +479,23 @@ pub async fn sendmessage(
                 vtoken = %redact_token(&vtoken),
                 "no mapping for virtual context token, or vtoken does not own vctx"
             );
-            return Json(SendMessageResponse::err(
-                403,
-                "Unknown context_token or not authorized for this context",
-            ));
+            return (
+                StatusCode::OK,
+                Json(SendMessageResponse::err(
+                    403,
+                    "Unknown context_token or not authorized for this context",
+                )),
+            );
         }
         Err(e) => {
             warn!(error = %e, vctx = %vctx, "DB lookup for context_token failed");
-            return Json(SendMessageResponse::err(
-                500,
-                "context_token resolution error",
-            ));
+            return (
+                StatusCode::OK,
+                Json(SendMessageResponse::err(
+                    500,
+                    "context_token resolution error",
+                )),
+            );
         }
     };
 
@@ -531,7 +594,7 @@ pub async fn sendmessage(
         // the caller's `call_agent` flow is the one that surfaces this reply
         // to the WeChat user.
         if is_a2a_reply {
-            return Json(SendMessageResponse::ok());
+            return (StatusCode::OK, Json(SendMessageResponse::ok()));
         }
         // Strip ilink_hub_ext before forwarding to upstream iLink.
         msg.ilink_hub_ext = None;
@@ -551,7 +614,7 @@ pub async fn sendmessage(
         // Media messages (image/file/video) have no text but do have content — allow them through.
         let is_text_empty = msg.text().map(|t| t.trim().is_empty()).unwrap_or(true);
         if is_text_empty && !msg.has_media_content() {
-            return Json(SendMessageResponse::default());
+            return (StatusCode::OK, Json(SendMessageResponse::default()));
         }
 
         let (client_meta, registered_count) = {
@@ -647,11 +710,14 @@ pub async fn sendmessage(
         .observe(upstream_start.elapsed());
 
     match result {
-        Ok(resp) => Json(resp),
-        Err(e) => Json(SendMessageResponse::err(
-            500,
-            format!("upstream error: {e}"),
-        )),
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => (
+            StatusCode::OK,
+            Json(SendMessageResponse::err(
+                500,
+                format!("upstream error: {e}"),
+            )),
+        ),
     }
 }
 
@@ -661,24 +727,49 @@ pub async fn sendtyping(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     Json(req): Json<SendTypingRequest>,
-) -> Json<serde_json::Value> {
+) -> (StatusCode, Json<serde_json::Value>) {
     let Some(vtoken) = extract_vtoken(&headers) else {
-        return Json(serde_json::json!({"ret": 401, "errmsg": "Missing Authorization"}));
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"ret": 401, "errmsg": "Missing Authorization"})),
+        );
     };
     {
         let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "sendtyping rejected: unknown virtual token");
-            return Json(serde_json::json!({"ret": 401, "errmsg": UNKNOWN_VTOKEN_MSG}));
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({"ret": 401, "errmsg": UNKNOWN_VTOKEN_MSG})),
+            );
         }
     }
 
+    if let Some(retry_after) = check_outbound_rate_limit(&state, &vtoken) {
+        let secs = retry_after_secs(retry_after);
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            retry_after_secs = secs,
+            "sendtyping rejected: per-vtoken rate limit exceeded"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "ret": 429,
+                "errmsg": format!("rate limit exceeded; retry after {secs}s")
+            })),
+        );
+    }
+
     match state.ilink.upstream.send_typing(req).await {
-        Ok(_) => Json(serde_json::json!({"ret": 0})),
-        Err(e) => Json(serde_json::json!({
-            "ret": 500,
-            "errmsg": format!("upstream error: {e}")
-        })),
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"ret": 0}))),
+        Err(e) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ret": 500,
+                "errmsg": format!("upstream error: {e}")
+            })),
+        ),
     }
 }
 
@@ -688,24 +779,47 @@ pub async fn getconfig(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     Json(mut req): Json<GetConfigRequest>,
-) -> Json<GetConfigResponse> {
+) -> (StatusCode, Json<GetConfigResponse>) {
     let Some(vtoken) = extract_vtoken(&headers) else {
-        return Json(GetConfigResponse {
-            ret: Some(401),
-            typing_ticket: None,
-            errmsg: Some("Missing Authorization".to_string()),
-        });
+        return (
+            StatusCode::OK,
+            Json(GetConfigResponse {
+                ret: Some(401),
+                typing_ticket: None,
+                errmsg: Some("Missing Authorization".to_string()),
+            }),
+        );
     };
     {
         let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getconfig rejected: unknown virtual token");
-            return Json(GetConfigResponse {
-                ret: Some(401),
-                typing_ticket: None,
-                errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
-            });
+            return (
+                StatusCode::OK,
+                Json(GetConfigResponse {
+                    ret: Some(401),
+                    typing_ticket: None,
+                    errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+                }),
+            );
         }
+    }
+
+    if let Some(retry_after) = check_outbound_rate_limit(&state, &vtoken) {
+        let secs = retry_after_secs(retry_after);
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            retry_after_secs = secs,
+            "getconfig rejected: per-vtoken rate limit exceeded"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetConfigResponse {
+                ret: Some(429),
+                typing_ticket: None,
+                errmsg: Some(format!("rate limit exceeded; retry after {secs}s")),
+            }),
+        );
     }
 
     // Translate virtual context token if present — only when this vtoken owns it.
@@ -722,29 +836,40 @@ pub async fn getconfig(
                         vctx = %token,
                         "getconfig rejected: vtoken does not own vctx"
                     );
-                    return Json(GetConfigResponse {
-                        ret: Some(403),
-                        typing_ticket: None,
-                        errmsg: Some("context_token not authorized for this client".to_string()),
-                    });
+                    return (
+                        StatusCode::OK,
+                        Json(GetConfigResponse {
+                            ret: Some(403),
+                            typing_ticket: None,
+                            errmsg: Some(
+                                "context_token not authorized for this client".to_string(),
+                            ),
+                        }),
+                    );
                 }
                 Err(e) => {
                     warn!(error = %e, "getconfig ownership check failed");
-                    return Json(GetConfigResponse {
-                        ret: Some(500),
-                        typing_ticket: None,
-                        errmsg: Some("context ownership check error".to_string()),
-                    });
+                    return (
+                        StatusCode::OK,
+                        Json(GetConfigResponse {
+                            ret: Some(500),
+                            typing_ticket: None,
+                            errmsg: Some("context ownership check error".to_string()),
+                        }),
+                    );
                 }
             },
             Ok(None) => {}
             Err(e) => {
                 warn!(error = %e, "getconfig context resolve failed");
-                return Json(GetConfigResponse {
-                    ret: Some(500),
-                    typing_ticket: None,
-                    errmsg: Some("context_token resolution error".to_string()),
-                });
+                return (
+                    StatusCode::OK,
+                    Json(GetConfigResponse {
+                        ret: Some(500),
+                        typing_ticket: None,
+                        errmsg: Some("context_token resolution error".to_string()),
+                    }),
+                );
             }
         }
     }
@@ -755,12 +880,15 @@ pub async fn getconfig(
     }
 
     match state.ilink.upstream.get_config(req).await {
-        Ok(resp) => Json(resp),
-        Err(e) => Json(GetConfigResponse {
-            ret: Some(500),
-            typing_ticket: None,
-            errmsg: Some(format!("upstream error: {e}")),
-        }),
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => (
+            StatusCode::OK,
+            Json(GetConfigResponse {
+                ret: Some(500),
+                typing_ticket: None,
+                errmsg: Some(format!("upstream error: {e}")),
+            }),
+        ),
     }
 }
 
@@ -770,32 +898,58 @@ pub async fn getuploadurl(
     State(state): State<Arc<HubState>>,
     headers: HeaderMap,
     Json(req): Json<GetUploadUrlRequest>,
-) -> Json<GetUploadUrlResponse> {
+) -> (StatusCode, Json<GetUploadUrlResponse>) {
     let Some(vtoken) = extract_vtoken(&headers) else {
-        return Json(GetUploadUrlResponse {
-            ret: Some(401),
-            errmsg: Some("Missing Authorization".to_string()),
-            ..Default::default()
-        });
+        return (
+            StatusCode::OK,
+            Json(GetUploadUrlResponse {
+                ret: Some(401),
+                errmsg: Some("Missing Authorization".to_string()),
+                ..Default::default()
+            }),
+        );
     };
     {
         let registry = state.clients.registry.read().await;
         if registry.get_by_vtoken(&vtoken).is_none() {
             warn!(vtoken = %redact_token(&vtoken), "getuploadurl rejected: unknown virtual token");
-            return Json(GetUploadUrlResponse {
-                ret: Some(401),
-                errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
-                ..Default::default()
-            });
+            return (
+                StatusCode::OK,
+                Json(GetUploadUrlResponse {
+                    ret: Some(401),
+                    errmsg: Some(UNKNOWN_VTOKEN_MSG.to_string()),
+                    ..Default::default()
+                }),
+            );
         }
     }
 
+    if let Some(retry_after) = check_outbound_rate_limit(&state, &vtoken) {
+        let secs = retry_after_secs(retry_after);
+        warn!(
+            vtoken = %redact_token(&vtoken),
+            retry_after_secs = secs,
+            "getuploadurl rejected: per-vtoken rate limit exceeded"
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(GetUploadUrlResponse {
+                ret: Some(429),
+                errmsg: Some(format!("rate limit exceeded; retry after {secs}s")),
+                ..Default::default()
+            }),
+        );
+    }
+
     match state.ilink.upstream.get_upload_url(req).await {
-        Ok(resp) => Json(resp),
-        Err(e) => Json(GetUploadUrlResponse {
-            ret: Some(500),
-            errmsg: Some(format!("upstream error: {e}")),
-            ..Default::default()
-        }),
+        Ok(resp) => (StatusCode::OK, Json(resp)),
+        Err(e) => (
+            StatusCode::OK,
+            Json(GetUploadUrlResponse {
+                ret: Some(500),
+                errmsg: Some(format!("upstream error: {e}")),
+                ..Default::default()
+            }),
+        ),
     }
 }

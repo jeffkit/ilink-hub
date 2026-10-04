@@ -78,6 +78,17 @@ use routes::*;
 /// Prevents a single burst of outbound messages from exhausting Hub worker threads.
 const SENDMESSAGE_MAX_CONCURRENCY: usize = 64;
 
+/// Maximum simultaneous in-flight requests Hub-wide for each of the auxiliary
+/// upstream routes (`sendtyping` / `getconfig` / `getuploadurl`).
+///
+/// Matches [`SENDMESSAGE_MAX_CONCURRENCY`]: all four routes hit the same
+/// upstream account and the same reqwest connection pool, so there is no
+/// reason for the aux routes to be allowed more concurrency than the send path.
+/// This is a Hub-wide backstop only — it does not stop one tenant from
+/// occupying every slot. The per-tenant guarantee comes from the vtoken token
+/// bucket in `crate::hub::rate_limit`.
+const BOT_AUX_MAX_CONCURRENCY: usize = 64;
+
 /// Middleware that logs every mutating admin API call with caller IP, method and path.
 async fn admin_audit_log(req: Request, next: Next) -> Response {
     let method = req.method().clone();
@@ -126,9 +137,24 @@ pub fn build_router(state: Arc<HubState>) -> Router {
                     .layer(ConcurrencyLimitLayer::new(SENDMESSAGE_MAX_CONCURRENCY)),
             ),
         )
-        .route("/ilink/bot/sendtyping", post(sendtyping))
-        .route("/ilink/bot/getconfig", post(getconfig))
-        .route("/ilink/bot/getuploadurl", post(getuploadurl))
+        // These three routes spend shared upstream quota but previously had no
+        // gate at all — neither a concurrency cap nor a rate cap. The
+        // per-vtoken token bucket (see `routes::bot::check_outbound_rate_limit`)
+        // provides the fair-share guarantee; this Hub-wide concurrency cap is
+        // the backstop that bounds in-flight upstream calls (and therefore
+        // Tokio worker occupancy) when *many* tenants are busy at once.
+        .route(
+            "/ilink/bot/sendtyping",
+            post(sendtyping).layer(ConcurrencyLimitLayer::new(BOT_AUX_MAX_CONCURRENCY)),
+        )
+        .route(
+            "/ilink/bot/getconfig",
+            post(getconfig).layer(ConcurrencyLimitLayer::new(BOT_AUX_MAX_CONCURRENCY)),
+        )
+        .route(
+            "/ilink/bot/getuploadurl",
+            post(getuploadurl).layer(ConcurrencyLimitLayer::new(BOT_AUX_MAX_CONCURRENCY)),
+        )
         .layer(bot_cors);
 
     let admin_api = Router::new()

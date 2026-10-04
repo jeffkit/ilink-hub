@@ -43,6 +43,16 @@ pub struct RuntimeConfig {
     /// Storage retention — disabled by default, dry-run by default. See
     /// [`RetentionConfig`].
     pub retention: RetentionConfig,
+    /// Per-vtoken sustained rate limit for the outbound bot API, in requests
+    /// per second. Defaults to
+    /// [`crate::hub::BOT_RATE_LIMIT_PER_SEC_DEFAULT`] (20). Operators can
+    /// raise this via `ILINK_BOT_RATE_LIMIT_PER_SEC` if a legitimate workload
+    /// is ever throttled.
+    pub bot_rate_limit_per_sec: f64,
+    /// Per-vtoken burst capacity for the outbound bot API, in requests.
+    /// Defaults to [`crate::hub::BOT_RATE_LIMIT_BURST_DEFAULT`] (40). Operators
+    /// can raise this via `ILINK_BOT_RATE_LIMIT_BURST`.
+    pub bot_rate_limit_burst: f64,
 }
 
 impl RuntimeConfig {
@@ -59,6 +69,22 @@ impl RuntimeConfig {
             parse_env_usize("ILINK_MAX_HUB_POLLS", crate::hub::MAX_HUB_POLLS_DEFAULT)?;
         if max_hub_polls == 0 {
             anyhow::bail!("ILINK_MAX_HUB_POLLS must be > 0");
+        }
+
+        let bot_rate_limit_per_sec = parse_env_f64(
+            "ILINK_BOT_RATE_LIMIT_PER_SEC",
+            crate::hub::BOT_RATE_LIMIT_PER_SEC_DEFAULT,
+        )?;
+        if !(bot_rate_limit_per_sec.is_finite() && bot_rate_limit_per_sec > 0.0) {
+            anyhow::bail!("ILINK_BOT_RATE_LIMIT_PER_SEC must be a positive, finite number");
+        }
+
+        let bot_rate_limit_burst = parse_env_f64(
+            "ILINK_BOT_RATE_LIMIT_BURST",
+            crate::hub::BOT_RATE_LIMIT_BURST_DEFAULT,
+        )?;
+        if !(bot_rate_limit_burst.is_finite() && bot_rate_limit_burst >= 1.0) {
+            anyhow::bail!("ILINK_BOT_RATE_LIMIT_BURST must be a finite number >= 1");
         }
 
         let admin = AdminConfig::from_env();
@@ -105,6 +131,8 @@ impl RuntimeConfig {
             admin,
             max_hub_polls,
             retention,
+            bot_rate_limit_per_sec,
+            bot_rate_limit_burst,
         })
     }
 
@@ -158,6 +186,17 @@ fn parse_env_u64(name: &str, default: u64) -> Result<u64> {
             .trim()
             .parse::<u64>()
             .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid non-negative integer")),
+    }
+}
+
+fn parse_env_f64(name: &str, default: f64) -> Result<f64> {
+    match std::env::var(name) {
+        Err(_) => Ok(default),
+        Ok(v) if v.trim().is_empty() => Ok(default),
+        Ok(v) => v
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| anyhow::anyhow!("{name}={v:?} is not a valid number")),
     }
 }
 
@@ -317,6 +356,19 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     info!(
         max_hub_polls = runtime_cfg.max_hub_polls,
         "hub poll cap installed"
+    );
+
+    // Apply operator-tuned per-vtoken outbound rate limits. ClientState::new
+    // installs the compiled-in defaults; this runs before the listener
+    // accepts, so no request can observe a half-applied policy.
+    state.clients.rate_limiter.set_limits(
+        runtime_cfg.bot_rate_limit_per_sec,
+        runtime_cfg.bot_rate_limit_burst,
+    );
+    info!(
+        bot_rate_limit_per_sec = runtime_cfg.bot_rate_limit_per_sec,
+        bot_rate_limit_burst = runtime_cfg.bot_rate_limit_burst,
+        "per-vtoken outbound rate limit installed"
     );
 
     if let Some(tx) = on_hub_state {
@@ -940,6 +992,8 @@ mod tests {
             },
             max_hub_polls: 8192,
             retention: RetentionConfig::default(),
+            bot_rate_limit_per_sec: crate::hub::BOT_RATE_LIMIT_PER_SEC_DEFAULT,
+            bot_rate_limit_burst: crate::hub::BOT_RATE_LIMIT_BURST_DEFAULT,
         };
         assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_ok());
     }
@@ -956,6 +1010,8 @@ mod tests {
             },
             max_hub_polls: 8192,
             retention: RetentionConfig::default(),
+            bot_rate_limit_per_sec: crate::hub::BOT_RATE_LIMIT_PER_SEC_DEFAULT,
+            bot_rate_limit_burst: crate::hub::BOT_RATE_LIMIT_BURST_DEFAULT,
         };
         assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_err());
         assert!(cfg.warn_if_insecure("[::]:8765").is_err());

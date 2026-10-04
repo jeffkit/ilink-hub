@@ -454,6 +454,11 @@ pub struct ClientState {
     /// Tracks concurrent `getupdates` long-polls per vtoken to detect bridges that share one
     /// credential/token (queue split-brain).
     pub poll_tracker: Arc<PollTracker>,
+    /// Per-vtoken token bucket shared by every outbound bot route
+    /// (`sendmessage` / `sendtyping` / `getconfig` / `getuploadurl`) and by the
+    /// MCP `call_agent` tool. Fair-shares the single upstream account across
+    /// tenants; see [`crate::hub::rate_limit`].
+    pub rate_limiter: Arc<VtokenRateLimiter>,
     /// Lock-free last-seen timestamps (Unix seconds) per vtoken.
     /// `getupdates` updates this atomically without acquiring the registry write lock.
     /// `spawn_health_checker` reads it to mark clients offline.
@@ -472,6 +477,10 @@ impl ClientState {
             pairing_notify: Arc::new(tokio::sync::Notify::new()),
             queue,
             poll_tracker,
+            // Defaults to BOT_RATE_LIMIT_{PER_SEC,BURST}_DEFAULT. Operators can
+            // override via ILINK_BOT_RATE_LIMIT_{PER_SEC,BURST}; see
+            // [`crate::runtime::serve::RuntimeConfig`].
+            rate_limiter: Arc::new(VtokenRateLimiter::default()),
             last_seen: Arc::new(DashMap::new()),
         }
     }

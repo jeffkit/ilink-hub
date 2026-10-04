@@ -34,6 +34,21 @@ curl http://localhost:8765/metrics
 | `ilink_hub_upstream_polls_ok_total` | Counter | 上游 `getupdates` 长轮询成功次数 |
 | `ilink_hub_upstream_polls_err_total` | Counter | 上游轮询失败或错误响应次数 |
 
+### 每租户出站限流
+
+所有租户共用同一个真实微信账号与同一条上游连接池，上游配额是全局的。Hub 对出站路径
+（`sendmessage` / `sendtyping` / `getconfig` / `getuploadurl` / MCP `call_agent`）按
+vtoken 做令牌桶限流，被限流时返回 HTTP 429。默认 20 req/s、突发 40，
+可用 `ILINK_BOT_RATE_LIMIT_PER_SEC` / `ILINK_BOT_RATE_LIMIT_BURST` 调整。
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `ilink_hub_ratelimit_tokens` | Gauge（带 `client` 标签） | 该租户令牌桶剩余配额（越接近 0 越接近 429） |
+| `ilink_hub_ratelimit_burst` | Gauge（带 `client` 标签） | 该租户令牌桶的突发容量 |
+| `ilink_hub_ratelimit_rejected_total` | Counter（带 `client` 标签） | 该租户被限流拒绝的出站请求数 |
+
+未产生过出站请求的后端没有令牌桶，因此不会出现在上述指标中——**没有序列表示「没有流量」，不是「没有限流」**。
+
 ## 示例 Prometheus 配置
 
 ```yaml
