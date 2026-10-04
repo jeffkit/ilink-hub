@@ -42,9 +42,14 @@ jobs:
         run: cargo build --bins --all-features
 
       - name: Run tests
+        # #39：仓规要求串行（docs/knowledge/project/conventions.md:28，集成测试
+        # --test-threads=1）——本套件含 sqlite::memory 连接池 + temp_env 窄窗口
+        # 用例，并行下存在跨用例 env/池竞争面；mutation-testing.yml 同款约定。
+        # 改回并行前先读 #39/#40 的事故记录。
         run: cargo test --all-features
         env:
           DATABASE_URL: "sqlite::memory:"
+          RUST_TEST_THREADS: 1
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
