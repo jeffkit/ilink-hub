@@ -19,7 +19,7 @@ use crate::hub::{
 };
 use crate::ilink::{LoginClient, QrLoginUiEvent, SessionRenewal, UpstreamClient};
 use crate::server::build_router;
-use crate::store::Store;
+use crate::store::{RetentionConfig, Store};
 
 /// Runtime tuning knobs read from environment variables at startup.
 ///
@@ -40,6 +40,9 @@ pub struct RuntimeConfig {
     /// [`crate::hub::state::MAX_HUB_POLLS_DEFAULT`] (8192). Operators can
     /// raise this via `ILINK_MAX_HUB_POLLS`.
     pub max_hub_polls: usize,
+    /// Storage retention — disabled by default, dry-run by default. See
+    /// [`RetentionConfig`].
+    pub retention: RetentionConfig,
 }
 
 impl RuntimeConfig {
@@ -73,11 +76,35 @@ impl RuntimeConfig {
             );
         }
 
+        let retention = RetentionConfig::from_env()?;
+        if retention.enabled && (retention.sweep_interval_secs == 0 || retention.batch_size == 0) {
+            anyhow::bail!(
+                "ILINK_RETENTION_SWEEP_SECS and ILINK_RETENTION_BATCH_SIZE must be > 0 \
+                 when ILINK_RETENTION_ENABLED is set"
+            );
+        }
+        if retention.enabled
+            && retention.messages_ttl_secs == 0
+            && retention.active_sessions_ttl_secs == 0
+        {
+            warn!(
+                "ILINK_RETENTION_ENABLED is set but both TTLs are 0 — the retention sweeper \
+                 has nothing to delete"
+            );
+        }
+        if retention.enabled && retention.dry_run {
+            warn!(
+                "retention sweeper is in dry-run mode: expired rows are counted and logged \
+                 but never deleted. Set ILINK_RETENTION_DRY_RUN=0 to actually delete them."
+            );
+        }
+
         Ok(Self {
             dispatch_channel_size,
             shutdown_drain_secs,
             admin,
             max_hub_polls,
+            retention,
         })
     }
 
@@ -304,6 +331,17 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     spawn_dispatcher(state.clone(), rx);
 
     spawn_health_checker(state.clone());
+
+    if runtime_cfg.retention.enabled
+        && (runtime_cfg.retention.messages_ttl_secs > 0
+            || runtime_cfg.retention.active_sessions_ttl_secs > 0)
+    {
+        crate::store::spawn_retention_sweeper(
+            store.clone(),
+            runtime_cfg.retention.clone(),
+            state.ilink.shutdown.clone(),
+        );
+    }
 
     {
         let upstream_clone = upstream.clone();
@@ -901,6 +939,7 @@ mod tests {
                 outbound_origin_label: None,
             },
             max_hub_polls: 8192,
+            retention: RetentionConfig::default(),
         };
         assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_ok());
     }
@@ -916,6 +955,7 @@ mod tests {
                 outbound_origin_label: None,
             },
             max_hub_polls: 8192,
+            retention: RetentionConfig::default(),
         };
         assert!(cfg.warn_if_insecure("0.0.0.0:8765").is_err());
         assert!(cfg.warn_if_insecure("[::]:8765").is_err());

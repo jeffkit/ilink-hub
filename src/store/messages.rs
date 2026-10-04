@@ -127,14 +127,11 @@ impl Store {
     ) -> Result<Option<(String, Option<String>)>> {
         let lo = ref_unix_secs - window_secs;
         let hi = ref_unix_secs + window_secs;
-        // SQLite stores created_at as "YYYY-MM-DD HH:MM:SS" (UTC). Cast via unixepoch().
-        let row = sqlx::query(
-            "SELECT vtoken, session_name FROM messages \
-             WHERE peer_user_id = $1 AND role = 'assistant' \
-               AND CAST(strftime('%s', created_at) AS INTEGER) BETWEEN $2 AND $3 \
-             ORDER BY ABS(CAST(strftime('%s', created_at) AS INTEGER) - $4) ASC \
-             LIMIT 1",
-        )
+        // The timestamp comparison is driver-selected: see
+        // `sql::find_assistant_message_by_timestamp_sql`.
+        let row = sqlx::query(super::sql::find_assistant_message_by_timestamp_sql(
+            self.kind,
+        ))
         .bind(peer_user_id)
         .bind(lo)
         .bind(hi)

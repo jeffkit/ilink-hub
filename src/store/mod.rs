@@ -18,11 +18,17 @@ mod messages;
 
 mod migrations;
 
+mod retention;
+
 mod sessions;
+
+mod sql;
 
 pub use clients::{ClientRow, HUB_DEFAULT_SENTINEL};
 
 pub use messages::{MessageRow, SessionStatusEntry};
+
+pub use retention::{spawn_retention_sweeper, RetentionConfig, RetentionReport};
 
 pub use sessions::BackendSessionRow;
 

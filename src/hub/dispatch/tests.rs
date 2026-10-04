@@ -468,6 +468,69 @@ async fn at_mention_quote_reply_l3_footer_persona_routing() {
     }
 }
 
+/// Issue #30: when two bridges have recorded the same `(vctx, session_name)`
+/// — the case that regressed on PostgreSQL, where the `rowid` ordering the
+/// lookup used does not exist — the footer resolver must resolve the *newest*
+/// row, not the first one and not `None` (which would silently fall back to
+/// the default route).
+#[tokio::test]
+async fn at_mention_quote_reply_l3_footer_picks_newest_vtoken_for_session() {
+    let (state, _vtoken) = make_state_with_client().await;
+
+    let (_, older_vtoken, _) =
+        state
+            .clients
+            .registry
+            .write()
+            .await
+            .register("ilink-older".to_string(), None, None);
+    let (_, newer_vtoken, _) =
+        state
+            .clients
+            .registry
+            .write()
+            .await
+            .register("ilink-newer".to_string(), None, None);
+
+    let vctx = state
+        .store
+        .find_or_create_vctx("user1", None, "ctx-at1-newest")
+        .await
+        .expect("find_or_create_vctx");
+
+    let session = "at-20261004-120000000";
+    state
+        .store
+        .set_backend_session(&vctx, &older_vtoken, session, "cli-older")
+        .await
+        .expect("set_backend_session older");
+    state
+        .store
+        .set_backend_session(&vctx, &newer_vtoken, session, "cli-newer")
+        .await
+        .expect("set_backend_session newer");
+
+    let quoted_text = "body\n\n---\nat-20261004-120000000";
+    let msg = make_quote_msg("user1", 1_000_000, Some(quoted_text));
+    let result = resolve_quote_from_footer(&state, &msg).await;
+
+    match result.expect("footer resolver must resolve, not fall back to the default route") {
+        QuoteOrigin::Client {
+            vtoken: vt,
+            session_name: sn,
+            ..
+        } => {
+            assert_eq!(
+                vt, newer_vtoken,
+                "the newest backend_sessions_v2 row owns the session"
+            );
+            assert_ne!(vt, older_vtoken, "must not pick the first-inserted row");
+            assert_eq!(sn, Some(session.to_string()));
+        }
+        other => panic!("expected QuoteOrigin::Client, got {other:?}"),
+    }
+}
+
 /// AT2: Unknown backend name in footer returns None.
 ///
 /// When the footer is `---\nghost-client · at-20260704-103000` and "ghost-client" is not

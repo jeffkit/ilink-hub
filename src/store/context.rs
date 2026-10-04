@@ -184,20 +184,20 @@ impl Store {
 
     /// Return the `vtoken` of the backend that owns `session_name` inside `vctx`.
     /// Looks up `backend_sessions_v2`; returns `None` when no matching row exists.
+    ///
+    /// The "newest row" ordering is driver-selected — see
+    /// `sql::find_vtoken_for_session_sql` for the per-driver ordering and its
+    /// semantics.
     pub async fn find_vtoken_for_session(
         &self,
         vctx: &str,
         session_name: &str,
     ) -> Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT vtoken FROM backend_sessions_v2 \
-             WHERE vctx = $1 AND session_name = $2 \
-             ORDER BY rowid DESC LIMIT 1",
-        )
-        .bind(vctx)
-        .bind(session_name)
-        .fetch_optional(&self.rpool)
-        .await?;
+        let row = sqlx::query(super::sql::find_vtoken_for_session_sql(self.kind))
+            .bind(vctx)
+            .bind(session_name)
+            .fetch_optional(&self.rpool)
+            .await?;
         Ok(row.map(|r| r.get("vtoken")))
     }
 

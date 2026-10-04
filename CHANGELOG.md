@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] — 2026-10-04
+
+### Fixed
+
+- **PostgreSQL 上引用回复静默回落默认路由**：`Store::find_vtoken_for_session`（persona footer 慢路径）使用 SQLite 专属的 `ORDER BY rowid DESC`，在 PostgreSQL 上直接报 `column "rowid" does not exist`；调用方只记 warning 后返回 `None`，于是引用回复落到默认/当前路由的后端（可能投错后端）。现按 `DatabaseKind` 分支（SQLite `rowid` / PostgreSQL `ctid`），SQL 集中在 `src/store/sql.rs` 并有静态守卫：`grep -rn rowid src/store/context.rs` 无残留。
+- **PostgreSQL 上 L1 时间戳引用回复静默 miss**：`Store::find_assistant_message_by_timestamp` 使用 SQLite 专属的 `strftime('%s', created_at)`，在 PostgreSQL 上报 `function strftime(unknown, text) does not exist`。现改为 `CAST(EXTRACT(EPOCH FROM CAST(created_at AS TIMESTAMPTZ)) AS BIGINT)`（PostgreSQL）/ `UNIX_TIMESTAMP(created_at)`（MySQL 编译期分支），症状与上条同族、一并修复。
+
+### Added
+
+- **opt-in 存储保留策略（默认关闭 + 默认 dry-run）**：新增 `ILINK_RETENTION_*` 开关与后台 sweeper，按 TTL 分批清理 `messages`（`created_at`）与 `active_sessions`（`updated_at`）。默认 `ILINK_RETENTION_ENABLED=false`、`ILINK_RETENTION_DRY_RUN=true`，两个 TTL 默认 `0`（不清理）——即不显式配置时**不会删除任何数据**。清理 SQL 无 SQLite 专属函数（SQLite 用定长 UTC 文本比较，PostgreSQL 用 epoch 秒），并有单测断言 dry-run 只记日志不删除。运维变量说明见 `docs/knowledge/api/configuration.md`。
+  （注：`backend_sessions_v2` 只有「首次注册时间」，按 TTL 清理会误删活跃 session，本版本不提供；MySQL 运行期仍不受支持。）
+
 ## [0.4.0] — 2026-07-23
 
 > **本版本是破坏性版本**：bridge 物理拆分到独立仓库 `im-agentproc`，`ilink-hub` 不再包含 bridge 代码与 `ilink-hub-bridge` bin。
