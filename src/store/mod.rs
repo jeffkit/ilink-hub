@@ -34,6 +34,14 @@ pub use retention::{spawn_retention_sweeper, RetentionConfig, RetentionReport};
 
 pub use sessions::BackendSessionRow;
 
+/// Environment variable holding the lifetime of an `active_sessions` grant,
+/// in seconds.
+pub const ENV_GRANT_TTL_SECS: &str = "ILINK_GRANT_TTL_SECS";
+
+/// Default `active_sessions` grant lifetime (24h) when [`ENV_GRANT_TTL_SECS`]
+/// is unset or unusable.
+pub const DEFAULT_GRANT_TTL_SECS: u64 = 86_400;
+
 /// Backend driver. Parsed from the URL scheme prefix in `Store::connect`
 /// (sqlite: / postgres: / mysql:). The migration runner needs this to
 /// pick the right SQL dialect for `try_claim_migration`, the v5 `id` column
@@ -99,6 +107,10 @@ pub struct Store {
     /// Read pool — multiple connections on SQLite WAL, same as `pool` for PG/MySQL.
     rpool: AnyPool,
     kind: DatabaseKind,
+    /// Lifetime of an `active_sessions` grant, in seconds. Read once from
+    /// [`ENV_GRANT_TTL_SECS`] at connect time; each inbound dispatch rewrites
+    /// the grant with a fresh `now + grant_ttl_secs` expiry.
+    grant_ttl_secs: u64,
     /// Master key for encrypting/decrypting sensitive credentials (like bot tokens).
     master_key: std::sync::OnceLock<std::sync::Arc<ring::aead::LessSafeKey>>,
 }
@@ -214,10 +226,33 @@ impl Store {
             pool,
             rpool,
             kind,
+            grant_ttl_secs: Self::grant_ttl_from_env(),
             master_key: std::sync::OnceLock::new(),
         };
+        tracing::info!(
+            grant_ttl_secs = store.grant_ttl_secs,
+            "active_sessions grant TTL configured"
+        );
         store.run_migrations().await?;
         Ok(store)
+    }
+
+    /// Read [`ENV_GRANT_TTL_SECS`], falling back to [`DEFAULT_GRANT_TTL_SECS`]
+    /// when it is unset, zero, or not a positive integer.
+    fn grant_ttl_from_env() -> u64 {
+        match std::env::var(ENV_GRANT_TTL_SECS) {
+            Err(_) => DEFAULT_GRANT_TTL_SECS,
+            Ok(raw) => match raw.trim().parse::<u64>() {
+                Ok(secs) if secs > 0 => secs,
+                _ => {
+                    tracing::warn!(
+                        value = %raw,
+                        "invalid {ENV_GRANT_TTL_SECS}; using default {DEFAULT_GRANT_TTL_SECS}s"
+                    );
+                    DEFAULT_GRANT_TTL_SECS
+                }
+            },
+        }
     }
 
     pub fn set_master_key(

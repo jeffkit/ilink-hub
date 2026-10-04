@@ -206,7 +206,14 @@ impl Store {
     ///
     /// Combines context lookup with an **ownership check**: the calling
     /// `vtoken` must already have been granted this `vctx` by Hub dispatch
-    /// (row in `active_sessions`, `backend_sessions_v2`, or `messages`).
+    /// (unexpired row in `active_sessions`, or a row in `backend_sessions_v2`).
+    ///
+    /// Message history deliberately does **not** grant ownership: the
+    /// `messages` table is append-only and never pruned, so treating it as an
+    /// authorization source would make grants impossible to revoke
+    /// (`DELETE FROM active_sessions` + `backend_sessions_v2` would still
+    /// leave the sender authorized).
+    ///
     /// Returns `None` when the vctx is unknown **or** the vtoken does not
     /// own it (caller should 400 / 403).
     pub async fn resolve_send_context(
@@ -214,27 +221,27 @@ impl Store {
         vctx: &str,
         vtoken: &str,
     ) -> Result<Option<(String, String, String)>> {
+        let now = Self::now_epoch_secs();
         let row = sqlx::query(
             "SELECT c.real_ctx, \
                     COALESCE(c.peer_user_id, '') AS peer_user_id, \
                     COALESCE( \
                       (SELECT session_name FROM active_sessions \
-                       WHERE vctx = $1 AND vtoken = $2 LIMIT 1), \
+                       WHERE vctx = $1 AND vtoken = $2 AND expires_at > $3 LIMIT 1), \
                       'default' \
                     ) AS session_name \
              FROM context_token_map c \
              WHERE c.vctx = $1 \
                AND ( \
                  EXISTS (SELECT 1 FROM active_sessions a \
-                         WHERE a.vctx = $1 AND a.vtoken = $2) \
+                         WHERE a.vctx = $1 AND a.vtoken = $2 AND a.expires_at > $3) \
                  OR EXISTS (SELECT 1 FROM backend_sessions_v2 b \
                             WHERE b.vctx = $1 AND b.vtoken = $2) \
-                 OR EXISTS (SELECT 1 FROM messages m \
-                            WHERE m.vctx = $1 AND m.vtoken = $2 LIMIT 1) \
                )",
         )
         .bind(vctx)
         .bind(vtoken)
+        .bind(now)
         .fetch_optional(&self.rpool)
         .await?;
         Ok(row.map(|r| {
@@ -247,19 +254,20 @@ impl Store {
     }
 
     /// Return `true` when `vtoken` has been granted access to `vctx`
-    /// (same ownership predicate as [`Self::resolve_send_context`]).
+    /// (same ownership predicate as [`Self::resolve_send_context`] —
+    /// unexpired `active_sessions` or `backend_sessions_v2`, never historical
+    /// messages).
     pub async fn vtoken_owns_vctx(&self, vctx: &str, vtoken: &str) -> Result<bool> {
         let row = sqlx::query(
             "SELECT 1 AS ok WHERE \
                EXISTS (SELECT 1 FROM active_sessions a \
-                       WHERE a.vctx = $1 AND a.vtoken = $2) \
+                       WHERE a.vctx = $1 AND a.vtoken = $2 AND a.expires_at > $3) \
                OR EXISTS (SELECT 1 FROM backend_sessions_v2 b \
-                          WHERE b.vctx = $1 AND b.vtoken = $2) \
-               OR EXISTS (SELECT 1 FROM messages m \
-                          WHERE m.vctx = $1 AND m.vtoken = $2 LIMIT 1)",
+                          WHERE b.vctx = $1 AND b.vtoken = $2)",
         )
         .bind(vctx)
         .bind(vtoken)
+        .bind(Self::now_epoch_secs())
         .fetch_optional(&self.rpool)
         .await?;
         Ok(row.is_some())

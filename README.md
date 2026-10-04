@@ -244,6 +244,7 @@ The Hub exposes the full iLink API surface **plus** Hub-specific management endp
 | `GET` | `/hub/clients` | List all registered clients (includes vtoken hash) |
 | `PATCH` | `/hub/clients/{name}` | Update a client's name and label |
 | `DELETE` | `/hub/clients/{name}` | Delete an offline client |
+| `POST` | `/hub/clients/{name}/revoke` | Revoke a client's grants and rotate its vtoken |
 | `GET` | `/hub/ui` | Web admin panel (browser UI) |
 | `GET` | `/metrics` | Prometheus-format metrics |
 | `GET` | `/health` | Health check |

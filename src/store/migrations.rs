@@ -264,6 +264,7 @@ impl Store {
         self.migrate_to_v12_tx(&mut tx).await?;
         self.migrate_to_v13_tx(&mut tx).await?;
         self.migrate_to_v14_tx(&mut tx).await?;
+        self.migrate_to_v15_tx(&mut tx).await?;
 
         tx.commit().await?;
         Ok(())
@@ -1135,6 +1136,76 @@ impl Store {
         Ok(())
     }
 
+    /// v15: Add `expires_at` to `active_sessions` so a dispatch grant can expire.
+    pub(super) async fn migrate_to_v15_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+    ) -> Result<()> {
+        if !self.try_claim_migration_in_tx(tx, 15).await? {
+            return Ok(());
+        }
+        // Guard: active_sessions table may be absent in partial-schema test environments.
+        let table_exists = match self.kind {
+            DatabaseKind::Sqlite => sqlx::query(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='active_sessions'",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+            DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                "SELECT 1 FROM information_schema.tables \
+                 WHERE table_name = 'active_sessions' LIMIT 1",
+            )
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+        };
+
+        if table_exists {
+            let col_exists = match self.kind {
+                DatabaseKind::Sqlite => sqlx::query(
+                    "SELECT 1 FROM pragma_table_info('active_sessions') WHERE name = 'expires_at'",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+                DatabaseKind::Postgres | DatabaseKind::MySql => sqlx::query(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_name = 'active_sessions' AND column_name = 'expires_at' LIMIT 1",
+                )
+                .fetch_optional(&mut **tx)
+                .await?
+                .is_some(),
+            };
+            if !col_exists {
+                sqlx::query(V15_ADD_EXPIRES_AT)
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("DDL failed: {V15_ADD_EXPIRES_AT}\n  Error: {e}")
+                    })?;
+            }
+            tracing::info!(
+                version = 15,
+                "migration applied: active_sessions.expires_at"
+            );
+        } else {
+            tracing::debug!(
+                "v15 migration: active_sessions table absent (partial schema), skipping expires_at column"
+            );
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(super) async fn migrate_to_v15(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        let mut tx = conn.begin().await?;
+        self.migrate_to_v15_tx(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
     /// v5 `CREATE TABLE messages` DDL, with the `id` clause selected by driver.
@@ -1284,3 +1355,5 @@ const V12_ADD_DESCRIPTION: &str = include_str!("../../migrations/0012_client_des
 const V13_ADD_ILINK_MSG_ID: &str = include_str!("../../migrations/0013_messages_ilink_msg_id.sql");
 
 const V14_ADD_SESSION_USAGE: &str = include_str!("../../migrations/0014_backend_session_usage.sql");
+
+const V15_ADD_EXPIRES_AT: &str = include_str!("../../migrations/0015_active_session_expiry.sql");

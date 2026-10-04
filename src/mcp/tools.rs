@@ -14,10 +14,21 @@ const CALL_AGENT_TIMEOUT: Duration = Duration::from_secs(120);
 
 // ─── list_agents ─────────────────────────────────────────────────────────────
 
-pub async fn list_agents(state: &Arc<HubState>) -> Value {
-    let registry = state.clients.registry.read().await;
+/// List the agents the caller is authorized to call over A2A.
+///
+/// The caller is identified by its hashed vtoken; an unknown caller gets an
+/// empty list (fail-closed). Visibility comes from `ILINK_AGENT_ALLOWLIST`:
+/// a `*` edge for the caller exposes every registered agent, otherwise only the
+/// explicitly granted targets are listed (including their `description` /
+/// `persona` metadata).
+pub async fn list_agents(state: &Arc<HubState>, caller_vtoken: &str) -> Value {
     let agents: Vec<Value> = {
-        let mut clients: Vec<_> = registry.all_clients().into_iter().collect();
+        let registry = state.clients.registry.read().await;
+        let Some(caller) = registry.get_by_vtoken(caller_vtoken) else {
+            return agents_content(&[]);
+        };
+        let allowed = state.a2a_acl.visible_targets_for_agent(&caller.name);
+        let mut clients: Vec<_> = registry.all_clients_in(allowed.as_ref());
         clients.sort_by(|a, b| a.name.cmp(&b.name));
         clients
             .iter()
@@ -38,10 +49,14 @@ pub async fn list_agents(state: &Arc<HubState>) -> Value {
             })
             .collect()
     };
+    agents_content(&agents)
+}
+
+fn agents_content(agents: &[Value]) -> Value {
     serde_json::json!({
         "content": [{
             "type": "text",
-            "text": serde_json::to_string_pretty(&agents).unwrap_or_default()
+            "text": serde_json::to_string_pretty(agents).unwrap_or_default()
         }]
     })
 }
@@ -97,7 +112,7 @@ pub async fn call_agent(
         }
     };
 
-    // 2. Caller name (for the notification message).
+    // 2. Caller name (for the notification message and the ACL check).
     let (caller_name, caller_persona_name, caller_persona_emoji) = {
         let registry = state.clients.registry.read().await;
         registry
@@ -112,34 +127,65 @@ pub async fn call_agent(
             .unwrap_or_else(|| ("unknown".to_string(), None, None))
     };
 
-    // 3. Determine session name for the target.
-    let session_name = params
-        .session
-        .clone()
-        .unwrap_or_else(|| format!("a2a-{}", chrono::Local::now().format("%Y%m%d-%H%M%S%3f")));
+    // 3. A2A allowlist gate (fail-closed: no edge → no call). Rejected before any
+    //    side effect: no waiter, no authorization row, no queue push.
+    if !state.a2a_acl.allows_a2a(&caller_name, &target_name) {
+        return error_content(format!(
+            "403: agent '{target_name}' is not authorized for A2A calls from '{caller_name}'"
+        ));
+    }
 
     // 4. Register a waiter before pushing the message, so we never miss a fast reply.
+    //    The call id doubles as the scope key of this call's authorization row.
     let (call_id, reply_rx) = state.a2a_waiter.register();
+    let grant_key = format!("a2a-{call_id}");
+    let reply_session = params.session.clone().unwrap_or_else(|| grant_key.clone());
 
-    // 5. Persist the target's active session with the incremented depth BEFORE pushing
-    //    the message — this ensures `get_active_ctx_for_vtoken` on the target returns
-    //    the correct depth when the target itself calls `call_agent`.
+    // 5. Snapshot the target's pre-call state so the one-shot grant can be rolled
+    //    back exactly (`release_a2a_grant`).
+    let prev_active = match state
+        .store
+        .get_active_session_row(&ctx.vctx, &target_vtoken)
+        .await
+    {
+        Ok(row) => row,
+        Err(e) => {
+            warn!(error = %e, target = %target_name, "failed to snapshot target active session");
+            None
+        }
+    };
+    let pre_sessions: Option<Vec<String>> = match state
+        .store
+        .list_backend_sessions(&ctx.vctx, &target_vtoken)
+        .await
+    {
+        Ok(rows) => Some(rows.into_iter().map(|r| r.session_name).collect()),
+        Err(e) => {
+            // Without a trustworthy snapshot we must not delete anything on release.
+            warn!(error = %e, target = %target_name, "failed to snapshot target backend sessions");
+            None
+        }
+    };
+
+    // 6. Persist the target's call-scoped active session with the incremented depth
+    //    BEFORE pushing the message — this ensures `get_active_ctx_for_vtoken` on the
+    //    target returns the correct depth when the target itself calls `call_agent`.
     let target_depth = ctx.a2a_depth.saturating_add(1);
     if let Err(e) = state
         .store
-        .set_active_session_with_depth(&ctx.vctx, &target_vtoken, &session_name, target_depth)
+        .set_active_session_with_depth(&ctx.vctx, &target_vtoken, &grant_key, target_depth)
         .await
     {
         warn!(error = %e, target = %target_name, "failed to persist a2a_depth for target");
     }
 
-    // 6. Push the message into the target Agent's queue.
+    // 7. Push the message into the target Agent's queue.
     //    We construct a synthetic WeixinMessage so the target sees a normal user message.
     let hub_ext = build_hub_ext_for_a2a(
         state,
         &ctx.vctx,
         &target_vtoken,
-        &session_name,
+        &reply_session,
         &call_id,
         target_depth,
     )
@@ -155,7 +201,7 @@ pub async fn call_agent(
     )
     .await;
 
-    // 7. Push the "caller @target: message" notification to WeChat.
+    // 8. Push the "caller @target: message" notification to WeChat.
     let target_handle = persona_handle(
         &target_name,
         target_persona_name.as_deref(),
@@ -173,12 +219,21 @@ pub async fn call_agent(
     )
     .await;
 
-    // 8. Wait for the target's reply (or timeout).
+    // 9. Wait for the target's reply (or timeout).
     let reply = match tokio::time::timeout(CALL_AGENT_TIMEOUT, reply_rx).await {
         Ok(Ok(text)) => text,
         Ok(Err(_)) => {
             // Sender dropped — target probably went offline.
             state.a2a_waiter.cancel(&call_id);
+            release_a2a_grant(
+                state,
+                &ctx.vctx,
+                &target_vtoken,
+                &grant_key,
+                &prev_active,
+                &pre_sessions,
+            )
+            .await;
             return error_content(format!(
                 "Agent '{}' disconnected before replying.",
                 target_name
@@ -187,6 +242,15 @@ pub async fn call_agent(
         Err(_) => {
             // Timeout.
             state.a2a_waiter.cancel(&call_id);
+            release_a2a_grant(
+                state,
+                &ctx.vctx,
+                &target_vtoken,
+                &grant_key,
+                &prev_active,
+                &pre_sessions,
+            )
+            .await;
             return error_content(format!(
                 "Agent '{}' did not reply within {} seconds.",
                 target_name,
@@ -195,9 +259,22 @@ pub async fn call_agent(
         }
     };
 
+    // 10. The target's reply (and any `backend_sessions_v2` row it carried) has
+    //     landed: the one-shot authorization is no longer needed. The target's
+    //     reply was already accepted by `sendmessage` before this point.
+    release_a2a_grant(
+        state,
+        &ctx.vctx,
+        &target_vtoken,
+        &grant_key,
+        &prev_active,
+        &pre_sessions,
+    )
+    .await;
+
     debug!(
         target = %target_name,
-        session = %session_name,
+        session = %reply_session,
         "a2a call_agent received reply"
     );
 
@@ -222,15 +299,97 @@ pub async fn call_agent(
     )
     .await;
 
-    // 10. Return the reply as MCP tool content, including the session name so
+    // 11. Return the reply as MCP tool content, including the session name so
     //    the caller can resume the conversation later.
     serde_json::json!({
         "content": [{
             "type": "text",
             "text": reply
         }],
-        "session": session_name
+        "session": reply_session
     })
+}
+
+/// Undo everything `call_agent` granted the target for a single call.
+///
+/// Three steps, all best-effort (authorization cleanup must never turn a
+/// delivered reply into an error):
+///
+/// 1. Drop this call's own row — keyed by `a2a-<call_id>`, so a legitimate
+///    grant written by the normal dispatch path for the same pair survives.
+/// 2. If the pair now has no row at all, restore the grant that existed before
+///    the call (broadcast / `/use` could have legitimately granted it).
+/// 3. Reclaim `backend_sessions_v2` by *difference*: every row for this pair
+///    that is not in the pre-call snapshot was created during the call (the
+///    target's reply echoing a `cli_session_id` under a session name of its
+///    choosing), so all of them are dropped — not just the reply session.
+///    `backend_sessions_v2` has no TTL, so any survivor would be a permanent
+///    authorization via the `backend_sessions_v2` ownership branch.
+///
+/// `pre_sessions == None` means the pre-call snapshot could not be read: step 3
+/// then deletes nothing (fail-safe — never delete a row we cannot prove was
+/// created by this call).
+async fn release_a2a_grant(
+    state: &Arc<HubState>,
+    vctx: &str,
+    target_vtoken: &str,
+    grant_key: &str,
+    prev_active: &Option<(String, u8)>,
+    pre_sessions: &Option<Vec<String>>,
+) {
+    if let Err(e) = state
+        .store
+        .delete_active_session_if_name(vctx, target_vtoken, grant_key)
+        .await
+    {
+        warn!(error = %e, "failed to release a2a grant row");
+    }
+
+    match state
+        .store
+        .get_active_session_row(vctx, target_vtoken)
+        .await
+    {
+        Ok(None) => {
+            if let Some((name, depth)) = prev_active {
+                if let Err(e) = state
+                    .store
+                    .set_active_session_with_depth(vctx, target_vtoken, name, *depth)
+                    .await
+                {
+                    warn!(error = %e, "failed to restore pre-a2a active session");
+                }
+            }
+        }
+        // A newer row (concurrent dispatch) owns the pair now — leave it alone.
+        Ok(Some(_)) => {}
+        Err(e) => warn!(error = %e, "failed to inspect active session after a2a release"),
+    }
+
+    match pre_sessions {
+        None => warn!("skipping a2a backend session reclaim: no trustworthy pre-call snapshot"),
+        Some(pre_sessions) => match state.store.list_backend_sessions(vctx, target_vtoken).await {
+            Ok(rows) => {
+                for row in rows {
+                    if pre_sessions.iter().any(|name| name == &row.session_name) {
+                        continue;
+                    }
+                    if let Err(e) = state
+                        .store
+                        .delete_backend_session(vctx, target_vtoken, &row.session_name)
+                        .await
+                    {
+                        warn!(
+                            error = %e,
+                            session = %row.session_name,
+                            "failed to drop a2a backend session"
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "failed to list backend sessions after a2a release"),
+        },
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -450,7 +609,10 @@ mod tests {
 
     // ─── list_agents integration test ────────────────────────────────────────
 
-    async fn make_state() -> Arc<HubState> {
+    /// Build a state whose `ILINK_AGENT_ALLOWLIST` is `acl_spec`. The env var is
+    /// process-wide, so these tests rely on the DB test convention of running
+    /// with `--test-threads=1`.
+    async fn make_state_with_acl(acl_spec: &str) -> Arc<HubState> {
         let upstream =
             Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("upstream"));
         let store = Arc::new(
@@ -460,20 +622,37 @@ mod tests {
         );
         let queue = Arc::new(InMemoryQueue::new());
         let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        HubState::new(
-            upstream,
-            store,
-            queue,
-            shutdown_rx,
-            "test-relay-secret".to_string(),
-            AdminConfig::from_env(),
-        )
+        temp_env::with_var(crate::hub::ENV_AGENT_ALLOWLIST, Some(acl_spec), || {
+            HubState::new(
+                upstream,
+                store,
+                queue,
+                shutdown_rx,
+                "test-relay-secret".to_string(),
+                AdminConfig::from_env(),
+            )
+        })
+    }
+
+    async fn register(state: &Arc<HubState>, name: &str) -> String {
+        crate::server::pairing::register_client_in_hub(state, name.to_string(), None, None)
+            .await
+            .hashed
+    }
+
+    fn listed_names(result: &Value) -> Vec<String> {
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        serde_json::from_str::<Vec<serde_json::Value>>(text)
+            .expect("agents JSON")
+            .iter()
+            .filter_map(|a| a["name"].as_str().map(str::to_string))
+            .collect()
     }
 
     #[tokio::test]
     async fn list_agents_returns_empty_array_when_no_clients() {
-        let state = make_state().await;
-        let result = list_agents(&state).await;
+        let state = make_state_with_acl("*->*").await;
+        let result = list_agents(&state, "unregistered-vtoken").await;
 
         let content = result
             .get("content")
@@ -490,18 +669,11 @@ mod tests {
 
     #[tokio::test]
     async fn list_agents_includes_registered_client_fields() {
-        let state = make_state().await;
+        let state = make_state_with_acl("caller->test-agent").await;
+        let caller = register(&state, "caller").await;
+        register(&state, "test-agent").await;
 
-        // Register a client.
-        crate::server::pairing::register_client_in_hub(
-            &state,
-            "test-agent".to_string(),
-            None,
-            None,
-        )
-        .await;
-
-        let result = list_agents(&state).await;
+        let result = list_agents(&state, &caller).await;
         let content = result
             .get("content")
             .and_then(|c| c.as_array())
@@ -530,56 +702,62 @@ mod tests {
 
     #[tokio::test]
     async fn list_agents_returns_clients_sorted_by_name() {
-        let state = make_state().await;
+        let state = make_state_with_acl("caller->zebra,caller->alpha,caller->mango").await;
+        let caller = register(&state, "caller").await;
 
         for name in &["zebra", "alpha", "mango"] {
-            crate::server::pairing::register_client_in_hub(&state, name.to_string(), None, None)
-                .await;
+            register(&state, name).await;
         }
 
-        let result = list_agents(&state).await;
-        let text = result["content"][0]["text"].as_str().unwrap_or("");
-        let agents: Vec<serde_json::Value> = serde_json::from_str(text).expect("JSON");
-        let names: Vec<&str> = agents.iter().filter_map(|a| a["name"].as_str()).collect();
+        let result = list_agents(&state, &caller).await;
         assert_eq!(
-            names,
+            listed_names(&result),
             vec!["alpha", "mango", "zebra"],
             "must be sorted alphabetically"
         );
     }
 
     #[tokio::test]
-    async fn list_agents_includes_description_when_set() {
-        use crate::store::Store;
-        let upstream =
-            Arc::new(UpstreamClient::new("sk-test".to_string(), None).expect("upstream"));
-        let store = Arc::new(
-            Store::connect("sqlite::memory:")
-                .await
-                .expect("in-memory store"),
-        );
-        let queue = Arc::new(InMemoryQueue::new());
-        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let state = HubState::new(
-            upstream,
-            store,
-            queue,
-            shutdown_rx,
-            "test-relay-secret".to_string(),
-            AdminConfig::from_env(),
-        );
+    async fn list_agents_hides_unauthorized_targets() {
+        let state = make_state_with_acl("caller->alpha").await;
+        let caller = register(&state, "caller").await;
+        register(&state, "alpha").await;
+        register(&state, "bravo").await;
 
-        // Register client with a description.
-        let out = crate::server::pairing::register_client_in_hub(
+        let result = list_agents(&state, &caller).await;
+        assert_eq!(
+            listed_names(&result),
+            vec!["alpha"],
+            "only allowlisted targets may be listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_lists_nothing_without_an_allowlist() {
+        let state = make_state_with_acl("").await;
+        let caller = register(&state, "caller").await;
+        register(&state, "target").await;
+
+        let result = list_agents(&state, &caller).await;
+        assert!(
+            listed_names(&result).is_empty(),
+            "A2A listing must be default-deny"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_agents_includes_description_when_set() {
+        let state = make_state_with_acl("caller->described-agent").await;
+        let caller = register(&state, "caller").await;
+        crate::server::pairing::register_client_in_hub(
             &state,
             "described-agent".to_string(),
             None,
             Some("This agent does cool things".to_string()),
         )
         .await;
-        let _ = out;
 
-        let result = list_agents(&state).await;
+        let result = list_agents(&state, &caller).await;
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         let agents: Vec<serde_json::Value> = serde_json::from_str(text).expect("JSON");
         let agent = &agents[0];

@@ -41,6 +41,8 @@ iLink Hub 遵循 [12-Factor](https://12factor.net/config) 原则，所有配置�
 | `ILINK_SHUTDOWN_DRAIN_SECS` | `30` | 优雅关闭时等待「所有已投递批次被客户端确认」的最长秒数；超时后未确认的消息随进程退出丢失 |
 | `ILINK_ADMIN_INSECURE_NO_AUTH` | 未设置 | 设为 `1` 关闭管理端点鉴权，**仅限本地调试**；与公网绑定（`0.0.0.0`/`::`）组合时**拒绝启动** |
 | `ILINK_CORS_ORIGINS` | 未设置（permissive `*`） | Bot API CORS 白名单，逗号分隔且须带 `http://`/`https://` 前缀。生产有浏览器客户端时建议显式设置 |
+| `ILINK_AGENT_ALLOWLIST` | 未设置 | Agent 授权白名单，逗号分隔。语法：`caller->target`（A2A 边，任一侧可用 `*` 通配）、`user:<uid>->backend`（该微信用户可见/可用）、裸 `backend`（所有微信用户可见）。**A2A 默认拒绝**：未配置时 `call_agent` 一律 403、`list_agents` 返回空列表；需要 A2A 的部署必须显式配置（`*->*` 表示全放）。微信侧未配置任何 `user:`/裸条目时保持不限制（单租户默认），多租户部署必须显式配置。非法条目记 `warn!` 并跳过（fail-closed）。**需重启生效** |
+| `ILINK_GRANT_TTL_SECS` | `86400` | `active_sessions` 授权行的寿命（秒）。每次入站派发都会以 `now + TTL` 重写该行的 `expires_at`，过期后该行不再构成发送授权（读时判定，不删行）。≤0 或非法值 ⇒ 记 `warn!` 并回退默认；未设置用默认，不告警。只约束 `active_sessions`：`backend_sessions_v2`（`@name`/命名会话）不受 TTL 约束，仅由 revoke / `/session delete` 清理。**需重启生效** |
 | `ILINK_RETENTION_ENABLED` | `false` | 开启存储保留 sweeper；关闭时完全不删除数据 |
 | `ILINK_RETENTION_DRY_RUN` | `true` | 只统计并记日志，不执行 `DELETE`；确认候选数后再显式设 `0`/`false` |
 | `ILINK_RETENTION_SWEEP_SECS` | `3600` | sweeper 周期（秒），开启时必须 > 0 |

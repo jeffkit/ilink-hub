@@ -47,7 +47,7 @@ use ilink_hub::ilink::types::{
 use ilink_hub::ilink::UpstreamSink;
 use ilink_hub::store::Store;
 use ilink_hub::{
-    hub::{AdminConfig, HubState},
+    hub::{AdminConfig, HubState, ENV_AGENT_ALLOWLIST},
     server, InMemoryQueue,
 };
 use serde_json::json;
@@ -245,6 +245,78 @@ async fn boot_without_default() -> Harness {
         _dispatch_tx: tx,
         _shutdown_tx: shutdown_tx,
     }
+}
+
+/// Boot a Hub whose `ILINK_AGENT_ALLOWLIST` is `spec` (same as [`boot`] otherwise).
+///
+/// `HubState::new` reads the env var once and it is process-wide, so the value is
+/// installed with `temp_env::with_var` around the (synchronous) construction:
+/// the window is as narrow as it can get, but this target still has to run with
+/// `--test-threads=1` (the repo convention for DB tests) so no other test can
+/// observe the spec.
+async fn boot_with_acl(spec: &str) -> Harness {
+    install_test_env();
+    let store = Arc::new(
+        Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store"),
+    );
+    let mock = Arc::new(MockUpstream::default());
+    let queue: Arc<dyn ilink_hub::hub::MessageQueue> = Arc::new(InMemoryQueue::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let state = temp_env::with_var(ENV_AGENT_ALLOWLIST, Some(spec), || {
+        HubState::new(
+            mock.clone() as Arc<dyn UpstreamSink>,
+            store,
+            queue,
+            shutdown_rx,
+            "test-relay-secret".to_string(),
+            AdminConfig::from_env(),
+        )
+    });
+
+    let router = server::build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random port");
+    let addr = listener.local_addr().expect("read bound addr");
+    let base_url = format!("http://{addr}");
+
+    let dispatch_channel_size: usize = 64;
+    let (tx, rx) = mpsc::channel::<WeixinMessage>(dispatch_channel_size);
+    ilink_hub::hub::spawn_dispatcher(state.clone(), rx);
+
+    let state_for_server = state.clone();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .expect("axum serve");
+        drop(state_for_server);
+    });
+
+    Harness {
+        base_url,
+        state,
+        mock,
+        cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
+        _dispatch_tx: tx,
+        _shutdown_tx: shutdown_tx,
+    }
+}
+
+/// Text of the single upstream reply recorded since the last `clear`.
+async fn last_reply_text(h: &Harness) -> String {
+    let sent = h.mock.sent_messages().await;
+    assert_eq!(sent.len(), 1, "expected exactly one upstream reply");
+    sent[0]
+        .msg
+        .as_ref()
+        .and_then(|m| m.text())
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn text_item(s: &str) -> MessageItem {
@@ -1017,6 +1089,115 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
         Some("feature-x"),
         "inbound message should advertise the active session name"
     );
+}
+
+/// 验收 C-1：微信侧 `/list` 与 `/use` 必须按 `ILINK_AGENT_ALLOWLIST` 的
+/// 「用户↔后端」白名单收敛 —— 未列入的后端既不可见（`/list` 不列出）也不可切换
+/// （`/use <name>` 拒绝），且序号别名按**可见集合**重排（`/use 1` 不能命中隐藏后端）。
+#[tokio::test]
+async fn hub_command_visibility_respects_wechat_allowlist() {
+    let h = boot_with_acl("user:alice@wechat->claude").await;
+    let vc = register_client(&h.base_url, "claude").await;
+    let _vb = register_client(&h.base_url, "codex").await;
+    // The first registration installs a default route; clear it so the `/use 1`
+    // assertion below cannot be satisfied by the default client.
+    h.state.routing.router.lock().await.unset_default();
+
+    let user = "alice@wechat";
+    let real_ctx = "real-ctx-acl-1";
+
+    // ── /list: only the allowlisted backend is listed.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/list"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let text = last_reply_text(&h).await;
+    assert!(
+        text.contains("`claude`"),
+        "/list must list the allowlisted backend: {text}"
+    );
+    assert!(
+        !text.contains("`codex`"),
+        "/list must not leak a backend outside the allowlist: {text}"
+    );
+    h.mock.clear().await;
+
+    // ── /use codex: refused, and the route must not change.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use codex"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let text = last_reply_text(&h).await;
+    assert!(
+        text.contains("未找到"),
+        "/use must reject a backend outside the allowlist: {text}"
+    );
+    assert!(
+        h.state
+            .routing
+            .router
+            .lock()
+            .await
+            .get_route(user)
+            .is_none(),
+        "a rejected /use must not change the user's route"
+    );
+    h.mock.clear().await;
+
+    // ── /use 1: numeric aliases are resolved against the visible set only.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "/use 1"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let expected = ilink_hub::hub::hash_vtoken(&vc);
+    let route = h
+        .state
+        .routing
+        .router
+        .lock()
+        .await
+        .get_route(user)
+        .map(str::to_string);
+    assert_eq!(
+        route.as_deref(),
+        Some(expected.as_str()),
+        "`/use 1` must resolve to the first *visible* backend (claude)"
+    );
+}
+
+/// 验收 C-2：`@name` 走同一份可见集合 —— 未列入白名单的后端既不可见也不可达：
+/// 该消息不会被派发到隐藏后端，而是落回普通路由。
+#[tokio::test]
+async fn at_mention_of_hidden_backend_is_not_dispatched() {
+    let h = boot_with_acl("user:alice@wechat->claude").await;
+    let vc = register_client(&h.base_url, "claude").await;
+    let vb = register_client(&h.base_url, "codex").await;
+    h.state.routing.router.lock().await.unset_default();
+
+    let user = "alice@wechat";
+    let real_ctx = "real-ctx-acl-at";
+
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "@codex hi"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        poll_for_messages(&h, &vb, 1).await.is_empty(),
+        "an @-mention of a backend outside the allowlist must not reach it"
+    );
+
+    // Control: the allowlisted backend still receives its @-mention.
+    h._dispatch_tx
+        .try_send(user_text_msg(user, real_ctx, "@claude hi"))
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let msgs = poll_for_messages(&h, &vc, 1).await;
+    assert_eq!(
+        msgs.len(),
+        1,
+        "the allowlisted backend must receive its @-mention"
+    );
+    assert_eq!(msgs[0].text(), Some("hi"), "the @name prefix is stripped");
 }
 
 // ─── getupdates 429 under split-brain load ──────────────────────────────────

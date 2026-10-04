@@ -26,6 +26,74 @@ All notable changes to this project will be documented in this file.
 新增请求字段：`GetUpdatesRequest.last_ack_id: Option<i64>`（与 `get_updates_buf` 同数空间，取 max；上游 bridge 不发送它，保留给自行维护投递序号的客户端）。已发布 bridge 无需改动：它自首个版本起就回带 `get_updates_buf`。
 
 范围外（未实现）：队列持久化（ADR-001 方案 B/C）、未确认消息的 TTL / 最大重投次数、`ILINK_QUEUE_BACKEND=redis`。
+
+## [0.5.0] — 2026-10-04
+
+> **授权模型破坏性变更**：授权从"业务产物表存在即通过"改为显式、可吊销、按调用限定的授权。
+> 新增 `POST /hub/clients/{name}/revoke`；`active_sessions` 授权带 TTL（`ILINK_GRANT_TTL_SECS`，
+> 默认 24h）；A2A **默认拒绝**；消息历史不再构成发送授权。
+> 升级说明：需要 A2A 的部署必须显式配置 `ILINK_AGENT_ALLOWLIST`；升级后存量 `active_sessions`
+> 授权行按"已过期"处理，由下一次入站派发自动重建。
+
+### Breaking Change — 可吊销的 vtoken 授权
+
+- 新增 admin 端点 `POST /hub/clients/{name}/revoke`：轮换 vtoken 并删除旧凭据的全部授权行
+  （`routing_state` / `active_sessions` / `backend_sessions_v2`），清空路由、队列与 `last_seen`，
+  并把该客户端标记为下线。新明文只在响应中返回一次；轮换后 bridge 必须用新明文重连
+  （旧明文不落库，遗失即需重新配对）。消息历史保留不变。
+
+### Breaking Change — 消息历史不再构成发送授权
+
+- `/ilink/bot/sendmessage` 与 `/ilink/bot/getconfig` 的归属判定只读 `active_sessions` /
+  `backend_sessions_v2`。`messages` 表是只增不减的历史，继续把它当授权来源会让吊销失效
+  （清掉授权行后仍能凭历史放行）。会话历史与引用回复检索不受影响。
+
+### Breaking Change — A2A 授权限定单次调用（绑定 `call_id`）
+
+- MCP `call_agent` 的授权行改为 `a2a-<call_id>` 作用域：回复投递后、超时后、断连后都会回收，
+  并恢复该 `(vctx, vtoken)` 在调用前的合法授权。`backend_sessions_v2` 按**调用前快照的差集**回收：
+  调用期间该 `(vctx, vtoken)` 上新建的**全部**行都被删除（不只本次 `reply_session`）——目标回复时
+  回带的 `cli_session_id` 的 session 名由目标自选，只按 `reply_session` 删除会留下**无 TTL 的永久授权**。
+  调用**进行中**的嵌套深度链路不受影响（`MAX_A2A_DEPTH` 守卫不变）。
+- 返回给调用方、并写入 `hub_ext` 的会话名默认由 `a2a-<时间戳>` 变为 `a2a-<call_id>`；
+  显式传入 `session` 时行为不变。
+
+### Breaking Change — A2A 默认拒绝 + `ILINK_AGENT_ALLOWLIST`
+
+- 新增 env `ILINK_AGENT_ALLOWLIST`（逗号分隔）：
+  - `caller->target`：A2A 边（任一侧可用 `*` 通配；`*->*` 恢复"全放"）；
+  - `user:<uid>->backend`：该微信用户可见/可用的后端；
+  - `backend`：对所有微信用户可见的后端；
+  - 非法条目只记 `warn!` 并跳过（fail-closed，绝不放大权限）。
+- **A2A 默认拒绝**：未配置时 `call_agent` 返回 403 语义错误（`isError`），
+  且在任何副作用（waiter / 授权行 / 队列）之前返回；MCP `list_agents` 只返回调用方被授权调用的 agent。
+- 微信侧 `/list` `/use` `@name` `/broadcast` 共用同一可见集合：序号按**可见集合**重排，
+  隐藏后端既不出现在列表里，也不能通过名称或序号选中。
+  未配置任何 `user:`/裸条目时微信侧保持不限制（单租户默认）；多租户部署必须显式配置。
+- 微信 `/status` 同样按该可见集合统计在线/总数与会话列表（原先向任意用户枚举全部后端）。
+
+### Breaking Change — `active_sessions` 授权带 TTL
+
+- 迁移 v15 给 `active_sessions` 加 `expires_at`（epoch 秒）。派发/广播/A2A 每次写入都把该行
+  刷新为 `now + ILINK_GRANT_TTL_SECS`（默认 `86400`）；`resolve_send_context` / `vtoken_owns_vctx` /
+  `get_active_ctx_for_vtoken` 一律要求 `expires_at > now`（读时判定，不删行）。
+- **存量授权行按"已过期"处理**（`DEFAULT 0`，fail-closed）：升级后旧的 `active_sessions` 行不再放行，
+  下一次入站派发自愈重建。若需要更长窗口，调大 `ILINK_GRANT_TTL_SECS`。
+- `backend_sessions_v2`（`@name` / 命名会话）授权**不受 TTL 约束**，仍只由 revoke / `/session delete` 清理。
+
+### 已知残余（供后续 issue）
+
+- `backend_sessions_v2` 授权无 TTL（仅 revoke / `/session delete` 清理）；
+- 进程被 abort 时 A2A 授权行残留（无后台清扫任务，靠下次派发覆盖）；
+- A2A 释放时用 `set_active_session_with_depth` 恢复调用前的 `active_sessions` 行，会同时**刷新该
+  `(vctx, vtoken)` 的 `expires_at`** —— 等于给这对授权续一个新窗口（仍受 `ILINK_GRANT_TTL_SECS`
+  约束，不构成永久授权）；
+- 微信**粘性路由**不受可见集合约束：已被 `/use` 选中的后端（`routing_state`，跨重启存活）即使
+  之后被移出 `ILINK_AGENT_ALLOWLIST`，仍会继续收到该用户的消息（`/list` 隐藏、`/use`/`@name`
+  拒绝均生效，即"不再可切换"成立、"不再可达"不成立）；
+- 未配置 `ILINK_AGENT_ALLOWLIST` 的微信条目时，微信侧仍不限制可见集合（单租户默认）；
+- 引用回复被移除 `messages` 授权分支后，仅凭历史消息授权的路径（显式 `/broadcast` 的接收方回复）会 403。
+
 ## [0.4.1] — 2026-10-04
 
 ### Fixed

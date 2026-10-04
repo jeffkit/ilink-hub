@@ -530,6 +530,87 @@ pub async fn unregister_client_in_hub(
     Ok(())
 }
 
+/// Outcome of a successful [`revoke_client_in_hub`] call.
+///
+/// `plaintext` is the freshly minted bearer credential for the rotated
+/// vtoken. It is returned to the admin caller exactly once and never
+/// persisted (same convention as [`RegisterClientOutcome`]).
+#[derive(Debug)]
+pub struct RevokeClientOutcome {
+    pub name: String,
+    pub plaintext: String,
+    pub hashed: String,
+}
+
+#[derive(Debug)]
+pub enum RevokeClientError {
+    NotFound,
+    Store(anyhow::Error),
+}
+
+/// Revoke every authorization a client currently holds and rotate its vtoken.
+///
+/// The old hash loses: its registry entry, its routing entries and default
+/// selection, its queue slot, its `last_seen` timestamp, and every
+/// authorization row (`routing_state` / `active_sessions` /
+/// `backend_sessions_v2`). The client itself survives with a brand-new
+/// plaintext, which the caller must hand to the bridge — the old plaintext is
+/// unrecoverable, so a lost response means re-pairing.
+///
+/// Message history is deliberately kept: it is no longer an authorization
+/// source (see `Store::resolve_send_context`).
+pub async fn revoke_client_in_hub(
+    state: &HubState,
+    name: &str,
+) -> Result<RevokeClientOutcome, RevokeClientError> {
+    // Lock order: registry → router (always); every guard is dropped before the
+    // next lock or await is taken (same discipline as `unregister_client_in_hub`).
+    let (old_hash, plaintext, new_hash, label, new_default) = {
+        let mut registry = state.clients.registry.write().await;
+        let Some(client) = registry.get_by_name(name) else {
+            return Err(RevokeClientError::NotFound);
+        };
+        let old_hash = client.vtoken.clone();
+        let label = client.label.clone();
+        let Some((plaintext, new_hash)) = registry.rotate_vtoken(name) else {
+            return Err(RevokeClientError::NotFound);
+        };
+        let new_default = registry.pick_default_after_remove(&old_hash);
+        (old_hash, plaintext, new_hash, label, new_default)
+    };
+
+    state.clients.last_seen.remove(&old_hash);
+    if let Err(e) = state.clients.queue.remove_client(&old_hash).await {
+        warn!(error = %e, vtoken = %crate::redact_token(&old_hash), "failed to remove revoked client queue");
+    }
+
+    {
+        let mut router = state.routing.router.lock().await;
+        router.remove_routes_for_vtoken(&old_hash, new_default);
+    }
+
+    // Order matters: clear the old vtoken's authorizations *before* the
+    // `clients` row is repointed at the new hash, so `upsert_client`'s
+    // routing_state migration cannot resurrect a revoked route.
+    state
+        .store
+        .revoke_authorizations_for_vtoken(&old_hash)
+        .await
+        .map_err(RevokeClientError::Store)?;
+    state
+        .store
+        .upsert_client(&new_hash, name, label.as_deref())
+        .await
+        .map_err(RevokeClientError::Store)?;
+
+    info!(client = %name, vtoken = %crate::redact_token(&new_hash), "admin revoked client vtoken");
+    Ok(RevokeClientOutcome {
+        name: name.to_string(),
+        plaintext,
+        hashed: new_hash,
+    })
+}
+
 #[derive(Debug)]
 pub enum UpdateClientError {
     NotFound,

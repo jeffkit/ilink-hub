@@ -73,13 +73,16 @@ pub(super) async fn dispatch_message(state: Arc<HubState>, mut msg: WeixinMessag
     // `@<backend> <message>` shortcut — highest priority, ahead of quote-reply and the
     // current `/use` route. It is a *temporary* operation (like a quote): it forwards this
     // one message to the named backend on a **fresh session**, without changing the user's
-    // active backend or active session. An unknown name falls through to normal routing.
+    // active backend or active session. An unknown — or not-visible — name falls through
+    // to normal routing.
     if let Some(text) = msg.text() {
         if let Some((backend_name, payload)) = router::parse_at_mention(text) {
+            let from_user_id = msg.from_user_id.clone().unwrap_or_default();
+            let visible = super::super::commands::wechat_visible(&state, &from_user_id).await;
             let vtoken = {
                 let registry = state.clients.registry.read().await;
                 registry
-                    .get_by_alias(&backend_name)
+                    .get_by_alias_in(&backend_name, visible.as_ref())
                     .map(|c| c.vtoken.clone())
             };
             if let Some(vtoken) = vtoken {
