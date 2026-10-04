@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`/metrics` 手写 exposition：无名字映射的 vtoken 产生重复 timeseries**：`ilink_hub_queue_size` 与 `ilink_hub_messages_rejected_total` 此前按 vtoken 逐条渲染，已删除客户端（无名字映射）的 vtoken 全部退化成 `client="unknown"`——≥2 个即产生重复 timeseries，Prometheus 会拒扫**整次**抓取（不是丢一条序列，`clients_online` / 直方图等全部拿不到）。现两张表统一按客户端名聚合求和后渲染，每个 family 恒 1 条；已删客户端的残余计数仍可见（归入 `client="unknown"` 桶，与字面名为 `unknown` 的客户端合并）。
+- **`ilink_hub_messages_rejected_total{client=…}` 未按 exposition 规则转义标签值**：客户端名含 `"` / `\` / 换行时此前可注入样本行或使整次抓取不可解析（`ilink_hub_queue_size` 已在 a19eb52 修好，这一块漏改）。现与 `ilink_hub_queue_size` 统一走 `escape_label_value`（只转义 `\\` / `\"` / `\n`）。
+
 ### Breaking Change — 投递语义改为 at-least-once（ack 驱动 + 游标续拉 + 溢出背压）
 
 **⚠️ Breaking Change** — `getupdates` 不再把「取走」当成「投递成功」：响应携带的投递高水位只有被客户端在**下一次** poll 回带时才确认该批，未回带的消息会被重投（响应回程丢失不再丢消息）。溢出策略从「静默丢最旧」改为「背压拒绝新消息」。
