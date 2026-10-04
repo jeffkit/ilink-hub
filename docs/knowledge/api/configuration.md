@@ -41,6 +41,17 @@ iLink Hub 遵循 [12-Factor](https://12factor.net/config) 原则，所有配置�
 | `ILINK_SHUTDOWN_DRAIN_SECS` | `30` | 优雅关闭时等待队列排空的最长秒数 |
 | `ILINK_ADMIN_INSECURE_NO_AUTH` | 未设置 | 设为 `1` 关闭管理端点鉴权，**仅限本地调试**；与公网绑定（`0.0.0.0`/`::`）组合时**拒绝启动** |
 | `ILINK_CORS_ORIGINS` | 未设置（permissive `*`） | Bot API CORS 白名单，逗号分隔且须带 `http://`/`https://` 前缀。生产有浏览器客户端时建议显式设置 |
+| `ILINK_RETENTION_ENABLED` | `false` | 开启存储保留 sweeper；关闭时完全不删除数据 |
+| `ILINK_RETENTION_DRY_RUN` | `true` | 只统计并记日志，不执行 `DELETE`；确认候选数后再显式设 `0`/`false` |
+| `ILINK_RETENTION_SWEEP_SECS` | `3600` | sweeper 周期（秒），开启时必须 > 0 |
+| `ILINK_RETENTION_BATCH_SIZE` | `500` | 单批删除行数（SQLite 单写连接，分批以免长时间持写锁），开启时必须 > 0 |
+| `ILINK_RETENTION_MESSAGES_TTL_SECS` | `0`（关闭） | `messages` 保留秒数。**注意**：L0/L1/L2 引用回复解析依赖 `messages` 行，TTL 过短会让老消息的引用回复退化 |
+| `ILINK_RETENTION_ACTIVE_SESSIONS_TTL_SECS` | `0`（关闭） | `active_sessions` 按 `updated_at` 保留秒数 |
+
+> **保留策略默认全关且默认 dry-run**：只有同时设置 `ILINK_RETENTION_ENABLED=1`、对应的 TTL 非 0、
+> 且 `ILINK_RETENTION_DRY_RUN=0` 才会真正删除数据；被删除的数据无法从 Hub 侧恢复（只能靠数据库备份）。
+> `backend_sessions_v2` 不在清理范围内：它的 `created_at` 是「首次注册时间」（upsert 不刷新），
+> 按 TTL 删除会误删活跃 session。
 
 ## 数据库连接格式
 

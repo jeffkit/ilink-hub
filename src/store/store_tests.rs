@@ -3688,3 +3688,673 @@ async fn resolve_send_context_accepts_backend_session_grant() {
         .expect("backend_sessions grant must suffice");
     assert_eq!(owned.0, "real-bsess");
 }
+
+// ─── Issue #30 — driver portability of runtime SQL + opt-in retention ────────
+//
+// `find_vtoken_for_session` ordered by SQLite's `rowid`, and
+// `find_assistant_message_by_timestamp` used SQLite's `strftime()`; both are
+// hard errors on PostgreSQL ("column rowid does not exist" / "function
+// strftime(unknown, text) does not exist"). The callers only warn and return
+// `None`, so persona-footer / timestamp quote replies were silently misrouted
+// (default route) on PostgreSQL. Both queries now come from `sql::*`, selected
+// by `DatabaseKind`; the guards below keep them there.
+
+/// Acceptance for #30: `grep -rn rowid src/store/context.rs` must be empty.
+#[test]
+fn issue30_context_sql_has_no_sqlite_only_rowid() {
+    let src = include_str!("context.rs");
+    assert!(
+        !src.contains("rowid"),
+        "src/store/context.rs must not contain the SQLite-only `rowid`: PostgreSQL has no \
+         rowid pseudo-column, so the query fails at runtime and quote-reply routing silently \
+         falls back to the default route. Driver-selected SQL lives in src/store/sql.rs."
+    );
+}
+
+/// Companion guard for the same defect family (issue #30 D2): the messages
+/// lookup must not contain the SQLite-only `strftime(`.
+#[test]
+fn issue30_messages_sql_has_no_sqlite_only_strftime() {
+    let src = include_str!("messages.rs");
+    assert!(
+        !src.contains("strftime("),
+        "src/store/messages.rs must not contain the SQLite-only `strftime(`: PostgreSQL has no \
+         such function, so the L1 timestamp quote-reply fallback silently misses. \
+         Driver-selected SQL lives in src/store/sql.rs."
+    );
+}
+
+/// Every driver-selected query keeps its dialect tokens on its own side:
+/// the PostgreSQL branch must be free of SQLite-only tokens (and vice versa).
+#[test]
+fn issue30_postgres_sql_branches_contain_no_sqlite_only_tokens() {
+    let cases: Vec<(&str, String, String)> = vec![
+        (
+            "find_vtoken_for_session",
+            sql::find_vtoken_for_session_sql(DatabaseKind::Sqlite).to_string(),
+            sql::find_vtoken_for_session_sql(DatabaseKind::Postgres).to_string(),
+        ),
+        (
+            "find_assistant_message_by_timestamp",
+            sql::find_assistant_message_by_timestamp_sql(DatabaseKind::Sqlite).to_string(),
+            sql::find_assistant_message_by_timestamp_sql(DatabaseKind::Postgres).to_string(),
+        ),
+        (
+            "messages_expired_selection",
+            sql::messages_expired_selection_sql(DatabaseKind::Sqlite).to_string(),
+            sql::messages_expired_selection_sql(DatabaseKind::Postgres).to_string(),
+        ),
+        (
+            "messages_expired_delete",
+            sql::messages_expired_delete_sql(DatabaseKind::Sqlite),
+            sql::messages_expired_delete_sql(DatabaseKind::Postgres),
+        ),
+        (
+            "active_sessions_expired_selection",
+            sql::active_sessions_expired_selection_sql(DatabaseKind::Sqlite).to_string(),
+            sql::active_sessions_expired_selection_sql(DatabaseKind::Postgres).to_string(),
+        ),
+        (
+            "active_sessions_expired_delete",
+            sql::active_sessions_expired_delete_sql(DatabaseKind::Sqlite),
+            sql::active_sessions_expired_delete_sql(DatabaseKind::Postgres),
+        ),
+    ];
+
+    for (name, sqlite, postgres) in cases {
+        for token in ["rowid", "strftime(", "datetime(", "autoincrement"] {
+            assert!(
+                !postgres.to_ascii_lowercase().contains(token),
+                "{name}: PostgreSQL SQL must not contain the SQLite-only token {token:?}: {postgres}"
+            );
+        }
+        for token in ["extract(", "timestamptz", "ctid"] {
+            assert!(
+                !sqlite.to_ascii_lowercase().contains(token),
+                "{name}: SQLite SQL must not contain the PostgreSQL-only token {token:?}: {sqlite}"
+            );
+        }
+    }
+}
+
+/// The session lookup must pick the newest row for a `(vctx, session_name)`
+/// pair — this is what makes persona-footer quote replies land on the bridge
+/// that owns the session.
+#[tokio::test]
+async fn issue30_find_vtoken_for_session_returns_newest_row_sqlite() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-issue30-newest", None, "ctx-issue30-newest")
+        .await
+        .unwrap();
+    let session = "at-20261004-120000000";
+
+    store
+        .set_backend_session(&vctx, "vtoken-issue30-a", session, "cli-a")
+        .await
+        .unwrap();
+    store
+        .set_backend_session(&vctx, "vtoken-issue30-b", session, "cli-b")
+        .await
+        .unwrap();
+
+    let found = store.find_vtoken_for_session(&vctx, session).await.unwrap();
+    assert_eq!(
+        found.as_deref(),
+        Some("vtoken-issue30-b"),
+        "the newest row for (vctx, session_name) must win"
+    );
+}
+
+fn issue30_now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `CURRENT_TIMESTAMP` text, the format (`%Y-%m-%d %H:%M:%S` UTC) SQLite writes
+/// and the retention cutoff compares against.
+fn issue30_utc_text(epoch_secs: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch_secs, 0)
+        .expect("valid timestamp")
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+}
+
+async fn issue30_count(store: &Store, table: &str) -> i64 {
+    let rows: (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(&store.pool)
+        .await
+        .expect("count rows");
+    rows.0
+}
+
+/// Retention must be off and dry-run out of the box: writing no config must
+/// never delete anything.
+#[test]
+fn issue30_retention_defaults_are_disabled_and_dry_run() {
+    let cfg = RetentionConfig::default();
+    assert!(!cfg.enabled, "retention must be opt-in");
+    assert!(cfg.dry_run, "retention must default to dry-run");
+    assert_eq!(cfg.messages_ttl_secs, 0);
+    assert_eq!(cfg.active_sessions_ttl_secs, 0);
+    assert!(cfg.sweep_interval_secs > 0);
+    assert!(cfg.batch_size > 0);
+}
+
+/// Dry-run reports the candidates and deletes nothing.
+#[tokio::test]
+async fn issue30_retention_dry_run_reports_candidates_without_deleting() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-issue30-dryrun", None, "ctx-issue30-dryrun")
+        .await
+        .unwrap();
+    let peer = "peer-issue30-dryrun";
+    for i in 0..4 {
+        store
+            .save_message(
+                &vctx,
+                Some("vtoken-issue30"),
+                "default",
+                peer,
+                "user",
+                &format!("dry-run body {i}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = issue30_now_epoch_secs();
+    let old = issue30_utc_text(now - 7200);
+    for i in 0..3 {
+        sqlx::query("UPDATE messages SET created_at = $1 WHERE content = $2")
+            .bind(&old)
+            .bind(format!("dry-run body {i}"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    let cfg = RetentionConfig {
+        dry_run: true,
+        messages_ttl_secs: 3600,
+        ..RetentionConfig::default()
+    };
+    let report = store.sweep_retention(&cfg, now).await.unwrap();
+
+    assert!(report.dry_run);
+    assert_eq!(report.messages_matched, 3, "all three backdated rows");
+    assert_eq!(report.messages_deleted, 0, "dry-run must not delete");
+    assert_eq!(issue30_count(&store, "messages").await, 4);
+}
+
+/// A real sweep deletes exactly the expired rows, in batches.
+#[tokio::test]
+async fn issue30_retention_deletes_only_expired_messages() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-issue30-delete", None, "ctx-issue30-delete")
+        .await
+        .unwrap();
+    let peer = "peer-issue30-delete";
+    for i in 0..4 {
+        store
+            .save_message(
+                &vctx,
+                Some("vtoken-issue30"),
+                "default",
+                peer,
+                "user",
+                &format!("sweep body {i}"),
+            )
+            .await
+            .unwrap();
+    }
+
+    let now = issue30_now_epoch_secs();
+    let old = issue30_utc_text(now - 7200);
+    for i in 0..3 {
+        sqlx::query("UPDATE messages SET created_at = $1 WHERE content = $2")
+            .bind(&old)
+            .bind(format!("sweep body {i}"))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+
+    let cfg = RetentionConfig {
+        dry_run: false,
+        batch_size: 2,
+        messages_ttl_secs: 3600,
+        ..RetentionConfig::default()
+    };
+    let report = store.sweep_retention(&cfg, now).await.unwrap();
+
+    assert_eq!(report.messages_deleted, 3);
+    assert!(
+        report.batches >= 2,
+        "batch_size 2 must split three deletions into >= 2 batches, got {}",
+        report.batches
+    );
+    assert_eq!(issue30_count(&store, "messages").await, 1, "fresh row kept");
+    let kept: (String,) = sqlx::query_as("SELECT content FROM messages")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept.0, "sweep body 3");
+}
+
+/// `active_sessions` uses the row-value `IN` delete on its `(vctx, vtoken)` key.
+#[tokio::test]
+async fn issue30_retention_deletes_only_expired_active_sessions() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let now = issue30_now_epoch_secs();
+    let old = issue30_utc_text(now - 7200);
+    let fresh = issue30_utc_text(now);
+
+    for (vctx, updated_at) in [
+        ("vctx-issue30-old-1", old.as_str()),
+        ("vctx-issue30-old-2", old.as_str()),
+        ("vctx-issue30-new", fresh.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO active_sessions (vctx, vtoken, session_name, updated_at) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(vctx)
+        .bind("vtoken-issue30")
+        .bind("default")
+        .bind(updated_at)
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    let cfg = RetentionConfig {
+        dry_run: false,
+        active_sessions_ttl_secs: 3600,
+        ..RetentionConfig::default()
+    };
+    let report = store.sweep_retention(&cfg, now).await.unwrap();
+
+    assert_eq!(report.active_sessions_deleted, 2);
+    assert_eq!(report.messages_deleted, 0, "no messages TTL configured");
+    assert_eq!(issue30_count(&store, "active_sessions").await, 1);
+    let kept: (String,) = sqlx::query_as("SELECT vctx FROM active_sessions")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept.0, "vctx-issue30-new");
+}
+
+/// TTL 0 means "do not touch this table", even with a real (non-dry-run) sweep.
+#[tokio::test]
+async fn issue30_retention_zero_ttl_is_noop() {
+    let store = Store::connect("sqlite::memory:").await.unwrap();
+    let vctx = store
+        .find_or_create_vctx("peer-issue30-noop", None, "ctx-issue30-noop")
+        .await
+        .unwrap();
+    store
+        .save_message(
+            &vctx,
+            Some("vtoken-issue30"),
+            "default",
+            "peer-issue30-noop",
+            "user",
+            "keep me",
+        )
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO active_sessions (vctx, vtoken, session_name) VALUES ($1, $2, $3)")
+        .bind(&vctx)
+        .bind("vtoken-issue30")
+        .bind("default")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let cfg = RetentionConfig {
+        enabled: true,
+        dry_run: false,
+        ..RetentionConfig::default()
+    };
+    let report = store
+        .sweep_retention(&cfg, issue30_now_epoch_secs())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report,
+        RetentionReport {
+            dry_run: false,
+            ..RetentionReport::default()
+        }
+    );
+    assert_eq!(issue30_count(&store, "messages").await, 1);
+    assert_eq!(issue30_count(&store, "active_sessions").await, 1);
+}
+
+/// `RetentionConfig::from_env` parsing, following the
+/// `ILINK_ADMIN_INSECURE_NO_AUTH` truthiness contract.
+#[test]
+fn issue30_retention_config_from_env_parsing() {
+    const NAMES: [&str; 6] = [
+        "ILINK_RETENTION_ENABLED",
+        "ILINK_RETENTION_DRY_RUN",
+        "ILINK_RETENTION_SWEEP_SECS",
+        "ILINK_RETENTION_BATCH_SIZE",
+        "ILINK_RETENTION_MESSAGES_TTL_SECS",
+        "ILINK_RETENTION_ACTIVE_SESSIONS_TTL_SECS",
+    ];
+
+    let _guard = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+    let saved: Vec<(&str, Option<String>)> = NAMES
+        .iter()
+        .map(|name| (*name, std::env::var(name).ok()))
+        .collect();
+    for name in NAMES {
+        std::env::remove_var(name);
+    }
+
+    let defaults = RetentionConfig::from_env().expect("unset env must parse");
+    assert!(!defaults.enabled);
+    assert!(defaults.dry_run);
+    assert_eq!(defaults.sweep_interval_secs, 3600);
+    assert_eq!(defaults.batch_size, 500);
+
+    std::env::set_var("ILINK_RETENTION_ENABLED", "1");
+    std::env::set_var("ILINK_RETENTION_DRY_RUN", "0");
+    std::env::set_var("ILINK_RETENTION_SWEEP_SECS", "60");
+    std::env::set_var("ILINK_RETENTION_BATCH_SIZE", "10");
+    std::env::set_var("ILINK_RETENTION_MESSAGES_TTL_SECS", "120");
+    std::env::set_var("ILINK_RETENTION_ACTIVE_SESSIONS_TTL_SECS", "300");
+
+    let parsed = RetentionConfig::from_env().expect("set env must parse");
+    assert!(parsed.enabled);
+    assert!(!parsed.dry_run);
+    assert_eq!(parsed.sweep_interval_secs, 60);
+    assert_eq!(parsed.batch_size, 10);
+    assert_eq!(parsed.messages_ttl_secs, 120);
+    assert_eq!(parsed.active_sessions_ttl_secs, 300);
+
+    std::env::set_var("ILINK_RETENTION_BATCH_SIZE", "not-a-number");
+    assert!(
+        RetentionConfig::from_env().is_err(),
+        "a non-numeric ILINK_RETENTION_BATCH_SIZE must fail startup"
+    );
+
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+}
+
+/// Live PostgreSQL checks for the production SQL text.
+///
+/// Each case runs against its own scratch table (a fresh PostgreSQL database
+/// needs no migrations, which sidesteps the unrelated multi-statement DDL
+/// blocker) and is skipped unless `TEST_POSTGRES_URL` is set, so the default
+/// SQLite CI job is unaffected.
+#[cfg(feature = "postgres")]
+mod issue30_pg {
+    use super::{issue30_now_epoch_secs, issue30_utc_text};
+    use crate::store::{sql, DatabaseKind};
+    use sqlx::Row as _;
+
+    fn pg_url() -> Option<String> {
+        match std::env::var("TEST_POSTGRES_URL") {
+            Ok(url) if !url.trim().is_empty() => Some(url),
+            _ => None,
+        }
+    }
+
+    fn unique_suffix() -> String {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+            .to_string()
+    }
+
+    async fn scratch_pool(url: &str) -> sqlx::AnyPool {
+        sqlx::any::install_default_drivers();
+        sqlx::AnyPool::connect(url)
+            .await
+            .expect("connect scratch PostgreSQL")
+    }
+
+    async fn create_scratch(pool: &sqlx::AnyPool, table: &str) {
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (vctx TEXT NOT NULL, \
+             vtoken TEXT, \
+             session_name TEXT NOT NULL DEFAULT 'default', \
+             peer_user_id TEXT NOT NULL DEFAULT '', \
+             role TEXT NOT NULL DEFAULT '', \
+             content TEXT NOT NULL DEFAULT '', \
+             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), \
+             PRIMARY KEY (vctx, vtoken, session_name))"
+        ))
+        .execute(pool)
+        .await
+        .expect("create scratch table");
+    }
+
+    async fn drop_scratch(pool: &sqlx::AnyPool, table: &str) {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(pool)
+            .await
+            .expect("drop scratch table");
+    }
+
+    /// Messages-shaped scratch table, so the retention `DELETE ... WHERE id IN`
+    /// and the timestamp lookup run against a schema whose key is the
+    /// auto-increment `id` (as in `migrations/0005_messages.sql`).
+    async fn create_scratch_messages(pool: &sqlx::AnyPool, table: &str) {
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (id BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY, \
+             vctx TEXT NOT NULL, \
+             vtoken TEXT, \
+             session_name TEXT NOT NULL DEFAULT 'default', \
+             peer_user_id TEXT NOT NULL DEFAULT '', \
+             role TEXT NOT NULL, \
+             content TEXT NOT NULL, \
+             created_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP))"
+        ))
+        .execute(pool)
+        .await
+        .expect("create scratch messages table");
+    }
+
+    /// The production SQL names the real tables; only the table name is
+    /// rewritten onto the scratch table. The ordering / predicate under test is
+    /// the production text verbatim.
+    fn retarget(sql: &str, real: &str, scratch: &str) -> String {
+        sql.replace(real, scratch)
+    }
+
+    #[tokio::test]
+    async fn issue30_pg_ctid_lookup_returns_newest_row() {
+        let Some(url) = pg_url() else {
+            eprintln!("[issue-30] PostgreSQL case skipped: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let pool = scratch_pool(&url).await;
+        let table = format!("issue30_sessions_{}", unique_suffix());
+        create_scratch(&pool, &table).await;
+
+        for vtoken in ["vtoken-issue30-old", "vtoken-issue30-new"] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (vctx, vtoken, session_name, role) VALUES ($1, $2, $3, $4)"
+            ))
+            .bind("vctx-issue30")
+            .bind(vtoken)
+            .bind("at-issue30")
+            .bind("assistant")
+            .execute(&pool)
+            .await
+            .expect("insert scratch row");
+        }
+
+        let sql = retarget(
+            sql::find_vtoken_for_session_sql(DatabaseKind::Postgres),
+            "backend_sessions_v2",
+            &table,
+        );
+        let row = sqlx::query(&sql)
+            .bind("vctx-issue30")
+            .bind("at-issue30")
+            .fetch_optional(&pool)
+            .await
+            .expect("find_vtoken_for_session SQL must execute on PostgreSQL");
+        let vtoken: String = row.expect("scratch row must be found").get("vtoken");
+        assert_eq!(vtoken, "vtoken-issue30-new", "highest ctid must win");
+
+        drop_scratch(&pool, &table).await;
+    }
+
+    #[tokio::test]
+    async fn issue30_pg_timestamp_lookup_executes() {
+        let Some(url) = pg_url() else {
+            eprintln!("[issue-30] PostgreSQL case skipped: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let pool = scratch_pool(&url).await;
+        let table = format!("issue30_ts_{}", unique_suffix());
+        create_scratch_messages(&pool, &table).await;
+
+        sqlx::query(&format!(
+            "INSERT INTO {table} (vctx, vtoken, session_name, peer_user_id, role, content) \
+             VALUES ($1, $2, $3, $4, $5, $6)"
+        ))
+        .bind("vctx-issue30")
+        .bind("vtoken-issue30")
+        .bind("at-issue30")
+        .bind("peer-issue30")
+        .bind("assistant")
+        .bind("timestamp probe")
+        .execute(&pool)
+        .await
+        .expect("insert scratch row");
+
+        let now = issue30_now_epoch_secs();
+        let sql = retarget(
+            sql::find_assistant_message_by_timestamp_sql(DatabaseKind::Postgres),
+            "messages",
+            &table,
+        );
+        let row = sqlx::query(&sql)
+            .bind("peer-issue30")
+            .bind(now - 10)
+            .bind(now + 10)
+            .bind(now)
+            .fetch_optional(&pool)
+            .await
+            .expect("find_assistant_message_by_timestamp SQL must execute on PostgreSQL");
+        let vtoken: String = row.expect("just-inserted row must match").get("vtoken");
+        assert_eq!(vtoken, "vtoken-issue30");
+
+        drop_scratch(&pool, &table).await;
+    }
+
+    #[tokio::test]
+    async fn issue30_pg_retention_delete_sql_executes() {
+        let Some(url) = pg_url() else {
+            eprintln!("[issue-30] PostgreSQL case skipped: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let pool = scratch_pool(&url).await;
+        let now = issue30_now_epoch_secs();
+
+        let table = format!("issue30_retention_msg_{}", unique_suffix());
+        create_scratch_messages(&pool, &table).await;
+        for (content, created_at) in [
+            ("expired", issue30_utc_text(now - 7200)),
+            ("fresh", issue30_utc_text(now)),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (vctx, vtoken, session_name, peer_user_id, role, content, \
+                 created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)"
+            ))
+            .bind("vctx-issue30")
+            .bind("vtoken-issue30")
+            .bind("at-issue30")
+            .bind("peer-issue30")
+            .bind("assistant")
+            .bind(content)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .expect("insert scratch row");
+        }
+
+        let sql = retarget(
+            &sql::messages_expired_delete_sql(DatabaseKind::Postgres),
+            "messages",
+            &table,
+        );
+        let result = sqlx::query(&sql)
+            .bind(now - 3600)
+            .bind(100i64)
+            .execute(&pool)
+            .await
+            .expect("messages retention DELETE must execute on PostgreSQL");
+        assert_eq!(result.rows_affected(), 1, "only the expired row is deleted");
+        let left: (String,) = sqlx::query_as(&format!("SELECT content FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("remaining row");
+        assert_eq!(left.0, "fresh");
+        drop_scratch(&pool, &table).await;
+
+        let table = format!("issue30_retention_sessions_{}", unique_suffix());
+        sqlx::query(&format!(
+            "CREATE TABLE {table} (vctx TEXT NOT NULL, vtoken TEXT NOT NULL, \
+             session_name TEXT NOT NULL DEFAULT 'default', \
+             updated_at TEXT NOT NULL DEFAULT (CURRENT_TIMESTAMP), \
+             PRIMARY KEY (vctx, vtoken))"
+        ))
+        .execute(&pool)
+        .await
+        .expect("create scratch table");
+        for (vctx, updated_at) in [
+            ("vctx-issue30-old", issue30_utc_text(now - 7200)),
+            ("vctx-issue30-new", issue30_utc_text(now)),
+        ] {
+            sqlx::query(&format!(
+                "INSERT INTO {table} (vctx, vtoken, session_name, updated_at) \
+                 VALUES ($1, $2, $3, $4)"
+            ))
+            .bind(vctx)
+            .bind("vtoken-issue30")
+            .bind("default")
+            .bind(updated_at)
+            .execute(&pool)
+            .await
+            .expect("insert scratch row");
+        }
+
+        let sql = retarget(
+            &sql::active_sessions_expired_delete_sql(DatabaseKind::Postgres),
+            "active_sessions",
+            &table,
+        );
+        let result = sqlx::query(&sql)
+            .bind(now - 3600)
+            .bind(100i64)
+            .execute(&pool)
+            .await
+            .expect("active_sessions retention DELETE must execute on PostgreSQL");
+        assert_eq!(result.rows_affected(), 1, "only the expired row is deleted");
+        let left: (String,) = sqlx::query_as(&format!("SELECT vctx FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .expect("remaining row");
+        assert_eq!(left.0, "vctx-issue30-new");
+        drop_scratch(&pool, &table).await;
+    }
+}
