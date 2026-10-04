@@ -165,6 +165,7 @@ pub fn build_router(state: Arc<HubState>) -> Router {
             "/hub/clients/{name}",
             patch(admin_update_client).delete(admin_delete_client),
         )
+        .route("/hub/clients/{name}/revoke", post(admin_revoke_client))
         .route("/hub/clients/{name}/sessions", get(admin_client_sessions))
         .route(
             "/hub/clients/{name}/sessions/{session}/history",

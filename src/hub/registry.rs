@@ -236,14 +236,29 @@ impl ClientRegistry {
     /// Resolution order: exact name first (so a client genuinely named `"1"`
     /// still wins), then the 1-based numeric index into the sorted list.
     pub fn get_by_alias(&self, name: &str) -> Option<&ClientInfo> {
+        self.get_by_alias_in(name, None)
+    }
+
+    /// [`Self::get_by_alias`] restricted to a caller-visible allowlist.
+    ///
+    /// `allowed = None` means "no restriction"; `Some(set)` means only clients
+    /// whose name is in `set` are visible. Both the exact-name and the numeric
+    /// alias path honour the filter, and the numeric index is computed over the
+    /// **visible** set only — otherwise `/use 2` could still reach a hidden
+    /// client that the filtered `/list` never showed.
+    pub fn get_by_alias_in(
+        &self,
+        name: &str,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Option<&ClientInfo> {
         if let Some(c) = self.get_by_name(name) {
-            return Some(c);
+            return allowed.is_none_or(|set| set.contains(&c.name)).then_some(c);
         }
         let n: usize = name.parse().ok()?;
         if n == 0 {
             return None;
         }
-        let mut sorted: Vec<&ClientInfo> = self.all_clients();
+        let mut sorted: Vec<&ClientInfo> = self.all_clients_in(allowed);
         sorted.sort_by(|a, b| a.name.cmp(&b.name));
         sorted.get(n - 1).copied()
     }
@@ -317,7 +332,49 @@ impl ClientRegistry {
     }
 
     pub fn all_clients(&self) -> Vec<&ClientInfo> {
-        self.by_vtoken.values().collect()
+        self.all_clients_in(None)
+    }
+
+    /// All clients, optionally restricted to a caller-visible allowlist
+    /// (`None` = no restriction, `Some(set)` = only names in `set`).
+    pub fn all_clients_in(
+        &self,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Vec<&ClientInfo> {
+        match allowed {
+            None => self.by_vtoken.values().collect(),
+            Some(set) => self
+                .by_vtoken
+                .values()
+                .filter(|c| set.contains(&c.name))
+                .collect(),
+        }
+    }
+
+    /// Mint a fresh vtoken for an existing client and swap it in place.
+    ///
+    /// Used by the admin revoke endpoint: the old hash loses all authority
+    /// (its `by_vtoken` entry and every `by_name` pointer to it are replaced),
+    /// while label / description / persona / registration time survive so the
+    /// client keeps its identity. The client is marked offline — the bridge
+    /// still holds the old bearer credential and must re-pair with the
+    /// returned plaintext.
+    ///
+    /// Returns `(plaintext, hashed)` for the rotated token, or `None` when no
+    /// client is registered under `name`.
+    pub fn rotate_vtoken(&mut self, name: &str) -> Option<(String, String)> {
+        let old_hash = self.by_name.get(name)?.clone();
+        let mut info = self.by_vtoken.remove(&old_hash)?;
+
+        let plain = format!("vhub_{}", Uuid::new_v4().simple());
+        let new_hash = hash_vtoken(&plain);
+
+        info.vtoken = new_hash.clone();
+        info.online = false;
+        self.by_vtoken.insert(new_hash.clone(), info);
+        self.by_name.insert(name.to_string(), new_hash.clone());
+
+        Some((plain, new_hash))
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -762,5 +819,112 @@ mod tests {
             new_default, None,
             "the removed token must not be picked as its own replacement"
         );
+    }
+
+    // ── allowlist-filtered resolution ───────────────────────────────────
+
+    #[test]
+    fn get_by_alias_in_rejects_hidden_name() {
+        let mut reg = ClientRegistry::new();
+        reg.register("claude".into(), None, None);
+        reg.register("codex".into(), None, None);
+        let allowed: std::collections::HashSet<String> = ["claude".to_string()].into();
+
+        assert_eq!(
+            reg.get_by_alias_in("claude", Some(&allowed))
+                .map(|c| c.name.as_str()),
+            Some("claude")
+        );
+        assert!(
+            reg.get_by_alias_in("codex", Some(&allowed)).is_none(),
+            "a hidden client must not resolve by exact name"
+        );
+    }
+
+    #[test]
+    fn get_by_alias_in_numbers_over_visible_set_only() {
+        let mut reg = ClientRegistry::new();
+        reg.register("charlie".into(), None, None);
+        reg.register("alpha".into(), None, None);
+        reg.register("bravo".into(), None, None);
+        let allowed: std::collections::HashSet<String> =
+            ["charlie".to_string(), "bravo".to_string()].into();
+
+        // Visible sorted set is [bravo, charlie] → 1 = bravo, 2 = charlie.
+        assert_eq!(
+            reg.get_by_alias_in("1", Some(&allowed))
+                .map(|c| c.name.as_str()),
+            Some("bravo")
+        );
+        assert_eq!(
+            reg.get_by_alias_in("2", Some(&allowed))
+                .map(|c| c.name.as_str()),
+            Some("charlie"),
+            "index must not skip to a hidden client"
+        );
+        assert!(reg.get_by_alias_in("3", Some(&allowed)).is_none());
+    }
+
+    #[test]
+    fn all_clients_in_filters_by_name() {
+        let mut reg = ClientRegistry::new();
+        reg.register("claude".into(), None, None);
+        reg.register("codex".into(), None, None);
+        let allowed: std::collections::HashSet<String> = ["claude".to_string()].into();
+
+        let names: Vec<&str> = reg
+            .all_clients_in(Some(&allowed))
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["claude"]);
+        assert_eq!(reg.all_clients_in(None).len(), 2);
+    }
+
+    // ── rotate_vtoken ───────────────────────────────────────────────────
+
+    #[test]
+    fn rotate_vtoken_replaces_hash_and_preserves_metadata() {
+        let mut reg = ClientRegistry::new();
+        let (_old_plain, old_hash, _) = reg.register(
+            "agent".into(),
+            Some("label".into()),
+            Some("description".into()),
+        );
+        reg.update_metadata(
+            &old_hash,
+            None,
+            None,
+            Some("Aria".into()),
+            Some("🤖".into()),
+        );
+        reg.mark_online(&old_hash);
+        let registered_at = reg.get_by_name("agent").unwrap().registered_at;
+
+        let (new_plain, new_hash) = reg.rotate_vtoken("agent").expect("rotate");
+        assert!(new_plain.starts_with("vhub_"), "plaintext must be returned");
+        assert_eq!(new_hash, crate::hub::hash_vtoken(&new_plain));
+        assert_ne!(new_hash, old_hash);
+
+        assert!(
+            reg.get_by_vtoken(&old_hash).is_none(),
+            "the old hash must no longer resolve"
+        );
+        let c = reg.get_by_name("agent").expect("client survives rotation");
+        assert_eq!(c.vtoken, new_hash);
+        assert_eq!(c.label.as_deref(), Some("label"));
+        assert_eq!(c.description.as_deref(), Some("description"));
+        assert_eq!(c.persona_name.as_deref(), Some("Aria"));
+        assert_eq!(c.persona_emoji.as_deref(), Some("🤖"));
+        assert_eq!(c.registered_at, registered_at);
+        assert!(!c.online, "rotated client must be marked offline");
+    }
+
+    #[test]
+    fn rotate_vtoken_unknown_name_returns_none() {
+        let mut reg = ClientRegistry::new();
+        reg.register("agent".into(), None, None);
+        assert!(reg.rotate_vtoken("nope").is_none());
+        assert!(reg.get_by_name("agent").is_some());
     }
 }

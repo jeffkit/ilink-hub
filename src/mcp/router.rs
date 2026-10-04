@@ -137,7 +137,7 @@ pub(crate) async fn handle_tools_call(
         .unwrap_or(Value::Object(Default::default()));
 
     match tool_name {
-        "list_agents" => Ok(list_agents(state).await),
+        "list_agents" => Ok(list_agents(state, caller_vtoken).await),
 
         "call_agent" => {
             // Per-vtoken fair-share gate. An A2A call ends in an outbound

@@ -1,6 +1,7 @@
 //! Hub command handling: the `/list`, `/use`, `/status`, `/help`, `/session …`
 //! and broadcast commands the user can send as WeChat messages.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -10,6 +11,28 @@ use crate::ilink::types::{SendMessageRequest, WeixinMessage};
 // Hub-internal items (HubState, HubCommand, the `messages`/`quote_route` modules,
 // …) plus the dispatch helpers via `super::dispatch::*`.
 use super::*;
+
+/// Backends `from_user_id` is allowed to see and select from WeChat.
+///
+/// `None` means the deployment configured no WeChat entry in
+/// `ILINK_AGENT_ALLOWLIST` (unrestricted); `Some(set)` is the resolved
+/// allowlist and may be empty. Every WeChat-side entry point that resolves a
+/// backend name (`/list`, `/use`, `@name`, `/broadcast`) must go through this,
+/// otherwise the hidden set leaks via numeric aliases.
+pub(super) async fn wechat_visible(
+    state: &HubState,
+    from_user_id: &str,
+) -> Option<HashSet<String>> {
+    let registered: Vec<String> = {
+        let registry = state.clients.registry.read().await;
+        registry
+            .all_clients()
+            .iter()
+            .map(|c| c.name.clone())
+            .collect()
+    };
+    state.a2a_acl.wechat_visible(from_user_id, &registered)
+}
 
 /// Resolve the vctx and currently routed vtoken for a Hub command from a given user.
 /// Returns `None` if no backend is selected (broadcasts a NO_BACKEND message via the caller).
@@ -52,7 +75,7 @@ pub(super) async fn handle_hub_command(state: Arc<HubState>, msg: WeixinMessage,
         HubCommand::Broadcast(ref text) => {
             handle_cmd_broadcast(&state, &from_user_id, &real_ctx, &msg, text).await
         }
-        HubCommand::Status => handle_cmd_status(&state).await,
+        HubCommand::Status => handle_cmd_status(&state, &from_user_id).await,
         HubCommand::Help => handle_cmd_help(),
         HubCommand::SessionList => {
             handle_cmd_session_list(&state, &from_user_id, &real_ctx, msg.group_id.as_deref()).await
@@ -108,59 +131,69 @@ pub(super) async fn handle_cmd_list(state: &HubState, from_user_id: &str) -> Str
     // Clone client list under the read lock, then release before taking router
     // (same pattern as `handle_cmd_use`). Holding both in opposite order from
     // `load_clients_from_db` (router → registry) would AB-BA deadlock.
+    // The visibility lookup takes its own (separate) registry read guard.
+    let visible = wechat_visible(state, from_user_id).await;
     let clients = {
         let registry = state.clients.registry.read().await;
-        let mut clients: Vec<_> = registry.all_clients().into_iter().cloned().collect();
-        // Sort by name so the 1-based index shown here matches `get_by_alias`.
+        let mut clients: Vec<_> = registry
+            .all_clients_in(visible.as_ref())
+            .into_iter()
+            .cloned()
+            .collect();
+        // Sort by name so the 1-based index shown here matches `get_by_alias_in`.
         clients.sort_by(|a, b| a.name.cmp(&b.name));
         clients
     };
     if clients.is_empty() {
-        "尚未注册任何后端客户端。".to_string()
-    } else {
-        let active_vtoken = {
-            let router = state.routing.router.lock().await;
-            router.get_route(from_user_id).map(str::to_string)
+        return if visible.is_some() {
+            "尚未授权任何后端客户端。".to_string()
+        } else {
+            "尚未注册任何后端客户端。".to_string()
         };
-        let active_name = active_vtoken.as_deref().and_then(|vt| {
-            clients
-                .iter()
-                .find(|c| c.vtoken == vt)
-                .map(|c| c.name.as_str())
-        });
-        let mut lines = vec!["**已注册的后端：**".to_string()];
-        for (i, c) in clients.iter().enumerate() {
-            let status = if c.online { "🟢" } else { "🔴" };
-            let label = c.label.as_deref().unwrap_or(&c.name);
-            let selected = if active_name == Some(c.name.as_str()) {
-                " ✅"
-            } else {
-                ""
-            };
-            lines.push(format!(
-                "{} {}. `{}`{} — {}",
-                status,
-                i + 1,
-                c.name,
-                selected,
-                label
-            ));
-        }
-        match active_name {
-            Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
-            None => lines.push("\n当前未选中（广播模式）".to_string()),
-        }
-        lines.push(
+    }
+    let active_vtoken = {
+        let router = state.routing.router.lock().await;
+        router.get_route(from_user_id).map(str::to_string)
+    };
+    let active_name = active_vtoken.as_deref().and_then(|vt| {
+        clients
+            .iter()
+            .find(|c| c.vtoken == vt)
+            .map(|c| c.name.as_str())
+    });
+    let mut lines = vec!["**已注册的后端：**".to_string()];
+    for (i, c) in clients.iter().enumerate() {
+        let status = if c.online { "🟢" } else { "🔴" };
+        let label = c.label.as_deref().unwrap_or(&c.name);
+        let selected = if active_name == Some(c.name.as_str()) {
+            " ✅"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{} {}. `{}`{} — {}",
+            status,
+            i + 1,
+            c.name,
+            selected,
+            label
+        ));
+    }
+    match active_name {
+        Some(name) => lines.push(format!("\n当前选中：`{}`", name)),
+        None => lines.push("\n当前未选中（广播模式）".to_string()),
+    }
+    lines.push(
             "用 `/use <名称或序号>`（或 `/u <名称或序号>`）切换后端，或发送 `@<名称或序号> <消息>` 直接发起临时会话。"
                 .to_string(),
         );
-        lines.join("\n")
-    }
+    lines.join("\n")
 }
 
 pub(super) async fn handle_cmd_use(state: &HubState, from_user_id: &str, name: &str) -> String {
+    let visible = wechat_visible(state, from_user_id).await;
     let registry = state.clients.registry.read().await;
-    if let Some(client) = registry.get_by_alias(name) {
+    if let Some(client) = registry.get_by_alias_in(name, visible.as_ref()) {
         let vtoken = client.vtoken.clone();
         let resolved_name = client.name.clone();
         drop(registry);
@@ -191,11 +224,13 @@ pub(super) async fn handle_cmd_broadcast(
     msg: &WeixinMessage,
     text: &str,
 ) -> String {
+    let visible = wechat_visible(state, from_user_id).await;
     let online = {
         let registry = state.clients.registry.read().await;
         registry
             .online_clients()
             .iter()
+            .filter(|c| visible.as_ref().is_none_or(|set| set.contains(&c.name)))
             .map(|c| c.vtoken.clone())
             .collect::<Vec<_>>()
     };
@@ -252,11 +287,15 @@ pub(super) async fn handle_cmd_broadcast(
     format!("📡 Broadcast to {} client(s)", online.len())
 }
 
-pub(super) async fn handle_cmd_status(state: &HubState) -> String {
+pub(super) async fn handle_cmd_status(state: &HubState, from_user_id: &str) -> String {
+    // Resolve visibility before taking the registry read lock: `wechat_visible`
+    // acquires (and drops) that lock itself, and this file keeps a single
+    // registry guard live at a time.
+    let visible = wechat_visible(state, from_user_id).await;
     let (online, total, online_clients) = {
         let registry = state.clients.registry.read().await;
-        let all = registry.all_clients();
-        let online = registry.online_clients().len();
+        let all = registry.all_clients_in(visible.as_ref());
+        let online = all.iter().filter(|c| c.online).count();
         let total = all.len();
         let online_clients: Vec<(String, String)> = all
             .iter()
@@ -508,6 +547,80 @@ mod tests {
         )
     }
 
+    /// A state whose `ILINK_AGENT_ALLOWLIST` is `acl_spec`. The env var is
+    /// process-wide, so these tests rely on the repo's serial DB-test convention
+    /// (`--test-threads=1`).
+    async fn make_hub_state_with_acl(acl_spec: &str) -> Arc<HubState> {
+        let store = crate::store::Store::connect("sqlite::memory:")
+            .await
+            .expect("in-memory store");
+        let queue: Arc<dyn crate::MessageQueue> = Arc::new(InMemoryQueue::new());
+        let (_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        temp_env::with_var(crate::hub::ENV_AGENT_ALLOWLIST, Some(acl_spec), || {
+            HubState::new(
+                crate::hub::tests::MockUpstream::returning_ok(),
+                Arc::new(store),
+                queue,
+                shutdown_rx,
+                "test-relay-secret".to_string(),
+                AdminConfig::from_env(),
+            )
+        })
+    }
+
+    /// The WeChat allowlist must constrain `/list` **and** `/use`: filtering only
+    /// the listing would leave the hidden backend reachable via its numeric alias.
+    #[tokio::test]
+    async fn list_and_use_respect_the_wechat_allowlist() {
+        let state = make_hub_state_with_acl("user:user1->claude").await;
+        for name in ["claude", "codex"] {
+            crate::server::pairing::register_client_in_hub(&state, name.to_string(), None, None)
+                .await;
+        }
+
+        let listed = handle_cmd_list(&state, "user1").await;
+        assert!(
+            listed.contains("`claude`"),
+            "an authorized backend must be listed: {listed}"
+        );
+        assert!(
+            !listed.contains("`codex`"),
+            "an unauthorized backend must not be listed: {listed}"
+        );
+
+        // `/use 1` indexes the visible set, so it resolves to claude only.
+        let used = handle_cmd_use(&state, "user1", "1").await;
+        assert!(
+            used.contains("claude"),
+            "index 1 must resolve inside the visible set: {used}"
+        );
+
+        let denied = handle_cmd_use(&state, "user1", "codex").await;
+        assert!(
+            denied.contains("未找到"),
+            "an unauthorized backend must not be selectable by name: {denied}"
+        );
+
+        // `/status` enumerates the same visible set, so it must neither name the
+        // hidden backend nor count it (only `claude` is visible → 0/1).
+        let status = handle_cmd_status(&state, "user1").await;
+        assert!(
+            !status.contains("codex"),
+            "an unauthorized backend must not appear in /status: {status}"
+        );
+        assert!(
+            status.contains("iLink Hub 状态：0/1"),
+            "the visible-set total must exclude the hidden backend: {status}"
+        );
+
+        // An unconfigured user sees nothing at all.
+        let other = handle_cmd_list(&state, "user2").await;
+        assert!(
+            other.contains("尚未授权"),
+            "an unconfigured user must be told they have no backends: {other}"
+        );
+    }
+
     /// M1-1: handle_cmd_broadcast with no online clients must return the correct
     /// count string. Catches the mutant that replaces the whole function body
     /// with String::new() or "xyzzy".
@@ -527,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn status_with_no_clients_returns_hub_status_string() {
         let state = make_hub_state().await;
-        let result = handle_cmd_status(&state).await;
+        let result = handle_cmd_status(&state, "user1").await;
         assert!(
             result.contains("iLink Hub 状态：0/0"),
             "status with no clients must contain '0/0', got: {result:?}"

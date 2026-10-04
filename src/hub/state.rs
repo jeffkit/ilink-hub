@@ -565,6 +565,9 @@ pub struct HubState {
     /// Pending Agent-to-Agent reply waiters.  MCP `call_agent` registers a
     /// oneshot here; the target Agent's `sendmessage` resolves it.
     pub a2a_waiter: Arc<crate::mcp::A2aWaiter>,
+    /// Agent access control (A2A edges + WeChat visibility), parsed once at
+    /// startup from `ILINK_AGENT_ALLOWLIST`.
+    pub a2a_acl: AgentAcl,
 }
 
 impl HubState {
@@ -582,6 +585,20 @@ impl HubState {
         relay_secret: String,
         admin: AdminConfig,
     ) -> Arc<Self> {
+        let a2a_acl = AgentAcl::from_env();
+        if a2a_acl.is_configured() {
+            tracing::info!(
+                a2a_edges = a2a_acl.a2a_edge_count(),
+                wechat_entries = a2a_acl.wechat_entry_count(),
+                "agent allowlist loaded from {}",
+                ENV_AGENT_ALLOWLIST
+            );
+        } else {
+            tracing::info!(
+                "{} unset — A2A calls are denied by default and WeChat visibility is unrestricted",
+                ENV_AGENT_ALLOWLIST
+            );
+        }
         Arc::new(Self {
             ilink: IlinkConnState::new(upstream, shutdown),
             routing: RoutingState::new(),
@@ -592,6 +609,7 @@ impl HubState {
             relay_secret,
             admin,
             a2a_waiter: Arc::new(crate::mcp::A2aWaiter::new()),
+            a2a_acl,
         })
     }
 

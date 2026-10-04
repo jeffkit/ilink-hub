@@ -49,6 +49,7 @@
 //! - `state.clients.poll_tracker.counts` (`StdMutex<HashMap<..>>`)
 //! - `state.clients.rate_limiter.buckets` (`StdMutex<HashMap<..>>`)
 
+pub mod acl;
 pub mod health;
 pub mod messages;
 pub mod outbound_label;
@@ -85,6 +86,7 @@ pub mod ilink_status {
     }
 }
 
+pub use acl::{AgentAcl, ENV_AGENT_ALLOWLIST};
 pub use dispatch::{
     build_hub_ext_for_vctx, push_to_queue_pub, resolve_vctx_for_message, spawn_dispatcher,
 };

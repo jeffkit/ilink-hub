@@ -167,6 +167,36 @@ iLink Hub 暴露两类 HTTP 端点：**兼容 iLink 协议的客户端端点**�
 }
 ```
 
+### POST /hub/clients/{name}/revoke
+
+吊销一个客户端当前持有的全部授权，并轮换它的 vtoken。
+
+**鉴权：** `Authorization: Bearer <ILINK_ADMIN_TOKEN>`
+
+**行为：**
+
+1. 删除旧 vtoken 的授权行（`routing_state`、`active_sessions`、`backend_sessions_v2`）；
+2. 生成新的明文 vtoken，替换 registry / `clients` 表中的旧 hash；
+3. 清空旧 vtoken 的路由、队列与 `last_seen`，并把该客户端标记为下线（bridge 仍持有旧凭据，需用新明文重新连接）。
+
+消息历史（`messages`）保留不变 —— 历史记录不再构成发送授权。
+
+**响应：**
+
+```json
+{
+  "ret": 0,
+  "name": "mac-home",
+  "vtoken": "vhub_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+}
+```
+
+::: warning
+`vtoken` 只在本次响应中返回一次明文，Hub 只保存 hash，无法恢复。撤销不可逆：若明文遗失，只能用 `DELETE /hub/clients/{name}` 删除后重新配对。
+:::
+
+**错误：** 名字为空 → `400`；客户端不存在 → `404`；存储失败 → `500`。
+
 ### GET /hub/ui
 
 Web 管理面板（浏览器界面）。返回 HTML 页面。

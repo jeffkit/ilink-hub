@@ -297,6 +297,24 @@ impl Store {
             .unwrap_or_else(|| "default".to_string()))
     }
 
+    /// Current wall-clock time as Unix epoch seconds (0 when the clock is
+    /// before the epoch, which is not a real-world case).
+    pub(super) fn now_epoch_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Expiry stamp for an `active_sessions` grant written right now.
+    ///
+    /// Read-time expiry only: the row is not deleted, it just stops satisfying
+    /// the ownership predicates in `context.rs` once `expires_at <= now`.
+    pub(super) fn grant_expires_at(&self) -> i64 {
+        Self::now_epoch_secs()
+            .saturating_add(i64::try_from(self.grant_ttl_secs).unwrap_or(i64::MAX))
+    }
+
     /// Set the active session name for a (vctx, vtoken) pair (upsert).
     pub async fn set_active_session_name(
         &self,
@@ -306,16 +324,18 @@ impl Store {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO active_sessions (vctx, vtoken, session_name)
-            VALUES ($1, $2, $3)
+            INSERT INTO active_sessions (vctx, vtoken, session_name, expires_at)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (vctx, vtoken) DO UPDATE SET
                 session_name = excluded.session_name,
+                expires_at   = excluded.expires_at,
                 updated_at   = CURRENT_TIMESTAMP
             "#,
         )
         .bind(vctx)
         .bind(vtoken)
         .bind(session_name)
+        .bind(self.grant_expires_at())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -328,6 +348,8 @@ impl Store {
     /// - Synthetic A2A messages: `a2a_depth = parent_depth + 1`
     ///
     /// This ensures `get_active_ctx_for_vtoken` can always find a row to check depth.
+    /// Each write also refreshes `expires_at`, so the grant lives for
+    /// `grant_ttl_secs` past the last inbound dispatch.
     pub async fn set_active_session_with_depth(
         &self,
         vctx: &str,
@@ -337,11 +359,12 @@ impl Store {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            INSERT INTO active_sessions (vctx, vtoken, session_name, a2a_depth)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO active_sessions (vctx, vtoken, session_name, a2a_depth, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (vctx, vtoken) DO UPDATE SET
                 session_name = excluded.session_name,
                 a2a_depth    = excluded.a2a_depth,
+                expires_at   = excluded.expires_at,
                 updated_at   = CURRENT_TIMESTAMP
             "#,
         )
@@ -349,8 +372,87 @@ impl Store {
         .bind(vtoken)
         .bind(session_name)
         .bind(i32::from(a2a_depth))
+        .bind(self.grant_expires_at())
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Read the raw `active_sessions` row for a `(vctx, vtoken)` pair.
+    ///
+    /// Returns `(session_name, a2a_depth)` or `None` when no grant row exists.
+    /// Used by the A2A release path to snapshot the pre-call grant before it is
+    /// overwritten, so the legitimate grant can be restored afterwards.
+    pub async fn get_active_session_row(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+    ) -> Result<Option<(String, u8)>> {
+        let row = sqlx::query(
+            "SELECT session_name, COALESCE(a2a_depth, 0) AS a2a_depth \
+             FROM active_sessions WHERE vctx = $1 AND vtoken = $2",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .fetch_optional(&self.rpool)
+        .await?;
+        Ok(row.map(|r| {
+            let depth: i32 = r.try_get("a2a_depth").unwrap_or(0);
+            (
+                r.get::<String, _>("session_name"),
+                u8::try_from(depth.max(0)).unwrap_or(u8::MAX),
+            )
+        }))
+    }
+
+    /// Delete the `active_sessions` grant for `(vctx, vtoken)` **only when its
+    /// `session_name` matches** `session_name`.
+    ///
+    /// The name guard keeps a scoped grant (e.g. an A2A call's `a2a-<call_id>`
+    /// key) from deleting a legitimate grant written by the normal dispatch
+    /// path for the same pair.
+    pub async fn delete_active_session_if_name(
+        &self,
+        vctx: &str,
+        vtoken: &str,
+        session_name: &str,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            "DELETE FROM active_sessions \
+             WHERE vctx = $1 AND vtoken = $2 AND session_name = $3",
+        )
+        .bind(vctx)
+        .bind(vtoken)
+        .bind(session_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete **every** authorization row held by `vtoken`, across the three
+    /// tables that can grant it outbound access: `routing_state` (per-user
+    /// selection), `active_sessions` (dispatch / A2A grants), and
+    /// `backend_sessions_v2` (named-session grants).
+    ///
+    /// Used by the admin revoke endpoint, which rotates a client's vtoken and
+    /// must leave the old hash with no residual authority. Message history
+    /// (`messages`) is intentionally preserved — it is no longer an
+    /// authorization source (see [`Self::resolve_send_context`]).
+    pub async fn revoke_authorizations_for_vtoken(&self, vtoken: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM routing_state WHERE active_vtoken = $1")
+            .bind(vtoken)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM active_sessions WHERE vtoken = $1")
+            .bind(vtoken)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM backend_sessions_v2 WHERE vtoken = $1")
+            .bind(vtoken)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -358,6 +460,9 @@ impl Store {
     ///
     /// Returns `(vctx, real_ctx, peer_user_id, a2a_depth)` by joining `active_sessions`
     /// with `context_token_map`, ordered by most recently updated session.
+    ///
+    /// Only **unexpired** grants are considered (`expires_at > now`); a revoked or
+    /// stale grant resolves to `None`.
     ///
     /// Used by the MCP `call_agent` handler to auto-fill context without requiring the
     /// calling LLM to pass hidden `_hub_vctx` / `_hub_real_ctx` / `_hub_peer` arguments.
@@ -369,11 +474,12 @@ impl Store {
                     COALESCE(c.peer_user_id, '') AS peer_user_id \
              FROM active_sessions a \
              JOIN context_token_map c ON a.vctx = c.vctx \
-             WHERE a.vtoken = $1 \
+             WHERE a.vtoken = $1 AND a.expires_at > $2 \
              ORDER BY a.updated_at DESC \
              LIMIT 1",
         )
         .bind(vtoken)
+        .bind(Self::now_epoch_secs())
         .fetch_optional(&self.rpool)
         .await?;
 

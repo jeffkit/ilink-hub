@@ -137,6 +137,75 @@ pub async fn admin_delete_client(
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct AdminRevokeClientResponse {
+    pub ret: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errmsg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The rotated plaintext vtoken. Returned exactly once — the Hub keeps only
+    /// the hash, so a lost response means re-pairing the client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vtoken: Option<String>,
+}
+
+/// Revoke all of a client's authorizations and rotate its vtoken.
+///
+/// The old credential stops working immediately and the client is marked
+/// offline; the returned plaintext is what the bridge must use from now on.
+pub async fn admin_revoke_client(
+    _admin: AdminGuard,
+    State(state): State<Arc<HubState>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> (StatusCode, Json<AdminRevokeClientResponse>) {
+    let name = name.trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(AdminRevokeClientResponse {
+                ret: 400,
+                errmsg: Some("Client name is required".to_string()),
+                name: None,
+                vtoken: None,
+            }),
+        );
+    }
+
+    match crate::server::pairing::revoke_client_in_hub(state.as_ref(), name).await {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(AdminRevokeClientResponse {
+                ret: 0,
+                errmsg: None,
+                name: Some(outcome.name),
+                vtoken: Some(outcome.plaintext),
+            }),
+        ),
+        Err(crate::server::pairing::RevokeClientError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(AdminRevokeClientResponse {
+                ret: 404,
+                errmsg: Some(format!("Client `{name}` not found")),
+                name: None,
+                vtoken: None,
+            }),
+        ),
+        Err(crate::server::pairing::RevokeClientError::Store(e)) => {
+            error!(error = %e, %name, "failed to revoke client vtoken");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AdminRevokeClientResponse {
+                    ret: 500,
+                    errmsg: Some("Failed to revoke client".to_string()),
+                    name: None,
+                    vtoken: None,
+                }),
+            )
+        }
+    }
+}
+
 pub async fn admin_update_client(
     _admin: AdminGuard,
     State(state): State<Arc<HubState>>,

@@ -13,11 +13,11 @@ async fn test_schema_version_tracking() {
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 14,
-        "expected all 14 migrations to be applied on a fresh DB"
+        version, 15,
+        "expected all 15 migrations to be applied on a fresh DB"
     );
 
-    for v in 1..=14 {
+    for v in 1..=15 {
         let applied = store.is_migration_run(v).await.expect("is_migration_run");
         assert!(applied, "migration v{v} should be marked as applied");
     }
@@ -50,8 +50,8 @@ async fn test_migration_idempotency() {
         .await
         .expect("get_current_version");
     assert_eq!(
-        version, 14,
-        "version must remain 14 after idempotent re-run"
+        version, 15,
+        "version must remain 15 after idempotent re-run"
     );
 }
 
@@ -71,6 +71,7 @@ async fn test_migration_incremental_from_v2() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
             master_key: std::sync::OnceLock::new(),
         };
 
@@ -154,9 +155,9 @@ async fn test_migration_incremental_from_v2() {
     store.run_migrations().await.expect("incremental migration");
 
     let version = store.get_current_version().await.unwrap();
-    assert_eq!(version, 14, "must reach v14 after incremental migration");
+    assert_eq!(version, 15, "must reach v15 after incremental migration");
 
-    for v in 1..=14 {
+    for v in 1..=15 {
         assert!(
             store.is_migration_run(v).await.unwrap(),
             "v{v} must be marked applied"
@@ -201,6 +202,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
             rpool: pool.clone(),
             pool,
             kind: DatabaseKind::Sqlite,
+            grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
             master_key: std::sync::OnceLock::new(),
         };
 
@@ -250,7 +252,7 @@ async fn test_migration_v6_normalizes_peer_user_id_format() {
     );
     store.run_migrations().await.expect("run_migrations");
     let cur_ver = store.get_current_version().await.unwrap();
-    assert_eq!(cur_ver, 14, "current version must be 14, got {}", cur_ver);
+    assert_eq!(cur_ver, 15, "current version must be 15, got {}", cur_ver);
     assert!(
         store.is_migration_run(6).await.unwrap(),
         "v6 must be marked after run"
@@ -604,13 +606,13 @@ async fn adversarial_concurrent_store_connect_succeeds_and_converges() {
     let s2 = s2.expect("connect #2 must succeed");
     assert_eq!(
         s1.get_current_version().await.unwrap(),
-        14,
-        "writer #1 must see all v1-v14 applied"
+        15,
+        "writer #1 must see all v1-v15 applied"
     );
     assert_eq!(
         s2.get_current_version().await.unwrap(),
-        14,
-        "writer #2 must see all v1-v14 applied"
+        15,
+        "writer #2 must see all v1-v15 applied"
     );
     // The whole schema must be usable from both writers — no half-applied
     // tables, no missing indexes.
@@ -678,8 +680,8 @@ async fn adversarial_many_concurrent_connects_converge() {
     for (i, s) in stores.iter().enumerate() {
         assert_eq!(
             s.get_current_version().await.unwrap(),
-            14,
-            "connect #{i} must see all v1-v14 applied"
+            15,
+            "connect #{i} must see all v1-v15 applied"
         );
     }
 }
@@ -702,6 +704,7 @@ async fn adversarial_v4_skips_alter_when_column_already_present() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the same v1+v2 state as `test_migration_incremental_from_v2`.
@@ -829,6 +832,7 @@ async fn adversarial_get_current_version_propagates_decode_error() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     store
@@ -891,8 +895,8 @@ async fn adversarial_version_api_boundaries() {
     assert!(!store.is_migration_run(0).await.unwrap());
     // is_migration_run(-1): not applied, no error.
     assert!(!store.is_migration_run(-1).await.unwrap());
-    // get_current_version: 14 (the highest applied after full connect).
-    assert_eq!(store.get_current_version().await.unwrap(), 14);
+    // get_current_version: 15 (the highest applied after full connect).
+    assert_eq!(store.get_current_version().await.unwrap(), 15);
 }
 
 /// F-M1-08: `try_claim_migration` is the atomic primitive. Two concurrent
@@ -991,6 +995,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap only the schema_version table — no migrations applied yet.
@@ -1046,7 +1051,7 @@ async fn m2_per_version_migrators_update_schema_version_independently() {
 #[tokio::test]
 async fn m2_migrators_are_idempotent_per_step() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
-    // After connect, all 14 are applied. Re-running each must NOT fail
+    // After connect, all 15 are applied. Re-running each must NOT fail
     // and must NOT touch the schema_version table.
     store.migrate_to_v1().await.expect("v1 re-run");
     store.migrate_to_v2().await.expect("v2 re-run");
@@ -1062,9 +1067,10 @@ async fn m2_migrators_are_idempotent_per_step() {
     store.migrate_to_v12().await.expect("v12 re-run");
     store.migrate_to_v13().await.expect("v13 re-run");
     store.migrate_to_v14().await.expect("v14 re-run");
+    store.migrate_to_v15().await.expect("v15 re-run");
 
-    // Still at v14.
-    assert_eq!(store.get_current_version().await.unwrap(), 14);
+    // Still at v15.
+    assert_eq!(store.get_current_version().await.unwrap(), 15);
 }
 
 /// F-M2-03: a DDL failure inside a migrator must propagate as `Err`,
@@ -1085,6 +1091,7 @@ async fn m2_ddl_error_propagates_through_migrator() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap the version-tracking table and the v1 schema with
@@ -1183,6 +1190,7 @@ async fn m2_v4_alone_with_minimal_preconditions() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     store
@@ -1244,7 +1252,7 @@ async fn m2_run_migrations_records_all_versions_in_order() {
         );
     }
     // get_current_version returns the maximum.
-    assert_eq!(store.get_current_version().await.unwrap(), 14);
+    assert_eq!(store.get_current_version().await.unwrap(), 15);
 }
 
 /// F-M2-07: `run_migrations` invoked twice in a row must remain
@@ -1255,8 +1263,8 @@ async fn m2_run_migrations_idempotent_double_call() {
     let store = Store::connect("sqlite::memory:").await.expect("connect");
     // Second call must succeed.
     store.run_migrations().await.expect("second run_migrations");
-    // Version stays at 14 (no ghost rows from a third call).
-    assert_eq!(store.get_current_version().await.unwrap(), 14);
+    // Version stays at 15 (no ghost rows from a third call).
+    assert_eq!(store.get_current_version().await.unwrap(), 15);
 }
 
 /// F-M2-08: each `migrate_to_vN` uses `CURRENT_TIMESTAMP` (not
@@ -1584,6 +1592,7 @@ async fn adversarial_column_exists_uses_pragma_on_sqlite() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     store
@@ -1926,8 +1935,8 @@ fn adversarial_ensure_sqlite_file_does_not_truncate_existing_db() {
     let store2 = rt.block_on(async { Store::connect(&url).await.expect("second connect") });
     let v = rt.block_on(store2.get_current_version()).unwrap();
     assert_eq!(
-        v, 14,
-        "database must still be at v14 after ensure_sqlite_file"
+        v, 15,
+        "database must still be at v15 after ensure_sqlite_file"
     );
 }
 
@@ -1978,7 +1987,7 @@ fn adversarial_ensure_sqlite_file_concurrent_threads_safe() {
             .expect("reconnect after concurrent race")
     });
     let v = rt.block_on(store2.get_current_version()).unwrap();
-    assert_eq!(v, 14);
+    assert_eq!(v, 15);
 }
 
 /// SEC-ADV-002: `column_exists` on the SQLite branch must propagate
@@ -2001,6 +2010,7 @@ async fn adversarial_v4_tx_pragma_error_propagates() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version table (required by run_migrations).
@@ -2060,6 +2070,7 @@ async fn adversarial_column_exists_returns_false_on_nonexistent_table() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // No tables created — `column_exists` on a non-existent table must
@@ -2092,6 +2103,7 @@ async fn adversarial_ddl_surfaces_error_after_column_exists_suppresses() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // column_exists returns false → caller tries DDL
@@ -2169,6 +2181,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool.clone(),
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Bootstrap schema_version.
@@ -2188,6 +2201,7 @@ async fn adversarial_try_claim_in_tx_is_mutually_exclusive() {
         rpool: pool.clone(),
         pool: pool2,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     let (r1, r2) = tokio::join!(
@@ -2408,6 +2422,7 @@ async fn test_bot_credentials_encryption_decryption() {
         pool: store.pool.clone(),
         rpool: store.pool.clone(),
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     // Because a row exists in bot_credentials now, loading should fail due to missing master key
@@ -2498,6 +2513,7 @@ async fn test_bot_credentials_decryption_adversarial_wrong_key() {
         pool: store.pool.clone(),
         rpool: store.pool.clone(),
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     store_b
@@ -2586,6 +2602,7 @@ async fn test_migration_v8_hash_vtoken_and_encrypt_bot_token() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
 
@@ -2708,6 +2725,7 @@ async fn test_migration_v8_missing_master_key_fails() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
 
@@ -2767,6 +2785,7 @@ async fn test_migration_v8_idempotency_does_not_double_encrypt() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
 
@@ -3541,6 +3560,7 @@ async fn find_or_create_vctx_pre_v7_fallback_is_stable() {
         rpool: pool.clone(),
         pool,
         kind: DatabaseKind::Sqlite,
+        grant_ttl_secs: DEFAULT_GRANT_TTL_SECS,
         master_key: std::sync::OnceLock::new(),
     };
     store
@@ -4357,4 +4377,227 @@ mod issue30_pg {
         assert_eq!(left.0, "vctx-issue30-new");
         drop_scratch(&pool, &table).await;
     }
+}
+
+// ─── active_sessions grant TTL ───────────────────────────────────────────────
+
+/// A dispatch-time grant must carry an explicit expiry (`now + TTL`), not a
+/// permanent/zero stamp — otherwise revoking or bounding the grant is
+/// impossible.
+#[tokio::test]
+async fn active_session_grant_carries_a_ttl_expiry() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vctx = "vctx-ttl";
+    let vtoken = "vtoken-ttl";
+
+    let now = Store::now_epoch_secs();
+    store
+        .set_active_session_name(vctx, vtoken, "default")
+        .await
+        .expect("grant");
+
+    let (expires_at,): (i64,) =
+        sqlx::query_as("SELECT expires_at FROM active_sessions WHERE vctx = $1 AND vtoken = $2")
+            .bind(vctx)
+            .bind(vtoken)
+            .fetch_one(&store.pool)
+            .await
+            .expect("expires_at");
+
+    assert!(
+        expires_at > now,
+        "a fresh grant must not already be expired: expires_at={expires_at}, now={now}"
+    );
+    let ttl = i64::try_from(DEFAULT_GRANT_TTL_SECS).expect("default TTL fits in i64");
+    assert!(
+        expires_at <= now + ttl + 5,
+        "a fresh grant must expire within the configured TTL: expires_at={expires_at}, now={now}"
+    );
+}
+
+/// TTL 0 pins the grant to `now`, which never satisfies `expires_at > now`:
+/// every ownership predicate must then refuse the pair, and a rewrite with a
+/// positive TTL must restore it (the upsert path refreshes `expires_at`).
+#[tokio::test]
+async fn expired_active_session_grant_is_not_authorization() {
+    let mut store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vctx = store
+        .find_or_create_vctx("peer-ttl-expired", None, "real-ctx-ttl")
+        .await
+        .expect("create vctx");
+    let vtoken = "vtoken-ttl-expired";
+
+    store.grant_ttl_secs = 0;
+    store
+        .set_active_session_name(&vctx, vtoken, "default")
+        .await
+        .expect("expired grant");
+
+    assert!(
+        store
+            .resolve_send_context(&vctx, vtoken)
+            .await
+            .expect("query")
+            .is_none(),
+        "an expired active_sessions row must not authorize sendmessage"
+    );
+    assert!(
+        !store.vtoken_owns_vctx(&vctx, vtoken).await.expect("owns"),
+        "an expired active_sessions row must not own the vctx"
+    );
+    assert!(
+        store
+            .get_active_ctx_for_vtoken(vtoken)
+            .await
+            .expect("query")
+            .is_none(),
+        "an expired active_sessions row must not resolve an active context"
+    );
+
+    store.grant_ttl_secs = DEFAULT_GRANT_TTL_SECS;
+    store
+        .set_active_session_name(&vctx, vtoken, "default")
+        .await
+        .expect("refreshed grant");
+
+    assert!(
+        store
+            .resolve_send_context(&vctx, vtoken)
+            .await
+            .expect("query")
+            .is_some(),
+        "rewriting the grant must refresh its expiry"
+    );
+    assert!(
+        store.vtoken_owns_vctx(&vctx, vtoken).await.expect("owns"),
+        "rewriting the grant must restore ownership"
+    );
+    assert!(
+        store
+            .get_active_ctx_for_vtoken(vtoken)
+            .await
+            .expect("query")
+            .is_some(),
+        "rewriting the grant must restore the active context"
+    );
+}
+
+/// Pins the TTL scope decision: `backend_sessions_v2` (named sessions) is not
+/// TTL-bounded — only `revoke` / `/session delete` clear it.
+#[tokio::test]
+async fn backend_session_grant_outlives_the_active_session_ttl() {
+    let mut store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vctx = store
+        .find_or_create_vctx("peer-bsess-ttl", None, "real-bsess-ttl")
+        .await
+        .expect("create vctx");
+
+    store.grant_ttl_secs = 0;
+    store
+        .set_backend_session(&vctx, "vtoken-bsess-ttl", "default", "sid-ttl")
+        .await
+        .expect("session");
+
+    let owned = store
+        .resolve_send_context(&vctx, "vtoken-bsess-ttl")
+        .await
+        .expect("query");
+    assert!(
+        owned.is_some(),
+        "backend_sessions_v2 grants are not TTL-bounded"
+    );
+}
+
+// ─── revoke ──────────────────────────────────────────────────────────────────
+
+/// 验收 A3-3：吊销必须清空**三张**授权表 —— `routing_state`（用户级选择）、
+/// `active_sessions`（派发 / A2A 授权）、`backend_sessions_v2`（命名会话授权）。
+///
+/// `routing_state` 残留的后果不是「能 sendmessage」而是更隐蔽的一条：`upsert_client`
+/// 会在写入新 vtoken 时把这个用户的 `active_vtoken` 从旧 hash 迁到新 hash
+/// （`src/store/clients.rs` 的 `UPDATE routing_state SET active_vtoken = …`），
+/// 于是「先 upsert 再清授权」的顺序会把已吊销的路由复活。本用例直接对被清理的行计数。
+#[tokio::test]
+async fn revoke_authorizations_clears_every_grant_table() {
+    let store = Store::connect("sqlite::memory:").await.expect("connect");
+    let vctx = store
+        .find_or_create_vctx("peer-revoke", None, "real-ctx-revoke")
+        .await
+        .expect("create vctx");
+    let vtoken = "vtoken-revoke";
+
+    store
+        .set_route("user-revoke", vtoken)
+        .await
+        .expect("set_route");
+    store
+        .set_active_session_with_depth(&vctx, vtoken, "default", 0)
+        .await
+        .expect("grant");
+    store
+        .set_backend_session(&vctx, vtoken, "named", "sid-revoke")
+        .await
+        .expect("named session");
+
+    let counts = [
+        (
+            "routing_state",
+            "SELECT COUNT(*) FROM routing_state WHERE active_vtoken = $1",
+        ),
+        (
+            "active_sessions",
+            "SELECT COUNT(*) FROM active_sessions WHERE vtoken = $1",
+        ),
+        (
+            "backend_sessions_v2",
+            "SELECT COUNT(*) FROM backend_sessions_v2 WHERE vtoken = $1",
+        ),
+    ];
+
+    for (table, sql) in counts {
+        let (count,): (i64,) = sqlx::query_as(sql)
+            .bind(vtoken)
+            .fetch_one(&store.pool)
+            .await
+            .expect("count before revoke");
+        assert_eq!(count, 1, "precondition: {table} must hold one row");
+    }
+    assert!(
+        store
+            .resolve_send_context(&vctx, vtoken)
+            .await
+            .expect("query")
+            .is_some(),
+        "precondition: the grants must authorize sendmessage"
+    );
+
+    store
+        .revoke_authorizations_for_vtoken(vtoken)
+        .await
+        .expect("revoke");
+
+    for (table, sql) in counts {
+        let (count,): (i64,) = sqlx::query_as(sql)
+            .bind(vtoken)
+            .fetch_one(&store.pool)
+            .await
+            .expect("count after revoke");
+        assert_eq!(count, 0, "{table} must be empty after revoke");
+    }
+    assert!(
+        store
+            .resolve_send_context(&vctx, vtoken)
+            .await
+            .expect("query")
+            .is_none(),
+        "a revoked vtoken must resolve no send context"
+    );
+    assert!(
+        store
+            .get_active_ctx_for_vtoken(vtoken)
+            .await
+            .expect("query")
+            .is_none(),
+        "a revoked vtoken must resolve no active context"
+    );
 }
