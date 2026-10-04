@@ -65,7 +65,15 @@ pub struct RelayState {
     /// Tracks (device_id, timestamp_secs) pairs that have already been used for
     /// registration. Prevents replay attacks within the 60-second skew window.
     /// Entries are passively evicted whenever a new registration arrives.
-    /// Only prevents replay within a single relay process (single-instance relay).
+    ///
+    /// **Limitations:**
+    /// - In-memory only: this table is lost on process restart.  An attacker
+    ///   who captures a valid registration message and restarts (or crashes) the
+    ///   relay within the 60-second skew window can replay it successfully.
+    ///   Acceptable for the current single-instance deployment model.
+    /// - Not safe for multi-instance relay deployments without a shared store
+    ///   (e.g. Redis); if the relay is ever scaled out, migrate nonce tracking
+    ///   to a distributed store before exposing the relay to untrusted networks.
     used_register_nonces: Arc<DashMap<(String, i64), Instant>>,
 }
 

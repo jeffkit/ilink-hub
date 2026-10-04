@@ -9,16 +9,6 @@
 * [质量门](project/quality-gates.md) — 每次代码变更必须通过的 CI 检查
 * [代码规范与约定](project/conventions.md) — Rust 规范、并发开发约定
 
-## Bridge（已迁出 im-agentproc）
-
-> Bridge 代码已物理拆分到独立仓库 [`jeffkit/im-agentproc`](https://github.com/jeffkit/im-agentproc)。
-> 以下为概念性知识，代码与最新规范以 im-agentproc 为准。
-
-* [Bridge 概览](bridges/overview.md) — Bridge 是什么、有哪些内置实现
-* [P0 协议与 Profile](bridges/profile-protocol.md) — 进程契约：环境变量输入、stdout 输出、流式格式
-* [Cursor Bridge](bridges/cursor.md) — Cursor IDE bridge 实现细节
-* [Claude Code Bridge](bridges/claude-code.md) — Claude Code CLI bridge 实现细节
-
 ## API & 命令
 
 * [微信命令](api/commands.md) — /list、/use、@name、/session、/broadcast 等

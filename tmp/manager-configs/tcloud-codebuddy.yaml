@@ -1,0 +1,13 @@
+# tcloud-codebuddy profile (im-agentproc manager child)
+# NOTE: executor name MUST match the agentproc-crate registration `codebuddy`.
+# The alias `codebuddy-code` is only for the `im-agentproc profile ...` subcommand
+# and is NOT recognised by the manager-mode runner (which delegates to the
+# agentproc crate). A mismatched name silently falls through to a no-args spawn.
+agentproc:
+  executor: codebuddy
+  command: codebuddy
+  cwd: /home/ubuntu/projects
+  timeout_secs: 600
+  max_reply_chars: 8000
+  env:
+    CODEBUDDY_MODEL: "hy3-ioa"
