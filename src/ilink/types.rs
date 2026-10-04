@@ -880,7 +880,10 @@ mod wire_roundtrip_tests {
         let out = serde_json::to_value(&msg).unwrap();
         println!("ROUNDTRIP OUT: {out}");
         let img = &out["item_list"][0]["image_item"];
-        assert_eq!(img["media"]["encrypt_query_param"], "pTn5z8BzIftZM_ACTFzglK_test_eqp");
+        assert_eq!(
+            img["media"]["encrypt_query_param"],
+            "pTn5z8BzIftZM_ACTFzglK_test_eqp"
+        );
         assert_eq!(img["media"]["aes_key"], "MzJjaGFyc0hleFRlc3RLZXk=");
         assert_eq!(img["media"]["encrypt_type"], 1);
         assert_eq!(img["mid_size"], 9616);
