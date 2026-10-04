@@ -9,6 +9,22 @@ use crate::hub::HubState;
 
 // ─── Metrics (Prometheus text format) ────────────────────────────────────────
 
+/// Escape a Prometheus label value per the text exposition format: backslash,
+/// double quote, and newline must be escaped, in that order (backslash first,
+/// so we do not double-escape the escapes we just wrote).
+pub(super) fn escape_label_value(v: &str) -> String {
+    let mut out = String::with_capacity(v.len());
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 pub async fn metrics(
     _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
@@ -100,16 +116,76 @@ pub async fn metrics(
         created,
     );
 
+    // Client names are operator-supplied, so they must be escaped before being
+    // interpolated into a label value — an unescaped quote or newline would
+    // produce a line the Prometheus text parser rejects, taking the whole
+    // scrape (not just one series) with it.
+    let client_label = |vtoken: &str| -> String {
+        escape_label_value(
+            client_names_by_vtoken
+                .get(vtoken)
+                .map(String::as_str)
+                .unwrap_or("unknown"),
+        )
+    };
+
     out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
     out.push_str("# TYPE ilink_hub_queue_size gauge\n");
     for (vtoken, size) in &queue_sizes {
-        let name = client_names_by_vtoken
-            .get(vtoken)
-            .map(String::as_str)
-            .unwrap_or("unknown");
         out.push_str(&format!(
             "ilink_hub_queue_size{{client=\"{}\"}} {}\n",
-            name, size
+            client_label(vtoken),
+            size
+        ));
+    }
+
+    // Per-tenant outbound rate limiting. `tokens` is the remaining quota in the
+    // client's token bucket (the "how close am I to a 429" signal); `rejected`
+    // counts requests the limiter turned away. All three are keyed by client
+    // name so cardinality stays bounded by the client registry. A client that
+    // has not made an outbound request since startup has no bucket and
+    // therefore no series here — absence means "no traffic", not "no limit".
+    //
+    // Buckets can outlive their client (a vtoken deleted via the admin API
+    // keeps its bucket until LRU eviction), and an unnamed bucket would render
+    // as `client="unknown"`. Two of those would be a duplicate series, which
+    // makes Prometheus reject the *entire* scrape — so only named clients are
+    // exported. Dropping the departed client's counters is the right trade:
+    // nobody can act on the quota of a client that no longer exists.
+    let rate_limits: Vec<_> = state
+        .clients
+        .rate_limiter
+        .snapshot()
+        .into_iter()
+        .filter(|(vtoken, _)| client_names_by_vtoken.contains_key(vtoken))
+        .collect();
+    out.push_str("# HELP ilink_hub_ratelimit_tokens Remaining outbound request tokens in this client's bucket\n");
+    out.push_str("# TYPE ilink_hub_ratelimit_tokens gauge\n");
+    for (vtoken, view) in &rate_limits {
+        out.push_str(&format!(
+            "ilink_hub_ratelimit_tokens{{client=\"{}\"}} {}\n",
+            client_label(vtoken),
+            view.tokens
+        ));
+    }
+    out.push_str(
+        "# HELP ilink_hub_ratelimit_burst Configured burst capacity of this client's bucket\n",
+    );
+    out.push_str("# TYPE ilink_hub_ratelimit_burst gauge\n");
+    for (vtoken, view) in &rate_limits {
+        out.push_str(&format!(
+            "ilink_hub_ratelimit_burst{{client=\"{}\"}} {}\n",
+            client_label(vtoken),
+            view.burst
+        ));
+    }
+    out.push_str("# HELP ilink_hub_ratelimit_rejected_total Outbound bot-API requests rejected by the per-client rate limiter\n");
+    out.push_str("# TYPE ilink_hub_ratelimit_rejected counter\n");
+    for (vtoken, view) in &rate_limits {
+        out.push_str(&format!(
+            "ilink_hub_ratelimit_rejected_total{{client=\"{}\"}} {}\n",
+            client_label(vtoken),
+            view.rejected
         ));
     }
 
@@ -220,4 +296,36 @@ pub(super) fn render_counter(out: &mut String, name: &str, help: &str, value: u6
     out.push_str(&format!("# TYPE {base} counter\n"));
     out.push_str(&format!("{name} {value}\n"));
     out.push_str(&format!("{base}_created {created}\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_label_value;
+
+    #[test]
+    fn escapes_backslash_quote_and_newline() {
+        assert_eq!(escape_label_value("plain-client"), "plain-client");
+        assert_eq!(escape_label_value(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(escape_label_value("a\nb"), r"a\nb");
+        // Backslash must be escaped first, otherwise the escape we write for a
+        // quote would itself be re-escaped into `\\"`.
+        assert_eq!(escape_label_value(r"a\b"), r"a\\b");
+        assert_eq!(escape_label_value("a\\\"b"), "a\\\\\\\"b");
+    }
+
+    /// A client name containing a quote or newline must not be able to break
+    /// the exposition format: the emitted line has to keep exactly one label
+    /// value and stay on one line.
+    #[test]
+    fn escaped_names_cannot_inject_extra_lines() {
+        let label = escape_label_value("evil\nclient\"x");
+        // Every dangerous character comes back escaped.
+        assert_eq!(label, r#"evil\nclient\"x"#);
+        // The escaped form carries no raw newline, so the exposition line that
+        // interpolates it stays a single line.
+        assert!(!label.contains('\n'), "label: {label:?}");
+
+        let line = format!("ilink_hub_ratelimit_tokens{{client=\"{label}\"}} 1\n");
+        assert_eq!(line.matches('\n').count(), 1, "line: {line:?}");
+    }
 }

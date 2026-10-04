@@ -42,6 +42,12 @@
 //! If a new lock is added to `HubState`, extend this list and place the new
 //! lock at a position that respects the order. Reviewers should reject PRs
 //! that introduce a new lock without updating this section.
+//!
+//! Leaf locks held for a bounded, non-awaiting critical section (no ordering
+//! participation, never acquired while holding another lock in this list):
+//!
+//! - `state.clients.poll_tracker.counts` (`StdMutex<HashMap<..>>`)
+//! - `state.clients.rate_limiter.buckets` (`StdMutex<HashMap<..>>`)
 
 pub mod health;
 pub mod messages;
@@ -49,6 +55,7 @@ pub mod outbound_label;
 pub mod pairing;
 pub mod queue;
 pub mod quote_route;
+pub mod rate_limit;
 pub mod registry;
 pub mod router;
 pub mod vtoken_hash;
@@ -91,6 +98,10 @@ pub use queue::{InMemoryQueue, MessageQueue};
 pub use quote_route::{
     collect_quoted, collect_quoted_msg_id, collect_quoted_timestamp, footer_from_user_quote,
     merge_routing_with_quote, parse_footer_from_quoted_text, QuoteOrigin,
+};
+pub use rate_limit::{
+    RateLimitOutcome, RateLimitSnapshot, VtokenRateLimiter, BOT_RATE_LIMIT_BURST_DEFAULT,
+    BOT_RATE_LIMIT_MAX_ENTRIES, BOT_RATE_LIMIT_PER_SEC_DEFAULT,
 };
 pub use registry::{ClientInfo, ClientRegistry};
 pub use router::{HubCommand, Router, RoutingDecision};

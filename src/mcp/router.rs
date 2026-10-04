@@ -140,6 +140,22 @@ pub(crate) async fn handle_tools_call(
         "list_agents" => Ok(list_agents(state).await),
 
         "call_agent" => {
+            // Per-vtoken fair-share gate. An A2A call ends in an outbound
+            // `sendmessage` on the shared upstream account, so it is charged
+            // against the same bucket as the bot routes — otherwise a tenant
+            // could bypass its own quota by looping through `call_agent`.
+            if let Some(retry_after) =
+                crate::server::routes::check_outbound_rate_limit(state, caller_vtoken)
+            {
+                let secs = crate::server::routes::retry_after_secs(retry_after);
+                warn!(
+                    caller = %crate::redact_token(caller_vtoken),
+                    retry_after_secs = secs,
+                    "call_agent rejected: per-vtoken rate limit exceeded"
+                );
+                return Err(format!("rate limit exceeded; retry after {secs}s"));
+            }
+
             let target_name = arguments
                 .get("name")
                 .and_then(Value::as_str)
