@@ -25,6 +25,30 @@ pub(super) fn escape_label_value(v: &str) -> String {
     out
 }
 
+/// Collapse per-vtoken values into per-client-name values. vtokens with no
+/// name mapping (deleted clients) all fall into a single `unknown` bucket, so
+/// they render as one series instead of one duplicate series per vtoken.
+/// Summing keeps a departed client's residual activity visible instead of
+/// silently dropping it.
+pub(super) fn collapse_by_client<'a, I>(
+    entries: I,
+    names: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, u64>
+where
+    I: IntoIterator<Item = (&'a String, u64)>,
+{
+    let mut per_client: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for (vtoken, value) in entries {
+        let client = match names.get(vtoken) {
+            Some(name) => name.clone(),
+            None => "unknown".to_string(),
+        };
+        let slot = per_client.entry(client).or_insert(0);
+        *slot = slot.saturating_add(value);
+    }
+    per_client
+}
+
 pub async fn metrics(
     _admin: AdminGuard,
     State(state): State<Arc<HubState>>,
@@ -94,15 +118,21 @@ pub async fn metrics(
         "# HELP ilink_hub_messages_rejected Messages rejected by per-client backpressure (queue full; oldest retained)\n",
     );
     out.push_str("# TYPE ilink_hub_messages_rejected counter\n");
-    for entry in state.metrics.messages_rejected_by_client.iter() {
-        let name = client_names_by_vtoken
-            .get(entry.key())
-            .map(String::as_str)
-            .unwrap_or("unknown");
+    // `DashMap` guards only live for one iteration, so the keys are owned
+    // before aggregation.
+    let rejected_per_vtoken: Vec<(String, u64)> = state
+        .metrics
+        .messages_rejected_by_client
+        .iter()
+        .map(|e| (e.key().clone(), e.value().load(Ordering::Relaxed)))
+        .collect();
+    for (client, rejected) in collapse_by_client(
+        rejected_per_vtoken.iter().map(|(vtoken, v)| (vtoken, *v)),
+        &client_names_by_vtoken,
+    ) {
         out.push_str(&format!(
-            "ilink_hub_messages_rejected_total{{client=\"{}\"}} {}\n",
-            name,
-            entry.value().load(Ordering::Relaxed)
+            "ilink_hub_messages_rejected_total{{client=\"{}\"}} {rejected}\n",
+            escape_label_value(&client)
         ));
     }
 
@@ -150,11 +180,15 @@ pub async fn metrics(
 
     out.push_str("# HELP ilink_hub_queue_size Current pending message count per client\n");
     out.push_str("# TYPE ilink_hub_queue_size gauge\n");
-    for (vtoken, size) in &queue_sizes {
+    for (client, size) in collapse_by_client(
+        queue_sizes
+            .iter()
+            .map(|(vtoken, size)| (vtoken, *size as u64)),
+        &client_names_by_vtoken,
+    ) {
         out.push_str(&format!(
-            "ilink_hub_queue_size{{client=\"{}\"}} {}\n",
-            client_label(vtoken),
-            size
+            "ilink_hub_queue_size{{client=\"{}\"}} {size}\n",
+            escape_label_value(&client)
         ));
     }
 
@@ -319,7 +353,25 @@ pub(super) fn render_counter(out: &mut String, name: &str, help: &str, value: u6
 
 #[cfg(test)]
 mod tests {
-    use super::escape_label_value;
+    use super::{collapse_by_client, escape_label_value};
+
+    fn name_map(pairs: &[(&str, &str)]) -> std::collections::HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(vtoken, name)| (vtoken.to_string(), name.to_string()))
+            .collect()
+    }
+
+    fn collapse(
+        entries: &[(&str, u64)],
+        names: &[(&str, &str)],
+    ) -> std::collections::BTreeMap<String, u64> {
+        let owned: Vec<(String, u64)> = entries
+            .iter()
+            .map(|(vtoken, value)| (vtoken.to_string(), *value))
+            .collect();
+        collapse_by_client(owned.iter().map(|(k, v)| (k, *v)), &name_map(names))
+    }
 
     #[test]
     fn escapes_backslash_quote_and_newline() {
@@ -346,5 +398,38 @@ mod tests {
 
         let line = format!("ilink_hub_ratelimit_tokens{{client=\"{label}\"}} 1\n");
         assert_eq!(line.matches('\n').count(), 1, "line: {line:?}");
+    }
+
+    /// Two vtokens without a name mapping must share one bucket: two series
+    /// with the identical label set are a duplicate timeseries, which makes
+    /// Prometheus reject the entire scrape.
+    #[test]
+    fn collapse_folds_unnamed_vtokens_into_one_unknown_bucket() {
+        let collapsed = collapse(&[("vt-a", 1), ("vt-b", 2)], &[]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed.get("unknown"), Some(&3));
+    }
+
+    /// Mapped vtokens are bucketed by name and summed per name; the bucket key
+    /// is the raw name, so escaping happens once at render time and cannot
+    /// split one name into two buckets.
+    #[test]
+    fn collapse_sums_per_client_name() {
+        let collapsed = collapse(
+            &[("vt-a", 1), ("vt-b", 2), ("vt-c", 4), ("vt-gone", 8)],
+            &[("vt-a", "alpha"), ("vt-b", "alpha"), ("vt-c", "beta")],
+        );
+        assert_eq!(collapsed.get("alpha"), Some(&3));
+        assert_eq!(collapsed.get("beta"), Some(&4));
+        assert_eq!(collapsed.get("unknown"), Some(&8));
+    }
+
+    /// A real client literally named `unknown` shares the unnamed bucket, so
+    /// the family still has exactly one series with that label set.
+    #[test]
+    fn collapse_merges_a_literal_unknown_name_into_the_unnamed_bucket() {
+        let collapsed = collapse(&[("vt-a", 2), ("vt-b", 3)], &[("vt-a", "unknown")]);
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed.get("unknown"), Some(&5));
     }
 }

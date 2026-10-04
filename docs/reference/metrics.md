@@ -22,7 +22,8 @@ curl http://localhost:8765/metrics
 |--------|------|------|
 | `ilink_hub_clients_online` | Gauge | 当前在线后端数量 |
 | `ilink_hub_clients_total` | Gauge | 已注册后端总数 |
-| `ilink_hub_queue_size` | Gauge（带 `client` 标签） | 每个后端当前待下发队列长度 |
+| `ilink_hub_queue_size` | Gauge（带 `client` 标签） | 每个后端当前待下发队列长度；已删除客户端的 vtoken 归入单个 `client="unknown"` 序列（多客户端求和），字面名为 `unknown` 的客户端与之合并 |
+| `ilink_hub_messages_rejected_total` | Counter（带 `client` 标签） | 因队列满被背压拒绝的消息条数（按客户端归因）；标签值按 exposition 规则转义，无名字映射的 vtoken 归入 `unknown` 桶 |
 
 ### 消息与上游
 
