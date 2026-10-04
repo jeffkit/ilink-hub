@@ -304,6 +304,10 @@ pub async fn run_serve(opts: ServeOptions, mut shutdown_rx: watch::Receiver<bool
     let store = Arc::new(Store::connect(&database_url).await?);
     let _ = store.set_master_key(std::sync::Arc::new(master_key));
 
+    // Issue #28: runtime state is per-process, so a second hub on the same
+    // database must fail fast instead of silently splitting messages.
+    let _instance_guard = store.acquire_instance_guard(&database_url).await?;
+
     let (token, base_url) = resolve_token(
         token_arg,
         ilink_base_url.clone(),
