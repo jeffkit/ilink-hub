@@ -45,6 +45,9 @@ jobs:
         run: cargo test --all-features
         env:
           DATABASE_URL: "sqlite::memory:"
+          # #39：仓规要求 DB/env 类集成测试串行（conventions.md:28）；并行下
+          # temp_env 类用例存在跨用例环境竞争的偶发失败面。
+          RUST_TEST_THREADS: "1"
 
   cross-compile:
     name: Cross-compile (${{ matrix.target }})
