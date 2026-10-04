@@ -14,6 +14,8 @@ mod context;
 
 mod credentials;
 
+pub(crate) mod instance_guard;
+
 mod messages;
 
 mod migrations;
@@ -237,22 +239,11 @@ impl Store {
     /// Extract the file path from a SQLite URL and create the file + parent
     /// directories if they do not already exist.
     fn ensure_sqlite_file(url: &str) -> Result<()> {
-        // Strip the "sqlite:" scheme prefix; handle the optional // or ///
-        let path_part = url
-            .strip_prefix("sqlite:///")
-            .or_else(|| url.strip_prefix("sqlite://"))
-            .or_else(|| url.strip_prefix("sqlite:"))
-            .unwrap_or("");
-
-        // Drop any query string (e.g. "?mode=rwc")
-        let path_str = path_part.split('?').next().unwrap_or("").trim();
-
         // Skip in-memory databases (:memory: or empty)
-        if path_str.is_empty() || path_str == ":memory:" {
+        let Some(path) = sqlite_file_path(url) else {
             return Ok(());
-        }
-
-        let path = std::path::Path::new(path_str);
+        };
+        let path = path.as_path();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
@@ -275,6 +266,24 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Extract the on-disk path from a SQLite URL; `None` for in-memory / empty.
+pub(crate) fn sqlite_file_path(url: &str) -> Option<std::path::PathBuf> {
+    // Strip the "sqlite:" scheme prefix; handle the optional // or ///
+    let path_part = url
+        .strip_prefix("sqlite:///")
+        .or_else(|| url.strip_prefix("sqlite://"))
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .unwrap_or("");
+
+    // Drop any query string (e.g. "?mode=rwc")
+    let path_str = path_part.split('?').next().unwrap_or("").trim();
+
+    if path_str.is_empty() || path_str == ":memory:" {
+        return None;
+    }
+    Some(std::path::PathBuf::from(path_str))
 }
 
 #[cfg(test)]

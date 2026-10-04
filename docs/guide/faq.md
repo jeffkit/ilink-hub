@@ -129,4 +129,10 @@ xattr -rd com.apple.quarantine /usr/local/bin/ilink-hub
 
 ### Q: 多个 Hub 实例可以同时运行吗？
 
-目前不支持（多个实例都会抢占同一个真实 iLink 连接）。单实例已足够大多数使用场景。
+不支持，Hub 是**单实例服务**：同一个 `DATABASE_URL` 上启动第二个进程会在启动时 **fail-fast**
+（非零退出并在 stderr 打印指引），不会出现两个实例同时跑。原因是客户端注册表、消息队列、路由表、
+轮询状态都在进程内，两个实例会各持一半状态并抢占同一个真实 iLink 会话 → 静默丢消息、
+`-14 session timeout`，甚至互相触发重新扫码登录。
+
+换成 PostgreSQL **不能**解决这一点：它只提升单个 Hub 的并发能力与持久化，副本数仍是 1。
+需要真·多实例，得先把队列与路由外置（尚未实现）。详见 [Docker 部署](/deployment/docker)。

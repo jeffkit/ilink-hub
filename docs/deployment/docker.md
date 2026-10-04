@@ -46,7 +46,14 @@ docker compose logs -f ilink-hub
 
 ## 使用 PostgreSQL 数据库
 
-适合多实例或需要高并发的场景：
+Hub 是**单实例服务**（副本数固定为 1）。PostgreSQL 解决的是**高并发与持久化**：多连接池、不受
+SQLite 单写连接限制、数据库可集中管理与备份——**它不是多副本方案**。客户端注册表、消息队列、
+路由表、轮询状态都在进程内，多开只会各持一半状态并互相抢占同一个 iLink 会话。
+
+同一个 `DATABASE_URL` 上启动第二个 hub 进程会在**启动时 fail-fast**（非零退出，并在 stderr 打印
+指引），因此不要用 `docker compose up --scale 2` 或 k8s `replicas: 2`。需要更高吞吐时请纵向扩容
+单个实例。多个 Hub 同时运行的问题见 [FAQ](/guide/faq)；「生产只跑一个 hub、同一 `ILINK_TOKEN`
+也只能有一个活跃实例」的运维纪律见 `docs/knowledge/ops/release-and-deploy.md`。
 
 ```yaml
 services:

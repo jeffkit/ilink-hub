@@ -77,6 +77,10 @@ bridge 由 im-agentproc 仓库独立发布，不在本 workflow 范围。
 > ⚠️ **生产 hub 唯一实例**：生产 hub **只在 `tcloud_gz`（`43.138.149.34`）**。切勿在其他机器另起
 > hub 共用同一 `ILINK_TOKEN`——iLink 对单个 bot 只允许一个活跃会话，多实例会互抢，被抢者持续
 > 报 `-14 session timeout` 且收不到任何消息。
+>
+> Hub 启动时会用 DB 级锁做单实例守卫：同一 `DATABASE_URL` 上的第二个实例会 fail-fast 退出。
+> 但守卫**以数据库为键**——不同 `DATABASE_URL` + 同一 `ILINK_TOKEN` 的多实例仍不会被拦截，
+> 所以本条的运维纪律不变。
 
 ### ⚠️ 交叉编译避坑：优先在服务器上直接编译
 
