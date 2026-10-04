@@ -233,6 +233,12 @@ pub(super) async fn handle_cmd_broadcast(
                     .metrics
                     .messages_dropped
                     .fetch_add(1, Ordering::Relaxed);
+                state
+                    .metrics
+                    .messages_rejected_by_client
+                    .entry(vtoken.to_string())
+                    .or_default()
+                    .fetch_add(1, Ordering::Relaxed);
             }
             Err(e) => {
                 error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push hub broadcast message");

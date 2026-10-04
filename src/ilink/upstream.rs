@@ -200,6 +200,8 @@ impl UpstreamClient {
         let url = format!("{}/ilink/bot/getupdates", self.base_url);
         let req_body = GetUpdatesRequest {
             get_updates_buf,
+            // The Hub does not ack its upstream with a delivery watermark.
+            last_ack_id: None,
             base_info: Some(BaseInfo::default()),
             timeout,
         };

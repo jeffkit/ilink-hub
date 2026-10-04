@@ -87,6 +87,25 @@ pub async fn metrics(
         messages_dropped,
         created,
     );
+    // Per-client backpressure attribution. Rendered by hand (not via
+    // `render_counter`) because the family carries a `client` label and must
+    // not emit an unlabelled `_created` sample.
+    out.push_str(
+        "# HELP ilink_hub_messages_rejected Messages rejected by per-client backpressure (queue full; oldest retained)\n",
+    );
+    out.push_str("# TYPE ilink_hub_messages_rejected counter\n");
+    for entry in state.metrics.messages_rejected_by_client.iter() {
+        let name = client_names_by_vtoken
+            .get(entry.key())
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        out.push_str(&format!(
+            "ilink_hub_messages_rejected_total{{client=\"{}\"}} {}\n",
+            name,
+            entry.value().load(Ordering::Relaxed)
+        ));
+    }
+
     render_counter(
         &mut out,
         "ilink_hub_messages_persist_dropped_total",

@@ -12,7 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use super::auth::{extract_vtoken, AdminGuard, UNKNOWN_VTOKEN_MSG};
 use super::wait::wait_notify_or_shutdown;
-use crate::hub::{HubState, RateLimitOutcome, MAX_CONCURRENT_POLLS_PER_VTOKEN};
+use crate::hub::{HubState, PollBatch, RateLimitOutcome, MAX_CONCURRENT_POLLS_PER_VTOKEN};
 use crate::ilink::types::*;
 use crate::redact_token;
 use crate::server::pairing::register_client_in_hub;
@@ -277,18 +277,19 @@ pub async fn getupdates(
 
     // Split-brain detection: more than one (but still under the cap)
     // concurrent long-poll means two bridge processes share one
-    // credential/token and will compete for this vtoken's queue (drain is
-    // a destructive read), so inbound messages get stolen
-    // non-deterministically.  Anything strictly above MAX has already been
-    // rejected above; we only warn for the legal-but-suspicious 1 < n <= MAX
-    // range.
+    // credential/token. Reads are non-destructive and each ack advances the
+    // shared vtoken watermark, so neither poller steals messages from the
+    // other — instead both receive the same batch and both process it, and
+    // whichever acks first retires it for the pair.  Anything strictly above
+    // MAX has already been rejected above; we only warn for the
+    // legal-but-suspicious 1 < n <= MAX range.
     if concurrent_polls > 1 {
         warn!(
             vtoken = %redact_token(&vtoken),
             concurrent = concurrent_polls,
             "multiple bridges are long-polling the same vtoken — they share one credential/token \
-             and will steal each other's messages. Give each backend its own registration \
-             instead of reusing a token."
+             and will receive duplicate deliveries of each inbound message. Give each backend \
+             its own registration instead of reusing a token."
         );
     }
 
@@ -334,7 +335,7 @@ pub async fn getupdates(
     }
 
     // Max poll is 55s — well within the upstream HTTP client's 70s socket timeout,
-    // leaving 15s margin for the drain + response serialization path.
+    // leaving 15s margin for the poll + response serialization path.
     let poll_secs = req.timeout.unwrap_or(30).min(55) as u64;
     let mut shutdown_rx = state.ilink.shutdown.clone();
     let notified = wait_notify_or_shutdown(
@@ -348,17 +349,21 @@ pub async fn getupdates(
         debug!(vtoken = %redact_token(&vtoken), "getupdates returning early due to shutdown");
     }
 
-    let messages = state
+    // Non-destructive read: the batch is retired only when the client echoes
+    // `get_updates_buf` back on a later poll. If this response never reaches the
+    // client, the same messages (same delivery ids) are returned next time.
+    let batch = state
         .clients
         .queue
-        .drain(&vtoken)
+        .poll(&vtoken, req.ack_watermark())
         .await
         .unwrap_or_else(|e| {
-            error!(error = %e, vtoken = %redact_token(&vtoken), "queue drain failed");
-            vec![]
+            error!(error = %e, vtoken = %redact_token(&vtoken), "queue poll failed");
+            PollBatch::default()
         });
+    let PollBatch { msgs, cursor } = batch;
 
-    debug!(vtoken = %redact_token(&vtoken), count = messages.len(), "getupdates returning");
+    debug!(vtoken = %redact_token(&vtoken), count = msgs.len(), "getupdates returning");
 
     (
         StatusCode::OK,
@@ -366,12 +371,8 @@ pub async fn getupdates(
             ret: Some(0),
             errcode: None,
             errmsg: None,
-            get_updates_buf: Some(String::new()),
-            msgs: if messages.is_empty() {
-                None
-            } else {
-                Some(messages)
-            },
+            get_updates_buf: Some(cursor.to_string()),
+            msgs: if msgs.is_empty() { None } else { Some(msgs) },
         }),
     )
 }

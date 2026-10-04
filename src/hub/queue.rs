@@ -31,7 +31,7 @@ pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
 /// and inject them into [`crate::hub::HubState`]:
 ///
 /// ```ignore
-/// use ilink_hub::MessageQueue;
+/// use ilink_hub::{MessageQueue, PollBatch};
 /// use ilink_hub::hub::HubState;
 /// use ilink_hub::error::HubError;
 /// use ilink_hub::ilink::types::WeixinMessage;
@@ -46,8 +46,8 @@ pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
 ///     async fn push(&self, _vtoken: &str, _msg: WeixinMessage) -> Result<bool, HubError> {
 ///         Ok(false)
 ///     }
-///     async fn drain(&self, _vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
-///         Ok(vec![])
+///     async fn poll(&self, _vtoken: &str, _ack: Option<u64>) -> Result<PollBatch, HubError> {
+///         Ok(PollBatch { msgs: vec![], cursor: 0 })
 ///     }
 ///     async fn wait_notify(&self, _vtoken: &str, _timeout_secs: u64) -> Result<bool, HubError> {
 ///         Ok(false)
@@ -60,8 +60,40 @@ pub const DEFAULT_MAX_QUEUE_SIZE: usize = 200;
 ///     }
 /// }
 /// ```
+/// One delivery batch returned by [`MessageQueue::poll`].
+///
+/// `msgs` holds **every still-unacknowledged** message for the vtoken, in FIFO
+/// order (delivery is at-least-once: a batch is only retired when the client
+/// echoes `cursor` back on its next poll). `cursor` is the delivery high-water
+/// mark the client must return verbatim to acknowledge the batch.
+#[derive(Debug, Clone, Default)]
+pub struct PollBatch {
+    pub msgs: Vec<WeixinMessage>,
+    pub cursor: u64,
+}
+
+impl PollBatch {
+    /// True when no unacknowledged message is pending for this vtoken.
+    pub fn is_empty(&self) -> bool {
+        self.msgs.is_empty()
+    }
+}
+
 #[async_trait]
 pub trait MessageQueue: Send + Sync {
+    /// Enqueue `msg` for `vtoken`.
+    ///
+    /// Return value is the **backpressure** flag, not a delivery verdict:
+    ///
+    /// * `Ok(false)` — the message was enqueued.
+    /// * `Ok(true)` — the queue is full and the message was **rejected**; the
+    ///   oldest queued message is retained (never silently dropped) and the
+    ///   caller should surface the rejection (see
+    ///   `Metrics::messages_rejected_by_client`).
+    ///
+    /// Implementations must stamp a per-vtoken stable delivery id
+    /// ([`WeixinMessage::seq`]) on every accepted message so redelivery of the
+    /// same message carries the same id.
     async fn push(&self, vtoken: &str, msg: WeixinMessage) -> Result<bool, HubError>;
     /// Optimised push for the broadcast path: the base message is shared via
     /// `Arc<WeixinMessage>` and only the per-recipient `context_token` and
@@ -83,7 +115,19 @@ pub trait MessageQueue: Send + Sync {
         msg.ilink_hub_ext = hub_ext;
         self.push(vtoken, msg).await
     }
-    async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError>;
+    /// Non-destructive read of the unacknowledged batch for `vtoken`.
+    ///
+    /// `ack` is the cursor the client echoed back from a previous response (or
+    /// `None` when it did not echo one). It acknowledges — and only then retires —
+    /// every message whose stable id is `<= ack`. Messages above the watermark,
+    /// and every message when `ack` is `None`, stay queued and are returned
+    /// again by the next poll. That is what makes delivery at-least-once: a
+    /// response lost on the way back is simply redelivered.
+    ///
+    /// Implementations must clamp `ack` to the highest id already allocated, so
+    /// a forged or stale cursor can neither retire unallocated messages nor
+    /// silence future ones.
+    async fn poll(&self, vtoken: &str, ack: Option<u64>) -> Result<PollBatch, HubError>;
     async fn wait_notify(&self, vtoken: &str, timeout_secs: u64) -> Result<bool, HubError>;
     async fn remove_client(&self, vtoken: &str) -> Result<(), HubError>;
     async fn queue_sizes(&self) -> Result<HashMap<String, usize>, HubError>;
@@ -98,8 +142,17 @@ pub trait MessageQueue: Send + Sync {
 // `wait_notify` clones Arc<Notify> and releases all locks before awaiting, so
 // N simultaneous long-polls hold zero shared locks while waiting.
 
+/// Buffer plus delivery-id allocator, guarded by a single mutex so that
+/// allocating an id, appending, and retiring an acknowledged prefix are one
+/// atomic step.
+struct SlotState {
+    messages: VecDeque<WeixinMessage>,
+    /// Next delivery id to hand out (1-based, monotonic per vtoken).
+    next_seq: u64,
+}
+
 struct PerClientSlot {
-    messages: std::sync::Mutex<VecDeque<WeixinMessage>>,
+    state: std::sync::Mutex<SlotState>,
     notify: Arc<Notify>,
     max_queue_size: usize,
 }
@@ -107,41 +160,70 @@ struct PerClientSlot {
 impl PerClientSlot {
     fn new(max_queue_size: usize) -> Arc<Self> {
         Arc::new(Self {
-            messages: std::sync::Mutex::new(VecDeque::new()),
+            state: std::sync::Mutex::new(SlotState {
+                messages: VecDeque::new(),
+                next_seq: 1,
+            }),
             notify: Arc::new(Notify::new()),
             max_queue_size,
         })
     }
 
-    fn push(&self, msg: WeixinMessage) -> bool {
-        let mut q = self.messages.lock().unwrap_or_else(|e| e.into_inner());
-        let dropped = if q.len() >= self.max_queue_size {
-            q.pop_front();
+    /// Enqueue unless the buffer is full. Returns `true` when the new message
+    /// was rejected (backpressure) — the oldest queued message is kept.
+    fn push(&self, mut msg: WeixinMessage) -> bool {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.messages.len() >= self.max_queue_size {
             warn!(
                 max = self.max_queue_size,
-                "client queue full, dropping oldest message"
+                "client queue full, rejecting new message (backpressure)"
             );
-            true
-        } else {
-            false
-        };
-        q.push_back(msg);
+            return true;
+        }
+        msg.seq = Some(st.next_seq as i64);
+        st.next_seq += 1;
+        st.messages.push_back(msg);
         self.notify.notify_one();
-        dropped
+        false
     }
 
-    fn drain(&self) -> Vec<WeixinMessage> {
-        self.messages
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect()
+    /// Retire the acknowledged prefix, then return everything still pending.
+    ///
+    /// `ack` is clamped to the highest allocated id: a client that acks by
+    /// `message_id` (a different, non-contiguous space) can never retire
+    /// messages the Hub has not yet handed out, and a forged large cursor
+    /// cannot silence messages pushed later.
+    fn poll(&self, ack: Option<u64>) -> PollBatch {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let allocated_max = st.next_seq.saturating_sub(1);
+        let watermark = ack.map(|a| a.min(allocated_max));
+
+        if let Some(watermark) = watermark {
+            while st
+                .messages
+                .front()
+                .and_then(|m| m.seq)
+                .is_some_and(|seq| seq >= 0 && seq as u64 <= watermark)
+            {
+                st.messages.pop_front();
+            }
+        }
+
+        let msgs: Vec<WeixinMessage> = st.messages.iter().cloned().collect();
+        let cursor = msgs
+            .last()
+            .and_then(|m| m.seq)
+            .and_then(|seq| u64::try_from(seq).ok())
+            .or(watermark)
+            .unwrap_or(allocated_max);
+        PollBatch { msgs, cursor }
     }
 
     fn len(&self) -> usize {
-        self.messages
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .messages
             .len()
     }
 }
@@ -201,11 +283,13 @@ impl MessageQueue for InMemoryQueue {
         Ok(self.get_or_create(vtoken).push(msg))
     }
 
-    async fn drain(&self, vtoken: &str) -> Result<Vec<WeixinMessage>, HubError> {
+    async fn poll(&self, vtoken: &str, ack: Option<u64>) -> Result<PollBatch, HubError> {
+        // Deliberately no `get_or_create`: polling an unknown vtoken must not
+        // materialise a slot. An empty batch carries the neutral cursor 0.
         Ok(self
             .slots
             .get(vtoken)
-            .map(|s| s.drain())
+            .map(|s| s.poll(ack))
             .unwrap_or_default())
     }
 
@@ -251,18 +335,18 @@ mod queue_config_tests {
             assert!(!dropped);
         }
 
-        // Push 11th message, should drop the first one
+        // Push 11th message: rejected (backpressure), oldest retained.
         let msg = WeixinMessage {
             message_id: Some(10),
             ..Default::default()
         };
-        let dropped = q.push(vtoken, msg).await.unwrap();
-        assert!(dropped);
+        let rejected = q.push(vtoken, msg).await.unwrap();
+        assert!(rejected);
 
-        let drained = q.drain(vtoken).await.unwrap();
-        assert_eq!(drained.len(), 10);
-        assert_eq!(drained[0].message_id, Some(1));
-        assert_eq!(drained[9].message_id, Some(10));
+        let batch = q.poll(vtoken, None).await.unwrap();
+        assert_eq!(batch.msgs.len(), 10);
+        assert_eq!(batch.msgs[0].message_id, Some(0));
+        assert_eq!(batch.msgs[9].message_id, Some(9));
     }
 
     #[tokio::test]
@@ -300,8 +384,8 @@ mod queue_config_tests {
         .await
         .unwrap();
 
-        let v1 = q.drain("v1").await.unwrap();
-        let v2 = q.drain("v2").await.unwrap();
+        let v1 = q.poll("v1", None).await.unwrap().msgs;
+        let v2 = q.poll("v2", None).await.unwrap().msgs;
         assert_eq!(v1.len(), 1);
         assert_eq!(v2.len(), 1);
         assert_eq!(v1[0].context_token.as_deref(), Some("vctx-v1"));
@@ -334,15 +418,17 @@ mod queue_config_tests {
         let slot = Arc::new(PerClientSlot::new(10));
         let slot_clone = slot.clone();
         let handle3 = thread::spawn(move || {
-            let _lock = slot_clone.messages.lock().unwrap();
+            let _lock = slot_clone.state.lock().unwrap();
             panic!("force panic to poison PerClientSlot Mutex");
         });
         let _ = handle3.join();
 
-        // Now test push/drain/len on the poisoned slot should not panic and should behave correctly
+        // Now test push/poll/len on the poisoned slot should not panic and should behave correctly
         assert!(!slot.push(WeixinMessage::default()));
         assert_eq!(slot.len(), 1);
-        assert_eq!(slot.drain().len(), 1);
+        let first_batch = slot.poll(None);
+        assert_eq!(first_batch.msgs.len(), 1);
+        assert!(slot.poll(Some(first_batch.cursor)).msgs.is_empty());
         assert_eq!(slot.len(), 0);
 
         // Push multiple messages into the poisoned slot
@@ -354,9 +440,12 @@ mod queue_config_tests {
             slot.push(msg);
         }
         assert_eq!(slot.len(), 5);
-        let drained = slot.drain();
-        assert_eq!(drained.len(), 5);
-        assert_eq!(drained[0].message_id, Some(0));
+        let batch = slot.poll(None);
+        assert_eq!(batch.msgs.len(), 5);
+        assert_eq!(batch.msgs[0].message_id, Some(0));
+        // Non-destructive: without an ack the messages stay queued.
+        assert_eq!(slot.len(), 5);
+        assert!(slot.poll(Some(batch.cursor)).msgs.is_empty());
         assert_eq!(slot.len(), 0);
 
         // Concurrent adversarial test on poisoned PerClientSlot
@@ -370,8 +459,8 @@ mod queue_config_tests {
                         ..Default::default()
                     };
                     slot_thread.push(msg);
-                    let drained = slot_thread.drain();
-                    for m in drained {
+                    let batch = slot_thread.poll(None);
+                    for m in batch.msgs {
                         assert!(m.message_id.is_some());
                     }
                 }
@@ -393,11 +482,12 @@ mod queue_config_tests {
         ) -> Result<bool, crate::error::HubError> {
             Ok(false)
         }
-        async fn drain(
+        async fn poll(
             &self,
             _vtoken: &str,
-        ) -> Result<Vec<crate::ilink::types::WeixinMessage>, crate::error::HubError> {
-            Ok(vec![])
+            _ack: Option<u64>,
+        ) -> Result<crate::hub::queue::PollBatch, crate::error::HubError> {
+            Ok(crate::hub::queue::PollBatch::default())
         }
         async fn wait_notify(
             &self,
@@ -427,11 +517,12 @@ mod queue_config_tests {
         ) -> Result<bool, crate::error::HubError> {
             Ok(true)
         }
-        async fn drain(
+        async fn poll(
             &self,
             _vtoken: &str,
-        ) -> Result<Vec<crate::ilink::types::WeixinMessage>, crate::error::HubError> {
-            Ok(vec![])
+            _ack: Option<u64>,
+        ) -> Result<crate::hub::queue::PollBatch, crate::error::HubError> {
+            Ok(crate::hub::queue::PollBatch::default())
         }
         async fn wait_notify(
             &self,
@@ -468,7 +559,68 @@ mod queue_config_tests {
         let result = queue.push_shared("v1", base, None, None).await.unwrap();
         assert!(
             result,
-            "push_shared default impl must propagate Ok(true) from push()"
+            "push_shared default impl must propagate the Ok(true) backpressure rejection from push()"
         );
+    }
+
+    /// Acceptance: a poll without an ack must redeliver the same ids, so a
+    /// response lost on the way back cannot lose the message.
+    #[tokio::test]
+    async fn poll_without_ack_redelivers_same_ids() {
+        let q = InMemoryQueue::new();
+        for i in 0..3 {
+            q.push(
+                "v1",
+                WeixinMessage {
+                    message_id: Some(i),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let first = q.poll("v1", None).await.unwrap();
+        assert_eq!(first.msgs.len(), 3);
+        let second = q.poll("v1", None).await.unwrap();
+        assert_eq!(
+            second.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            first.msgs.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            "redelivery must reuse the same delivery ids"
+        );
+        assert_eq!(second.cursor, first.cursor);
+    }
+
+    /// Acceptance: echoing the cursor retires exactly the delivered prefix.
+    #[tokio::test]
+    async fn poll_with_ack_prunes_acked_prefix() {
+        let q = InMemoryQueue::new();
+        q.push(
+            "v1",
+            WeixinMessage {
+                message_id: Some(0),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let first = q.poll("v1", None).await.unwrap();
+        assert_eq!(first.cursor, 1);
+
+        q.push(
+            "v1",
+            WeixinMessage {
+                message_id: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let second = q.poll("v1", Some(first.cursor)).await.unwrap();
+        assert_eq!(second.msgs.len(), 1, "only the unacked message remains");
+        assert_eq!(second.msgs[0].message_id, Some(1));
+        assert_eq!(second.cursor, 2);
+        assert_eq!(q.queue_sizes().await.unwrap()["v1"], 1);
     }
 }

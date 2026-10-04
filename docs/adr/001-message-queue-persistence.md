@@ -33,6 +33,7 @@ bridge 调 getupdates 拉走消息
 | 意外崩溃 / SIGKILL | OOM、panic | **必然**：内存队列直接消失 |
 | Bridge 暂时离线 | Bridge 重启 | **不丢失**：消息在内存中等待 bridge 重连 |
 | Hub 和 Bridge 同时重启 | 计划性双重重启 | **必然** |
+| 响应回程丢失 / 客户端未回带游标 | 已投递但未被 ack（issue #27 前的破坏性 `drain` 会永久丢） | **不丢失**：投递已改为 at-least-once（ack 驱动 + 游标续拉），未确认的消息在下次 poll 重投（同 id、同内容） |
 
 ---
 
@@ -182,6 +183,9 @@ async fn restore_queued_messages(state: &HubState) {
 1. **SIGKILL（方案 A 和 C）**：进程被强制杀死，快照无法写入
 2. **机器断电（所有方案）**：DB 未 fsync 时数据可能未落盘
 3. **Bridge 永久离线 + Hub 重启**：消息曾在内存中，但已超出恢复窗口
+
+> 注（issue #27 之后的 ack 语义）：未确认（unacked）消息在 Hub 重启后仍然丢失 —— 重投
+> 只覆盖「Hub 存活、客户端未回带游标」这一窗口；跨重启的存活属于方案 B/C，尚未实现。
 
 这是有意接受的设计权衡：iLink Hub 定位是个人/小团队消息路由网关，偶发的消息丢失在上述极端场景下可接受；追求电信级消息不丢失需要完整的 MQ（Kafka/RabbitMQ）架构，超出本项目范围。
 

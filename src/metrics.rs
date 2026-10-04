@@ -50,8 +50,20 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
     )?;
     registry.register(Box::new(messages_dispatched.clone()))?;
 
-    let messages_dropped = IntCounter::new("ilink_hub_messages_dropped_total", "Messages dropped")?;
+    let messages_dropped = IntCounter::new(
+        "ilink_hub_messages_dropped_total",
+        "Hub-level messages lost (per-client backpressure rejections + queue push errors); per-client attribution in ilink_hub_messages_rejected_total",
+    )?;
     registry.register(Box::new(messages_dropped.clone()))?;
+
+    let messages_rejected = IntCounterVec::new(
+        Opts::new(
+            "ilink_hub_messages_rejected_total",
+            "Messages rejected by per-client backpressure (queue full; oldest retained)",
+        ),
+        &["client"],
+    )?;
+    registry.register(Box::new(messages_rejected.clone()))?;
 
     let upstream_user_messages = IntCounter::new(
         "ilink_hub_upstream_user_messages_total",
@@ -154,6 +166,17 @@ pub async fn gather_metrics(state: &HubState, hub_name: &str) -> Result<String, 
         .inc_by(state.metrics.messages_dispatched.load(Ordering::Relaxed));
 
     messages_dropped.inc_by(state.metrics.messages_dropped.load(Ordering::Relaxed));
+
+    for entry in state.metrics.messages_rejected_by_client.iter() {
+        let name = client_names_by_vtoken
+            .get(entry.key())
+            .map(String::as_str)
+            .unwrap_or("unknown");
+        messages_rejected
+            .with_label_values(&[name])
+            .inc_by(entry.value().load(Ordering::Relaxed));
+    }
+
     upstream_user_messages.inc_by(state.metrics.upstream_user_messages.load(Ordering::Relaxed));
     upstream_polls_ok.inc_by(state.ilink.upstream.polls_ok());
     upstream_polls_err.inc_by(state.ilink.upstream.polls_err());
@@ -235,6 +258,15 @@ mod tests {
                 .await
                 .register("test-client".to_string(), None, None)
         };
+        // Record one per-client rejection: the prometheus crate omits
+        // label-vector families that have no children yet, so without a child
+        // `ilink_hub_messages_rejected_total` would not show up at all.
+        state
+            .metrics
+            .messages_rejected_by_client
+            .entry(vtoken.clone())
+            .or_default()
+            .fetch_add(1, Ordering::Relaxed);
         // Push a message to create a queue entry so queue_sizes() returns data.
         let msg = WeixinMessage {
             seq: None,
@@ -266,6 +298,7 @@ mod tests {
             "ilink_hub_clients_total",
             "ilink_hub_messages_dispatched_total",
             "ilink_hub_messages_dropped_total",
+            "ilink_hub_messages_rejected_total",
             "ilink_hub_upstream_user_messages_total",
             "ilink_hub_upstream_polls_ok_total",
             "ilink_hub_upstream_polls_err_total",
@@ -427,12 +460,13 @@ mod tests {
             out_b.contains("ilink_hub_clients_online{hub=\"hub-b\"}"),
             "hub-b output should contain its own label"
         );
-        // Both must independently contain all 15 metric families.
+        // Both must independently contain all 16 metric families.
         for name in &[
             "ilink_hub_clients_online",
             "ilink_hub_clients_total",
             "ilink_hub_messages_dispatched_total",
             "ilink_hub_messages_dropped_total",
+            "ilink_hub_messages_rejected_total",
             "ilink_hub_upstream_user_messages_total",
             "ilink_hub_upstream_polls_ok_total",
             "ilink_hub_upstream_polls_err_total",
@@ -485,7 +519,7 @@ mod tests {
             help_names, type_names,
             "every HELP must have a matching TYPE"
         );
-        assert_eq!(help_names.len(), 15, "expected exactly 15 metric families");
+        assert_eq!(help_names.len(), 16, "expected exactly 16 metric families");
     }
 
     #[tokio::test]
