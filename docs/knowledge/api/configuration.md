@@ -35,10 +35,10 @@ iLink Hub 遵循 [12-Factor](https://12factor.net/config) 原则，所有配置�
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `ILINK_QUEUE_BACKEND` | `memory` | 消息队列后端，**目前仅支持 `memory`**。`redis` **尚未实现**，传入会启动失败。**内存队列中的待投递消息在 Hub 重启后丢失**，不可当作持久化队列 |
-| `ILINK_MAX_QUEUE_SIZE` | `200` | 每个 vtoken 的内存队列上限，超出范围会被钳制并告警 |
+| `ILINK_QUEUE_BACKEND` | `memory` | 消息队列后端，**目前仅支持 `memory`**。`redis` **尚未实现**，传入会启动失败。**内存队列中未确认（unacked）的消息在 Hub 重启后丢失**，不可当作持久化队列 |
+| `ILINK_MAX_QUEUE_SIZE` | `200` | 每个 vtoken 的内存队列**未确认消息**上限（投递语义为 at-least-once：只有客户端在下次 poll 回带 `get_updates_buf` 的消息才算确认）。超出上限时**背压拒绝新消息**（保留最旧，绝不静默丢弃），拒绝计数见 `ilink_hub_messages_rejected_total{client=…}`；配置值超出范围会被钳制并告警 |
 | `ILINK_DISPATCH_CHANNEL_SIZE` | `1024` | 分发广播通道容量，过小会触发 Lagged 丢消息 |
-| `ILINK_SHUTDOWN_DRAIN_SECS` | `30` | 优雅关闭时等待队列排空的最长秒数 |
+| `ILINK_SHUTDOWN_DRAIN_SECS` | `30` | 优雅关闭时等待「所有已投递批次被客户端确认」的最长秒数；超时后未确认的消息随进程退出丢失 |
 | `ILINK_ADMIN_INSECURE_NO_AUTH` | 未设置 | 设为 `1` 关闭管理端点鉴权，**仅限本地调试**；与公网绑定（`0.0.0.0`/`::`）组合时**拒绝启动** |
 | `ILINK_CORS_ORIGINS` | 未设置（permissive `*`） | Bot API CORS 白名单，逗号分隔且须带 `http://`/`https://` 前缀。生产有浏览器客户端时建议显式设置 |
 | `ILINK_RETENTION_ENABLED` | `false` | 开启存储保留 sweeper；关闭时完全不删除数据 |

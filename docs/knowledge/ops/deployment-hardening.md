@@ -73,15 +73,16 @@ iLink Hub 有三条需要分别加固的暴露面：
 
 | 边界 | 默认 | 作用 |
 |------|------|------|
-| 每 vtoken 内存队列 | `ILINK_MAX_QUEUE_SIZE=200` | 防单租户消息堆积撑爆内存 |
+| 每 vtoken 内存队列 | `ILINK_MAX_QUEUE_SIZE=200` | 防单租户消息堆积撑爆内存；队列满时**背压拒绝新消息**（保留最旧，`ilink_hub_messages_rejected_total{client=…}` 可观测） |
 | 分发广播通道 | `ILINK_DISPATCH_CHANNEL_SIZE=1024` | 过小会触发 Lagged 丢消息 |
-| 每 vtoken 并发拉取 | 内置上限 | 防单租户耗尽拉取并发 |
+| 每 vtoken 并发拉取 | 内置上限 | 防单租户耗尽拉取并发；同一 vtoken 有多个 poller 时会**重复投递**（ack 语义），不再互相「偷」消息 |
 | 中继 Hub 出站队列 | 256，满则返回 503 卸载 | 背压，防出站积压 OOM |
 | 中继转发响应体 | 8 MiB 流式上限 | 防超大响应体 OOM |
 | Bridge CLI 输出捕获 | 64 MiB（stdout/stderr，全路径含流式） | 防失控 CLI 无界增长内存 |
-| 优雅关闭排空 | `ILINK_SHUTDOWN_DRAIN_SECS=30` | 关闭时等待队列排空上限 |
+| 优雅关闭排空 | `ILINK_SHUTDOWN_DRAIN_SECS=30` | 关闭时等待「已投递批次被客户端确认」的上限；客户端持续不回带 `get_updates_buf` 时会等到超时，未确认消息随进程退出丢失 |
 
-- **队列仅为内存实现**（`ILINK_QUEUE_BACKEND=memory`；`redis` 未实现）：Hub **重启会丢失未投递消息**，不要当作持久化/可靠队列做容量规划或 SLA。
+- **队列仅为内存实现**（`ILINK_QUEUE_BACKEND=memory`；`redis` 未实现）：Hub **重启会丢失未确认（unacked）消息**，不要当作持久化/可靠队列做容量规划或 SLA。
+- **投递语义为 at-least-once**：Hub 每轮 `getupdates` 返回全部未确认消息，客户端必须回带响应里的 `get_updates_buf` 才算确认；不回带的客户端会被持续重投，队列被未确认消息占满后**新消息被背压拒绝**（不是静默丢弃）。客户端侧需自行按 `seq` 去重。
 
 ## 7. Bridge 执行面隔离
 

@@ -807,9 +807,9 @@ mod tests {
             .await
             .unwrap();
         assert!(dropped);
-        let drained = q.drain("vtoken").await.unwrap();
+        let drained = q.poll("vtoken", None).await.unwrap().msgs;
         assert_eq!(drained.len(), 15);
-        assert_eq!(drained[0].message_id, Some(1));
+        assert_eq!(drained[0].message_id, Some(0));
         clear_env();
     }
 
@@ -841,8 +841,9 @@ mod tests {
             .await
             .unwrap();
         assert!(dropped);
-        let drained = q.drain("vtoken").await.unwrap();
+        let drained = q.poll("vtoken", None).await.unwrap().msgs;
         assert_eq!(drained.len(), 10);
+        assert_eq!(drained[0].message_id, Some(0));
         clear_env();
     }
 
@@ -1066,20 +1067,28 @@ mod tests {
     }
 }
 
-/// Maximum time to wait for message queues to drain during graceful shutdown (seconds).
+/// Maximum time to wait for delivered batches to be acknowledged during graceful
+/// shutdown (seconds).
 ///
 /// Configurable via `ILINK_SHUTDOWN_DRAIN_SECS`. Set to `0` to disable drain waiting.
-/// Default is 30 seconds — enough for most bridge clients to issue a final `getupdates` poll.
+/// Default is 30 seconds — enough for most bridge clients to issue a final `getupdates`
+/// poll (and thus echo the cursor acknowledging the batch).
 const DEFAULT_SHUTDOWN_DRAIN_SECS: u64 = 30;
 
-/// Wait for all per-vtoken message queues to empty before returning, up to `drain_secs`.
+/// Wait until every delivered batch has been acknowledged by its client, up to
+/// `drain_secs`.
 ///
-/// Called during graceful shutdown while the Axum listener is still accepting connections,
-/// so bridge clients can continue long-polling and drain the queues normally. Once the queues
-/// are empty (or the timeout expires), this returns and Axum closes remaining connections.
+/// Delivery is at-least-once (issue #27): `queue_sizes()` counts **unacknowledged**
+/// messages, and a client acknowledges a batch by echoing the `get_updates_buf`
+/// cursor on its next poll. Called during graceful shutdown while the Axum listener is
+/// still accepting connections, so bridge clients can keep long-polling and acknowledge
+/// their pending batches. Once every queue is empty (or the timeout expires), this
+/// returns and Axum closes remaining connections.
 ///
-/// On timeout, logs a warning with the number of undelivered messages so operators can tune
-/// the timeout or investigate why bridges are not polling fast enough.
+/// On timeout, logs a warning with the number of unacknowledged messages so operators can
+/// tune the timeout or investigate why clients are not polling fast enough. A client that
+/// simply never echoes the cursor holds the shutdown open until the timeout — that is the
+/// price of not silently dropping unacknowledged messages.
 async fn drain_queues_before_shutdown(state: &HubState, drain_secs: u64) {
     if drain_secs == 0 {
         info!("shutdown queue drain disabled (ILINK_SHUTDOWN_DRAIN_SECS=0)");
@@ -1101,7 +1110,7 @@ async fn drain_queues_before_shutdown(state: &HubState, drain_secs: u64) {
 
         let total: usize = sizes.values().sum();
         if total == 0 {
-            info!("all message queues drained; proceeding with shutdown");
+            info!("all delivered batches acknowledged; proceeding with shutdown");
             return;
         }
 
@@ -1109,8 +1118,9 @@ async fn drain_queues_before_shutdown(state: &HubState, drain_secs: u64) {
             warn!(
                 pending_messages = total,
                 timeout_secs = drain_secs,
-                "shutdown drain timeout: {} message(s) undelivered — \
-                 increase ILINK_SHUTDOWN_DRAIN_SECS or ensure bridges are online during shutdown",
+                "shutdown drain timeout: {} delivered message(s) still unacknowledged — \
+                 increase ILINK_SHUTDOWN_DRAIN_SECS, ensure clients are polling during shutdown, \
+                 or accept the loss (a client that never echoes get_updates_buf cannot be waited for)",
                 total
             );
             return;
@@ -1118,7 +1128,7 @@ async fn drain_queues_before_shutdown(state: &HubState, drain_secs: u64) {
 
         info!(
             pending_messages = total,
-            "waiting for message queues to drain before shutdown"
+            "waiting for delivered batches to be acknowledged before shutdown"
         );
         tokio::time::sleep(check_interval).await;
     }

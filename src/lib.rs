@@ -13,6 +13,7 @@ pub mod store;
 pub use error::HubError;
 pub use hub::queue::InMemoryQueue;
 pub use hub::queue::MessageQueue;
+pub use hub::queue::PollBatch;
 pub use hub::HubState;
 pub use ilink::QrLoginUiEvent;
 pub use runtime::serve::{run_serve, ServeOptions};

@@ -210,6 +210,8 @@ pub struct MessageItem {
 /// Field names mirror the official iLink / openclaw-weixin SDK.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WeixinMessage {
+    /// Hub → 下游方向的投递序号（per-vtoken 单调、从 1 起），Hub 在入队时赋值，
+    /// 同一消息重投时保持不变。上游（iLink）方向的该字段不再被 Hub 依赖。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -646,14 +648,34 @@ mod outbound_tests {
 /// Request body for `POST /ilink/bot/getupdates`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GetUpdatesRequest {
-    /// Long-poll cursor; send empty string on first call.
+    /// 客户端已确认的投递水位：把上次响应里的 `get_updates_buf` 原样回带即表示
+    /// 「该批次已收到」。首次调用（或客户端丢失游标）为空串。
     #[serde(default)]
     pub get_updates_buf: String,
+    /// 显式 ack 载体，与 `get_updates_buf` 同数空间；两者同时存在时取较大值。
+    /// 上游 bridge 不会发送它，保留给能自行维护投递序号的客户端。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ack_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_info: Option<BaseInfo>,
     /// Long-poll seconds (0 = return immediately if no messages). Defaults to 30 on Hub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
+}
+
+impl GetUpdatesRequest {
+    /// 客户端上送的 ack 水位：取 `get_updates_buf`（十进制）与 `last_ack_id`
+    /// 的较大值。空串 / 非十进制 / 负数一律视为「未 ack」（`None`）。
+    pub fn ack_watermark(&self) -> Option<u64> {
+        let from_buf = self.get_updates_buf.trim().parse::<u64>().ok();
+        let from_field = self.last_ack_id.and_then(|id| u64::try_from(id).ok());
+        match (from_buf, from_field) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Response body for `POST /ilink/bot/getupdates`.
@@ -668,7 +690,8 @@ pub struct GetUpdatesResponse {
     pub errmsg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msgs: Option<Vec<WeixinMessage>>,
-    /// Updated cursor to pass on next request.
+    /// Hub 的投递高水位（恒非空）。客户端必须在下一次请求里原样回带它；只有被
+    /// 回带过的批次才算确认，否则 Hub 会重复投递同一批消息（at-least-once）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub get_updates_buf: Option<String>,
 }
@@ -888,5 +911,47 @@ mod wire_roundtrip_tests {
         assert_eq!(img["media"]["encrypt_type"], 1);
         assert_eq!(img["mid_size"], 9616);
         assert_eq!(out["item_list"][0]["type"], 2);
+    }
+}
+
+#[cfg(test)]
+mod get_updates_ack_tests {
+    use super::*;
+
+    fn req(buf: &str, last_ack_id: Option<i64>) -> GetUpdatesRequest {
+        GetUpdatesRequest {
+            get_updates_buf: buf.to_string(),
+            last_ack_id,
+            base_info: None,
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn empty_cursor_and_no_field_means_no_ack() {
+        assert_eq!(req("", None).ack_watermark(), None);
+    }
+
+    #[test]
+    fn non_decimal_cursor_is_ignored() {
+        assert_eq!(req("not-a-cursor", None).ack_watermark(), None);
+    }
+
+    #[test]
+    fn non_negative_last_ack_id_is_used_when_cursor_is_empty() {
+        assert_eq!(req("", Some(7)).ack_watermark(), Some(7));
+    }
+
+    #[test]
+    fn negative_last_ack_id_is_ignored() {
+        assert_eq!(req("", Some(-1)).ack_watermark(), None);
+        assert_eq!(req("3", Some(-1)).ack_watermark(), Some(3));
+    }
+
+    #[test]
+    fn larger_of_cursor_and_last_ack_id_wins() {
+        assert_eq!(req("9", Some(3)).ack_watermark(), Some(9));
+        assert_eq!(req("3", Some(9)).ack_watermark(), Some(9));
+        assert_eq!(req("5", Some(5)).ack_watermark(), Some(5));
     }
 }

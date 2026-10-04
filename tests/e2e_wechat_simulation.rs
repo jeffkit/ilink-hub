@@ -125,6 +125,11 @@ struct Harness {
     base_url: String,
     state: Arc<HubState>,
     mock: Arc<MockUpstream>,
+    /// Per-vtoken delivery cursor last seen in a `getupdates` response. The
+    /// bridge echoes it back on the next poll, which is what acknowledges the
+    /// batch; the harness must do the same or every poll would redeliver the
+    /// whole unacknowledged backlog.
+    cursors: std::sync::Mutex<std::collections::HashMap<String, String>>,
     _dispatch_tx: mpsc::Sender<WeixinMessage>,
     /// Held so the watch::channel is never closed for the lifetime of the
     /// harness. Closing the sender would let `wait_shutdown_signal` resolve
@@ -177,6 +182,7 @@ async fn boot() -> Harness {
         base_url,
         state,
         mock,
+        cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
         _dispatch_tx: tx,
         _shutdown_tx: shutdown_tx,
     }
@@ -235,6 +241,7 @@ async fn boot_without_default() -> Harness {
         base_url,
         state,
         mock,
+        cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
         _dispatch_tx: tx,
         _shutdown_tx: shutdown_tx,
     }
@@ -277,19 +284,39 @@ async fn register_client(base_url: &str, name: &str) -> String {
         .to_string()
 }
 
-/// Long-poll for messages on `vtoken`. Returns the first batch of messages
-/// received within `poll_secs`, or empty if the timeout fires.
-async fn poll_for_messages(base_url: &str, vtoken: &str, poll_secs: u32) -> Vec<WeixinMessage> {
+/// Long-poll for messages on `vtoken`, faithfully mimicking a bridge: the
+/// request carries the cursor stored from the previous response (which
+/// acknowledges that batch) and the response's `get_updates_buf` is stored back
+/// for the next call. Returns the messages received within `poll_secs`, or empty
+/// if the timeout fires.
+async fn poll_for_messages(h: &Harness, vtoken: &str, poll_secs: u32) -> Vec<WeixinMessage> {
+    let cursor = h
+        .cursors
+        .lock()
+        .expect("cursor map")
+        .get(vtoken)
+        .cloned()
+        .unwrap_or_default();
     let client = reqwest::Client::new();
     let resp = client
-        .post(format!("{base_url}/ilink/bot/getupdates"))
+        .post(format!("{}/ilink/bot/getupdates", h.base_url))
         .header(header::AUTHORIZATION, format!("Bearer {vtoken}"))
-        .json(&json!({ "timeout": poll_secs, "base_info": BaseInfo::default() }))
+        .json(&json!({
+            "timeout": poll_secs,
+            "get_updates_buf": cursor,
+            "base_info": BaseInfo::default(),
+        }))
         .send()
         .await
         .expect("getupdates http");
     assert_eq!(resp.status(), StatusCode::OK, "getupdates should succeed");
     let body: serde_json::Value = resp.json().await.expect("getupdates json");
+    if let Some(buf) = body.get("get_updates_buf").and_then(|v| v.as_str()) {
+        h.cursors
+            .lock()
+            .expect("cursor map")
+            .insert(vtoken.to_string(), buf.to_string());
+    }
     if let Some(msgs) = body.get("msgs").and_then(|m| m.as_array()) {
         msgs.iter()
             .map(|m| serde_json::from_value(m.clone()).expect("decode msg"))
@@ -357,8 +384,8 @@ async fn bridge_send_with_session(
 /// Long-poll for *one* message on `vtoken`, with a short timeout. Tests that
 /// expect exactly one inbound message use this so they fail loudly if the
 /// bridge got zero or two instead.
-async fn poll_one(base_url: &str, vtoken: &str, poll_secs: u32) -> WeixinMessage {
-    let msgs = poll_for_messages(base_url, vtoken, poll_secs).await;
+async fn poll_one(h: &Harness, vtoken: &str, poll_secs: u32) -> WeixinMessage {
+    let msgs = poll_for_messages(h, vtoken, poll_secs).await;
     assert_eq!(
         msgs.len(),
         1,
@@ -393,7 +420,7 @@ async fn user_message_flows_through_dispatcher_to_bridge_and_reply_reaches_upstr
     //    bridge must echo that vctx back when sending the AI reply.
     // Give the dispatcher a moment to process the broadcast channel message.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let polled = poll_for_messages(&h.base_url, &vtoken, 2).await;
+    let polled = poll_for_messages(&h, &vtoken, 2).await;
     assert_eq!(polled.len(), 1, "bridge should receive the message");
     let inbound = &polled[0];
     assert_eq!(inbound.text(), Some("hello"));
@@ -473,8 +500,8 @@ async fn no_default_no_route_sends_help_not_broadcast() {
     h.state.routing.router.lock().await.unset_default();
 
     // Mark both bridges online (getupdates with timeout=0 is the real path).
-    let _ = poll_for_messages(&h.base_url, &v1, 0).await;
-    let _ = poll_for_messages(&h.base_url, &v2, 0).await;
+    let _ = poll_for_messages(&h, &v1, 0).await;
+    let _ = poll_for_messages(&h, &v2, 0).await;
 
     // Clear any upstream messages produced by the polls above.
     h.mock.clear().await;
@@ -486,8 +513,8 @@ async fn no_default_no_route_sends_help_not_broadcast() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Neither bridge should have received the raw user message.
-    let a = poll_for_messages(&h.base_url, &v1, 0).await;
-    let b = poll_for_messages(&h.base_url, &v2, 0).await;
+    let a = poll_for_messages(&h, &v1, 0).await;
+    let b = poll_for_messages(&h, &v2, 0).await;
     assert!(
         a.is_empty(),
         "claude must NOT receive message when no route set"
@@ -532,7 +559,7 @@ async fn cli_session_id_round_trips_through_persistence() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let inbound1 = poll_one(&h.base_url, &vtoken, 2).await;
+    let inbound1 = poll_one(&h, &vtoken, 2).await;
     assert_eq!(inbound1.text(), Some("first question"));
     let vctx1 = inbound1.context_token.as_deref().unwrap().to_string();
 
@@ -568,7 +595,7 @@ async fn cli_session_id_round_trips_through_persistence() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let inbound2 = poll_one(&h.base_url, &vtoken, 2).await;
+    let inbound2 = poll_one(&h, &vtoken, 2).await;
     assert_eq!(inbound2.text(), Some("follow-up"));
     // The session_id must round-trip — the bridge needs this to `--resume`.
     let session_id = inbound2
@@ -613,8 +640,8 @@ async fn quote_reply_routes_back_to_originating_backend() {
     let real_ctx = "real-ctx-quote-001";
 
     // Mark both bridges as online via a short poll.
-    let _ = poll_for_messages(&h.base_url, &va, 0).await;
-    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+    let _ = poll_for_messages(&h, &va, 0).await;
+    let _ = poll_for_messages(&h, &vb, 0).await;
 
     // ── Turn 1: user explicitly routes to claude via /use.
     h._dispatch_tx
@@ -630,7 +657,7 @@ async fn quote_reply_routes_back_to_originating_backend() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
+    let claude_msgs = poll_for_messages(&h, &va, 1).await;
     assert_eq!(
         claude_msgs.len(),
         1,
@@ -681,14 +708,14 @@ async fn quote_reply_routes_back_to_originating_backend() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Codex (current /use default) must NOT receive the quote-reply.
-    let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
+    let codex_after = poll_for_messages(&h, &vb, 1).await;
     assert!(
         codex_after.is_empty(),
         "quote-reply must NOT land on codex (current /use default); got {:?}",
         codex_after.iter().map(|m| m.text()).collect::<Vec<_>>()
     );
     // Claude (origin of the quoted message) MUST receive the quote-reply.
-    let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
+    let claude_after = poll_for_messages(&h, &va, 1).await;
     assert_eq!(
         claude_after.len(),
         1,
@@ -734,8 +761,8 @@ async fn quote_reply_routes_via_l0_msg_id_exact_match() {
     let real_ctx = "real-ctx-l0-001";
 
     // Mark both bridges online.
-    let _ = poll_for_messages(&h.base_url, &va, 0).await;
-    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+    let _ = poll_for_messages(&h, &va, 0).await;
+    let _ = poll_for_messages(&h, &vb, 0).await;
 
     // ── Turn 1: /use claude, then ask a question.
     h._dispatch_tx
@@ -749,7 +776,7 @@ async fn quote_reply_routes_via_l0_msg_id_exact_match() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
+    let claude_msgs = poll_for_messages(&h, &va, 1).await;
     assert_eq!(claude_msgs.len(), 1, "/use claude must route to claude");
     let claude_vctx = claude_msgs[0].context_token.as_deref().unwrap().to_string();
 
@@ -801,14 +828,14 @@ async fn quote_reply_routes_via_l0_msg_id_exact_match() {
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Codex (current /use default) must NOT receive it.
-    let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
+    let codex_after = poll_for_messages(&h, &vb, 1).await;
     assert!(
         codex_after.is_empty(),
         "L0 quote-reply must NOT land on codex (current /use default); got {:?}",
         codex_after.iter().map(|m| m.text()).collect::<Vec<_>>()
     );
     // Claude (originator) MUST receive it.
-    let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
+    let claude_after = poll_for_messages(&h, &va, 1).await;
     assert_eq!(
         claude_after.len(),
         1,
@@ -830,8 +857,8 @@ async fn quote_reply_with_unknown_msg_id_falls_through_l0() {
     let user = "alice@wechat";
     let real_ctx = "real-ctx-l0-miss-001";
 
-    let _ = poll_for_messages(&h.base_url, &va, 0).await;
-    let _ = poll_for_messages(&h.base_url, &vb, 0).await;
+    let _ = poll_for_messages(&h, &va, 0).await;
+    let _ = poll_for_messages(&h, &vb, 0).await;
 
     // /use codex — this is where base routing should send the follow-up.
     h._dispatch_tx
@@ -855,8 +882,8 @@ async fn quote_reply_with_unknown_msg_id_falls_through_l0() {
     h._dispatch_tx.try_send(msg).unwrap();
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let claude_after = poll_for_messages(&h.base_url, &va, 1).await;
-    let codex_after = poll_for_messages(&h.base_url, &vb, 1).await;
+    let claude_after = poll_for_messages(&h, &va, 1).await;
+    let codex_after = poll_for_messages(&h, &vb, 1).await;
     assert!(
         claude_after.is_empty(),
         "unknown msg_id must not route to claude; got {:?}",
@@ -937,8 +964,8 @@ async fn hub_command_use_reroutes_subsequent_messages() {
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    let claude_msgs = poll_for_messages(&h.base_url, &va, 1).await;
-    let codex_msgs = poll_for_messages(&h.base_url, &vb, 1).await;
+    let claude_msgs = poll_for_messages(&h, &va, 1).await;
+    let codex_msgs = poll_for_messages(&h, &vb, 1).await;
     assert!(
         claude_msgs.is_empty(),
         "claude should NOT receive the message after /use codex"
@@ -979,7 +1006,7 @@ async fn hub_command_session_use_propagates_to_inbound_messages() {
         .try_send(user_text_msg(user, real_ctx, "work on feature-x please"))
         .unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let inbound = poll_one(&h.base_url, &vtoken, 2).await;
+    let inbound = poll_one(&h, &vtoken, 2).await;
 
     let session_name = inbound
         .ilink_hub_ext

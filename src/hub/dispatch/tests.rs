@@ -932,7 +932,13 @@ async fn dispatch_broadcast_online_empty_context_skips_queue() {
         before,
         "empty context must not push_shared to online clients"
     );
-    let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+    let drained = state
+        .clients
+        .queue
+        .poll(&vtoken, None)
+        .await
+        .expect("poll")
+        .msgs;
     assert!(
         drained.is_empty(),
         "queue must stay empty when broadcast context is empty"
@@ -965,7 +971,13 @@ async fn dispatch_broadcast_online_pushes_shared_to_queue() {
         before + 1,
         "broadcast must call push_shared_to_queue for each online client"
     );
-    let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+    let drained = state
+        .clients
+        .queue
+        .poll(&vtoken, None)
+        .await
+        .expect("poll")
+        .msgs;
     assert_eq!(
         drained.len(),
         1,
@@ -1006,7 +1018,13 @@ async fn dispatch_at_mention_empty_context_skips_queue() {
         before,
         "@mention with empty context must not push to queue"
     );
-    let drained = state.clients.queue.drain(&vtoken).await.expect("drain");
+    let drained = state
+        .clients
+        .queue
+        .poll(&vtoken, None)
+        .await
+        .expect("poll")
+        .msgs;
     assert!(
         drained.is_empty(),
         "queue must stay empty for empty-ctx @mention"

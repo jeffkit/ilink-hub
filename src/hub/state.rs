@@ -19,9 +19,9 @@ use super::*;
 /// Maximum number of concurrent `getupdates` long-polls allowed for a single vtoken.
 ///
 /// A healthy backend has exactly one bridge process polling its vtoken at a time.
-/// When two or more bridge processes share one credential/token, they race for
-/// the destructive `drain` of the per-vtoken message queue and inbound messages
-/// get stolen non-deterministically (split-brain). To stop a malicious or
+/// When two or more bridge processes share one credential/token, both receive
+/// the same (non-destructive) delivery batch and process every inbound message
+/// twice — the first ack retires it for both (split-brain). To stop a malicious or
 /// misconfigured client from holding an unbounded number of long-polls (which
 /// would saturate the Tokio worker pool), the Hub caps the concurrent poll
 /// count per vtoken at this value and rejects additional polls with HTTP 429.
@@ -129,7 +129,12 @@ impl LatencyHistogram {
 
 pub struct Metrics {
     pub messages_dispatched: AtomicU64,
+    /// Hub-level total: per-client backpressure rejections plus queue push errors
+    /// (see `messages_rejected_by_client` for the per-client attribution).
     pub messages_dropped: AtomicU64,
+    /// Per-client backpressure rejections, keyed by hashed vtoken (the same key
+    /// space as the queue slots and `client_names_by_vtoken`).
+    pub messages_rejected_by_client: DashMap<String, AtomicU64>,
     /// User-side (or command) messages taken from upstream and passed into routing
     /// (excludes bot-side echo copies with `message_type == 2`).
     pub upstream_user_messages: AtomicU64,
@@ -180,6 +185,7 @@ impl Metrics {
         Self {
             messages_dispatched: AtomicU64::new(0),
             messages_dropped: AtomicU64::new(0),
+            messages_rejected_by_client: DashMap::new(),
             upstream_user_messages: AtomicU64::new(0),
             sendmessage_total: AtomicU64::new(0),
             sendmessage_errors: AtomicU64::new(0),
@@ -232,9 +238,9 @@ impl Drop for LatencyGuard<'_> {
 ///
 /// A healthy backend has at most one process polling its vtoken at a time. Two or more
 /// concurrent polls for the same vtoken mean multiple bridge processes share one
-/// credential/token and are competing for the same per-vtoken message queue (`drain` is a
-/// destructive read), so inbound messages get stolen non-deterministically. This tracker
-/// lets the Hub surface that misconfiguration instead of failing silently.
+/// credential/token and therefore receive duplicate deliveries of every message
+/// (each poll reads the same unacknowledged batch). This tracker lets the Hub surface
+/// that misconfiguration instead of failing silently.
 #[derive(Debug, Default)]
 pub struct PollTracker {
     /// Per-vtoken concurrent poll counter. Public for test-only access so

@@ -39,7 +39,9 @@ use crate::error::HubError;
 ///
 /// - `push` MUST be idempotent with respect to queue creation: calling `push` on an
 ///   unregistered vtoken MUST create the queue entry, not return an error.
-/// - `drain` MUST return an empty `Vec` (not an error) for unknown or empty vtokens.
+/// - `poll` MUST return an empty batch (not an error) for unknown or empty vtokens.
+/// - `poll` MUST NOT retire a message that the client has not acknowledged:
+///   delivery is at-least-once (see `poll` below).
 /// - `wait_notify` MUST NOT panic when called for a vtoken with no pending messages.
 /// - `remove_client` MUST NOT panic when called for an unknown vtoken (no-op is correct).
 /// - All methods MUST be safe to call concurrently from multiple tokio tasks.
@@ -53,22 +55,37 @@ pub trait MessageQueue: Send + Sync {
     /// If no queue entry exists for `vtoken`, one is created automatically.
     /// Callers do not need to call any initialization method before `push`.
     ///
-    /// # Overflow policy
+    /// # Overflow policy (backpressure)
     ///
-    /// When the queue is at capacity, the **oldest** message is dropped before
-    /// the new message is appended (head-drop / FIFO overflow). The capacity
-    /// is determined by each implementation; `InMemoryQueue` uses 200 messages.
+    /// When the queue is at capacity, the **new** message is rejected and the
+    /// queued (not yet acknowledged) messages are retained. The capacity is
+    /// determined by each implementation; `InMemoryQueue` uses 200 messages.
+    /// The rejection is reported as `Ok(true)` so the caller can surface it
+    /// (`ilink_hub_messages_rejected_total{client=…}`).
+    ///
+    /// # Delivery ids
+    ///
+    /// Implementations MUST stamp a per-vtoken stable delivery id on every
+    /// accepted message so that redelivery of the same message carries the same
+    /// id.
     ///
     /// # Errors
     ///
     /// Returns `Err(HubError::QueueBackend(...))` if the backend store is unavailable
     /// (e.g., Redis connection refused). `InMemoryQueue` never returns an error.
-    async fn push(&self, vtoken: &str, msg: InboundMessage) -> Result<(), HubError>;
+    async fn push(&self, vtoken: &str, msg: InboundMessage) -> Result<bool, HubError>;
 
-    /// Drain and return all pending messages for `vtoken`.
+    /// Read the still-unacknowledged messages for `vtoken`.
     ///
-    /// All messages are removed from the queue atomically. Subsequent calls
-    /// with no intervening `push` return an empty `Vec`.
+    /// `ack` is the cursor the client echoed back from a previous response
+    /// (`None` when it did not echo one). Messages with a delivery id `<= ack`
+    /// are retired; everything else — and everything when `ack` is `None` — is
+    /// returned again by the next `poll`. Delivery is therefore at-least-once: a
+    /// response lost on the way back is redelivered, never lost.
+    ///
+    /// Implementations MUST clamp `ack` to the highest delivery id already
+    /// allocated, so a forged or stale cursor can neither retire unallocated
+    /// messages nor silence future ones.
     ///
     /// # Not blocking
     ///
@@ -77,19 +94,20 @@ pub trait MessageQueue: Send + Sync {
     ///
     /// # Unknown vtokens
     ///
-    /// If `vtoken` has no queue entry, returns `Ok(vec![])` — not an error.
+    /// If `vtoken` has no queue entry, returns an empty batch with cursor `0` —
+    /// not an error.
     ///
     /// # Errors
     ///
     /// Returns `Err(HubError::QueueBackend(...))` on backend failure.
-    async fn drain(&self, vtoken: &str) -> Result<Vec<InboundMessage>, HubError>;
+    async fn poll(&self, vtoken: &str, ack: Option<u64>) -> Result<PollBatch, HubError>;
 
     /// Wait until a message is available for `vtoken` or until `timeout_secs` elapses.
     ///
     /// # Return value
     ///
     /// - `Ok(true)` — a notification was received (one or more messages are available);
-    ///   the caller should call [`drain`] to retrieve them.
+    ///   the caller should call [`poll`] to retrieve them.
     /// - `Ok(false)` — `timeout_secs` elapsed without any push to this queue.
     ///
     /// # Auto-creation
@@ -101,7 +119,7 @@ pub trait MessageQueue: Send + Sync {
     ///
     /// Implementations may use any notification primitive (tokio `Notify`,
     /// Redis pub/sub, etc.) internally. There is no guarantee about how many
-    /// messages are available when `true` is returned — always call `drain` to
+    /// messages are available when `true` is returned — always call `poll` to
     /// retrieve the full batch.
     ///
     /// # Errors
@@ -128,7 +146,7 @@ pub trait MessageQueue: Send + Sync {
     /// Remove the queue and any associated notification state for `vtoken`.
     ///
     /// Called when a client disconnects or is de-registered. After this call:
-    /// - `drain(vtoken)` returns `Ok(vec![])`.
+    /// - `poll(vtoken, None)` returns an empty batch.
     /// - A concurrent `push(vtoken, msg)` creates a new queue entry (no panic).
     ///
     /// # Unknown vtokens
@@ -170,11 +188,13 @@ impl InMemoryQueue {
 lock queues
   get or create ClientQueue for vtoken
   if pending.len() >= MAX_QUEUE_SIZE:
-    pending.pop_front()
-    log WARN "queue full, dropping oldest"
+    log WARN "queue full, rejecting new message"
+    return Ok(true)          ← backpressure; the queued messages are retained
+  msg.delivery_id = next_seq; next_seq += 1
   pending.push_back(msg)
   notify.notify_one()
 unlock
+return Ok(false)
 ```
 
 **`wait_notify` pseudocode** (lock safety critical):
@@ -189,13 +209,18 @@ tokio::time::timeout(timeout_secs, notify.notified()).await
 → return true / false
 ```
 
-**`drain` pseudocode**:
+**`poll` pseudocode**:
 ```
 lock queues
-  if no entry for vtoken: return Ok(vec![])
-  messages = queue.pending.drain(..).collect()
+  if no entry for vtoken: return Ok(PollBatch { msgs: [], cursor: 0 })
+  watermark = min(ack, next_seq - 1)              ← clamp; None (no ack) ⇒ nothing retired
+  if watermark is Some:
+    while pending.front().delivery_id <= watermark:
+      pending.pop_front()                          ← the ONLY removal point
+  msgs = pending.iter().cloned().collect()         ← non-destructive read
+  cursor = msgs.last().delivery_id or watermark or next_seq - 1
 unlock
-return Ok(messages)
+return Ok(PollBatch { msgs, cursor })
 ```
 
 **`queue_sizes` pseudocode**:
@@ -222,7 +247,7 @@ A downstream implementor can satisfy the trait with a stub:
 
 ```rust
 use async_trait::async_trait;
-use ilink_hub::{MessageQueue, HubError};
+use ilink_hub::{MessageQueue, PollBatch, HubError};
 use ilink_hub::ilink::types::InboundMessage;
 use std::collections::HashMap;
 
@@ -230,11 +255,11 @@ pub struct MockQueue;
 
 #[async_trait]
 impl MessageQueue for MockQueue {
-    async fn push(&self, _vtoken: &str, _msg: InboundMessage) -> Result<(), HubError> {
-        Ok(())
+    async fn push(&self, _vtoken: &str, _msg: InboundMessage) -> Result<bool, HubError> {
+        Ok(false)
     }
-    async fn drain(&self, _vtoken: &str) -> Result<Vec<InboundMessage>, HubError> {
-        Ok(vec![])
+    async fn poll(&self, _vtoken: &str, _ack: Option<u64>) -> Result<PollBatch, HubError> {
+        Ok(PollBatch::default())
     }
     async fn wait_notify(&self, _vtoken: &str, timeout_secs: u64) -> Result<bool, HubError> {
         tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)).await;
@@ -259,10 +284,12 @@ fn _assert_object_safe() {
 
 ## Behavioral Contract Matrix
 
-| Scenario | `push` | `drain` | `wait_notify` | `queue_sizes` | `remove_client` |
+| Scenario | `push` | `poll(vtoken, ack)` | `wait_notify` | `queue_sizes` | `remove_client` |
 |----------|--------|---------|---------------|---------------|-----------------|
-| Unknown vtoken | Creates entry, buffers msg | Returns `[]` | Creates entry, waits | Does not include vtoken | No-op |
-| Known vtoken, empty queue | Buffers msg | Returns `[]` | Waits until push or timeout | Returns `{vtoken: 0}` | Removes entry |
-| Known vtoken, N messages | Buffers; drops oldest if N≥cap | Returns N messages, empties queue | Returns `true` immediately if msg exists | Returns `{vtoken: N}` | Removes entry + messages |
+| Unknown vtoken | Creates entry, buffers msg | Empty batch, cursor `0` | Creates entry, waits | Does not include vtoken | No-op |
+| Known vtoken, empty queue | Buffers msg | Empty batch, cursor unchanged | Waits until push or timeout | Returns `{vtoken: 0}` | Removes entry |
+| Known vtoken, N messages, **no ack** | Buffers; rejects the new msg if N≥cap | Returns all N (non-destructive) | Returns `true` immediately if msg exists | Returns `{vtoken: N}` | Removes entry + messages |
+| Known vtoken, N messages, **with ack covering the first k** | Buffers; rejects the new msg if N−k≥cap | Retires the first k, returns the remaining N−k | Returns `true` immediately if msg exists | Returns `{vtoken: N−k}` | Removes entry + messages |
+| Ack beyond the allocated ids | N/A | Clamped: retires everything allocated, future pushes still delivered | N/A | N/A | N/A |
 | Concurrent push from 2 tasks | Both succeed; serialized by mutex | N/A | N/A | N/A | N/A |
 | push after remove_client | Creates fresh entry | N/A | N/A | N/A | N/A |

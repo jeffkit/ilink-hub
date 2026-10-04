@@ -30,6 +30,11 @@ pub(super) async fn push_to_queue(
         }
         Ok(true) => {
             metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .messages_rejected_by_client
+                .entry(vtoken.to_string())
+                .or_default()
+                .fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
             error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push message to queue");
@@ -59,6 +64,11 @@ pub(super) async fn push_shared_to_queue(
         }
         Ok(true) => {
             metrics.messages_dropped.fetch_add(1, Ordering::Relaxed);
+            metrics
+                .messages_rejected_by_client
+                .entry(vtoken.to_string())
+                .or_default()
+                .fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
             error!(error = %e, vtoken = %crate::redact_token(vtoken), "failed to push shared message to queue");

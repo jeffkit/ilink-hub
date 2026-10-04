@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Breaking Change — 投递语义改为 at-least-once（ack 驱动 + 游标续拉 + 溢出背压）
+
+**⚠️ Breaking Change** — `getupdates` 不再把「取走」当成「投递成功」：响应携带的投递高水位只有被客户端在**下一次** poll 回带时才确认该批，未回带的消息会被重投（响应回程丢失不再丢消息）。溢出策略从「静默丢最旧」改为「背压拒绝新消息」。
+
+| 旧行为 | 新行为 |
+|--------|--------|
+| `MessageQueue::drain(vtoken)`（破坏性读取） | `MessageQueue::poll(vtoken, ack: Option<u64>) -> PollBatch { msgs, cursor }`（非破坏性；只有 ack 覆盖的前缀被移除） |
+| `push` 返回 `Ok(true)` = 已丢弃最旧消息 | `push` 返回 `Ok(true)` = 新消息被背压拒绝，队列内容不变 |
+| `getupdates` 响应 `get_updates_buf` 恒为 `""` | 恒为本 vtoken 的投递水位（非空十进制）；请求侧的 `get_updates_buf` 被真正解析为 ack |
+| 队列满时丢最旧、只记全局无标签计数 | 队列满时拒新；新增 `ilink_hub_messages_rejected_total{client="…"}` 按客户端归因（`ilink_hub_messages_dropped_total` 语义收敛为 Hub 级总量 = 背压拒绝 + push 错误） |
+| 消息无稳定投递 id（上游 `message_id` 可能缺失） | Hub 在入队时为每条消息分配 per-vtoken 单调 `WeixinMessage.seq`，重投时保持同一 id |
+| `queue_sizes()` / `ilink_hub_queue_size` = 待投递消息数 | = 未确认（unacked）消息数 |
+| 停机 drain 等待「队列排空」 | 等待「所有已投递批次被客户端确认」，超时（`ILINK_SHUTDOWN_DRAIN_SECS`，默认 30s）仍是兜底 |
+
+新增请求字段：`GetUpdatesRequest.last_ack_id: Option<i64>`（与 `get_updates_buf` 同数空间，取 max；上游 bridge 不发送它，保留给自行维护投递序号的客户端）。已发布 bridge 无需改动：它自首个版本起就回带 `get_updates_buf`。
+
+范围外（未实现）：队列持久化（ADR-001 方案 B/C）、未确认消息的 TTL / 最大重投次数、`ILINK_QUEUE_BACKEND=redis`。
 ## [0.4.1] — 2026-10-04
 
 ### Fixed
