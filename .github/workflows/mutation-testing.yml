@@ -1,10 +1,11 @@
 name: Mutation Testing
 
 on:
-  # 每周一凌晨 3 点（UTC）自动运行全量扫描
-  schedule:
-    - cron: '0 3 * * 1'
-  # 手动触发，可选指定单文件
+  # 每周一定时全量扫描已移除（2026-11-05）：连续 5 周都在 360 分钟
+  # timeout-minutes 上限处被取消（cargo-mutants 全量在该容量下跑不完），
+  # 恒定 cancelled 且零产出。恢复定时扫描前需先分片化
+  # （参照 recursive 的 mutants 分片模式：matrix + 文件均衡切片）。
+  # 手动触发保留，可选指定单文件
   workflow_dispatch:
     inputs:
       file:
